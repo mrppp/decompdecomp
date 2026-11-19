@@ -1297,6 +1297,9 @@ class ForkEngine:
         for key, r in existing.items():
             if key not in here and key[0]:
                 moved[(key[0].split("/", 1)[0], key[1])].append(r)
+        by_symbol: dict[str, list] = defaultdict(list)  # symbol -> the moved keys holding it
+        for key in moved:
+            by_symbol[key[1]].append(key)
         with self.net.project_store(slug).tx() as db:
             for uname, f in rows:
                 sym = f["name"]
@@ -1313,8 +1316,15 @@ class ForkEngine:
                 if real := reals.get(sym):
                     meta["real"] = real
                 old = existing.get((uname, sym, k))
-                if old is None and moved.get((uname.split("/", 1)[0], sym)):
-                    old = moved[(uname.split("/", 1)[0], sym)].pop(0)
+                mkey = (uname.split("/", 1)[0], sym)
+                if old is None and not moved.get(mkey) and counts[sym] == 1 and len(by_symbol[sym]) == 1 \
+                        and moved.get(by_symbol[sym][0]):
+                    # moved to another file of no module (an Xbox 360 game's files are all top level): one function
+                    # of that symbol, and one row that lost its file. A reimport moved 22 such out of the way of
+                    # matched code, and they were marked gone with their history instead of following
+                    mkey = by_symbol[sym][0]
+                if old is None and moved.get(mkey):
+                    old = moved[mkey].pop(0)
                     name = sym if counts[sym] == 1 else f"{sym}@{uname}" + (f"#{k + 1}" if k else "")
                     used.discard(old["name"])
                     while name in used:
