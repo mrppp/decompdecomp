@@ -1051,6 +1051,35 @@ class ForkEngine:
             return None
         return consoles.get(cfg.get("platform")).analyse_unanalysed(self.net, slug, log=log)
 
+    @staticmethod
+    def _keep_going(cmd: list[str]) -> list[str]:
+        """A ninja setup step that goes on past a source that doesn't compile (-k 0), so every failure is named."""
+        return [*cmd, "-k", "0"] if cmd and Path(cmd[0]).name.startswith("ninja") and "-k" not in cmd else cmd
+
+    @staticmethod
+    def _source_digests(fp) -> dict[str, str]:
+        """{source file (relative): its SHA-1}, for every file under src/."""
+        src = fp.root / "src"
+        return {f.relative_to(fp.root).as_posix(): hashlib.sha1(f.read_bytes()).hexdigest()
+                for f in src.rglob("*") if f.is_file()} if src.is_dir() else {}
+
+    def _already_broken(self, fp, failed: list[str], sources: dict[str, str]) -> list[str]:
+        """The sources behind `failed`, when every failed target is a unit's own object compiled from a source that
+        was there before (`sources`) and is unchanged: then the failures are those files', not a new analysis's.
+        Empty when anything else failed (a delinked target, a link, a new source), or nothing was named."""
+        if not failed:
+            return []
+        units = {fp._target(u.base): u for u in fp.units() if u.base is not None}
+        now = self._source_digests(fp)
+        stale = []
+        for target in failed:
+            unit = units.get(os.path.normpath(target))
+            source = unit.source if unit is not None else None
+            if not source or source not in sources or now.get(source) != sources[source]:
+                return []
+            stale.append(source)
+        return sorted(set(stale))
+
     def reanalyse(self, slug: str, step, paths=("config",), fix=False, log=print) -> str | None:
         """A console's improved analysis of its games, applied to a project made before it (Console.on_start): `step`
         changes the project's `paths` (its config, its build tools; its source files keep their ranges, so the work in
@@ -1095,6 +1124,7 @@ class ForkEngine:
         with self._tree(proj).exclusive(), self._build_locks[proj["id"]]:
             before = (fp.manifest or {}).get("rebuild") or {}
             there = untracked()
+            sources = self._source_digests(fp)
             try:
                 said = step(fp)
             except (ForkError, NetworkError, OSError) as e:
@@ -1103,7 +1133,16 @@ class ForkEngine:
             else:
                 if said is None:
                     return None
-                setup = [fp.run(cmd, log=log)[0] for cmd in fp.setup_commands(version)]
+                failed: list[str] = []
+                commands = fp.setup_commands(version)
+                setup = [fp.run(self._keep_going(cmd), log=log, failed=failed)[0] for cmd in commands]
+                only_ninja = all(ok or (cmd and Path(cmd[0]).name.startswith("ninja")) for ok, cmd in zip(setup, commands))
+                if not all(setup) and only_ninja and (stale := self._already_broken(fp, failed, sources)):
+                    # Agents' work in progress that didn't compile before and still doesn't: not the analysis's
+                    # doing (it changes no source). Five such files of 3,511 took one game's reimport back.
+                    setup = [True]
+                    said += (f"; {len(stale)} source file{'s' if len(stale) != 1 else ''} that didn't compile before "
+                             f"still don't: {', '.join(stale[:5])}")
                 after = console.check_rebuild(fp, version, log=log) if checks and all(setup) else {"identical": None}
                 # the config says more about the same bytes: a rebuild that differs where it didn't is its doing
                 kept = all(setup) and (not checks or after.get("identical") or not before.get("identical") and (
