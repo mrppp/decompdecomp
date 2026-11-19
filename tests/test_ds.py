@@ -1108,3 +1108,43 @@ def test_autopilot_with_assembly_still_returns_the_open_functions(tmp_path, monk
     ids = net.forks.autopilot_prepare("p")
     assert ids == [net.store.one("SELECT id FROM functions WHERE project_id=1")["id"]]
     assert "M2C_DEFINES" in (root / "include" / "common.h").read_text() and len(commits) == 1
+
+
+def test_a_reimport_isnt_taken_back_for_sources_that_didnt_compile_before(per_file, monkeypatch):
+    """A reimport changes no source, but the project's work in progress always holds a few that don't compile: five
+    of an Xbox 360 game's 3,511 took its reimport back. Failures in sources that were there before and are unchanged
+    don't count against it; any other failure still does."""
+    net, slug, agent, root, state, lerp = per_file
+    config = root / "tools" / "reference" / "game.c"
+    before = config.read_bytes()
+    fp = net.forks.get(slug)[1]
+    unit = next(u for u in fp.units() if u.base is not None and u.source and (root / u.source).exists())
+    target = fp._target(unit.base)
+    monkeypatch.setattr(ForkProject, "setup_commands", lambda self, version=None: [["ninja", "prepare"]])
+    ran = []
+
+    def run(self, cmd, log=print, failed=None, **kw):
+        ran.append(cmd)
+        if failed is not None:
+            failed.extend(failing)
+        return not failing, "FAILED"
+    monkeypatch.setattr(ForkProject, "run", run)
+
+    def found(fp, touch=None):
+        config.write_bytes(b"a new analysis")
+        if touch:
+            (fp.root / touch).write_text("int broken(;\n")
+        return "more functions"
+
+    failing = ["build/somewhere/target.o"]  # not a source's object (a delinked target, a link): taken back
+    assert net.forks.reanalyse(slug, found, paths=("tools",), log=lambda *_: None) is None
+    assert config.read_bytes() == before and ran[0][-2:] == ["-k", "0"], "every failure is named"
+    failing = [target]  # the object of a source that didn't compile before either: kept
+    said = net.forks.reanalyse(slug, found, paths=("tools",), log=lambda *_: None)
+    assert said and "didn't compile before" in said and unit.source in said
+    assert config.read_bytes() == b"a new analysis"
+    config.write_bytes(before)
+    original = (root / unit.source).read_text()
+    # the same object, but its source changed with the analysis: its failure may be the analysis's doing
+    assert net.forks.reanalyse(slug, lambda fp: found(fp, unit.source), paths=("tools",), log=lambda *_: None) is None
+    (root / unit.source).write_text(original)
