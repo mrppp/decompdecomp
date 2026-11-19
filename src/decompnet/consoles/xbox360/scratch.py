@@ -22,6 +22,7 @@ uncompressed XEX2 the raw file is the image and its ``payload_offset`` stays the
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
@@ -606,13 +607,29 @@ def ghidra_functions(game: Path, xex: dict, *, base_offset: int | None = None, l
     return found or None
 
 
+DEFINITION = r"\b(\w+)\s*\([^;{}()]*(?:\([^;{}()]*\)[^;{}()]*)*\)\s*\{"  # name(params) {
+
+
+def _defined(root: Path, unit: str, keep: set[str]) -> set[str]:
+    """The functions a unit's source file defines (a name, its parameters, then a body), and every matched one."""
+    names = set(keep)
+    for path in (root / "src" / "auto" / f"{unit}.c", root / "src" / f"{unit}.c"):
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            # parameters hold no ( ) but a function pointer's: `#pragma optimize("gt", on)` before a definition
+            # otherwise read as one function named optimize, the definition after it swallowed
+            names |= {m.group(1) for m in re.finditer(DEFINITION, text)}
+            break
+    return names
+
+
 def _with_leaves(rows: list[dict], image: bytes, image_base: int, base_offset: int, log) -> list[dict]:
     """``rows`` with the leaf functions found in the code between them (pdata.leaves): functions with no table entry
     that analysis didn't find either."""
     from . import pdata
 
     extra = [{"name": f"FUN_{addr:08x}", "addr": addr, "offset": file_offset(addr, image_base, base_offset),
-              "size": size, "ranges": [[addr, addr + size]]}
+              "size": size, "ranges": [[addr, addr + size]], "leaf": True}
              for addr, size in pdata.leaves(image, image_base, [(r["addr"], r["size"]) for r in rows], log=log)]
     return sorted(rows + extra, key=lambda r: r["addr"]) if extra else rows
 
@@ -648,6 +665,7 @@ def reanalyse_functions(root: Path, version: str, keep: set[str] = frozenset(), 
     merged = len(fresh)
     fresh = _with_leaves(fresh, data[base_offset:base_offset + image_size], image_base, base_offset, log)
     leaves = len(fresh) - merged
+    found_between = {row["addr"] for row in fresh if row.get("leaf")}
 
     old = [dict(fn, unit=unit) for unit, fns in info["units"].items() for fn in fns]
     by_addr = {fn["addr"]: fn for fn in old}
@@ -666,8 +684,6 @@ def reanalyse_functions(root: Path, version: str, keep: set[str] = frozenset(), 
         if fn["name"] in used:
             fn["name"] = f"func_{fn['addr']:08X}"
         used.add(fn["name"])
-    if [(f["addr"], f["size"], f["name"]) for f in out] == [(f["addr"], f["size"], f["name"]) for f in sorted(old, key=lambda f: f["addr"])]:
-        return None
 
     # A function at an address the project had stays in its file (agents' C for it is there); a new one joins the
     # file of the function just before it (a compiler emits a file's functions together), unless a gap parts them.
@@ -677,6 +693,16 @@ def reanalyse_functions(root: Path, version: str, keep: set[str] = frozenset(), 
     ends: dict[str, int] = {}  # where each file's code ended: it grows by GAP_BYTES past that at most
     for fn in old:
         ends[fn["unit"]] = max(ends.get(fn["unit"], 0), fn["addr"] + fn["size"])
+    # A file's target object lays its functions out one after another, and the judge reads a call out of a
+    # function by where that lands in it (an agent's `DAT_006cfe34` is that offset). A function put in front of
+    # one a file's C defines moves it: one game's reimport put leaves between a file's matched functions, and 12 of
+    # them reopened. So a new function without C goes in no file ahead of one with C, and nor does a leaf found
+    # between functions (an earlier reimport's): it gets a file of its own. What else a file had stays.
+    written = {unit: _defined(root, unit, keep) for unit in info["units"]}
+    last_c = {unit: max((fn["addr"] for fn in fns if fn["name"] in written[unit]), default=0)
+              for unit, fns in info["units"].items()}
+    olds = sorted(old, key=lambda o: o["addr"])  # (code a file had: a new extent of it is no insertion)
+    starts = [o["addr"] for o in olds]
     homeless: list[Function] = []
     last_unit, last_end = "", 0
     for fn in out:  # (in address order)
@@ -685,10 +711,20 @@ def reanalyse_functions(root: Path, version: str, keep: set[str] = frozenset(), 
             if unit is None:
                 near = fn["addr"] - last_end <= GAP_BYTES and fn["addr"] < ends.get(last_unit, 0) + GAP_BYTES
                 unit = last_unit if last_unit and near else ""
+            ahead = unit and fn["name"] not in written.get(unit, ()) and fn["addr"] < last_c.get(unit, 0)
+            replaces = any(o["unit"] == unit and o["addr"] < fn["addr"] + fn["size"] and fn["addr"] < o["addr"] + o["size"]
+                           and (o["addr"], o["size"]) != (fn["addr"], fn["size"])
+                           for o in olds[max(0, bisect.bisect_left(starts, fn["addr"]) - 1):
+                                         bisect.bisect_left(starts, fn["addr"] + fn["size"])])
+            if ahead and not replaces and (fn["addr"] not in held or fn["addr"] in found_between):
+                unit = ""  # it moves (or moved, an earlier reimport's leaf) code the file's C matches
             fn["unit"] = unit
         last_unit, last_end = fn["unit"], fn["addr"] + fn["size"]
         if not fn["unit"]:
             homeless.append(Function(fn["addr"], fn["offset"], fn["size"], fn["name"]))
+    if not homeless and [(f["addr"], f["size"], f["name"], f["unit"]) for f in out] == \
+            [(f["addr"], f["size"], f["name"], f["unit"]) for f in sorted(old, key=lambda f: f["addr"])]:
+        return None  # (a file too: a function moved out of the way of a file's C is a change)
     added_units: dict[str, list[Function]] = {}
     for unit, fns in units(homeless).items():
         name = unit

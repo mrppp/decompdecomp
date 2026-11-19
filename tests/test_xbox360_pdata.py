@@ -318,3 +318,25 @@ def test_a_reimport_adds_the_leaf_functions_between_table_functions(tmp_path, mo
     said = scratch.reanalyse_functions(root, "game", log=lambda line: None)
     assert "1 leaf functions found" in said
     assert _units(root)["text_82002000"][-1] == (f"FUN_{leaf:08x}", 0x38 + TEXT_VA, 8)
+
+
+def test_a_new_function_goes_in_no_file_ahead_of_the_files_c(tmp_path, monkeypatch):
+    """A file's target object lays its functions out in a row, and the judge reads a call out of a function by where
+    it lands there: a reimport that put leaves between a file's matched functions reopened 12 of them. A function
+    without C ahead of one with C gets a file of its own; with no C after it, it joins the file."""
+    from decompnet.forks import ghidra
+
+    monkeypatch.setattr(ghidra, "available", lambda: False)
+    a, b, c = (start for start, _ in FUNCS)
+    units = {"text_82002000": [(f"FUN_{a:08x}", a, 0x10), (f"FUN_{c:08x}", c, 0x8)]}  # b is new
+    written = tmp_path / "written"
+    root = _project(written, units)
+    (root / "src" / "auto" / "text_82002000.c").write_text(
+        f'#include "common.h"\n#pragma optimize("gt", on)\nint FUN_{c:08x}(int x)\n{{\n    return x;\n}}\n')
+    scratch.reanalyse_functions(root, "game", log=lambda line: None)
+    got = _units(root)
+    assert [n for n, _, _ in got["text_82002000"]] == [f"FUN_{a:08x}", f"FUN_{c:08x}"]
+    assert [u for u in got if u != "text_82002000" and [n for n, _, _ in got[u]] == [f"FUN_{b:08x}"]]
+    bare = _project(tmp_path / "bare", units)  # nothing written yet: nothing to move
+    scratch.reanalyse_functions(bare, "game", log=lambda line: None)
+    assert [n for n, _, _ in _units(bare)["text_82002000"]] == [f"FUN_{a:08x}", f"FUN_{b:08x}", f"FUN_{c:08x}"]
