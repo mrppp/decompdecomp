@@ -275,10 +275,11 @@ def test_code_with_no_clear_end_before_a_named_start_is_left_out():
 
 def test_import_thunks_and_exception_handler_words_are_not_leaf_functions():
     thunk = [0x3D608200, 0x816B0010, pdata.MTCTR_R11, pdata.BCTR]  # lis r11 / lwz r11 / mtctr r11 / bctr
+    unpatched = [0x01000034, 0x02000034, pdata.MTCTR_R11, pdata.BCTR]  # as the file holds it: two import records
     handler = [BASE + 0x3000, BASE + 0x3010]  # an exception handler and its data, before the function they serve
     lines = []
-    image = _leaf_image({0x10: thunk, 0x20: handler})
-    assert pdata.leaves(image, BASE, [(BASE + TEXT_VA, 0x10), (BASE + TEXT_VA + 0x28, 0x10)], log=lines.append) == []
+    image = _leaf_image({0x10: thunk, 0x20: unpatched, 0x30: handler})
+    assert pdata.leaves(image, BASE, [(BASE + TEXT_VA, 0x10), (BASE + TEXT_VA + 0x38, 0x10)], log=lines.append) == []
     assert not lines, "addresses before a function aren't reported as code with no clear end"
 
 
