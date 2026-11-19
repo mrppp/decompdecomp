@@ -151,7 +151,7 @@ def test_the_import_takes_its_functions_from_the_table_without_ghidra(tmp_path, 
     got = sorted((fn["addr"], fn["size"], fn["name"]) for fns in cfg["units"].values() for fn in fns)
     assert got == [(a, n, f"FUN_{a:08x}") for a, n in FUNCS]
     assert any("function table (.pdata) lists 3 functions" in line for line in logs)
-    assert any("small leaf functions" in line for line in logs), "what is missing without Ghidra is said"
+    assert any("from the code between them alone" in line for line in logs), "where they come from without Ghidra is said"
 
 
 def _project(tmp_path, units):
@@ -201,13 +201,13 @@ def test_a_reimport_gives_code_no_file_held_files_of_its_own(tmp_path, monkeypat
     from decompnet.forks import ghidra
 
     monkeypatch.setattr(ghidra, "available", lambda: False)
-    a = FUNCS[0][0]
-    root = _project(tmp_path, {"text_82002000": [("FUN_82002000", a, 0x10)]})
+    c = FUNCS[2][0]
+    root = _project(tmp_path, {"text_82002030": [("FUN_82002030", c, 0x8)]})  # no file before the first two
     scratch.reanalyse_functions(root, "game", log=lambda line: None)
     got = _units(root)
-    assert got["text_82002000"] == [("FUN_82002000", TEXT_VA, 0x10)]
-    [new_unit] = [u for u in got if u != "text_82002000"]
-    assert [n for n, _, _ in got[new_unit]] == [f"FUN_{FUNCS[1][0]:08x}", f"FUN_{FUNCS[2][0]:08x}"]
+    assert got["text_82002030"] == [("FUN_82002030", TEXT_VA + 0x30, 0x8)]
+    [new_unit] = [u for u in got if u != "text_82002030"]
+    assert [n for n, _, _ in got[new_unit]] == [f"FUN_{FUNCS[0][0]:08x}", f"FUN_{FUNCS[1][0]:08x}"]
     assert (root / "src" / "auto" / f"{new_unit}.c").read_text(encoding="utf-8").endswith('#include "common.h"\n')
 
 
@@ -230,3 +230,90 @@ def test_the_console_offers_reimport():
     from decompnet.consoles.xbox360 import XBOX360
 
     assert XBOX360.reimports is True
+
+
+def _leaf_image(words_at: dict[int, list[int]], data: list[int] = ()) -> bytes:
+    """A memory-layout image whose .text (0x100 bytes at TEXT_VA) holds `words_at` {offset: [words]}, and whose
+    .rdata holds `data` (code addresses, as a vtable does)."""
+    sections = SECTIONS + [(".rdata", 0x3000, 0x40, 0x3000, 0x40, 0x40000040)]
+    image = _pe(sections)
+    image.extend(bytes(IMAGE_SIZE - len(image)))
+    for offset, words in words_at.items():
+        for i, w in enumerate(words):
+            struct.pack_into(">I", image, TEXT_VA + offset + 4 * i, w)
+    for i, v in enumerate(data):
+        struct.pack_into(">I", image, 0x3000 + 4 * i, v)
+    return bytes(image)
+
+
+ADDI = 0x38630001  # addi r3,r3,1
+BEQ_8 = 0x41820008  # beq +8
+B_BACK_4 = 0x4BFFFFFC  # b -4
+
+
+def test_leaf_functions_between_table_functions_are_found_where_they_end():
+    """A leaf function (no frame, no calls) has no .pdata entry: the code between table functions is cut after each
+    return or jump that nothing before it jumps past, padding skipped."""
+    known = [(BASE + TEXT_VA, 0x10)]
+    image = _leaf_image({
+        0x10: [ADDI, BLR],  # a leaf
+        0x18: [0, 0],  # padding
+        0x20: [BEQ_8, BLR, ADDI, BLR],  # an early return: the beq jumps past the first blr, so one function
+        0x30: [ADDI, B_BACK_4],  # ends on a jump back (a tail call to the code before it)
+    })
+    assert pdata.leaves(image, BASE, known, log=lambda *_: None) == [
+        (BASE + TEXT_VA + 0x10, 8), (BASE + TEXT_VA + 0x20, 16), (BASE + TEXT_VA + 0x30, 8)]
+
+
+def test_code_with_no_clear_end_before_a_named_start_is_left_out():
+    """A start that something names (here a vtable entry) is never inside a found function: code that runs past one
+    without ending is not cut on a guess, and the named function itself is still found."""
+    named = BASE + TEXT_VA + 0x18
+    image = _leaf_image({0x10: [ADDI, ADDI], 0x18: [ADDI, BLR]}, data=[named])
+    assert pdata.leaves(image, BASE, [(BASE + TEXT_VA, 0x10)], log=lambda *_: None) == [(named, 8)]
+
+
+def test_import_thunks_and_exception_handler_words_are_not_leaf_functions():
+    thunk = [0x3D608200, 0x816B0010, pdata.MTCTR_R11, pdata.BCTR]  # lis r11 / lwz r11 / mtctr r11 / bctr
+    handler = [BASE + 0x3000, BASE + 0x3010]  # an exception handler and its data, before the function they serve
+    lines = []
+    image = _leaf_image({0x10: thunk, 0x20: handler})
+    assert pdata.leaves(image, BASE, [(BASE + TEXT_VA, 0x10), (BASE + TEXT_VA + 0x28, 0x10)], log=lines.append) == []
+    assert not lines, "addresses before a function aren't reported as code with no clear end"
+
+
+def test_a_switch_keeps_its_cases():
+    """A switch ends its dispatch with bctr (a bounds check, then a table lookup): the cases after it are its own."""
+    switch = [0x2803_0003, 0x4181_0014, 0x7D6B_182E, 0x7D69_03A6, pdata.BCTR, ADDI, BLR]  # cmplwi, bgt, lwzx, ...
+    image = _leaf_image({0x10: switch})
+    assert pdata.leaves(image, BASE, [(BASE + TEXT_VA, 0x10)], log=lambda *_: None) == [(BASE + TEXT_VA + 0x10, 28)]
+
+
+def test_a_reimport_keeps_each_function_in_its_file_when_files_interleave(tmp_path, monkeypatch):
+    """After one reimport a file's code can reach past another's (one game had 196 such files). Assigning functions
+    by the first file whose span held them moved 451 of them away from the file with their C."""
+    from decompnet.forks import ghidra
+
+    monkeypatch.setattr(ghidra, "available", lambda: False)
+    a, b, c = (start for start, _ in FUNCS)
+    root = _project(tmp_path, {"outer": [(f"FUN_{a:08x}", a, 0x10), (f"FUN_{c:08x}", c, 0x8)],
+                               "inner": [(f"FUN_{b:08x}", b, 0x10)]})  # the table says 0x20: a new extent
+    scratch.reanalyse_functions(root, "game", log=lambda line: None)
+    got = _units(root)
+    assert [n for n, _, _ in got["inner"]] == [f"FUN_{b:08x}"]
+    assert [n for n, _, _ in got["outer"]] == [f"FUN_{a:08x}", f"FUN_{c:08x}"]
+
+
+def test_a_reimport_adds_the_leaf_functions_between_table_functions(tmp_path, monkeypatch):
+    """A leaf function in the code between table functions joins the file of the function before it."""
+    from decompnet.forks import ghidra
+
+    monkeypatch.setattr(ghidra, "available", lambda: False)
+    root = _project(tmp_path, {"text_82002000": [(f"FUN_{a:08x}", a, n) for a, n in FUNCS]})
+    image = bytearray((root / "orig" / "game.xex").read_bytes())
+    leaf = BASE + TEXT_VA + 0x38
+    struct.pack_into(">II", image, TEXT_VA + 0x38, ADDI, BLR)
+    (root / "orig" / "game.xex").write_bytes(bytes(image))
+    said = scratch.reanalyse_functions(root, "game", log=lambda line: None)
+    assert "1 leaf functions found" in said
+    assert _units(root)["text_82002000"][-1] == (f"FUN_{leaf:08x}", 0x38 + TEXT_VA, 8)
