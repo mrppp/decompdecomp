@@ -724,7 +724,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Feature | N64 | PS1 | PS2 | PS3 | PS4 | PSP | GBA | GameCube · Wii | Windows PC | Xbox | DS | Public decomps |
 | :-- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
 | Loader/buffer tracing, named contracts and small wrappers | ✓ MIPS / named PI DMA | ✓ MIPS static | ✓ MIPS EE EABI | — | — | ✓ shared MIPS reader | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
-| Automatic texture banks (CI4/CI8, mixed CI8 palettes, RGBA32, RGBA16 mipmaps, RNC 1/2, named four-block banks, embedded ZIP packs, textures loaded by uncompressed display lists, I64 images in a chunked-RNC filesystem, model textures in a deflated asset table, UVTX files in a UV FORM filesystem, a texture table of back-reference-packed textures with inferred widths, display-list textures and sprites in a table of relocatable VPK0 files, image packs and model bitmaps in a party-game series' main filesystem, FLA2-packed texture banks; a fork's own splat image segments, JSON asset lists and sno texture sheets) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — image adapter | — image adapter | — | — image adapter | ✓ forks with the game file (N64 checked) |
+| Automatic texture banks (CI4/CI8, mixed CI8 palettes, RGBA32, RGBA16 mipmaps, RNC 1/2 and byte-sum RNC banks, named four-block banks, embedded ZIP packs, textures loaded by uncompressed display lists, I64 images in a chunked-RNC filesystem, model textures in a deflated asset table, UVTX files in a UV FORM filesystem, a texture table of back-reference-packed textures with inferred widths, display-list textures and sprites in a table of relocatable VPK0 files, image packs and model bitmaps in a party-game series' main filesystem, FLA2-packed texture banks; a fork's own splat image segments, JSON asset lists and sno texture sheets) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — image adapter | — image adapter | — | — image adapter | ✓ forks with the game file (N64 checked) |
 | Audio browser, filters, sortable samples and explicit WAV preparation | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | Texture gallery, filters and distinct address / loader reference links | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | ✓ forks with the game file (N64 checked) |
 | Native directory roles: animation, collision, placements, grid, sequences and demos | ✓ validated schema / linked records | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
@@ -2122,6 +2122,14 @@ alone took it to 99.1%), let the deep pass score a share of its candidates under
 scheduling-off profile try statement orders that follow the target's instruction order; a match there goes through
 the existing profile-bundle recheck before the function's settings change. Every console whose compiler has
 scheduling flags (GCC and EE-GCC, SNC's `-Xsched=0`).
+
+Done for every console's installed compilers (`app/compiler_fingerprints.py`, `app/profile_climb.py`): the deep
+pass reads a function's habits from its bytes (where the frame is made, save order, delay slots, branch-likely,
+moves, frame rounding, multiply/divide result reads), compares them with what each installed profile and its own
+compiler's flag variants make of a small probe, measures the best-agreeing ones on the current C and, when one
+scores it strictly better than the function's own settings, climbs under it with the same proposals before the
+local repairs; an exact pair goes through `deep_profiles.probe`'s recheck and suggestion. Still to do: statement
+orders that follow the target's instruction order under a scheduling-off profile (the `strcmp` needs them).
 
 ### ROM projects as project folders: editable units
 
