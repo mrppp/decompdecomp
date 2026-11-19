@@ -237,7 +237,8 @@ def leaves(image: bytes, image_base: int, known: list[tuple[int, int]], *, log=p
     cut where a function ends (_end): after a return or a jump that nothing before it jumps past, padding skipped. A
     start some evidence names (a call's target, a code address in data, such as a vtable's) is never inside a found
     function: there, 7,448 of 7,465 such starts were found as starts and none fell inside one. Code that doesn't end
-    cleanly before the next named start is left out, as are import thunks (the linker's, not the game's C).
+    cleanly before the next named start is left out, as are import thunks (the linker's, not the game's C), patched
+    or not, and anything holding a word that is no instruction.
     """
     parsed = header(image)
     if parsed is None or parsed[0] != image_base:
@@ -303,8 +304,11 @@ def leaves(image: bytes, image_base: int, known: list[tuple[int, int]], *, log=p
                 # (else addresses, not code: the exception handler and its data a function with one is preceded by)
                 at = stop
                 continue
-            if not (end - at == 16 and word(at) >> 16 == 0x3D60 and word(at + 4) >> 16 == 0x816B
-                    and word(at + 8) == MTCTR_R11 and word(at + 12) == BCTR):  # lis/lwz/mtctr/bctr: an import thunk
+            if any(word(x) >> 26 in (0, 1) for x in range(at, end, 4)):
+                pass  # no instruction has primary opcode 0 or 1: data. An import thunk as the file holds it (the
+                # loader writes its lis/lwz over two import records): 773 of one game's "leaves" were those
+            elif not (end - at == 16 and word(at) >> 16 == 0x3D60 and word(at + 4) >> 16 == 0x816B
+                      and word(at + 8) == MTCTR_R11 and word(at + 12) == BCTR):  # lis/lwz/mtctr/bctr: a patched one
                 found.append((at, end - at))
             at = end
     if found or unclear:
