@@ -1810,3 +1810,41 @@ def test_a_unit_diff_keeps_a_match_the_judge_confirms_though_objdiffs_rows_diffe
     status = {r["name"]: r["status"] for r in net.store.all("SELECT name, status FROM functions")}
     assert status == {"operand": "matched", "really": "open", "far": "open"}
     assert sorted(judged) == ["operand", "really"], "a function far from matching isn't judged again"
+
+
+def test_a_function_moved_to_another_top_level_file_keeps_its_row_and_history(tmp_path, monkeypatch):
+    """A move between files was followed within a module (`main/a` to `main/b`) only. An Xbox 360 game's files are
+    all top level, so a reimport that moved 22 leaves to files of their own had their rows, which held attempts,
+    marked gone instead. One function of a symbol and one row that lost its file are the same function."""
+    from types import SimpleNamespace
+
+    from decompnet.forks.project import ForkProject
+
+    net = RomNetwork(tmp_path / "decomp.db", tmp_path / "ws")
+    root = tmp_path / "ws" / "p"
+    root.mkdir(parents=True)
+    (root / "objdiff.json").write_text(json.dumps({"units": []}))
+    net.forks._register("p", "P", "fork", root, {"kind": "fork", "version": "X", "fork_kind": "objdiff", "ready": False}, "x")
+    fn = lambda name: {"name": name, "size": "8", "metadata": {"virtual_address": "1"}, "fuzzy_match_percent": 40.0}
+    report = {"measures": {}, "units": [{"name": "text_a", "functions": [fn("FUN_1"), fn("FUN_2"), fn("dup")]},
+                                        {"name": "text_c", "functions": [fn("dup")]}]}
+    files = ["text_a", "text_c"]
+    monkeypatch.setattr(ForkProject, "report", lambda self: report)
+    monkeypatch.setattr(ForkProject, "units", lambda self: [SimpleNamespace(name=n, source=f"src/{n}.c", target=None)
+                                                           for n in files])
+    (root / "src").mkdir()
+    for n in ("text_a", "text_b", "text_c"):
+        (root / "src" / f"{n}.c").write_text("/* C */\n")
+    net.forks.sync("p", log=lambda *_: None)
+    store = net.project_store("p")
+    ids = {r["name"]: r["id"] for r in store.all("SELECT id, name FROM functions")}
+    with store.tx() as db:
+        db.execute("INSERT INTO attempts(function_id, agent_id, score, compiled, source, created_at) "
+                   "VALUES(?, 1, 5, 1, 'int f;', 0)", (ids["FUN_2"],))
+    report["units"] = [{"name": "text_a", "functions": [fn("FUN_1"), fn("dup")]},
+                       {"name": "text_b", "functions": [fn("FUN_2")]}, {"name": "text_c", "functions": [fn("dup")]}]
+    files.append("text_b")
+    net.forks.sync("p", log=lambda *_: None)
+    row = store.one("SELECT id, unit, status, meta FROM functions WHERE id=?", ids["FUN_2"])
+    assert (row["unit"], row["status"]) == ("text_b", "open") and '"gone"' not in (row["meta"] or "")
+    assert store.one("SELECT COUNT(*) AS n FROM attempts WHERE function_id=?", ids["FUN_2"])["n"] == 1
