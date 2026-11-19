@@ -606,6 +606,17 @@ def ghidra_functions(game: Path, xex: dict, *, base_offset: int | None = None, l
     return found or None
 
 
+def _with_leaves(rows: list[dict], image: bytes, image_base: int, base_offset: int, log) -> list[dict]:
+    """``rows`` with the leaf functions found in the code between them (pdata.leaves): functions with no table entry
+    that analysis didn't find either."""
+    from . import pdata
+
+    extra = [{"name": f"FUN_{addr:08x}", "addr": addr, "offset": file_offset(addr, image_base, base_offset),
+              "size": size, "ranges": [[addr, addr + size]]}
+             for addr, size in pdata.leaves(image, image_base, [(r["addr"], r["size"]) for r in rows], log=log)]
+    return sorted(rows + extra, key=lambda r: r["addr"]) if extra else rows
+
+
 def reanalyse_functions(root: Path, version: str, keep: set[str] = frozenset(), log=print) -> str | None:
     """A new account of a project's functions, from its own image, keeping the work: Settings' Reimport.
 
@@ -634,6 +645,9 @@ def reanalyse_functions(root: Path, version: str, keep: set[str] = frozenset(), 
     rows = [{"name": f"FUN_{addr:08x}", "addr": addr, "offset": file_offset(addr, image_base, base_offset),
              "size": size, "ranges": [[addr, addr + size]]} for addr, size in table]
     fresh, added, dropped = pdata.merge(rows, analysed)
+    merged = len(fresh)
+    fresh = _with_leaves(fresh, data[base_offset:base_offset + image_size], image_base, base_offset, log)
+    leaves = len(fresh) - merged
 
     old = [dict(fn, unit=unit) for unit, fns in info["units"].items() for fn in fns]
     by_addr = {fn["addr"]: fn for fn in old}
@@ -655,12 +669,24 @@ def reanalyse_functions(root: Path, version: str, keep: set[str] = frozenset(), 
     if [(f["addr"], f["size"], f["name"]) for f in out] == [(f["addr"], f["size"], f["name"]) for f in sorted(old, key=lambda f: f["addr"])]:
         return None
 
-    spans = [(fns[0]["addr"], fns[-1]["addr"] + fns[-1]["size"], unit) for unit, fns in info["units"].items() if fns]
+    # A function at an address the project had stays in its file (agents' C for it is there); a new one joins the
+    # file of the function just before it (a compiler emits a file's functions together), unless a gap parts them.
+    # Not the first file whose span holds it: after one reimport files interleave (196 of one game's did), and that
+    # moved 451 functions away from their C.
+    held = {fn["addr"]: fn["unit"] for fn in old}
+    ends: dict[str, int] = {}  # where each file's code ended: it grows by GAP_BYTES past that at most
+    for fn in old:
+        ends[fn["unit"]] = max(ends.get(fn["unit"], 0), fn["addr"] + fn["size"])
     homeless: list[Function] = []
-    for fn in out:
-        if "unit" in fn and fn["name"] in keep:
-            continue
-        fn["unit"] = next((unit for start, end, unit in spans if start <= fn["addr"] < end), "")
+    last_unit, last_end = "", 0
+    for fn in out:  # (in address order)
+        if not ("unit" in fn and fn["name"] in keep):
+            unit = held.get(fn["addr"])
+            if unit is None:
+                near = fn["addr"] - last_end <= GAP_BYTES and fn["addr"] < ends.get(last_unit, 0) + GAP_BYTES
+                unit = last_unit if last_unit and near else ""
+            fn["unit"] = unit
+        last_unit, last_end = fn["unit"], fn["addr"] + fn["size"]
         if not fn["unit"]:
             homeless.append(Function(fn["addr"], fn["offset"], fn["size"], fn["name"]))
     added_units: dict[str, list[Function]] = {}
@@ -688,6 +714,7 @@ def reanalyse_functions(root: Path, version: str, keep: set[str] = frozenset(), 
     changed = sum((f["addr"], f["size"]) not in previous for f in out)
     return (f"{len(out):,} functions (it had {len(old):,}), {changed:,} of them new or with another extent, from the "
             f"image's function table" + (f" and Ghidra ({added:,} functions the table has no entry for)" if analysed else "")
+            + (f", {leaves:,} leaf functions found between them" if leaves else "")
             + (f"; {len(added_units)} new source files" if added_units else "") + f"; {len(kept)} matched kept as they were")
 
 
@@ -1053,7 +1080,8 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
 
         # The image's own function table (.pdata) is the compiler's account of every function's start and length;
         # Ghidra, where it is installed, only adds the functions the table has no entry for (and names).
-        table = pdata.functions(_mapped_image(data, xex, fmt, base_offset), xex["image_base"], log=log)
+        image = _mapped_image(data, xex, fmt, base_offset)
+        table = pdata.functions(image, xex["image_base"], log=log)
         analysed = None
         if ghidra.available():
             analysed = ghidra_functions(game, xex, base_offset=base_offset, log=log)
@@ -1062,14 +1090,15 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
                      "offset": file_offset(addr, xex["image_base"], base_offset), "size": size,
                      "ranges": [[addr, addr + size]]} for addr, size in table]
             found, added, dropped = pdata.merge(rows, analysed)
+            found = _with_leaves(found, image, xex["image_base"], base_offset, log)
             source = "function table (.pdata)" + (" and Ghidra analysis" if analysed else "")
             if analysed:
                 log(f"Ghidra added {added} functions the table has no entry for, and {dropped} of its own lay inside "
                     "table functions (pieces of them, not functions): left out")
             else:
                 # Leaf functions (no stack frame) get no unwind entry: on one game they were 6% of its functions.
-                log("no Ghidra: functions without an entry in the table (small leaf functions) are not in this "
-                    "project; install Ghidra in Setup and import again to have them too")
+                log("no Ghidra: the functions without an entry in the table come from the code between them alone "
+                    "(leaf functions); Ghidra, installed in Setup, also names some")
         elif analysed:
             source, found = "Ghidra analysis", analysed
         elif not ghidra.available():

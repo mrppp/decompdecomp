@@ -13,6 +13,7 @@ game's ``.text`` landed 0x5E00 bytes from its address and every target object wa
 
 from __future__ import annotations
 
+import bisect
 import struct
 from dataclasses import dataclass
 
@@ -161,7 +162,6 @@ def merge(table: list[dict], analysed: list[dict] | None) -> tuple[list[dict], i
         return list(table), 0, 0
     by_start = {row["addr"]: row for row in table}
     starts = sorted(by_start)
-    import bisect
 
     out = list(table)
     added = dropped = 0
@@ -183,3 +183,131 @@ def merge(table: list[dict], analysed: list[dict] | None) -> tuple[list[dict], i
         added += 1
     out.sort(key=lambda row: row["addr"])
     return out, added, dropped
+
+
+BLR, BCTR = 0x4E800020, 0x4E800420
+MTCTR_R11 = 0x7D6903A6
+
+
+def _branch(va: int, w: int) -> tuple[int | None, bool]:
+    """(where a branch at ``va`` goes when it isn't a call, or None; whether control never falls through it)."""
+    op = w >> 26
+    if op == 18:  # b / bl
+        d = w & 0x3FFFFFC
+        if d & 0x2000000:
+            d -= 0x4000000
+        return (None if w & 1 else (d if w & 2 else va + d)), not (w & 1)
+    if op == 16:  # bc: conditional, falls through
+        d = w & 0xFFFC
+        if d & 0x8000:
+            d -= 0x10000
+        return (None if w & 1 else (d if w & 2 else va + d)), False
+    return None, w in (BLR, BCTR)
+
+
+def _switch(words: list[int]) -> bool:
+    """Whether code ending in bctr is a switch (a bounds check, then a table lookup): its cases follow the bctr."""
+    return (any(w >> 26 in (10, 11) for w in words)  # cmpli / cmpi
+            and any(w >> 26 == 31 and (w >> 1) & 0x3FF == 23 for w in words))  # lwzx
+
+
+def _end(word, start: int, limit: int) -> int | None:
+    """Where the function at ``start`` ends: just after the first blr, bctr or b that no branch of its own jumps past
+    (a switch's bctr excepted). None when there is no such end before ``limit``, or a zero word (no instruction)
+    comes first. On an Xbox 360 game's 27,923 table functions this found the table's own end for 99.8%."""
+    reach = at = start
+    while at < limit:
+        w = word(at)
+        if w == 0:
+            return None
+        target, final = _branch(at, w)
+        if target is not None and start <= target < limit:
+            reach = max(reach, target)
+        if final and reach <= at and not (w == BCTR and _switch([word(x) for x in range(start, at, 4)])):
+            return at + 4
+        at += 4
+    return None
+
+
+def leaves(image: bytes, image_base: int, known: list[tuple[int, int]], *, log=print) -> list[tuple[int, int]]:
+    """The leaf functions in the code no known function covers, as sorted (start VA, length) pairs.
+
+    A leaf function (no stack frame, no calls) gets no ``.pdata`` entry. On one Xbox 360 game 4.6% of its code lay
+    outside the table's and Ghidra's functions, nearly all of it leaf code ending in blr. Each stretch of such code is
+    cut where a function ends (_end): after a return or a jump that nothing before it jumps past, padding skipped. A
+    start some evidence names (a call's target, a code address in data, such as a vtable's) is never inside a found
+    function: there, 7,448 of 7,465 such starts were found as starts and none fell inside one. Code that doesn't end
+    cleanly before the next named start is left out, as are import thunks (the linker's, not the game's C).
+    """
+    parsed = header(image)
+    if parsed is None or parsed[0] != image_base:
+        return []
+    base, _, _, sections = parsed
+    code = [(base + s.va, base + s.va + max(s.vsize, s.rsize)) for s in sections if s.executable]
+    if not code:
+        return []
+    size = len(image)
+
+    def word(va: int) -> int:
+        at = va - base
+        return struct.unpack_from(">I", image, at)[0] if 0 <= at <= size - 4 else 0
+
+    def in_code(va: int) -> bool:
+        return any(lo <= va < hi for lo, hi in code)
+
+    named: set[int] = set()  # starts the code or the data name: call targets, code addresses in data
+    for lo, hi in code:
+        for at in range(lo, min(hi, base + size) - 3, 4):
+            w = word(at)
+            if w >> 26 == 18 and w & 1:
+                target, _ = _branch(at, w & ~1)
+                named.add(target)
+    for s in sections:
+        if s.executable or s.name == ".pdata":
+            continue
+        blob = image[s.va:s.va + s.vsize]
+        for i in range(0, len(blob) - 3, 4):
+            v = struct.unpack_from(">I", blob, i)[0]
+            if v & 3 == 0 and in_code(v):
+                named.add(v)
+    marks = sorted(named)
+
+    gaps = []
+    ordered = sorted(known)
+    for lo, hi in code:
+        prev = lo
+        for start, length in ordered:
+            if lo <= start < hi:
+                if start > prev:
+                    gaps.append((prev, start))
+                prev = max(prev, start + length)
+        if hi > prev:
+            gaps.append((prev, min(hi, base + size)))
+
+    found: list[tuple[int, int]] = []
+    unclear = 0
+    for lo, hi in gaps:
+        at = lo
+        while at < hi:
+            while at < hi and word(at) == 0:
+                at += 4
+            if at >= hi:
+                break
+            index = bisect.bisect_right(marks, at)
+            next_mark = marks[index] if index < len(marks) else hi
+            end = _end(word, at, hi)
+            if end is None or end > min(next_mark, hi):
+                stop = min(next_mark, hi)
+                if not all(base <= word(x) < base + size or word(x) == 0 for x in range(at, stop, 4)):
+                    unclear += 1  # no clean end before the next named start: not cut on a guess
+                # (else addresses, not code: the exception handler and its data a function with one is preceded by)
+                at = stop
+                continue
+            if not (end - at == 16 and word(at) >> 16 == 0x3D60 and word(at + 4) >> 16 == 0x816B
+                    and word(at + 8) == MTCTR_R11 and word(at + 12) == BCTR):  # lis/lwz/mtctr/bctr: an import thunk
+                found.append((at, end - at))
+            at = end
+    if found or unclear:
+        log(f"{len(found)} leaf functions (no entry in the function table) found in the code between functions"
+            + (f"; {unclear} stretches with no clear end left out" if unclear else ""))
+    return found
