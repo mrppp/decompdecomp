@@ -76,3 +76,87 @@ def test_check_accepts_the_c_symbol_and_old_splitter_name(tmp_path, monkeypatch)
     assert module.check('old_entry')
     assert module.check('renamed_entry')
     assert not module.B['functions'][0].get('entry_only')
+
+
+def test_rebuild_verifies_image_with_mixed_mips_abis(tmp_path, monkeypatch):
+    import subprocess
+
+    import pytest
+
+    from decompnet import toolchains
+
+    if toolchains.installed('binutils-mips') is None:
+        pytest.skip('needs binutils-mips')
+    module = builder(tmp_path, [], monkeypatch)
+    prefix = toolchains.binary('binutils-mips').parent / 'mips-ps2-decompals-'
+    monkeypatch.setattr(module, 'binutils', lambda tool: str(prefix) + tool)
+    (tmp_path / 'build').mkdir()
+    todo = []
+    expected = bytes.fromhex('03e0000800000000')
+    for abi, word in [('32', '0x03e00008'), ('eabi', '0')]:
+        src, obj = f'{abi}.s', f'build/{abi}.o'
+        (tmp_path / src).write_text(f'.text\n.word {word}\n')
+        subprocess.run([module.binutils('as'), '-EB', '-march=vr4300', f'-mabi={abi}',
+                        '-no-pad-sections', '-o', obj, src], cwd=tmp_path, check=True)
+        todo.append(('asm', src, obj))
+    (tmp_path / 'baserom').write_bytes(expected)
+    module.B.update(image='baserom', output='build/game.bin', ld_flags=['-EB'])
+    monkeypatch.setattr(module, 'setup', lambda: None)
+    monkeypatch.setattr(module, 'objects', lambda: (todo, {}, []))
+    monkeypatch.setattr(module, 'build_objects', lambda _: None)
+    monkeypatch.setattr(module, 'fill_gaps', lambda _: [])
+    monkeypatch.setattr(module, 'linker_script', lambda *_: f'SECTIONS {{ .text 0x80000000 : {{ *(.text) }} /DISCARD/ : {{ {module.DISCARD} }} }}')
+    assert module.build()
+    assert (tmp_path / 'build/game.bin').read_bytes() == expected
+
+    (tmp_path / 'baserom').write_bytes(bytes(len(expected)))
+    assert not module.build()
+
+
+def test_mips_abi_retry_requires_only_abi_diagnostics(tmp_path, monkeypatch):
+    module = builder(tmp_path, [], monkeypatch)
+    diagnostics = ('ld: entry.o: linking 32-bit code with 64-bit code\n'
+                   'ld: entry.o: failed to merge target specific data of file entry.o\n')
+    assert module.mixed_mips_abi(diagnostics)
+    assert not module.mixed_mips_abi(diagnostics + 'ld: undefined reference to missing\n')
+    assert not module.mixed_mips_abi('ld: cannot find entry.o\n')
+
+
+def test_placement_index_uses_rom_offsets_for_overlays(tmp_path, monkeypatch):
+    module = builder(tmp_path, [], monkeypatch)
+    placements = module.placements_by_rom([
+        (0x80000000, 0x200, 'overlay2.o'),
+        (0x80000000, 0x100, 'overlay1.o'),
+        (0x80000004, 0x104, 'tail.o'),
+        (0x80000008, None, 'unmapped.o'),
+    ])
+    assert placements(0x100, 0x200) == [(0x80000000, 0x100, 'overlay1.o'), (0x80000004, 0x104, 'tail.o')]
+    assert placements(0x200, 0x204) == [(0x80000000, 0x200, 'overlay2.o')]
+    assert placements(0x105, 0x200) == []
+
+
+def test_pinned_default_compiler_rebuilds_distinct_objects_concurrently(tmp_path, monkeypatch):
+    from threading import Event
+
+    from decompnet.rom import export_workers
+
+    functions = [{'name': name, 'vram': i * 8, 'c': f'{name}.c'} for i, name in enumerate(('one', 'two'))]
+    module = builder(tmp_path, functions, monkeypatch)
+    module.B['compiler'] = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O2'], 'timeout': 20}
+    for fn in functions:
+        (tmp_path / fn['c']).touch()
+    monkeypatch.setattr(export_workers.os, 'cpu_count', lambda: 4)
+    monkeypatch.setattr(export_workers.compiler, 'concurrency_limit', lambda: 2)
+    compile_object = module.run_in
+    second_started = Event()
+
+    def wait_for_second(cfg, root, argv, *, inputs, outputs):
+        if outputs == ['one.o']:
+            assert second_started.wait(3)
+        else:
+            second_started.set()
+        return compile_object(cfg, root, argv, inputs=inputs, outputs=outputs)
+
+    monkeypatch.setattr(module, 'run_in', wait_for_second)
+    module.build_objects([('c', fn['c'], f"{fn['name']}.o") for fn in functions])
+    assert (tmp_path / 'one.o').read_bytes() == (tmp_path / 'two.o').read_bytes() == b'object'

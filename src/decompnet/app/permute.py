@@ -296,6 +296,10 @@ class State:
             self.current = ", ".join(self._held)
 
 
+class StaleProjectGeneration(NetworkError):
+    """A project generation changed before a parallel candidate could be recorded."""
+
+
 class Permuter:
     def __init__(self, net):
         self.net = net
@@ -1018,6 +1022,8 @@ class Permuter:
                     changed.append('header')
                 if self.net._generation.get(proj['id'], 0) != generation:
                     changed.append('symbols or layout')
+                if changed == ['symbols or layout']:
+                    raise StaleProjectGeneration('Search inputs changed while compiling (symbols or layout).')
                 if changed:
                     raise NetworkError('Search inputs changed while compiling ('+', '.join(changed)+'); the saved result was left untouched. Retry the function.')
         compile_candidate = getattr(self.net, "_attempt_compilation", self.net._compile)
@@ -1050,6 +1056,9 @@ class Permuter:
                 d = scoring.diff(target, cand)
         if verdict is not None:
             d = scoring.DiffResult(0 if verdict else max(1, d.score), d.max_score, d.rows, verdict)
+        if (current_trial() or {}).get('exact_only') and not d.bytes_match:
+            self._trial_outcome = 'exact_only_miss'
+            return None
         if getattr(result, 'batched', False) and (d.score < best or d.bytes_match):
             # Compiled with other candidates (batch_compile.py): what is kept is always judged from its own compile.
             batched_score = d.score
@@ -1066,6 +1075,9 @@ class Permuter:
                 d = scoring.diff(target, cand)
             if verdict is not None:
                 d = scoring.DiffResult(0 if verdict else max(1, d.score), d.max_score, d.rows, verdict)
+            if (current_trial() or {}).get('exact_only') and not d.bytes_match:
+                self._trial_outcome = 'exact_only_miss'
+                return None
             compile_timing.add('batch_rechecks', 1)
             if d.score != batched_score:
                 compile_timing.add('batch_disagreements', 1)
@@ -1075,7 +1087,6 @@ class Permuter:
             # Ordinary misses skip export/address reports; search feedback remains available.
             finish=getattr(self.net,'_complete_search_evaluation',self.net._evaluate)
             finish(fn,proj,result.obj)
-        from ..repair_feedback import current_trial
         self._compact_trial = ((current_trial() or {}).get('kind') == 'random rewrite'
                                and source != fn['best_source'] and d.score >= best and not d.bytes_match)
         if not self._compact_trial:

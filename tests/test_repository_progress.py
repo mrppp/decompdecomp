@@ -137,6 +137,31 @@ def test_capture_reports_its_steps(progress):
         'Checking saved progress', 'Reading saved progress', 'Comparing with Git']
 
 
+def test_scoped_capture_skips_checkpoint_git_and_raw_reads_of_unselected_sources(progress, monkeypatch):
+    net, root, _ = progress
+    header = root/'include/common.h'
+    header.write_bytes(header.read_bytes().replace(b'\n', b'\r\n'))
+    (root/'private.txt').write_text('Keep unrelated work in the checkout')
+    original = repository_progress._capture_bytes
+    read_paths = []
+
+    def capture(path, text):
+        read_paths.append(path)
+        return original(path, text)
+
+    def unexpected_git(*args):
+        pytest.fail('A scoped capture does not inspect the whole Git checkout')
+
+    monkeypatch.setattr(repository_progress, '_capture_bytes', capture)
+    monkeypatch.setattr(repository_sync, 'git', unexpected_git)
+    files, paths, manifest = repository_progress.snapshot(net, 'game', root, print,
+                                                          directories=('include',))
+    assert read_paths == [header]
+    assert files == {'include/common.h': header.read_bytes()}
+    assert paths == set(files)
+    assert 'matched_by' in manifest['functions']['f']
+
+
 def test_index_lock_and_branch_change_preserve_checkpoint(progress, monkeypatch):
     _, root, _ = progress
     files = {'src/f.c': b'captured\n'}
@@ -323,13 +348,11 @@ def test_recovered_source_is_rejudged_before_the_snapshot_is_captured(progress, 
     net.progress.signatures['game'] = net.progress._signature(root)
     monkeypatch.setattr(net, 'apply_remote_layout', lambda *args: None)
     judged = []
-    def attempt(agent, name, text, slug):
-        judged.append(name)
-        with net.store.tx() as db:
-            db.execute("UPDATE functions SET status=?,matched_source=?,best_source=?,best_score=? WHERE project_id=? AND name=?",
-                       ('matched' if matched else 'open', text if matched else None, text, 0 if matched else 10, proj['id'], name))
-        return {'matched': matched}
-    monkeypatch.setattr(net, 'attempt', attempt)
+    def recheck(project, header, fn, text):
+        assert fn['status'] == 'matched'
+        judged.append(fn['name'])
+        return matched, 0 if matched else 10, None
+    monkeypatch.setattr(net, '_saved_match_verdict', recheck)
     files, _, manifest = repository_progress.snapshot(net, 'game', root, print)
     assert judged == ['f']
     assert files['src/f.c' if matched else 'best/f.c'] == source.encode()

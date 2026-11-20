@@ -35,6 +35,7 @@ from .. import compiler, consoles, toolchains
 from ..hostenv import NO_WINDOW, stop_process_tree
 from ..metadata_rows import rows as metadata_rows
 from ..network import CLAIM_ORDERS, NetworkError
+from ..readme_links import DECOMPDECOMP, START_YOUR_OWN
 from ..request_timing import phase
 from ..scoring import percent_text
 from . import save_readme
@@ -835,9 +836,11 @@ def _write_readme(net, proj, folder: Path, manifest: dict, functions: dict) -> N
                f"- **Compiler:** {compiler_name}")
     readme = f"""# {proj['name']}: decompdecomp progress
 
-This is a saved decompilation project created with [decompdecomp](https://github.com/RetroReversing/decompdecomp).
+This is a saved decompilation project created with {DECOMPDECOMP}.
 AI agents were used during the decompilation; their C attempts were kept only when decompdecomp's byte-for-byte
 judge accepted them as matches.
+
+{START_YOUR_OWN}
 
 ## Project details
 
@@ -960,9 +963,11 @@ def _save_best(net, proj, folder: Path) -> dict:
             f"{names.get(r['best_agent_id'], '?')}; it belongs in {source} */\n\n" + r["best_source"].strip() + "\n")
     readme = f"""# {proj['name']}: the closest attempts so far
 
-Saved by [decompdecomp](https://github.com/RetroReversing/decompdecomp). Each file in `best/` is the closest C an agent wrote
+Saved by {DECOMPDECOMP}. Each file in `best/` is the closest C an agent wrote
 for a function of the game that doesn't match byte for byte yet: its comment says how close,
 who wrote it and which source file it belongs in. They compile, but they're not the original's code.
+
+{START_YOUR_OWN}
 
 The matched functions aren't here: they're in the project's own source files (and its git history), where every
 match was judged byte for byte. No game data is in this folder.
@@ -1278,15 +1283,7 @@ def _apply_context(net, slug: str, folder: Path, manifest: dict, log,
             db.execute("INSERT OR REPLACE INTO symbols(project_id,name,address,size,kind) VALUES(?,?,?,?,?)",
                        (pid, symbol["name"], symbol["address"], symbol.get("size", 0), symbol.get("kind", "data")))
     net._syms.pop(pid, None)
-    with store.tx() as db:
-        for item in manifest.get("set_aside") or []:
-            # A synced layout can already have set it aside before this runs; its reason still has to come back.
-            row = _set_aside_row(db, pid, item)
-            if row is None:
-                continue
-            why = restored_aside(item)
-            meta = json.loads(row["meta"] or "{}") | why
-            db.execute("UPDATE functions SET status='asm',meta=? WHERE id=?", (json.dumps(meta), row["id"]))
+    _restore_set_aside(store, pid, manifest.get("set_aside") or [])
 
     def setup(cfg):
         if manifest.get("compiler") and toolchains.installed(manifest["compiler"].get("toolchain") or "") is not None:
@@ -1356,13 +1353,6 @@ def _apply_context(net, slug: str, folder: Path, manifest: dict, log,
             db.execute("INSERT INTO notes(project_id,function_id,agent_id,text,created_at,score_before,score_after) "
                        "VALUES(?,?,?,?,?,?,?)", (pid, functions.get(name), agents[author], note["text"],
                                                at, before, after))
-    with store.tx() as db:
-        for item in manifest.get("set_aside") or []:
-            row = _set_aside_row(db, pid, item)
-            if row is not None:
-                why = restored_aside(item)
-                db.execute("UPDATE functions SET status='asm', meta=? WHERE id=?",
-                           (json.dumps({**json.loads(row["meta"] or "{}"), **why}), row["id"]))
     by_name = {r["name"]: r for r in store.all("SELECT name,vram FROM functions WHERE project_id=?", pid)}
     return by_name, manifest.get("functions") or {}
 
@@ -1375,6 +1365,14 @@ def _saved_name(old_name, info, by_name, by_vram):
     return candidates[0] if len(candidates) == 1 else None
 
 
+
+def _file_identity(path: Path) -> tuple:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return (None,)
+    return (info.st_mtime_ns, info.st_size, info.st_mode, info.st_ctime_ns, info.st_ino)
+
 def _saved_current(store, project_id, name, kind):
     # Already matched entries never use C here. For an open saved source, only the
     # normal judge needs the full function; unchanged drafts compare just best C.
@@ -1383,7 +1381,7 @@ def _saved_current(store, project_id, name, kind):
                      "FROM functions WHERE project_id=? AND name=?", kind == 'best', project_id, name)
 
 
-def _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code, check_cancel):
+def _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code, check_cancel, verifying=()):
     """Compile a bounded window ahead; only the caller may judge or change project state."""
     store = net.project_store(proj['id'])
     from .restore_compilation import Pool
@@ -1418,14 +1416,20 @@ def _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code,
                 kind = "src" if "matched_by" in info else "best"
                 text = _saved_source(folder, files, f"{kind}/{_source_file(old_name)}")
                 name = _saved_name(old_name, info, by_name, by_vram)
+                if name in verifying and text is None:
+                    removed_status, previous_source = verifying[name]
+                    if not removed_status:
+                        text = previous_source
                 prepared = None
                 if judge_code and name is not None and text is not None:
                     current = _saved_current(store, proj["id"], name, kind)
-                    if current["status"] != "matched" and not (kind == "best" and current["best_source"] == text):
+                    if name in verifying or (current["status"] != "matched"
+                                             and not (kind == "best" and current["best_source"] == text)):
                         fn = dict(store.one("SELECT * FROM functions WHERE project_id=? AND name=?", proj["id"], name))
                         # A foreground result can arrive between the narrow read and
                         # the full compiler snapshot. Recheck against that fresh row.
-                        if fn["status"] != "matched" and not (kind == "best" and fn["best_source"] == text):
+                        if name in verifying or (fn["status"] != "matched"
+                                                 and not (kind == "best" and fn["best_source"] == text)):
                             ctx = net._context(proj["id"], fn["unit"])
                             if ctx is not None:
                                 snapshot = net._compile_snapshot(proj, fn, ctx["header"], text)
@@ -1451,7 +1455,8 @@ def _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code,
 
 @restore_batch
 def _judge_saved(net, slug: str, folder: Path, manifest: dict, by_name: dict, saved: dict, log,
-                 files: dict[str, str] | None = None, judge_code: bool = True) -> dict:
+                 files: dict[str, str] | None = None, judge_code: bool = True, verifying=None) -> dict:
+    verifying = verifying or {}
     store = net.project_store(slug)
     check_cancel = getattr(log, "check_cancel", lambda: None)
     proj = dict(net._project(slug))
@@ -1470,10 +1475,11 @@ def _judge_saved(net, slug: str, folder: Path, manifest: dict, by_name: dict, sa
             check_cancel()
             name = _saved_name(old_name, info, by_name, by_vram)
             kind = "src" if "matched_by" in info else "best"
-            if name is not None and _saved_source(folder, files, f"{kind}/{_source_file(old_name)}") is not None:
+            if name is not None and name not in verifying and _saved_source(folder, files, f"{kind}/{_source_file(old_name)}") is not None:
                 yield name, old_name
     progress = getattr(net, "progress", None)
     verdict_lock = progress._project_lock(slug) if progress is not None else nullcontext()
+    active = None
     with verdict_lock:
         restore_evidence_many(net, pid, evidence_names(), manifest, check_cancel)
         if progress is not None and (active := progress.rechecking.get(slug)) is not None:
@@ -1485,9 +1491,10 @@ def _judge_saved(net, slug: str, folder: Path, manifest: dict, by_name: dict, sa
     # reading best_source here would inflate every candidate without using it.
     current_rows = None if judge_code else {row["name"]:row for row in store.all(
         "SELECT name,status FROM functions WHERE project_id=?", pid)}
+    guard = {entry[0]: entry[1:] for entry in active.signature} if active and verifying else {}
     last_update = 0
     judge_agent=None;credits={}
-    checks = _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code, check_cancel)
+    checks = _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code, check_cancel, verifying)
     with closing(checks):
         for index, (old_name, info, kind, text, name, prepared) in enumerate(checks):
             # Compile workers do no writes. Wait outside the lock so a slow compiler cannot
@@ -1510,9 +1517,10 @@ def _judge_saved(net, slug: str, folder: Path, manifest: dict, by_name: dict, sa
                 try:
                     with verdict_lock:
                         check_cancel()
-                        current = (None if name is None or text is None else
+                        current = (None if name is None or (text is None and name not in verifying) else
                                    _saved_current(store, pid, name, kind) if judge_code else current_rows[name])
-                        needs_attempt = (judge_code and current is not None and current['status'] != 'matched'
+                        needs_attempt = (judge_code and name not in verifying and current is not None
+                                         and current['status'] != 'matched'
                                          and not (kind == 'best' and current['best_source'] == text))
                         if needs_attempt and not yielded_autopilot:
                             # Only entries needing a verdict may wait for a claim.
@@ -1529,6 +1537,37 @@ def _judge_saved(net, slug: str, folder: Path, manifest: dict, by_name: dict, sa
                         check_cancel()
                         if judge_code:
                             log(f"checking {old_name}")
+                        if name in verifying:
+                            status, previous_source = verifying[name]
+                            path = _source_file(old_name)
+                            unit = store.one("SELECT unit FROM functions WHERE project_id=? AND name=?", pid, name)
+                            headers = manifest.get("headers") or {}
+                            own_header = headers.get(unit["unit"]) if unit is not None else None
+                            header_paths = {f"include/{path}" for path in (headers.get(""), own_header) if path}
+                            def check_verdict(paths=(MANIFEST, "include", f"src/{path}", f"best/{path}", *header_paths)):
+                                check_cancel()
+                                for key in paths:
+                                    if guard and _file_identity(folder / key) != guard.get(key, (None,)):
+                                        raise NetworkError(f"{key} changed during saved verification. Check saved progress again.")
+                            author = info.get("matched_by") or info.get("best_by") or "restored"
+                            try:
+                                if author not in credits:
+                                    credits[author] = net.attribution_agent(author)
+                                with net.compiled_ahead(prepared, strict=True):
+                                    exact = net._verify_saved_match(pid, name, text, credits[author],
+                                                                    info.get("readable", False), check_verdict,
+                                                                    previous_source=previous_source, removed_status=status)
+                            except (NetworkError, toolchains.ToolchainError) as error:
+                                check_cancel()
+                                raise NetworkError(f"Could not verify saved C for {name}: {error}. "
+                                                   "Saved files are retained. Resolve the error and retry synchronization.") from error
+                            if exact:
+                                matched += 1
+                            elif kind == "src":
+                                lost.append(name)
+                            else:
+                                best += 1
+                            break
                         if name is None or text is None:
                             lost.append(old_name) if kind == "src" else None
                             break
@@ -1622,15 +1661,39 @@ def _layout_matches_db(net, project_id: int, layout: list[dict]) -> bool:
                and by_name[entry["name"]]["size"] == entry["size"] for entry in layout)
 
 
-def _set_aside_row(db, project_id: int, item: dict):
-    """The function a saved set-aside entry names, never another overlay's function at the same address."""
-    row = db.execute("SELECT id,meta FROM functions WHERE project_id=? AND name=? AND vram=? "
-                     "AND status IN ('open','asm')", (project_id, item["name"], item["vram"])).fetchone()
-    if row is not None:
-        return row
-    rows = db.execute("SELECT id,meta FROM functions WHERE project_id=? AND vram=? "
-                      "AND status IN ('open','asm') ORDER BY id", (project_id, item["vram"])).fetchall()
-    return rows[0] if len(rows) == 1 else None
+def _restore_set_aside(store, project_id: int, items: list[dict]) -> None:
+    """Restore reasons in one pass. Name wins at a shared address; only a unique candidate can stand in."""
+    if not items:
+        return
+    addresses = sorted({item["vram"] for item in items})
+    with store.tx() as db:
+        rows = db.execute(
+            "SELECT id,name,vram,status,meta FROM functions WHERE project_id=? "
+            "AND status IN ('open','asm') AND vram IN (SELECT value FROM json_each(?))",
+            (project_id, json.dumps(addresses))).fetchall()
+        by_address = {}
+        for row in rows:
+            by_address.setdefault(row["vram"], {})[row["name"]] = row
+        pending = {}
+        for item in items:
+            candidates = by_address.get(item["vram"], {})
+            row = candidates.get(item["name"])
+            if row is None and len(candidates) == 1:
+                row = next(iter(candidates.values()))
+            if row is None:
+                continue
+            identity = row["id"]
+            # A layout can already mark the function as assembly. Keep the
+            # reason, but avoid dirtying an unchanged row on every import.
+            meta = pending.get(identity)
+            if meta is None:
+                meta = json.loads(row["meta"] or "{}")
+            merged = meta | restored_aside(item)
+            if row["status"] != "asm" or merged != meta:
+                pending[identity] = merged
+        if pending:
+            db.executemany("UPDATE functions SET status='asm',meta=? WHERE id=?",
+                           [(json.dumps(meta), identity) for identity, meta in pending.items()])
 
 
 def _join_saved_layout(net, proj, layout: list[dict], report=None) -> None:
@@ -1898,8 +1961,9 @@ class Autosave:
             self.stop.wait(1)
 
     def _commit_once(self, slug, output):
-        # Read preferences now, not the coordinator's older discovery snapshot.
-        proj = self.net.project_row(slug)
+        # Check the current preferences without synchronizing the tree on every poll.
+        # The commit workers check their queues first and verify saved inputs at capture.
+        proj = self.net.project_row(slug, sync=False)
         if proj is None:return
         cfg = _settings(proj)
         if cfg.get('auto_commit_matches') or cfg.get('auto_commit_polished'):
