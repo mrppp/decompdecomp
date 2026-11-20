@@ -13,17 +13,28 @@ from __future__ import annotations
 import re
 
 GHIDRA_HEADER = "ghidra.h"
-GHIDRA_H = """/* Ghidra's names for the types and operations it can't tell yet, so its machine drafts compile as they are:
+GHIDRA_H = """/* ghidra.h 2. Ghidra's names for the types and operations it can't tell yet, so its machine drafts compile as they are:
  * autopilot tries them (`#include "ghidra.h"`). The game's own types are better: agents write those in common.h. */
 #ifndef GHIDRA_H
 #define GHIDRA_H
 
+/* Watcom before 11.0 (9.5, 10.x: __WATCOMC__ 950-1060) has no long long: the 64-bit names are a pair of words there */
+#if defined(__WATCOMC__) && __WATCOMC__ < 1100
+typedef struct { unsigned int lo, hi; } undefined8;
+typedef struct { unsigned int lo, hi; } ulonglong;
+typedef struct { unsigned int lo; int hi; } longlong;
+typedef struct { unsigned int lo, hi; } qword;
+#else
+typedef unsigned long long undefined8;
+typedef unsigned long long ulonglong;
+typedef long long longlong;
+typedef unsigned long long qword;
+#endif
 typedef unsigned char undefined;
 typedef unsigned char undefined1;
 typedef unsigned short undefined2;
 typedef unsigned int undefined3;
 typedef unsigned int undefined4;
-typedef unsigned long long undefined8;
 typedef unsigned char byte;
 typedef unsigned char uchar;
 typedef unsigned short ushort;
@@ -32,9 +43,6 @@ typedef unsigned int uint;
 typedef unsigned int uint3;
 typedef unsigned long ulong;
 typedef unsigned int dword;
-typedef long long longlong;
-typedef unsigned long long ulonglong;
-typedef unsigned long long qword;
 typedef long double float10;
 typedef int code();
 

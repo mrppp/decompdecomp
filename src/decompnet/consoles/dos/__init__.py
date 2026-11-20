@@ -231,7 +231,8 @@ class Dos(Console):
     def prepare_drafts(self, fp) -> str | None:
         from .drafts import GHIDRA_H, GHIDRA_HEADER
         path = Path(fp.root) / "include" / GHIDRA_HEADER
-        if path.exists():
+        # one made before carries no version: brought up to this one (it is decompdecomp's, not the agents')
+        if path.exists() and path.read_text(encoding="utf-8", errors="replace") == GHIDRA_H:
             return None
         path.write_text(GHIDRA_H, encoding="utf-8")
         return path.relative_to(fp.root).as_posix()
