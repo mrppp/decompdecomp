@@ -1,0 +1,10 @@
+A 32-bit DOS game (DOS/4GW, Watcom C) being decompiled with decompdecomp.
+
+    python tools/configure.py VERSION   # writes build.ninja and objdiff.json
+    ninja                               # cuts the targets out of your copy and compiles src/
+
+config/VERSION/functions.json says where each function is in the game's code and what it refers to (its
+relocations); tools/delink.py cuts them out of orig/VERSION.code.bin (the game's code object as the loader sees it)
+into one ELF object per source file. tools/compile.py compiles a source file with Watcom's wcc386 and turns its OMF
+object into ELF (tools/omf2elf.py) for objdiff to compare. The compiler is OpenWatcom's, installed by decompdecomp;
+DOS_CC and DOS_FLAGS override it and its flags ("-zq -bt=dos -mf -5r -ox" by default).

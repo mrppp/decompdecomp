@@ -762,6 +762,7 @@ class Console:
 
 
 def _registry() -> list[Console]:
+    from .dos import DOS
     from .gba import GBA
     from .gc_wii import GAMECUBE, WII
     from .n64 import N64
@@ -780,7 +781,7 @@ def _registry() -> list[Console]:
     # the PS2, whose sniff takes any ISO 9660 disc and any MIPS ELF; the Xbox and the Xbox 360 before them all: a
     # full disc dump starts with a DVD video partition, whose ISO 9660 filesystem is what a PlayStation sniff sees;
     # the PS3 before the PS2 too, though the PS2 takes only 32-bit MIPS ELFs)
-    return [N64, XBOX360, XBOX, PSP, PS1, PS3, PS2, PS4_CONSOLE, GBA, GAMECUBE, WII, PC, NDS, *PUBLIC_ONLY]
+    return [N64, XBOX360, XBOX, PSP, PS1, PS3, PS2, PS4_CONSOLE, GBA, GAMECUBE, WII, PC, NDS, DOS, *PUBLIC_ONLY]
 
 
 CONSOLES: list[Console] = _registry()
