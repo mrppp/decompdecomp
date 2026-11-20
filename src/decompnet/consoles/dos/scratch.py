@@ -72,6 +72,16 @@ def write_tools(root: Path) -> list[str]:
     return changed
 
 
+def _ninja() -> str:
+    """The ninja bundled next to this interpreter (the app's), or the one on PATH."""
+    bundled = Path(sys.executable).with_name("ninja")
+    if bundled.is_file():
+        return str(bundled)
+    if found := shutil.which("ninja"):
+        return found
+    raise ForkError("ninja is needed to cut the project's target objects; install it and try again")
+
+
 def _run(cmd: list[str], root: Path, what: str, log) -> None:
     run = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
     if run.returncode != 0:
@@ -144,9 +154,7 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
         f"2. `python tools/configure.py {version}` and `ninja` build it with OpenWatcom.\n"
         "3. Decompiled code goes in `src/`; `objdiff.json` shows each function's progress.\n", encoding="utf-8")
     _run([sys.executable, "tools/configure.py", version], root, "the first build", log)
-    from ... import toolchains
-    ninja = str(toolchains.binary("ninja")) if toolchains.installed("ninja") else shutil.which("ninja") or "ninja"
-    _run([ninja, "prepare-targets"], root, "cutting the targets", log)
+    _run([_ninja(), "prepare-targets"], root, "cutting the targets", log)
     missing = [u for u in groups if not (root / "build" / version / "target" / f"{u}.o").is_file()]
     if missing:
         raise ForkError(f"delink finished without writing every target object (e.g. {', '.join(missing[:3])})")

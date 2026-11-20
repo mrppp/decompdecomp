@@ -199,11 +199,15 @@ def _function(net, slug: str, symbols: dict, name: str) -> tuple[str, str]:
 
     from decompnet.forks import csource
 
-    address = next(a for s, a in symbols.items() if re.sub(r"^[_@]|@\d+$", "", s) == name) & ~1  # (a Thumb function)
+    exact = next(a for s, a in symbols.items() if re.sub(r"^[_@]|@\d+$", "", s) == name)
     pid = net.project_row(slug)["id"]
-    row = net.store.one("SELECT name FROM functions WHERE project_id=? AND vram=?", pid, address) or next(
-        r for r in net.store.all("SELECT name FROM functions WHERE project_id=?", pid) if f"{address:08x}" in r["name"].lower())
-    plain = re.sub(r"^[_@]|@\d+$", "", row["name"])  # (a PC function's name says its calling convention)
+    rows = net.store.all("SELECT name, meta, vram FROM functions WHERE project_id=?", pid)
+    # the symbol's own address, then without its low bit (a Thumb function's): an x86 function may start on any byte
+    row = next(r for address in dict.fromkeys((exact, exact & ~1)) for r in rows
+               if r["vram"] == address or f"{address:08x}" in r["name"].lower())
+    # how the source spells it: the console's (Console.real_names: Watcom's f_ is C's f), else the name without the
+    # decoration a PC function's says its calling convention with
+    plain = json.loads(row["meta"] or "{}").get("real") or re.sub(r"^[_@]|@\d+$", "", row["name"])
     return row["name"], csource.get(DEMO_GAME.read_text(), name).replace(f"{name}(", f"{plain}(", 1)
 
 
