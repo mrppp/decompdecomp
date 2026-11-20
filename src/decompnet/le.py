@@ -59,7 +59,7 @@ class Module:
 
     def relocated(self) -> None:
         """Apply the fixups as the loader does at the link-time bases: a field holds its offset in the target
-        object (12,100 of DOOM's 12,103 do; the rest are offset 0), and becomes the target's address, so the image
+        object (12,100 of one game's 12,103 do; the rest are offset 0), and becomes the target's address, so the image
         reads as the game's code and data refer to each other."""
         for f in self.fixups:
             o = self.object_at(f.source)
@@ -85,7 +85,7 @@ class Module:
 
 def module_start(data: bytes, header: int) -> int:
     """Where the LE module's own MZ header is: the LE format counts its "from the file's start" offsets (the data
-    pages) from there. Bound to DOS/4GW, that header follows the extender's program (DOOM's is at 0x25214, its LE
+    pages) from there. Bound to DOS/4GW, that header follows the extender's program (one game's is at 0x25214, its LE
     header 0x28B8 after it), so it is the MZ header whose pointer at 0x3C reaches `header`."""
     at = data.rfind(b"MZ", 0, header)
     while at >= 0:
@@ -104,7 +104,7 @@ def header_offset(data: bytes) -> int:
     if 0 < at < len(data) - 4 and data[at:at + 2] == b"LE":
         return at
     # bound to DOS/4GW, the extender's own MZ program comes first and its "BW" blocks chain on to the module,
-    # which needn't start on any boundary (DOOM's is at 0x27ACC): the first "LE" whose fields make sense
+    # which needn't start on any boundary (one game's is at 0x27ACC): the first "LE" whose fields make sense
     at = data.find(b"LE\0\0")
     while at >= 0:
         cpu, os_ = struct.unpack_from("<HH", data, at + 8)

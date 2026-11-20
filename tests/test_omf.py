@@ -1,7 +1,6 @@
 """OMF objects (Watcom's) converted to ELF32 for objdiff: the objects are OpenWatcom 2's output for watcom_flat.c,
 `wcc386 -zq -bt=dos -mf -oxt -6r` (and the same with `* 3` changed to `* 5`)."""
 
-import shutil
 import struct
 from pathlib import Path
 

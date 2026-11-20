@@ -1,4 +1,4 @@
-"""DOS/4GW executables (LE): a synthetic module built here (no game in the repository), bound like DOOM's, with its
+"""DOS/4GW executables (LE): a synthetic module built here (no game in the repository), bound like a real game's, with its
 own MZ header after an extender's and its data pages counted from that header."""
 
 import struct
@@ -12,7 +12,6 @@ def _bound(code: bytes, fixups: list[tuple[int, int]]) -> bytes:
     """An extender stub, then the module's MZ header at an odd offset, its LE header, one code object of one page
     at 0x10000 and one data object at 0x20000, and OFFSET32 fixups (code offset -> data offset)."""
     stub = b"MZ" + bytes(0x3E) + b"BW" + bytes(0x50)  # an extender whose 0x3C doesn't point at the module
-    mz_at = len(stub) + 6
     le_rel = 0x80
     le_hdr = bytearray(0xB0)
     le_hdr[0:4] = b"LE\0\0"
