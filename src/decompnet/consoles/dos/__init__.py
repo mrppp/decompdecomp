@@ -84,8 +84,11 @@ class Dos(Console):
     kits = ("watcom",)
 
     def tool_args(self) -> list[str]:
-        """configure.py's --own for each Watcom of the user's own: VERSION=RUNNER,EXE,HEADERS..."""
+        """configure.py's --own for each Watcom of the user's own: VERSION=RUNNER,EXE,HEADERS... (OpenWatcom 2 installed
+        first where it isn't: a project imported without it builds with it from its next setup)."""
         from ... import kits
+        from .scratch import ensure_compiler
+        ensure_compiler(log=lambda *_: None)
         return [arg for c in kits.compilers(self.kits)
                 for arg in ("--own", ",".join([f"{c.version}={c.runner or 'none'}", str(c.exe), *map(str, c.includes)]))]
 

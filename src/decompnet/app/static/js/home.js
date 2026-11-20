@@ -423,8 +423,8 @@ function notSupported(head, file) {
       return "That Windows program isn't for an x86 processor (it's for ARM or another one). decompdecomp starts PC "
         + "games from their 32-bit or 64-bit x86 .exe.";
     }
-    return "That's a DOS program, not a Windows one. decompdecomp starts PC games from their 32-bit or 64-bit "
-      + "Windows .exe.";
+    return "That's a 16-bit (real-mode) DOS program, or a DOS one without the DOS/4GW extender. decompdecomp starts "
+      + "DOS games from their 32-bit DOS/4GW .exe, and PC games from their 32-bit or 64-bit Windows .exe.";
   }
   if (ext === "nds") return "That doesn't look like a DS ROM: its header's checksum is wrong. Try a clean dump of your cartridge.";
   if (ext === "gba") return "That doesn't look like a Game Boy Advance ROM: its header's branch, fixed 0x96 byte or checksum is wrong. Try a clean dump of your cartridge.";
@@ -445,12 +445,32 @@ function notSupported(head, file) {
 const TRY_AND_TELL = `This version is new, so <a href="https://github.com/n-delic/decompdecomp/issues" target="_blank" rel="noopener">tell us how it goes</a> on your game.`;
 const NOT_A_GAME = "That isn't a game file decompdecomp can start from scratch (yet). For other platforms, continue a public decomp.";
 
+/* A 32-bit DOS program bound to DOS/4GW: an MZ program with an LE module behind the extender (DOS/4GW itself comes
+   first, so the module can be a few hundred KB in), as the server's le.header_offset finds it: "LE\0\0", little-
+   endian byte and word order, a 386-or-later processor and a DOS or OS/2 system. Read only when the head is an MZ
+   program that isn't a Windows one. */
+async function identifyDos4gw(head, file) {
+  if (String.fromCharCode(head[0], head[1]) !== "MZ") return null;
+  const data = new Uint8Array(await file.slice(0, Math.min(file.size, 0x200000)).arrayBuffer());
+  const dv = new DataView(data.buffer);
+  for (let at = 0; at + 0x2c <= data.length; at++) {
+    if (data[at] !== 0x4c || data[at + 1] !== 0x45 || data[at + 2] || data[at + 3]) continue;  // "LE\0\0"
+    const cpu = dv.getUint16(at + 8, true), os = dv.getUint16(at + 10, true), page = dv.getUint32(at + 0x28, true);
+    if (cpu >= 2 && cpu <= 4 && os >= 1 && os <= 4 && page && !(page & (page - 1))) {
+      return { title: file.name.replace(/\.[^.]*$/, ""), size: file.size, platform: "dos",
+               order: "DOS/4GW program (.exe)", entry: null };
+    }
+  }
+  return null;
+}
+
 async function pickFile(file, extras = []) {
   const head = new Uint8Array(await file.slice(0, 0x9400).arrayBuffer());
   // dropped before the page finished loading: the state first, as what the file is needs it (a PC program's pack is
   // the server's table: pcPack), and so do the compiler lists
   if (!S.st) await loadState().catch(() => {});
   let info = await identifyXboxDisc(file).catch(() => null) || identifyHead(head, file), buf = file;
+  if (!info) info = await identifyDos4gw(head, file).catch(() => null);
   if (!info) {
     const why = notSupported(head, file);
     if (why || file.size > 64 * 1024 * 1024) return toast(esc(why || NOT_A_GAME), "err");
@@ -469,7 +489,7 @@ async function pickFile(file, extras = []) {
     ? [["Game code", info.code || "—"], ["Region", info.region], ["Size", MB(info.size)], ["Format", info.order],
        ["Entry", hex8(info.entry)], ["Looks like", info.compiler === "IDO" ? "IDO" : "GCC (KMC)"]]
     : [["Platform", platformName(p)], ["Format", info.order], ["Size", MB(info.size)],
-       info.code ? ["Game ID", info.code] : ["Entry", info.entry != null ? hex8(info.entry) : "from the disc"],
+       info.code ? ["Game ID", info.code] : ["Entry", info.entry != null ? hex8(info.entry) : p === "dos" ? "read at import" : "from the disc"],
        ["Project", consoleOf(p)?.layout || ""], ...(picked.extras.length ? [["Function maps / debug symbols", picked.extras.map((f) => f.name).join(", ")]] : [])];
   $("romFacts").innerHTML = facts.map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("");
   const level = platformStatus(p);

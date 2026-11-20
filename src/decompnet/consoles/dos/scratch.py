@@ -72,6 +72,15 @@ def write_tools(root: Path) -> list[str]:
     return changed
 
 
+def ensure_compiler(log=print) -> None:
+    """OpenWatcom 2, installed where it isn't (a pinned download, toolchains.toml): every project builds with it, and
+    without it configure.py could only name a wcc386 on PATH, so every compile of the agents' would fail."""
+    from ... import toolchains
+    if toolchains.installed("openwatcom-2.0") is None:
+        log("installing OpenWatcom C 2.0, which DOS projects build with")
+        toolchains.ensure("openwatcom-2.0", log=log)
+
+
 def _ninja() -> str:
     """The ninja bundled next to this interpreter (the app's), or the one on PATH."""
     bundled = Path(sys.executable).with_name("ninja")
@@ -92,6 +101,7 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     """Make the project in `root` (which mustn't exist yet) from the user's copy `game`."""
     if root.exists():
         raise ForkError(f"{root} exists already")
+    ensure_compiler(log)
     info = game_info(game)
     version = info["id"]
     data = game.read_bytes()
