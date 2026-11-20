@@ -297,7 +297,7 @@ sdist = { hash = "sha256:3e3dd508800641aee3d6f4c5cd43dfbd1ba52576bcacf786149b146
 
 [[package]]
 name = "decompnet"
-version = "1.0.9+rr.13"
+version = "1.0.9+rr.14"
 source = { editable = "." }
 dependencies = [
     { name = "capstone" },
