@@ -444,6 +444,8 @@ def register(app: App) -> None:
         uploaded = isinstance(game, Path) and game.parent.parent == home / "uploads"
 
         def work(log):
+            if all_compilers:  # a project console's build needs its compiler from the start: installed first
+                install_project_compilers(game, accept, log)
             try:
                 slug = net.import_rom(game, toolchain=toolchain, confirmed=True, name=name, log=log, scope=scope,
                                      options=options, project_layout=project_layout)
@@ -592,3 +594,21 @@ def register(app: App) -> None:
         return JSONResponse({"cancelled": await app.control(lambda: jobs.cancel(str(data.get("id") or "")))})
 
     app.autopilot = autopilot
+
+
+def install_project_compilers(game, accept: bool, log) -> None:
+    """The import card's "Install the missing compiler first", for a game of a project console (DOS: OpenWatcom 2):
+    its compilers the app downloads, before the import, whose first build names the compiler's path. A ROM console's
+    are installed after its import, which then tests them all (Engine.install_compilers). Kits (the user's own
+    copies) aren't downloads; a proprietary compiler only with the user's consent."""
+    try:
+        console = consoles.identify(game)
+    except Exception:  # noqa: BLE001  the import says what the file is
+        return
+    if console.mode != consoles.PROJECT:
+        return
+    for tid in console.installable_compilers():
+        tc = toolchains.get(tid)
+        if toolchains.installed(tid) is None and not tc.local and (accept or not tc.proprietary):
+            log(f"installing {tc.name}")
+            toolchains.install(tid, accept_license=accept, log=log)

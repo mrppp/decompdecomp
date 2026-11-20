@@ -54,6 +54,7 @@ class Dos(Console):
     ram = (0x10000, 0x1000000)  # a DOS/4GW game's objects are linked low (code at 0x10000 is common)
     demo = "demo-dos"
     demo_tools = ("openwatcom-2.0", "objdiff-cli")
+    packs = (("openwatcom-2.0", "OpenWatcom C 2.0, the compiler DOS projects build with (free and open source)"),)
     own_features = frozenset({REBUILD_CHECK})
 
     def sniff(self, head: bytes, file) -> bool:
@@ -84,11 +85,8 @@ class Dos(Console):
     kits = ("watcom",)
 
     def tool_args(self) -> list[str]:
-        """configure.py's --own for each Watcom of the user's own: VERSION=RUNNER,EXE,HEADERS... (OpenWatcom 2 installed
-        first where it isn't: a project imported without it builds with it from its next setup)."""
+        """configure.py's --own for each Watcom of the user's own: VERSION=RUNNER,EXE,HEADERS..."""
         from ... import kits
-        from .scratch import ensure_compiler
-        ensure_compiler(log=lambda *_: None)
         return [arg for c in kits.compilers(self.kits)
                 for arg in ("--own", ",".join([f"{c.version}={c.runner or 'none'}", str(c.exe), *map(str, c.includes)]))]
 

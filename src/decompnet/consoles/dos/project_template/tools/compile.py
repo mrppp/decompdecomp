@@ -71,6 +71,10 @@ def main() -> int:
             cmd = [wine, args.compiler, *args.flags, f"-i={headers}", windows(Path(args.source).resolve()),
                    f"-fo={windows(obj)}"]
         else:
+            if not (Path(args.compiler).is_file() or shutil.which(args.compiler)):
+                sys.stderr.write(f"{args.source}: OpenWatcom ({args.compiler}) isn't installed: install OpenWatcom C 2.0 "
+                                 "in decompdecomp's Setup (Compilers & tools), then set the project up again\n")
+                return 1
             if (home / "h").is_dir():
                 env.setdefault("WATCOM", str(home))
                 env["INCLUDE"] = os.pathsep.join(p for p in (args.include, str(home / "h"), env.get("INCLUDE", ""))

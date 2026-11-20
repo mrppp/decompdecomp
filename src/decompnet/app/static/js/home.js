@@ -537,6 +537,13 @@ function setupCompilers(info) {
     $("allAccept").checked = !owned.length;  // consent to proprietary software is the user's tick, never ours
     $("allText").textContent = `Install the ${plural(missing.length, "missing compiler")} first, so the import tests which one built the game`
       + (owned.length ? `. ${owned.map((t) => t.name).join(" and ")} ${owned.length > 1 ? "are" : "is"} proprietary software, kept by the decomp community: tick this only if you accept that.` : ".");
+  } else if (con.mode === "project") {
+    // a project console's free compiler its build needs (DOS: OpenWatcom 2), installed before the import; kits (the
+    // user's own copies) and proprietary packs have their own ways (Setup, the pack's consent below)
+    const missing = missingCompilers(p).filter((t) => !t.local && t.license !== "proprietary");
+    $("allCompilers").hidden = !missing.length;
+    $("allAccept").checked = true;
+    $("allText").textContent = `Install ${missing.map((t) => t.name).join(" and ")} first: its projects build with it (free, a download of a few MB).`;
   }
   if (con.mode === "rom") {
     if (info.order.endsWith("disc image")) {

@@ -72,13 +72,13 @@ def write_tools(root: Path) -> list[str]:
     return changed
 
 
-def ensure_compiler(log=print) -> None:
-    """OpenWatcom 2, installed where it isn't (a pinned download, toolchains.toml): every project builds with it, and
-    without it configure.py could only name a wcc386 on PATH, so every compile of the agents' would fail."""
+def require_compiler() -> None:
+    """OpenWatcom 2, which every project builds with, installed: the import card's "Install the missing compiler"
+    or Setup's Compilers & tools installs it (a pinned download, toolchains.toml), never the import by itself."""
     from ... import toolchains
     if toolchains.installed("openwatcom-2.0") is None:
-        log("installing OpenWatcom C 2.0, which DOS projects build with")
-        toolchains.ensure("openwatcom-2.0", log=log)
+        raise ForkError("DOS projects build with OpenWatcom C 2.0, which isn't installed: tick \"Install the missing "
+                        "compiler first\" on the import, or install it in Setup (Compilers & tools), then import again")
 
 
 def _ninja() -> str:
@@ -101,7 +101,7 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     """Make the project in `root` (which mustn't exist yet) from the user's copy `game`."""
     if root.exists():
         raise ForkError(f"{root} exists already")
-    ensure_compiler(log)
+    require_compiler()
     info = game_info(game)
     version = info["id"]
     data = game.read_bytes()
