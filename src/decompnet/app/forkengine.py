@@ -1247,8 +1247,11 @@ class ForkEngine:
         for uname, f in rows:
             raw = f.get("fuzzy_match_percent")
             old = prior.get((uname, f["name"]))
-            if (raw is None or not self.JUDGE_FROM <= raw < 100 or uname in broken or old is None
-                    or not (old["status"] == "matched" or ("matched_source" in keys and old["matched_source"]))
+            # matched, or was, or has C of its own written: on one Xbox 360 game 231 functions whose C the judge
+            # calls identical read 95-99% in objdiff's raw rows (a relocation's spelling), and were never counted
+            written = old is not None and (old["status"] == "matched" or any(
+                k in keys and old[k] for k in ("matched_source", "best_source")))
+            if (raw is None or not self.JUDGE_FROM <= raw < 100 or uname in broken or not written
                     or self._meta(old).get("reopened")):  # given back on purpose: not matched again by a measure
                 continue
             recheck.append((uname, f["name"]))
