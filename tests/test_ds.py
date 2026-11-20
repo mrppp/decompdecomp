@@ -1155,7 +1155,6 @@ def test_source_files_changed_after_a_reimport_come_back_with_it(per_file, monke
     taken back with the new analysis: its files come back too."""
     net, slug, agent, root, state, lerp = per_file
     config = root / "tools" / "reference" / "game.c"
-    before = config.read_bytes()
     fp = net.forks.get(slug)[1]
     unit = next(u for u in fp.units() if u.source and (root / u.source).exists())
     source = root / unit.source
