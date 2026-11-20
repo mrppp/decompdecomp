@@ -110,12 +110,12 @@ def coff_prints(data: bytes) -> dict[str, Print]:
     return out
 
 
-_WATCOM = re.compile(r"_?((?:func|D)_[0-9A-Fa-f]{8})_?")
+_WATCOM = re.compile(r"_?((?:func|D)_[0-9A-Fa-f]{8})_?(?:@\d+)?")
 
 
 def _watcom_c_name(name: str) -> str:
     """A DOS project's symbol as its C writes it: Watcom's func_0001A2B0_ (register convention), _func_0001A2B0
-    (stack) and _D_0001A2B0 (data) are func_0001A2B0 and D_0001A2B0."""
+    (__cdecl), _func_0001A2B0@8 (__stdcall) and _D_0001A2B0 (data) are func_0001A2B0 and D_0001A2B0."""
     m = _WATCOM.fullmatch(name)
     return m.group(1) if m else name
 

@@ -103,6 +103,12 @@ def main() -> None:
     lines.append(f"rule rebuild\n  command = {q([sys.executable, 'tools/rebuild.py', str(config), str(build), str(rebuilt)])}"
                  "\n  description = REBUILD (compared with your copy)")
     lines.append(f"build {rebuilt}: rebuild {' '.join([*targets, *objects])} | tools/rebuild.py")
+    # build.ninja writes itself again when what it was made from changes: the manifest (a file's own flags or
+    # compiler: search_flags, try_compiler), the config (a split or join adds a file), this script. Its arguments
+    # come along (a Watcom of the user's own: --own)
+    lines.append(f"rule configure\n  command = {q([sys.executable, 'tools/configure.py', *sys.argv[1:]])}"
+                 "\n  description = CONFIGURE\n  generator = 1")
+    lines.append(f"build build.ninja: configure | tools/configure.py {MANIFEST.relative_to(ROOT).as_posix()} {config}")
     lines += [f"build rebuild: phony {rebuilt}", "build prepare-targets: phony " + " ".join(targets),
               "build prepare: phony " + " ".join(["prepare-targets", *objects]), "default prepare"]
     Path("build.ninja").write_text("\n".join(lines) + "\n", encoding="utf-8")

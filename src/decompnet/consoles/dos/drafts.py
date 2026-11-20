@@ -55,10 +55,10 @@ typedef int code();
 _UNWRITABLE = re.compile(r"\b(unaff_\w+|in_stack_\w+|extraout_\w+|in_E[ABCD]X|in_E[SD]I|in_EBP|in_ESP|in_[A-Z]{2}\b|"
                          r"stack0x\w+|halt_baddata|swi|LOCK|UNLOCK|CARRY\d|SCARRY\d|SBORROW\d|POPCOUNT|"
                          r"in\(|out\()\b|\.\_\d+_\d+_")
-_FUNC = re.compile(r"\b_?(func_[0-9A-Fa-f]{8})_?\b")
+_FUNC = re.compile(r"\b_?(func_[0-9A-Fa-f]{8})_?(?:@\d+)?(?![\w@])")
 _DATA = re.compile(r"\b(_{1,2})(D_[0-9A-Fa-f]{8})\b")
 _HEAD = re.compile(r"^(?P<ret>[^\n;{}]*?)\s*\b(?P<conv>__cdecl|__stdcall|__fastcall|__regparm\d)?\s*"
-                   r"(?P<name>_?func_(?P<addr>[0-9A-Fa-f]{8})_?)\s*\((?P<params>[^()]*)\)\s*\{", re.M)
+                   r"(?P<name>_?func_(?P<addr>[0-9A-Fa-f]{8})_?(?:@\d+)?)\s*\((?P<params>[^()]*)\)\s*\{", re.M)
 
 
 def adapt(text: str) -> str:
@@ -92,10 +92,11 @@ def _register_arguments(body: str, params: list[str]) -> tuple[str, list[str]]:
     return body, params
 
 
-def compilable(draft: str, symbol: str, stack: set[str], known: str = "") -> tuple[str, str] | None:
+def compilable(draft: str, symbol: str, stack: dict[str, str], known: str = "") -> tuple[str, str] | None:
     """Ghidra's draft (as it gave it) as C that compiles in the function's source file, (prelude, definition), or None.
-    `symbol`: its Watcom symbol; `stack`: the C names of the game's stack-convention functions (declared __cdecl
-    for the calls to them); `known`: the header and file's text, whose declarations are used as they are."""
+    `symbol`: its Watcom symbol (_func_X@8: __stdcall); `stack`: the C name of each of the game's stack-convention
+    functions -> its keyword (__cdecl, __stdcall), for the calls to them; `known`: the header and file's text, whose
+    declarations are used as they are."""
     text = re.sub(r"/\*.*?\*/", "", adapt(draft), flags=re.S)  # (briefs' drafts come adapted already)
     head = _HEAD.search(text)
     if head is None:
@@ -112,7 +113,7 @@ def compilable(draft: str, symbol: str, stack: set[str], known: str = "") -> tup
         body, params = _register_arguments(body, params)
     if _UNWRITABLE.search(body):
         return None
-    if conv in ("__stdcall", "__fastcall"):
+    if conv == "__fastcall" or (conv == "__stdcall" and "@" not in symbol):
         return None
     name = f"func_{head.group('addr').upper()}"
     ret = head.group("ret").strip() or "void"
@@ -126,10 +127,11 @@ def compilable(draft: str, symbol: str, stack: set[str], known: str = "") -> tup
     lines = []
     for callee in callees:
         if not re.search(rf"\b{callee}\s*\(", known):
-            lines.append(f"int {'__cdecl ' if callee in stack else ''}{callee}();")
+            lines.append(f"int {stack[callee] + ' ' if callee in stack else ''}{callee}();")
     for g, kind in sorted(globals_.items()):
         if not re.search(rf"\b{g}\b", known):
             lines.append(f"extern {kind} {g};")
     prelude = "\n".join([f'#include "{GHIDRA_HEADER}"', *lines]) + "\n"
-    definition = f"{ret} {'__cdecl ' if is_stack else ''}{name}({', '.join(params) or 'void'})\n{{{body[:-1]}}}\n"
+    keyword = ("__stdcall " if "@" in symbol else "__cdecl ") if is_stack else ""
+    definition = f"{ret} {keyword}{name}({', '.join(params) or 'void'})\n{{{body[:-1]}}}\n"
     return prelude, definition

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ...forks.project import ForkError
 
-ADDRESS = re.compile(r"_?(func|D)_([0-9A-Fa-f]{8})_?$")  # func_0001A2B0, func_0001A2B0_, _func_..., D_..., _D_...
+ADDRESS = re.compile(r"_?(func|D)_([0-9A-Fa-f]{8})_?(?:@\d+)?$")  # func_0001A2B0(_), _func_...(@8), D_..., _D_...
 
 
 def config_path(root: Path, version: str) -> Path:
@@ -75,14 +75,14 @@ def rename(root: Path, version: str, old: str, new: str) -> dict:
 
 def names_for_build(info: dict) -> dict[str, str]:
     """{the symbol Watcom gives a real name: the address symbol the targets have}: what compile.py renames back.
-    A function's convention says how Watcom spells it (register: name_, stack: _name); data is _name."""
+    A function's symbol says how Watcom spells it (register: name_, __cdecl: _name, __stdcall: _name@8); data is
+    _name."""
     out = {}
-    conventions = {fn["name"]: fn.get("convention", "register") for _, fn in _functions(info)}
+    symbols = {fn["name"]: fn["symbol"] for _, fn in _functions(info)}
     for key, real in (info.get("names") or {}).items():
-        if key.startswith("func_"):
-            stack = conventions.get(key) == "stack"
-            out[f"_{real}" if stack else f"{real}_"] = f"_{key}" if stack else f"{key}_"
-        else:
+        if key in symbols:  # (its symbol spells the name as its convention does: name_, _name, _name@8)
+            out[symbols[key].replace(key, real)] = symbols[key]
+        elif key.startswith("D_"):
             out[f"_{real}"] = f"_{key}"
     return out
 

@@ -85,10 +85,15 @@ def test_a_real_name_is_kept_by_address_and_given_back_to_the_build(tmp_path):
 
 def test_compile_renames_back_the_way_the_project_does():
     compile_tool = _tool("compile")
-    info = {"units": {"u": [{"name": "func_00010010", "convention": "register"},
-                            {"name": "func_00010020", "convention": "stack"}]},
-            "names": {"func_00010010": "dispatch", "func_00010020": "helper", "D_00020000": "counter"}}
-    assert compile_tool.names_for_build(info) == project.names_for_build(info)
+    info = {"units": {"u": [{"name": "func_00010010", "symbol": "func_00010010_", "convention": "register"},
+                            {"name": "func_00010020", "symbol": "_func_00010020", "convention": "stack"},
+                            {"name": "func_00010030", "symbol": "_func_00010030@8", "convention": "stack", "pops": 8}]},
+            "names": {"func_00010010": "dispatch", "func_00010020": "helper", "func_00010030": "divide",
+                      "D_00020000": "counter"}}
+    assert compile_tool.names_for_build(info) == project.names_for_build(info) == {
+        "dispatch_": "func_00010010_", "_helper": "_func_00010020", "_divide@8": "_func_00010030@8",
+        "_counter": "_D_00020000"}
+    assert project.address_key("_func_00010030@8") == "func_00010030"
 
 
 def test_a_source_file_divides_at_a_function(tmp_path):
@@ -152,8 +157,10 @@ def test_flag_variants_try_the_processor_and_optimisation_not_the_convention():
     variants = DOS.flag_variants(["-zq", "-bt=dos", "-mf", "-5r", "-ox"])
     assert variants[0] == ["-zq", "-bt=dos", "-mf", "-5r", "-ox"]
     assert ["-zq", "-bt=dos", "-mf", "-3r", "-ox"] in variants
-    assert ["-zq", "-bt=dos", "-mf", "-5r", "-os"] in variants
+    assert ["-zq", "-bt=dos", "-mf", "-5r", "-os", "-s"] in variants
     assert not any("-5s" in v or "-3s" in v for v in variants)
+    assert ["-zq", "-bt=dos", "-mf", "-5r", "-os", "-s", "-of"] in variants  # (a __stdcall library's)
+    assert len(variants) == len({tuple(v) for v in variants})
 
 
 def test_a_ghidra_draft_becomes_the_projects_c():
@@ -176,20 +183,25 @@ int __regparm3 func_00010079_(int param_1,int param_2)
 }
 """
     assert "func_00010079(" in drafts.adapt(draft) and "WARNING" not in drafts.adapt(draft)
-    prelude, definition = drafts.compilable(draft, "func_00010079_", {"func_00010020"})
+    prelude, definition = drafts.compilable(draft, "func_00010079_", {"func_00010020": "__cdecl"})
     assert definition.startswith("int func_00010079(int param_1, int param_2, int param_3)")  # ebx: the third
     assert "unaff" not in definition
     assert "int __cdecl func_00010020();" in prelude
     assert "extern undefined4 D_00020000;" in prelude and "extern undefined1 D_00020010;" in prelude
     # three register arguments as Ghidra read them: its third is GCC's ecx, not Watcom's ebx
     assert drafts.compilable("int __regparm3 func_00010000_(int a,int b,int c)\n{\n  return a;\n}", "func_00010000_",
-                             set()) is None
+                             {}) is None
+    # a __stdcall function: defined as one, and its callers declare it so
+    _, own = drafts.compilable("int __stdcall _func_0001051B@8(short param_1,int param_2)\n{\n  return param_2 * param_1;\n}",
+                               "_func_0001051B@8", {"func_0001051B": "__stdcall"})
+    assert own.startswith("int __stdcall func_0001051B(short param_1, int param_2)")
 
 
 def test_twins_read_watcom_names_as_c_writes_them():
     assert _watcom_c_name("func_0001A2B0_") == "func_0001A2B0"
     assert _watcom_c_name("_func_0001A2B0") == "func_0001A2B0"
     assert _watcom_c_name("_D_0001A2B0") == "D_0001A2B0"
+    assert _watcom_c_name("_func_0001A2B0@8") == "func_0001A2B0"  # (__stdcall)
     assert _watcom_c_name("_TEXT") == "_TEXT"
 
 

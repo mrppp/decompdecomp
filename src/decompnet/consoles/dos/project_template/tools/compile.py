@@ -31,12 +31,11 @@ def names_for_build(info: dict) -> dict:
     """{the symbol Watcom gives a real name: the address symbol the targets have} (decompnet's
     consoles/dos/project.py names_for_build, kept here so the project needs nothing of decompdecomp's)."""
     out = {}
-    conventions = {fn["name"]: fn.get("convention", "register") for fns in info["units"].values() for fn in fns}
+    symbols = {fn["name"]: fn["symbol"] for fns in info["units"].values() for fn in fns}
     for key, real in (info.get("names") or {}).items():
-        if key.startswith("func_"):
-            stack = conventions.get(key) == "stack"
-            out[f"_{real}" if stack else f"{real}_"] = f"_{key}" if stack else f"{key}_"
-        else:
+        if key in symbols:  # (its symbol spells the name as its convention does: name_, _name, _name@8)
+            out[symbols[key].replace(key, real)] = symbols[key]
+        elif key.startswith("D_"):
             out[f"_{real}"] = f"_{key}"
     return out
 

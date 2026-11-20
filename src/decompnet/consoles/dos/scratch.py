@@ -30,7 +30,7 @@ TYPES_H = """\
 /* Types for this decompilation (32-bit x86, Watcom C). Agents add structs and prototypes here or in new headers.
  * The game's functions are func_XXXXXXXX and its data D_XXXXXXXX (their addresses): write them with those names
  * and the build gives them the original's symbols. A function in Watcom's stack convention (functions.json says
- * "stack") is declared __cdecl. */
+ * "stack") is declared __cdecl, or __stdcall where it says "pops" (its symbol _func_XXXXXXXX@8). */
 #ifndef COMMON_H
 #define COMMON_H
 typedef unsigned char u8;
@@ -138,8 +138,8 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     (conf / "functions.json").write_text(json.dumps({
         "format": 1, "image": f"orig/{version}.code.bin", "sha1": hashlib.sha1(main.data).hexdigest(),
         "code_base": main.base, "entry": mod.entry,
-        "units": {u: [{"name": f.name, "symbol": f.symbol, "convention": f.convention, "addr": f.addr,
-                       "size": f.size, "relocs": f.relocs} for f in group] for u, group in groups.items()},
+        "units": {u: [{"name": f.name, "symbol": f.symbol, "convention": f.convention, **({"pops": f.pops} if f.pops else {}),
+                       "addr": f.addr, "size": f.size, "relocs": f.relocs} for f in group] for u, group in groups.items()},
     }, indent=1), encoding="utf-8")
     for u, group in groups.items():
         src = root / "src" / "auto" / f"{u}.c"
@@ -233,8 +233,8 @@ def reanalyse(root: Path, version: str, matched: set[str], log=print) -> str | N
     last = order[0]
     for a, n in spans:
         f = fns[a]
-        entry = {"name": f.name, "symbol": f.symbol, "convention": f.convention, "addr": a, "size": n,
-                 "relocs": [list(r) for r in f.relocs]}
+        entry = {"name": f.name, "symbol": f.symbol, "convention": f.convention, **({"pops": f.pops} if f.pops else {}),
+                 "addr": a, "size": n, "relocs": [list(r) for r in f.relocs]}
         if a in old:
             last, before = old[a]
             for key in ("set_aside", "generated"):
@@ -244,8 +244,8 @@ def reanalyse(root: Path, version: str, matched: set[str], log=print) -> str | N
                 entry = before
         units[last].append(entry)
     units = {u: group for u, group in units.items() if group}
-    before = {(fn["addr"], fn["size"], json.dumps(fn["relocs"])) for _, fn in old.values()}
-    after = {(fn["addr"], fn["size"], json.dumps(fn["relocs"])) for group in units.values() for fn in group}
+    before = {(fn["addr"], fn["size"], fn["symbol"], json.dumps(fn["relocs"])) for _, fn in old.values()}
+    after = {(fn["addr"], fn["size"], fn["symbol"], json.dumps(fn["relocs"])) for group in units.values() for fn in group}
     if before == after:
         return None
     new_addrs = {fn["addr"] for group in units.values() for fn in group}

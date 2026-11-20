@@ -9,8 +9,10 @@ refers to, as a compiled object's do:
   console names data), or a place in the function itself (its jump tables: a local label);
 - every call and jump out of the function (relative, so never fixed up) is an R_386_PC32 to its target's symbol.
 A function's symbol is its C name as Watcom spells it: `func_XXXXXXXX_` for the register convention Watcom
-defaults to, `_func_XXXXXXXX` for a stack-convention one (it reads its arguments from [ebp+8] on: a hand-written or
-cdecl library's, like a sound library linked into one game).
+defaults to, `_func_XXXXXXXX` for a stack-convention one (it reads its arguments from [ebp+8] on: __cdecl), and
+`_func_XXXXXXXX@8` for one that also takes them off the stack as it returns (`ret 8`: __stdcall). A shareware game's
+sound library is __stdcall code Watcom built with a frame (-of) and for size (-os), whose `push ebp; mov ebp, esp`
+is 55 89 E5 (Watcom's encoding as GNU as's: it isn't GCC's code).
 """
 
 from __future__ import annotations
@@ -36,12 +38,31 @@ class Function:
     addr: int
     size: int
     name: str  # C name: func_XXXXXXXX
-    convention: str = "register"  # Watcom's default; "stack": cdecl-style
+    convention: str = "register"  # Watcom's default; "stack": __cdecl, or __stdcall where `pops`
     relocs: list[tuple[int, int, str | None, int]] = field(default_factory=list)  # (offset, R_386_*, symbol, addend)
+    pops: int = 0  # the bytes of arguments a stack-convention function takes off as it returns (__stdcall: ret 8)
 
     @property
     def symbol(self) -> str:
-        return f"_{self.name}" if self.convention == "stack" else f"{self.name}_"
+        return watcom_symbol(self.name, self.convention, self.pops)
+
+
+def watcom_symbol(name: str, convention: str, pops: int = 0) -> str:
+    """How Watcom spells a function's C name: name_ (register convention), _name (__cdecl), _name@8 (__stdcall)."""
+    if convention != "stack":
+        return f"{name}_"
+    return f"_{name}@{pops}" if pops else f"_{name}"
+
+
+def pops(mod: Module, addr: int, size: int) -> int:
+    """The bytes a function's `ret N` takes off the stack (0: a plain ret)."""
+    o = mod.object_at(addr)
+    if o is None:
+        return 0
+    for ins in _CS.disasm(o.data[addr - o.base:addr - o.base + size], addr):
+        if ins.id == cs_x86.X86_INS_RET and ins.operands:
+            return ins.operands[0].imm
+    return 0
 
 
 def data_symbol(addr: int) -> str:
@@ -56,8 +77,7 @@ def convention(mod: Module, addr: int, size: int) -> str:
     if o is None:
         return "register"
     code = o.data[addr - o.base:addr - o.base + min(size, 64)]
-    # push ebp; mov ebp, esp, as Watcom and Microsoft encode it (8B EC) or GNU as does (89 E5): one game's sound
-    # library came from GCC, its functions all 55 89 E5
+    # push ebp; mov ebp, esp, as Microsoft encodes it (8B EC) or Watcom and GNU as do (89 E5)
     if not code.startswith((b"\x55\x8b\xec", b"\x55\x89\xe5")):
         return "register"
     for ins in _CS.disasm(code, addr):
@@ -69,7 +89,8 @@ def convention(mod: Module, addr: int, size: int) -> str:
 
 def functions(mod: Module, found: list[tuple[int, int]]) -> list[Function]:
     """Functions with their names, conventions and relocations (`mod` relocated, `found` from dosfind)."""
-    out = [Function(a, n, f"func_{a:08X}", convention(mod, a, n)) for a, n in sorted(found)]
+    out = [Function(a, n, f"func_{a:08X}", conv := convention(mod, a, n), pops=pops(mod, a, n) if conv == "stack" else 0)
+           for a, n in sorted(found)]
     starts = [f.addr for f in out]
     by_addr = {f.addr: f for f in out}
     code = [o for o in mod.objects if o.executable]

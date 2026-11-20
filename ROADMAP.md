@@ -2136,7 +2136,7 @@ its column are features not yet run on it. Next, in order:
   it back: those need the old compilers. A Watcom of your own (Setup, kits/watcom.py) builds them, through wine
   (wibo lacks GetOEMCP); no 1990s copy has been tried, so its version reading (a version resource, else the banner
   in its files) and its command line are unconfirmed for them;
-- a compiler map for DOS (which files a Watcom built and which GCC: GNU as's 55 89 E5 prologues tell), and twins
+- a compiler map for DOS (which files are which Watcom flags: a frame kept or not, for size or speed), and twins
   across two games of one Watcom;
 - Watcom's own debug information, where a game shipped with it (names, types);
 - drafts: Ghidra has no Watcom convention and reads register arguments as GCC's __regparm3 (eax, edx, ecx), so a
@@ -2144,8 +2144,11 @@ its column are features not yet run on it. Next, in order:
   that takes stack arguments (GCC's code) is named as a register one (`func_X_`), so its C can't match yet;
 - the instruction count project sync uses (size / 4) undercounts x86 code, so the permuter's near-miss bar is
   stricter on DOS (and PC) than on fixed-width processors;
-- code a game built with GCC (a shareware game's sound library: GNU as's 55 89 E5 prologues) needs a DOS GCC
-  (DJGPP) toolchain for those files, and a per-file compiler (`set_file_compiler`);
+- a DOS GCC (DJGPP), for a game built with it: none seen yet. The shareware game's sound library looked like GCC's
+  (`push ebp; mov ebp, esp` as 55 89 E5, GNU as's encoding), but Watcom encodes it so too when it keeps a frame:
+  it's Watcom __stdcall code built -os -s -of, and its functions match with that (search_flags found it). Those
+  functions are named as __stdcall's (`_func_X@8`) since 20 November 2026; a project imported before gets the names
+  by its reimport;
 - 16-bit (real-mode) DOS: objdiff's x86 is 32/64-bit only, and those compilers write segmented OMF.
 
 ### Deep passes that climb under a closer compiler profile
