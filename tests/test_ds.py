@@ -1190,3 +1190,30 @@ def test_source_files_changed_after_a_reimport_come_back_with_it(per_file, monke
         return "more functions again"
     assert net.forks.reanalyse(slug, again, paths=("tools",), log=lambda *_: None, after=renamed_then_fails) is None
     assert config.read_bytes() == committed and source.read_text() == original, "taken back, the C too"
+
+
+@pytest.mark.parametrize("stage", ["build", "diff"])
+def test_a_try_cancelled_while_it_waits_leaves_the_file_as_it_was(per_file, monkeypatch, stage):
+    """A job cancelled while its try built (as at shutdown) let the exception out before the file was put back:
+    four of one game's files kept a saved draft placed without its declarations, and broke every build after."""
+    from decompnet.app.forkengine import ForkEngine
+
+    net, slug, agent, root, state, lerp = per_file
+    before = (root / "src" / "game.c").read_text()
+
+    class Cancelled(BaseException):
+        pass
+
+    real = ForkEngine._build_unit if stage == "build" else ForkProject.diff
+
+    def stop(*a, **k):  # cancelled once the try is in the file (the baseline before it builds as usual)
+        if "/* a try */" in (root / "src" / "game.c").read_text():
+            raise Cancelled
+        return real(*a, **k)
+    if stage == "build":
+        monkeypatch.setattr(ForkEngine, "_build_unit", stop)
+    else:
+        monkeypatch.setattr(ForkProject, "diff", stop)
+    with pytest.raises(Cancelled):
+        net.forks._attempt(agent, slug, "lerp", lerp.replace("return", "/* a try */ return", 1))
+    assert (root / "src" / "game.c").read_text() == before
