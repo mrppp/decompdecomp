@@ -195,7 +195,8 @@ def parse(data: bytes) -> Module:
                 raise LEError(f"page {page} has a fixup to object {target_obj}, which doesn't exist")
             if kind not in (OFFSET32, SELF32, SELECTOR16, OFFSET16, POINTER48):
                 raise LEError(f"page {page} has a fixup of type {kind}, which isn't supported")
-            target = mod.objects[target_obj - 1].base + target_off
+            # (32-bit arithmetic: an offset just below the object, `array[-1]`, wraps as the processor's does)
+            target = (mod.objects[target_obj - 1].base + target_off) & 0xFFFFFFFF
             for s in sources:
                 mod.fixups.append(Fixup(page_base + s, kind, target, target_obj))
     # A field that straddles two pages is listed in both pages' records (the second page's with a negative offset):

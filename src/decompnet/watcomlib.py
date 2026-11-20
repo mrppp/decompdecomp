@@ -23,8 +23,13 @@ from . import omf
 
 MIN_BYTES = 12  # a function this small or smaller is named only by a call from a sure match
 PAD = 16  # the alignment padding a function may have after its library code
-# the libraries a register-convention (-3r to -6r) game links: its C runtime, then its maths
-LIBRARIES = ("lib386/dos/clib3r.lib", "lib386/math3r.lib", "lib386/math387r.lib", "lib386/dos/emu387.lib")
+# the libraries a game links, by the calling convention it was built with: register (-3r to -6r) or stack (-3s to
+# -6s, whose symbols are _name: a 1994 game of Bullfrog's was), its C runtime, then its maths
+LIBRARIES = {
+    "register": ("lib386/dos/clib3r.lib", "lib386/math3r.lib", "lib386/math387r.lib", "lib386/dos/emu387.lib"),
+    "stack": ("lib386/dos/clib3s.lib", "lib386/math3s.lib", "lib386/math387s.lib", "lib386/dos/emu387.lib"),
+}
+ENOUGH = 20  # matches that say which Watcom (and convention) linked a game, not a coincidence of small functions
 
 
 @dataclass
@@ -82,12 +87,38 @@ def functions(data: bytes, library: str = "") -> list[LibFunction]:
     return out
 
 
-def load(folder: Path) -> list[LibFunction]:
-    """The functions of a Watcom copy's libraries (LIBRARIES, found ignoring case)."""
+@dataclass
+class Match:
+    """Which of the user's Watcom copies, and which convention's libraries, a game's library code is."""
+    folder: Path
+    convention: str  # "register" or "stack"
+    found: dict  # game symbol -> LibFunction
+    data: dict  # data symbol -> the library's name
+
+    @property
+    def sure(self) -> bool:
+        return len(self.found) >= ENOUGH
+
+
+def best(fns: list[dict], code: bytes, base: int, folders: list[Path]) -> Match | None:
+    """The copy and convention whose libraries the game matches most (identify), or None where none matches."""
+    out = None
+    for folder in folders:
+        for convention in LIBRARIES:
+            libs = load(folder, convention)
+            if libs:
+                found, data = identify(fns, code, base, libs)
+                if found and (out is None or len(found) > len(out.found)):
+                    out = Match(folder, convention, found, data)
+    return out
+
+
+def load(folder: Path, convention: str = "register") -> list[LibFunction]:
+    """The functions of a Watcom copy's libraries for a convention (LIBRARIES, found ignoring case)."""
     from .kits import find
 
     out = []
-    for rel in LIBRARIES:
+    for rel in LIBRARIES[convention]:
         path = find(folder, rel)
         if path is not None:
             out += functions(path.read_bytes(), path.name)

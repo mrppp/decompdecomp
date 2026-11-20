@@ -87,9 +87,13 @@ def convention(mod: Module, addr: int, size: int) -> str:
     return "register"
 
 
-def functions(mod: Module, found: list[tuple[int, int]]) -> list[Function]:
-    """Functions with their names, conventions and relocations (`mod` relocated, `found` from dosfind)."""
-    out = [Function(a, n, f"func_{a:08X}", conv := convention(mod, a, n), pops=pops(mod, a, n) if conv == "stack" else 0)
+def functions(mod: Module, found: list[tuple[int, int]], default: str = "register") -> list[Function]:
+    """Functions with their names, conventions and relocations (`mod` relocated, `found` from dosfind). `default`:
+    the convention the game was built with (its library code says: watcomlib.best). A stack-convention game's
+    functions are all stack ones (most read their arguments from esp, with no frame to tell them by)."""
+    def conv_of(a: int, n: int) -> str:
+        return "stack" if default == "stack" else convention(mod, a, n)
+    out = [Function(a, n, f"func_{a:08X}", conv := conv_of(a, n), pops=pops(mod, a, n) if conv == "stack" else 0)
            for a, n in sorted(found)]
     starts = [f.addr for f in out]
     by_addr = {f.addr: f for f in out}

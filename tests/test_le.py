@@ -74,3 +74,11 @@ def test_a_fixup_listed_twice_is_applied_once():
     assert len(mod.fixups) == 1
     mod.relocated()
     assert struct.unpack_from("<I", mod.objects[0].data, 1)[0] == 0x20010
+
+
+def test_a_fixup_below_its_object_wraps_to_32_bits():
+    """A target offset just below zero (code addressing array[-1]) is 32-bit arithmetic: a game's fixup came out as
+    _D_100002485, nine digits, which no rebuild could resolve."""
+    code = bytes.fromhex("a1") + struct.pack("<I", 0xFFFFFFFC) + bytes(11)
+    mod = le.parse(_bound(code, [(1, 0xFFFFFFFC)]))
+    assert [f.target for f in mod.fixups] == [0x1FFFC]

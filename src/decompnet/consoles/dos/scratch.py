@@ -81,19 +81,26 @@ def library_folders(compiler: str = "") -> list[Path]:
     return list(dict.fromkeys(Path(c.exe).parent.parent for c in copies))
 
 
-def apply_library(info: dict, code: bytes, folders: list[Path], log=print) -> int:
-    """Mark the game's functions that are Watcom's library code (watcomlib.identify, with the libraries of the
-    copy among `folders` the game matches most: the Watcom that linked it): each gets "library" (set aside:
+def library_match(info: dict, code: bytes, folders: list[Path]):
+    """Which of the user's Watcom copies, in which convention, the game's library code is (watcomlib.best)."""
+    fns = [fn for fns in info["units"].values() for fn in fns]
+    return watcomlib.best(fns, code, info["code_base"], folders) if folders else None
+
+
+def own_compiler(folder: Path) -> str | None:
+    """The compiler id of the user's Watcom copy in `folder` (watcom-10.0a), or None."""
+    from ... import kits
+    return next((c.version for c in kits.compilers(("watcom",)) if Path(c.exe).parent.parent == folder), None)
+
+
+def apply_library(info: dict, code: bytes, folders: list[Path], log=print, match=None) -> int:
+    """Mark the game's functions that are Watcom's library code (the copy among `folders`, and the convention, whose
+    libraries the game matches most: the Watcom that linked it): each gets "library" (set aside:
     generated_functions) and its real name, and the library's data its names, where no other symbol has them yet.
     Returns how many functions."""
     fns = [fn for fns in info["units"].values() for fn in fns]
-    found, data, folder = {}, {}, None
-    for candidate in folders:
-        libs = watcomlib.load(candidate)
-        if libs:
-            f, d = watcomlib.identify(fns, code, info["code_base"], libs)
-            if len(f) > len(found):
-                found, data, folder = f, d, candidate
+    match = match or library_match(info, code, folders)
+    found, data = (match.found, match.data) if match else ({}, {})
     names = dict(info.get("names") or {})
     taken = set(names.values())
     for fn in fns:
@@ -112,9 +119,9 @@ def apply_library(info: dict, code: bytes, folders: list[Path], log=print) -> in
             names[key] = real
             taken.add(real)
     info["names"] = dict(sorted(names.items()))
-    if found and folder is not None:
-        log(f"{len(found)} functions are Watcom's C library (your copy at {folder}), set aside and named; "
-            f"{len(data)} of the library's data named")
+    if found and match is not None:
+        log(f"{len(found)} functions are Watcom's C library (your copy at {match.folder}, {match.convention} "
+            f"convention), set aside and named; {len(data)} of the library's data named")
     return len(found)
 
 
@@ -161,7 +168,19 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     main = _main_object(mod)
     # the largest code object only (a second one's code is an address to it: D_XXXXXXXX), before the relocations
     # are named, so no relocation names a function the project doesn't have
-    fns = dosdelink.functions(mod, [f for f in found.functions if main.base <= f[0] < main.base + main.size])
+    spans = [f for f in found.functions if main.base <= f[0] < main.base + main.size]
+    fns = dosdelink.functions(mod, spans)
+    # which Watcom linked it, and in which convention: its library code says (the user's copies, kits/watcom.py).
+    # A stack-convention game's functions are _func_X and build with -5s; it builds with that copy
+    probe = {"code_base": main.base, "units": {"all": [_entry(f) for f in fns]}}
+    match = library_match(probe, main.data, library_folders(compiler or ""))
+    convention = match.convention if match and match.sure else "register"
+    if convention == "stack":
+        fns = dosdelink.functions(mod, spans, default="stack")
+    linked_with = own_compiler(match.folder) if match and match.sure else None
+    if linked_with:
+        log(f"its library code is {linked_with}'s ({convention} convention, {len(match.found)} functions): "
+            "the project builds with that copy")
     groups = dosdelink.units(fns)
     covered = sum(f.size for f in fns) / main.size
     log(f"{len(fns)} functions ({covered:.0%} of the code) in {len(groups)} source files")
@@ -184,20 +203,20 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     config = {
         "format": 1, "image": f"orig/{version}.code.bin", "sha1": hashlib.sha1(main.data).hexdigest(),
         "code_base": main.base, "entry": mod.entry,
-        "units": {u: [{"name": f.name, "symbol": f.symbol, "convention": f.convention, **({"pops": f.pops} if f.pops else {}),
-                       "addr": f.addr, "size": f.size, "relocs": [list(r) for r in f.relocs]} for f in group]
-                  for u, group in groups.items()},
+        "units": {u: [_entry(f) for f in group] for u, group in groups.items()},
     }
-    apply_library(config, main.data, library_folders(compiler or ""), log)
+    apply_library(config, main.data, [match.folder] if match else [], log,
+                  match=library_match(config, main.data, [match.folder]) if match else None)
     (conf / "functions.json").write_text(json.dumps(config, indent=1), encoding="utf-8")
     for u, group in groups.items():
         src = root / "src" / "auto" / f"{u}.c"
         src.parent.mkdir(parents=True, exist_ok=True)
         src.write_text(f"/* {len(group)} function{'s' if len(group) != 1 else ''} from 0x{group[0].addr:08X}, found "
                        "from the game's code and fixups. */\n#include \"common.h\"\n", encoding="utf-8")
-    chosen = compiler or "openwatcom-2.0"
+    chosen = compiler or linked_with or "openwatcom-2.0"
     (root / ".decomp.wtf.json").write_text(json.dumps({
         "created": "from scratch", "platform": "dos", "version": version, "compiler": chosen,
+        **({"dos_convention": "stack", "dos_flags": "-zq -bt=dos -mf -5s -ox"} if convention == "stack" else {}),
         "game": {"what": "your own copy of the game's DOS/4GW program", "path": f"orig/{version}.exe",
                  "sha1": info["sha1"]},
         "setup": [["python", "tools/configure.py", version], ["ninja", "prepare"]],
@@ -251,6 +270,12 @@ def check_code(root: Path, version: str, log=print) -> dict:
             "what": "The game's code, rebuilt from the project,"}
 
 
+def _entry(f) -> dict:
+    """A function as functions.json keeps it."""
+    return {"name": f.name, "symbol": f.symbol, "convention": f.convention, **({"pops": f.pops} if f.pops else {}),
+            "addr": f.addr, "size": f.size, "relocs": [list(r) for r in f.relocs]}
+
+
 def _main_object(mod):
     code = [o for o in mod.objects if o.executable]
     return max(code, key=lambda o: o.size)
@@ -276,7 +301,8 @@ def reanalyse(root: Path, version: str, matched: set[str], log=print) -> str | N
         return any(k < a + n and a < k + fn["size"] for k, (_, fn) in kept.items())
     spans = sorted([(a, n) for a, n in found if a not in kept and not inside_kept(a, n)]
                    + [(a, fn["size"]) for a, (_, fn) in kept.items()])
-    fns = {f.addr: f for f in dosdelink.functions(mod, spans)}
+    manifest = json.loads((root / ".decomp.wtf.json").read_text(encoding="utf-8"))
+    fns = {f.addr: f for f in dosdelink.functions(mod, spans, default=manifest.get("dos_convention", "register"))}
     order = list(info["units"])
     units: dict[str, list] = {u: [] for u in order}
     last = order[0]
@@ -296,7 +322,6 @@ def reanalyse(root: Path, version: str, matched: set[str], log=print) -> str | N
     library_before = {fn["symbol"]: fn.get("library") for _, fn in old.values()}
     names_before = dict(info.get("names") or {})
     new_info = {**info, "units": units}
-    manifest = json.loads((root / ".decomp.wtf.json").read_text(encoding="utf-8"))
     apply_library(new_info, main.data, library_folders(manifest.get("compiler", "")), log)
     library_after = {fn["symbol"]: fn.get("library") for group in units.values() for fn in group}
     before = {(fn["addr"], fn["size"], fn["symbol"], json.dumps(fn["relocs"])) for _, fn in old.values()}

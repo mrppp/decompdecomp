@@ -151,11 +151,12 @@ def compilable(draft: str, symbol: str, stack: dict[str, str], known: str = "") 
             if not re.search(rf"^[^\n;{{}}]*\b{callee}\s*\([^;{{}}]*\)\s*;", known, re.M):
                 lines.append(defined + ";")
         elif not re.search(rf"\b{callee}\s*\(", known):
-            lines.append(f"int {stack[callee] + ' ' if callee in stack else ''}{callee}();")
+            lines.append(f"int {stack[callee] + ' ' if stack.get(callee) else ''}{callee}();")
     for g, kind in sorted(globals_.items()):
         if not re.search(rf"\b{g}\b", known):
             lines.append(f"extern {kind} {g};")
     prelude = "\n".join([f'#include "{GHIDRA_HEADER}"', *lines]) + "\n"
-    keyword = ("__stdcall " if "@" in symbol else "__cdecl ") if is_stack else ""
+    own = stack.get(name, "__stdcall" if "@" in symbol else "__cdecl") if is_stack else ""
+    keyword = own + " " if own else ""
     definition = f"{ret} {keyword}{name}({', '.join(params) or 'void'})\n{{{body[:-1]}}}\n"
     return prelude, definition

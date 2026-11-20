@@ -143,6 +143,7 @@ class Dos(Console):
     # with -5r or -4r, came out 77% with -3r) and how hard it optimised (-os: 48%). The calling convention (-5s) is
     # left alone: it renames every symbol the targets were cut with.
     CPUS = ("-5r", "-4r", "-3r", "-6r")
+    STACK_CPUS = ("-5s", "-4s", "-3s", "-6s")  # a stack-convention game's (the convention stays: it names the symbols)
     # how hard it optimised, each a set of flags: -ox has -s in it (no stack checks), -os and -ot alone would check
     # the stack in every function
     OPTIMISATIONS = (("-ox",), ("-oneatx",), ("-otexan",), ("-os", "-s"), ("-ot", "-s"))
@@ -202,8 +203,9 @@ class Dos(Console):
         frame = [] if "-of" in flags else ["-of"]
         add([*flags, *frame])
         add([*[f for f in rest if f != "-of"], "-os", "-s", "-of"])
-        for cpu in self.CPUS:
-            add([cpu if f in self.CPUS else f for f in flags] + ([] if any(f in self.CPUS for f in flags) else [cpu]))
+        cpus = self.STACK_CPUS if any(f in self.STACK_CPUS for f in flags) else self.CPUS
+        for cpu in cpus:
+            add([cpu if f in cpus else f for f in flags] + ([] if any(f in cpus for f in flags) else [cpu]))
         for opt in self.OPTIMISATIONS:
             add([*rest, *opt])
         return out
@@ -250,7 +252,9 @@ class Dos(Console):
     def compilable_draft(self, fp, symbol: str, draft: str, known: str = "") -> tuple[str, str] | None:
         from .drafts import compilable
         info = _functions_json(fp, self._version(fp))
-        stack = {fn["name"]: "__stdcall" if fn.get("pops") else "__cdecl" for fns in info.get("units", {}).values()
+        # a stack-convention game (-5s) needs no keyword for its own convention: __cdecl is another one
+        plain = "" if (fp.manifest or {}).get("dos_convention") == "stack" else "__cdecl"
+        stack = {fn["name"]: "__stdcall" if fn.get("pops") else plain for fns in info.get("units", {}).values()
                  for fn in fns if fn.get("convention") == "stack"}
         return compilable(draft, symbol, stack, known)
 
