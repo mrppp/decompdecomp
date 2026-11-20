@@ -913,6 +913,12 @@ def register(app: App) -> None:
             return {'job': last['id'] if last and last['state'] == 'running' else None, 'last': last}
         return {'job': start_search(slug, str(data.get('name', '')), data.get('minutes', 10), data.get('variants', 500))}
 
+    def p_rejudge_best(slug, request, data):
+        """Every open function's best attempt judged again as it builds now (ForkEngine.rejudge_best): after its
+        source file moved to another compiler."""
+        return {"job": jobs.start("rejudge-best", lambda log: net.forks.rejudge_best(slug, log), project=slug,
+                                  cancel_message="Stopped: the attempts judged so far keep what they found.")}
+
     def p_finish_near(slug, request, data):
         from .. import finish_near
         seconds,attempts=data.get('seconds',120),data.get('attempts',128)
@@ -1227,6 +1233,7 @@ def register(app: App) -> None:
                                                         r.query_params.get("which", "latest")), ["GET"]),
         "/api/symbol-names": (p_symbol_names, ["POST"]),
         "/api/compiler": (p_compiler, ["POST"]),
+        "/api/rejudge-best": (p_rejudge_best, ["POST"]),
         "/api/compiler/test-default": (p_compiler_default_test, ["POST"]),
         "/api/compiler/cleanup": (p_compiler_cleanup, ["POST"]),
         "/api/compiler/unverified": (p_unverified_profiles, ["GET", "POST"]), "/api/export": (p_export, ["POST"]),

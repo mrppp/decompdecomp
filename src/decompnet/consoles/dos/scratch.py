@@ -30,7 +30,9 @@ TYPES_H = """\
 /* Types for this decompilation (32-bit x86, Watcom C). Agents add structs and prototypes here or in new headers.
  * The game's functions are func_XXXXXXXX and its data D_XXXXXXXX (their addresses): write them with those names
  * and the build gives them the original's symbols. A function in Watcom's stack convention (functions.json says
- * "stack") is declared __cdecl, or __stdcall where it says "pops" (its symbol _func_XXXXXXXX@8). */
+ * "stack") is declared __cdecl, or __stdcall where it says "pops" (its symbol _func_XXXXXXXX@8).
+ * Watcom 9.5 and 10.x are C89 compilers: declare a function before you call it, declarations at the start of a
+ * block, no long long, bool or inline (guide "watcom"). */
 #ifndef COMMON_H
 #define COMMON_H
 typedef unsigned char u8;

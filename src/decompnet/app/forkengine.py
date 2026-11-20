@@ -3988,6 +3988,53 @@ class ForkEngine:
                 if repaired:
                     yield '', '/* private initial draft recovery, judged normally */\n'+drafts.self_contained(source, repaired, current)
 
+    def rejudge_best(self, slug: str, log=print) -> dict:
+        """Every open function's best attempt judged again as it builds now, where its source file doesn't hold it
+        (a file's own functions were judged again with the file: a compiler switch's _apply_scores). After a file
+        moves to another compiler (a DOS game's files to the Watcom that built it), attempts scored under the old
+        one are near misses that can match now. Each is submitted as autopilot submits a draft: kept when it
+        matches or comes closer, else nothing changes. Returns the counts."""
+        proj, fp, cfg = self.get(slug)
+        agent, _ = self.net.local_agent("autopilot")
+        rows = self.net.project_store(proj["id"]).all(
+            "SELECT * FROM functions WHERE project_id=? AND status='open' AND best_source IS NOT NULL ORDER BY size",
+            proj["id"])
+        counts = {"tried": 0, "matched": 0, "closer": 0, "in_file": 0, "skipped": 0}
+        for n, fn in enumerate(rows, 1):
+            try:
+                unit = fp.unit(fn["unit"])
+                text = (fp.root / unit.source).read_text(errors="replace", encoding="utf-8") if unit.source else ""
+            except (ForkError, OSError, ValueError):
+                counts["skipped"] += 1
+                continue
+            if self._find(text, self._names(self._meta(fn), fn))[1] is not None:
+                counts["in_file"] += 1
+                continue
+            now = time.time()
+            with self.net.project_store(proj["id"]).tx() as db:
+                if db.execute("SELECT 1 FROM claims WHERE function_id=?", (fn["id"],)).fetchone():
+                    counts["skipped"] += 1  # an agent holds it: its own attempts judge it
+                    continue
+                db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + 300))
+            try:
+                before = fn["best_score"]
+                res = self.attempt(agent, slug, fn["name"], fn["best_source"], keep=True)
+                counts["tried"] += 1
+                counts["matched"] += bool(res.get("matched"))
+                score = res.get("score")
+                counts["closer"] += bool(not res.get("matched") and score is not None and before is not None
+                                         and score < before)
+            except (NetworkError, OSError, subprocess.SubprocessError) as e:
+                logging.getLogger("decompdecomp").info("rejudge: %s not tried: %s", fn["name"], str(e)[:300])
+                counts["skipped"] += 1
+            finally:
+                with self.net.project_store(proj["id"]).tx() as db:
+                    db.execute("DELETE FROM claims WHERE function_id=? AND agent_id=?", (fn["id"], agent.id))
+            if n % 25 == 0 or n == len(rows):
+                log(f"{n} of {len(rows)} best attempts looked at: {counts['tried']} judged again, {counts['matched']} "
+                    f"now match, {counts['closer']} closer ({counts['in_file']} already in their files)")
+        return counts
+
     def autopilot_one(self, agent: Agent, proj, fid: int) -> str:
         """match | near | far | fail | skip, for one function's drafts, each built and diffed like an agent's, until
         one matches. A draft autopilot already judged as it is now is skipped: autopilot tries a function again when

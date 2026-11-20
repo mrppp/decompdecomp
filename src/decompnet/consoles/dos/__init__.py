@@ -48,8 +48,8 @@ class Dos(Console):
     compilers = (Compiler("openwatcom-2.0", "OpenWatcom C 2.0", "32-bit DOS/4GW games of the mid-1990s",
                           guess="Watcom"),)
     compiler_config = (".decomp.wtf.json", "config/**/*")
-    guides = ("x86",)
-    compiler_guide = ""
+    guides = ("watcom",)  # (the PC's x86 guide is Microsoft's compiler: Watcom keeps ecx and edx, and passes in registers)
+    compiler_guide = "watcom"  # every helper reads it before its first claim
     m2c = ""  # m2c has no x86 target
     ram = (0x10000, 0x1000000)  # a DOS/4GW game's objects are linked low (code at 0x10000 is common)
     demo = "demo-dos"
