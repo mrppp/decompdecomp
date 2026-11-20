@@ -194,6 +194,12 @@ class Xbox360(Console):
 
         fp = net.forks.get(slug)[1]
         version = (fp.manifest or {})["version"]
+        # the build tools first: a reimport rebuilds with them, and startup's upgrade (on_start) reaches a project
+        # only when background maintenance gets to it; an older delinker would cut what a new analysis writes
+        if (fp.manifest or {}).get("created") == "from scratch" and (fp.manifest or {}).get("tools") != scratch.tools_version():
+            if changed := scratch.write_tools(fp.root):
+                log(f"updated this project's build tools to decompdecomp's current ones ({', '.join(changed)})")
+            fp.update_manifest(tools=scratch.tools_version())
         matched = {r["name"] for r in net.project_store(slug).all(
             "SELECT name FROM functions WHERE project_id=? AND status='matched'", net.project_row(slug)["id"])}
         log("finding this project's functions again from its own image: its function table (.pdata), then Ghidra")
