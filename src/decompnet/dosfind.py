@@ -84,6 +84,8 @@ def _clean_end(o, start: int, limit: int, table_fields: set[int]) -> bool:
         if ins is None or ins.id in (cs_x86.X86_INS_INT3, cs_x86.X86_INS_IN, cs_x86.X86_INS_OUT, cs_x86.X86_INS_INSB,
                                      cs_x86.X86_INS_INSD, cs_x86.X86_INS_OUTSB, cs_x86.X86_INS_OUTSD):
             return False
+        if bytes(ins.bytes[:2]) == b"\0\0":  # `add [eax], al`: zeros decode, but compiled code doesn't hold them
+            return False
         if ins.id in ENDS or ins.id == cs_x86.X86_INS_JMP:
             return True
         at += ins.size
