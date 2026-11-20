@@ -21,6 +21,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import omf2elf  # noqa: E402
 
+# how long wine's server stays after the last compile: Watcom under wine takes 0.8 s a file started cold and 0.02 s
+# with its server there (OpenWatcom 2 natively: 0.006 s). It leaves by itself after this long, however the app ended
+SERVER_IDLE_SECONDS = 600
+
+
+def keep_wine_server(wine: str, env: dict) -> None:
+    """A wine server that stays between compiles (`wineserver -p<seconds>`); one already running stays, and the new
+    one leaves at once. It's given none of the build's pipes, which would keep the build waiting on them."""
+    beside = [folder / "wineserver" for folder in (Path(wine).parent, Path(wine).resolve().parent)]
+    server = next((str(s) for s in beside if s.is_file()), None) or shutil.which("wineserver")
+    if server is None:
+        return  # (wine starts one of its own, which lives only a few seconds)
+    try:
+        subprocess.run([server, f"-p{SERVER_IDLE_SECONDS}"], env=env, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
 
 def windows(path: Path) -> str:
     """A path as a Windows program under wine reads it: wine's Z: is /."""
@@ -83,6 +101,7 @@ def main() -> int:
             if prefix:
                 env["WINEPREFIX"] = prefix
             env.update(WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=", WATCOM=windows(home))
+            keep_wine_server(wine, env)
             headers = ";".join(windows(Path(p).resolve()) for p in (args.include, *args.system_include))
             cmd = [wine, args.compiler, *args.flags, f"-i={headers}", windows(Path(args.source).resolve()),
                    f"-fo={windows(obj)}"]
