@@ -17,6 +17,17 @@ const row={region:'40-80',index:0,sample,asset,name:'Synthetic · 1'};
 (async()=>{
  {const t=setup();t.c.report={regions:[{id:'bank',kind:'audio',detected_asset:asset,direct_function_refs:['reader']},{id:'split',kind:'audio',detected_asset:{...asset,offset:1000},traced_function_refs:['loader']}]};const rows=t.run('romAudioRows(report)');assert.equal(rows.length,1);assert.equal(rows[0].refs,2);assert.equal(rows[0].region,'bank');
  t.c.report={regions:[{id:'wave',kind:'audio',evidence:[{kind:'audio',confidence:'validated',offset:128,size:128,format:'PCM WAVE',rate:16000,seconds:1}]}]};assert.equal(t.run('romAudioRows(report)[0].codec'),'PCM WAVE');}
+ {const t=setup();const samples=[{...sample,label:'Sample 1'},{...sample,offset:2000,label:'Sample 2'}];
+ t.c.report={regions:[{id:'bank',kind:'audio',detected_asset:{...asset,samples}}]};
+ assert.equal(t.run('romAudioRows(report).map(row=>row.name).join(",")'),'Synthetic · Sample 1,Synthetic · Sample 2');}
+ {const t=setup();const dean={...sample,rate:11025,codec:'Acclaim DEAN',samples:null,preview_available:false};
+ delete t.c.view.audio;
+ t.c.view.report.regions=[{id:'dean',kind:'audio',detected_asset:{...asset,rate_basis:null,samples:[dean]}}];
+ t.run('renderRomAudioBrowser()');assert.match(t.c.$('romAudioItems').innerHTML,/Acclaim DEAN.*Playback unavailable/);
+ assert.doesNotMatch(t.c.$('romAudioItems').innerHTML,/data-audio-prepare/);assert.equal(t.calls.length,0);
+ t.c.view.report.regions[0].detected_asset.samples=[{...dean,samples:11025,preview_available:true}];
+ t.run('renderRomAudioBrowser()');assert.match(t.c.$('romAudioItems').innerHTML,/Acclaim DEAN.*1\.00.*Prepare audio/);
+ assert.equal(t.calls.length,0);}
  {const t=setup();t.c.$('romAudioPanel').open=false;t.run('renderRomAudioBrowser()');assert.equal(t.calls.length,0);assert.match(t.c.$('romAudioContext').textContent,/0 samples/);}
  {const t=setup();t.c.row=row;const first=t.run('prepareRomAudio(row)');assert.equal(t.c.$('romAudioPanel').controls[0].disabled,true);await t.run('prepareRomAudio(row)');assert.equal(t.calls.length,1);
  t.c.$('romAudioStop').onclick();assert.equal(t.calls[0].options.signal.aborted,true);assert.equal(t.c.$('romAudioPanel').controls[0].disabled,false);

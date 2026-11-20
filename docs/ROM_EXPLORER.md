@@ -344,7 +344,35 @@ material extent, byte-plane vertex stream and polygon stream. Triangle commands 
 32-slot cache: the decoder loads the first 32 vertices, then alternates 16-slot replacements.
 Every reference must resolve to a loaded vertex; every run must terminate and consume the
 complete stream. Positions alone never establish a model. Empty containers are not labelled
-as models. Compressed candidates must pass both RNC checksums.
+as models. That indexed layout requires both RNC CRCs when compressed.
+
+The Model browser also recognizes EMshV010 meshes in byte-sum RNC blocks and chained RNX streams. It checks the
+decoded byte sum, table extents, corner indexes and optional ATEX trailer, then reconstructs
+local positions from signed deltas and triangulates the polygons. For effect meshes, the
+mesh group and texture resource tables can identify a bank in the same checked directory.
+The preview uses each polygon’s texture slot and each corner’s UVs. Meshes with unresolved
+scene materials still display in local space.
+
+RNX advances from one independently checked block to the next with 8-byte padding
+relative to the block start. It recognizes a terminal RNC block or a fill record and the
+stream terminator. Complete streams can contain descriptor texture banks, EMsh meshes,
+ELv9 levels and shared-palette graphics. Choose a bank and slot in the Texture browser
+to view checked CI4, RGBA, solid and referenced tiles.
+
+Search ROM Explorer for **ELv9**, **PATH** or **NCS** to inspect sector extents,
+path positions or cutscene commands. PATH shows connected positions in keyframe
+order. NCS shows opcode numbers and operand words. Sector geometry, runtime
+material binding and cutscene execution remain planned.
+
+Dialogue scripts are listed by language in the region table. Search for **dialogue**, open a
+script region, and choose **Browse dialogue**. The scene and speaker filters apply to all
+cue records before paging. Cues include dialogue and production notes, and the other
+language links to its own script. Detection checks the archive length and byte sum,
+scene headings and speaker key, then reads the script as Windows-1252.
+
+Audio browser prepares mono WAV previews for Acclaim DEAN streams with verified ROM
+codebooks. A verified voice link in the dialogue browser opens the same player. Press
+Play to listen. Long previews are capped at 30 seconds.
 
 Open a model region, choose **Model mesh**, then **Preview asset**. Changing the mesh prepares
 its wireframe. The selector shows node, part and section identity; **Save notes** retains the

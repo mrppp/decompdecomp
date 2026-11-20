@@ -666,3 +666,128 @@ def init_repo(root):
     except subprocess.CalledProcessError:
         git(root, 'init')
         git(root, 'symbolic-ref', 'HEAD', 'refs/heads/main')
+
+
+def test_rebuildable_setup_verifies_the_linked_save_once_before_export(project, monkeypatch):
+    net, _, _ = project
+    checks = []
+    sync = net.progress.sync
+    console = net.console(net.project_row('game'))
+    export = console.export_project
+
+    def record_sync(slug, **kwargs):
+        checks.append(bool(kwargs.get('force')))
+        return sync(slug, **kwargs)
+
+    def verify_then_export(net, slug, out, log):
+        assert checks.count(True) == 1
+        before = list(checks)
+        net._project(slug)
+        assert checks == before
+        return export(net, slug, out, log)
+
+    monkeypatch.setattr(net.progress, 'sync', record_sync)
+    monkeypatch.setattr(console, 'export_project', verify_then_export)
+    assert repository_setup.run(net, 'game', 'init', '', lambda _: None)['rebuildable']
+
+
+def test_repository_upgrade_preserves_previous_extraction_locally(project, monkeypatch):
+    net, root, _ = project
+    console = net.console(net.project_row('game'))
+    export = console.export_project
+    asm = 'asm/nonmatchings/code/function.s'
+    asset = 'assets/extracted.bin'
+
+    def verified_export(net, slug, out, log):
+        result = export(net, slug, out, log)
+        (out/asm).parent.mkdir(parents=True)
+        (out/asm).write_bytes(b'verified assembly')
+        return result
+
+    monkeypatch.setattr(console, 'export_project', verified_export)
+    originals = {asm: b'previous assembly', asset: b'previous extraction'}
+    for name, data in originals.items():
+        (root/name).parent.mkdir(parents=True, exist_ok=True)
+        (root/name).write_bytes(data)
+
+    state = repository_setup.run(net, 'game', 'init', '', lambda _: None)
+    assert state['rebuildable']
+    assert (root/asm).read_bytes() == b'verified assembly'
+    assert (root/asset).read_bytes() == b'PRIVATE DATA'
+    backup, = (root/'.decomp-extraction-backups').iterdir()
+    for name, data in originals.items():
+        saved = backup/name
+        assert saved.read_bytes() == data
+        relative = saved.relative_to(root).as_posix()
+        assert git(root, 'check-ignore', relative) == relative
+
+    git(root, 'config', 'user.name', 'Test')
+    git(root, 'config', 'user.email', 'test@example.invalid')
+    repository_setup.run(net, 'game', 'checkpoint', '', lambda _: None)
+    tracked = git(root, 'ls-files').splitlines()
+    assert all(not name.startswith(('asm/', 'assets/', '.decomp-extraction-backups/')) for name in tracked)
+
+
+def test_repository_creation_backs_up_a_readme_found_after_export(project, monkeypatch):
+    net, root, _ = project
+    console = net.console(net.project_row('game'))
+    export = console.export_project
+    readme = root/'README.md'
+    previous = b'# Local project notes\r\n\r\nKeep these notes verbatim.\r\n'
+
+    def verified_export(net, slug, out, log):
+        result = export(net, slug, out, log)
+        # A README absent from the flat save's baseline used to block publication.
+        readme.write_bytes(previous)
+        return result
+
+    (root/'README.md').unlink(missing_ok=True)
+    monkeypatch.setattr(console, 'export_project', verified_export)
+    messages = []
+    assert repository_setup.run(net, 'game', 'init', '', messages.append)['rebuildable']
+    assert readme.read_text().startswith('# Full source tree\n')
+    backup, = (root/'.decomp-repository-backups').glob('*/README.md')
+    assert backup.read_bytes() == previous
+    relative = backup.relative_to(root).as_posix()
+    assert git(root, 'check-ignore', relative) == relative
+    assert any(relative.rsplit('/', 1)[0] in line for line in messages)
+
+    git(root, 'config', 'user.name', 'Test')
+    git(root, 'config', 'user.email', 'test@example.invalid')
+    repository_setup.run(net, 'game', 'checkpoint', '', lambda _: None)
+    tracked = git(root, 'ls-files').splitlines()
+    assert 'README.md' in tracked and relative not in tracked
+
+def test_repository_creation_backs_up_conflicting_build_files_together(project, monkeypatch):
+    net, root, _ = project
+    console = net.console(net.project_row('game'))
+    export = console.export_project
+    previous = {
+        'build.json': b'{"previous": true}\n',
+        'build.py': b'# previous builder\n',
+        'export_entry.py': b'# previous entry extraction\n',
+        'splat.yaml': b'# previous layout\n',
+        'symbol_addrs.txt': b'# previous symbol names\n',
+        'objdiff.json': b'{"units": []}\n',
+    }
+    for name, data in previous.items():
+        (root/name).write_bytes(data)
+
+    def verified_export(net, slug, out, log):
+        result = export(net, slug, out, log)
+        for name in previous.keys() - {'build.py', 'build.json'}:
+            (out/name).write_bytes(b'verified replacement\n')
+        return result
+
+    monkeypatch.setattr(console, 'export_project', verified_export)
+    assert repository_setup.run(net, 'game', 'init', '', lambda _: None)['rebuildable']
+    backup, = (root/'.decomp-repository-backups').iterdir()
+    for name, data in previous.items():
+        assert (backup/name).read_bytes() == data
+        assert (root/name).read_bytes() != data
+    git(root, 'config', 'user.name', 'Test')
+    git(root, 'config', 'user.email', 'test@example.invalid')
+    repository_setup.run(net, 'game', 'checkpoint', '', lambda _: None)
+    tracked = set(git(root, 'ls-files').splitlines())
+    assert previous.keys() <= tracked
+    assert not any(name.startswith('.decomp-repository-backups/') for name in tracked)

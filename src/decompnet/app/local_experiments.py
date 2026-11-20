@@ -72,11 +72,11 @@ def run(net, agent, slug, function, revision, families=None, max_trials=6, *, se
         checked = agent_evidence.preflight(net,agent,slug,fn,source)
         if checked and checked.get('error'):
             return agent_evidence.blocked_message(checked, actual)
+        if time.monotonic()>=deadline:
+            return 'Local repair time budget reached during baseline checking; no variants submitted.'
         if checked and checked.get('exact'):
             from .tools import _compile
             return _compile(net,agent,slug,function,source)
-        if time.monotonic()>=deadline:
-            return 'Local repair time budget reached during baseline checking; no variants submitted.'
         if checked and checked.get('score') is not None:
             if not hasattr(net, '_agent_outcomes'):
                 net._agent_outcomes={}
@@ -117,10 +117,9 @@ def run(net, agent, slug, function, revision, families=None, max_trials=6, *, se
         policy_profile=adaptive_repairs.profile(net,net._project(slug),fn)
         from .permuter_focus import classify
         focus=classify((baseline or {}).get('rows') or [])
-        remaining=deadline-time.monotonic()
-        if remaining<=0:return 'Local repair time budget reached during proposal generation; no variants submitted.'
+        if time.monotonic() >= deadline:return 'Local repair time budget reached during proposal generation; no variants submitted.'
         result=agent_tokens.variants(net,agent,slug,function,revision,[{'old':source,'new':s} for _,s in selected], 'local repairs',
-                                     seconds=remaining,provenance_kind=provenance_kind,variant_families=[family for family,_ in selected])
+                                     seconds=seconds,deadline=deadline,provenance_kind=provenance_kind,variant_families=[family for family,_ in selected])
         observations=getattr(net,'_local_trial_observations',{}).get((agent.id,fn['id']),[])
         for (family,_), measured in zip(selected,observations):
             repair_ranking.remember(net,effect_scope,family,baseline,measured)
@@ -131,12 +130,13 @@ def run(net, agent, slug, function, revision, families=None, max_trials=6, *, se
                 repair_sequences.observe(net,recipe_profile,repair_sequences.focus((baseline or {}).get('rows'),net._project(slug)['arch']),[],family,
                     (baseline or {}).get('score'),measured.get('score'),output_key(baseline or {}),output_key(measured),
                     exact=bool(measured.get('matched') or measured.get('exact')),elapsed_ms=measured.get('elapsed_ms'))
-        for (family,candidate),measured in zip(selected,observations):
-            if not measured or measured.get('score') is None:
-                continue
+        tried = [(fn['id'], scope, 'local:'+family, hashlib.sha256(candidate.encode()).hexdigest())
+                 for (family, candidate), measured in zip(selected, observations)
+                 if measured and measured.get('score') is not None]
+        if tried:
+            # Scored trials are already settled. Enter the project writer once for their history.
             with net.project_store(fn['project_id']).tx() as db:
-                db.execute('INSERT OR IGNORE INTO agent_family_targets VALUES(?,?,?,?)',
-                           (fn['id'],scope,'local:'+family,hashlib.sha256(candidate.encode()).hexdigest()))
+                db.executemany('INSERT OR IGNORE INTO agent_family_targets VALUES(?,?,?,?)', tried)
         current=net._function(function,slug)
         if (current['status']=='matched' and current['best_source'] in [candidate for _,candidate in selected]
                 and recipe_profile==repair_sequences.profile(net,net._project(slug),fn)):
@@ -349,8 +349,8 @@ def _available(net, agent, slug, fn, source, revision, requested):
     return pools
 
 
-def summary(net, agent, slug, fn, source, revision):
-    """Exact counts from the runner's remaining proposal pool; no compiler/provider calls."""
+def summary(net, agent, slug, fn, source, revision, *, discover=True):
+    """Report a current repair count. Candidate reads can use saved counts without generating proposals."""
     from ..forks.project import ForkError
     try:
         scope = agent_tokens.target_scope(net,fn,'')
@@ -360,26 +360,35 @@ def summary(net, agent, slug, fn, source, revision):
             latest=net.project_store(fn['project_id']).one('SELECT MAX(id) AS id FROM attempts WHERE function_id=?',fn['id'])['id'] or 0
             if latest <= failure.get('after_attempt',0):
                 return f'Remaining local repairs [{revision}]: baseline blocked. Fix C/build inputs or redraft before variants.'
+        cache = getattr(net, '_remaining_repairs', {})
+        prefix = (fn['id'], agent.id, revision, scope)
+        unchecked = f'Use try_local_repairs to look for applicable repairs for revision {revision}.'
+        # Reading C and its revision must stay cheap even if a single repair stage overruns its budget.
+        if not discover and not any(key[:len(prefix)] == prefix for key in tuple(cache)):
+            return unchecked
         count = net.project_store(fn['project_id']).one('SELECT COUNT(*) AS n FROM agent_family_targets WHERE function_id=?',fn['id'])['n']
         measured = getattr(net,'_agent_outcomes',{}).get((agent.id,fn['id']))
         evidence = hashlib.sha256(repr((measured.get('score'),measured.get('rows')) if measured and measured.get('source')==source else None).encode()).hexdigest()
         from . import rtl_value_trace, verified_unit_context
         proj=net._project(slug);ctx=net._context(proj['id'],fn['unit'])
         trace_scope=hashlib.sha256(repr(rtl_value_trace.saved(net,proj,fn,source,ctx['header'] if ctx else '')).encode()).hexdigest()
-        key = (fn['id'],agent.id,revision,scope,count,evidence,generation_signature(prototype_reuse.signature,net,proj,source),
+        key = (*prefix, count, evidence, generation_signature(prototype_reuse.signature,net,proj,source),
                generation_signature(verified_unit_context.signature,net,proj,fn,source),trace_scope)
-        cache = getattr(net,'_remaining_repairs',{})
-        net._remaining_repairs = cache
-        if key not in cache:
+        cached = cache.get(key)
+        if cached is None:
+            if not discover:
+                return unchecked
+            net._remaining_repairs = cache
             pools = available(net,agent,slug,fn,source,revision,list(FAMILIES),deadline=time.monotonic()+1)
             counts = [(family,len(set(pool))) for family,pool in pools.items() if pool]
             total = len(set(candidate for pool in pools.values() for candidate in pool))
-            cache[key] = (total,counts,getattr(pools,"incomplete",False))
-            while len(cache)>32:
-                del cache[next(iter(cache))]
-        total,counts,incomplete = cache[key]
+            cached = (total,counts,getattr(pools,"incomplete",False))
+            if not cached[2]:
+                cache[key] = cached
+                while len(cache)>32:
+                    del cache[next(iter(cache))]
+        total,counts,incomplete = cached
         if incomplete:
-            cache.pop(key,None)
             return f'Remaining local repairs [{revision}]: at least {total} known proposals; discovery paused at its generation budget. Cached stages resume on the next pass; this is not exhaustion.'
         if not total:
             return f'Remaining local repairs [{revision}]: 0. Do not retry unchanged families; inspect the diff or release with notes.'
