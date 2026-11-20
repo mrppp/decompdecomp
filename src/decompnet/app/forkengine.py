@@ -3539,7 +3539,18 @@ class ForkEngine:
                     if linked:
                         self._verify(proj, fp)
 
-            ok, log = self._build_unit(proj, fp, unit)
+            def left_behind() -> None:
+                """The file as it was, when the build or diff raised instead of returning: a job cancelled while it
+                waited (as at shutdown) left the try in the file. Four of one game's files kept a saved draft placed
+                without its declarations that way, and broke every build of them after."""
+                _rewrite(path, before)
+                unname()
+
+            try:
+                ok, log = self._build_unit(proj, fp, unit)
+            except BaseException:
+                left_behind()
+                raise
             if not ok and (broken := fp.build_problem()) is not None:
                 # the build itself is broken, not the agent's code: nothing recorded or counted, and the project
                 # is set up again in the background (one project spent five compiles on a build.ninja whose python
@@ -3564,6 +3575,9 @@ class ForkEngine:
             except (ObjdiffError, ForkError) as e:
                 undo()
                 return {"text": f"❌ objdiff couldn't compare (your change was undone): {e}", "score": None, "matched": False}
+            except BaseException:
+                left_behind()
+                raise
             if quiet is None:
                 d.rows = with_constant_values(d.rows, consoles.get(cfg.get("platform")), fp)
                 self.net.keep_diff(agent.id, fn["id"], d.rows, objdiff.LEGEND)
