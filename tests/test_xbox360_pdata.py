@@ -384,3 +384,26 @@ def test_callees_named_by_offset_are_renamed_in_each_function_alone():
     assert "/* DAT_006cfe34 */" in out, "comments are left alone"
     assert out.startswith("extern int DAT_006cfe34(int, int);\nextern int FUN_9291176c(int, int);\n")
     assert sorted(callees.function_spans(out)) == ["FUN_a", "FUN_b"]
+
+
+def test_a_reimport_brings_the_build_tools_up_to_date_first(tmp_path):
+    """Startup's tool upgrade reaches a project only when background maintenance gets to it, and a reimport
+    rebuilds with the project's tools: an older delinker cut every call a new analysis named."""
+    from types import SimpleNamespace
+
+    from decompnet.consoles.xbox360 import XBOX360
+
+    root = _project(tmp_path, {"text_82002000": [(f"FUN_{a:08x}", a, n) for a, n in FUNCS]})
+    (root / "tools").mkdir(exist_ok=True)
+    (root / "tools" / "delink.py").write_text("# an older delinker\n")
+    manifest = {"created": "from scratch", "version": "game", "tools": "old"}
+    fp = SimpleNamespace(root=root, manifest=manifest, update_manifest=lambda **kw: manifest.update(kw))
+    store = SimpleNamespace(all=lambda *a: [])
+    seen = []
+    net = SimpleNamespace(forks=SimpleNamespace(get=lambda slug: (None, fp, None),
+                                                reanalyse=lambda slug, step, **kw: seen.append(
+                                                    (root / "tools" / "delink.py").read_text())),
+                          project_store=lambda slug: store, project_row=lambda slug: {"id": 1})
+    XBOX360.reimport(net, "p", tmp_path / "game.xex", log=lambda line: None)
+    assert seen and seen[0] == (scratch.TEMPLATE / "tools" / "delink.py").read_text()
+    assert manifest["tools"] == scratch.tools_version()
