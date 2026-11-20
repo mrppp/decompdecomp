@@ -89,10 +89,13 @@ def elf64(unit: str, functions: list[dict], blob: bytes, start: int) -> bytes:
         for off, rtype, name, addend in fn.get("relocs") or []:
             if not name:
                 continue
-            width = RELOC_WIDTH.get(rtype)
+            mask = RELOC_MASKS.get(rtype)
+            width = None if mask is None else mask[1]
             if width is None or off < 0 or off + width > size:
                 raise ValueError(f"invalid relocation field in {fn['name']} at {off}: type {rtype}")
-            text[off:off + width] = bytes(width)  # big-endian: the field is a run of zero bytes either way
+            # only the field's bits: a REL24's opcode and link bit stay (cleared, a call read as no instruction)
+            field = int.from_bytes(text[off:off + width], "big") & ~mask[2]
+            text[off:off + width] = field.to_bytes(width, "big")
             if name not in externs:
                 externs[name] = len(symbols) + 1
                 symbols.append((name, (STB_GLOBAL << 4) | STT_NOTYPE, 0, 0, 0))

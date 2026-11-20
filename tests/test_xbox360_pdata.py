@@ -340,3 +340,47 @@ def test_a_new_function_goes_in_no_file_ahead_of_the_files_c(tmp_path, monkeypat
     bare = _project(tmp_path / "bare", units)  # nothing written yet: nothing to move
     scratch.reanalyse_functions(bare, "game", log=lambda line: None)
     assert [n for n, _, _ in _units(bare)["text_82002000"]] == [f"FUN_{a:08x}", f"FUN_{b:08x}", f"FUN_{c:08x}"]
+
+
+def test_calls_out_of_a_function_name_their_callee():
+    """A delinked call was a bare displacement, read back from the object's layout; a relocation names the callee.
+    A call into a register save routine names the entry the compiler calls (`__savegprlr_28`); a call to code no
+    function holds names its address; a branch within the function is left alone."""
+    image = bytearray(_leaf_image({}))
+
+    def put(offset, *words):
+        for i, w in enumerate(words):
+            struct.pack_into(">I", image, TEXT_VA + offset + 4 * i, w)
+
+    def bl(at, target, link=1):
+        return 0x48000000 | ((target - at) & 0x3FFFFFC) | link
+
+    caller, callee, save, nowhere = (BASE + TEXT_VA + o for o in (0x00, 0x20, 0x40, 0xF0))
+    put(0x40, *[0xF9C1FF68 + (r - 14) * 0x200008 for r in range(14, 32)])  # std r14,-0x98(r1) ... std r31,-0x10(r1)
+    put(0x00, bl(caller, callee), bl(caller + 4, save + 4 * 14), 0x4BFFFFFC, bl(caller + 12, nowhere, 0))
+    fns = [{"name": "caller", "addr": caller, "size": 0x10}, {"name": "callee", "addr": callee, "size": 0x10},
+           {"name": "FUN_save", "addr": save, "size": 18 * 4}]
+    assert pdata.branch_relocs(bytes(image), BASE, fns)["caller"] == [
+        [0, pdata.R_PPC64_REL24, "callee", 0], [4, pdata.R_PPC64_REL24, "__savegprlr_28", 0],
+        [12, pdata.R_PPC64_REL24, f"FUN_{nowhere:08x}", 0]]
+
+
+def test_callees_named_by_offset_are_renamed_in_each_function_alone():
+    """One offset name meant a different callee in each function of a file (where Ghidra laid each one out):
+    renamed inside each function only, and a file-scope declaration repeated under the new name."""
+    from decompnet.consoles.xbox360 import callees
+
+    text = ('extern int DAT_006cfe34(int, int);\n'
+            '#pragma optimize("gt", on)\n'
+            'int FUN_a(int a, int b)\n{\n    /* DAT_006cfe34 */ return DAT_006cfe34(a, b);\n}\n'
+            'int FUN_b(void)\n{\n    extern int DAT_006cfe34(int);\n    return DAT_006cfe34(1);\n}\n')
+    rows_a = [("i", "bl FUN_9291176c", "bl DAT_006cfe34")]
+    plans = {"FUN_a": callees.plan(rows_a, [("FUN_9291176c", "DAT_006cfe34")]),
+             "FUN_b": callees.plan([("i", "b FUN_9291177c", "b DAT_006cfe34")], [("FUN_9291177c", "DAT_006cfe34")])}
+    assert plans == {"FUN_a": {"DAT_006cfe34": "FUN_9291176c"}, "FUN_b": {"DAT_006cfe34": "FUN_9291177c"}}
+    assert callees.plan([("i", "bl FUN_1+0x8", "bl DAT_2")], [("FUN_1+0x8", "DAT_2")]) == {}, "no rename into a middle"
+    out = callees.rename(text, plans)
+    assert "return FUN_9291176c(a, b);" in out and "return FUN_9291177c(1);" in out
+    assert "/* DAT_006cfe34 */" in out, "comments are left alone"
+    assert out.startswith("extern int DAT_006cfe34(int, int);\nextern int FUN_9291176c(int, int);\n")
+    assert sorted(callees.function_spans(out)) == ["FUN_a", "FUN_b"]
