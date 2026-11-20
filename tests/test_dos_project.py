@@ -130,14 +130,20 @@ def test_the_rebuild_puts_every_function_back_and_tells_a_wrong_one(tmp_path):
     (target / "text_00010000.o").write_bytes(delink.elf(info["units"]["text_00010000"], code, BASE))
     report = rebuild.rebuild(root / "config" / "g" / "functions.json", root / "build" / "g", root)
     assert report["identical"] and report["image"] == code and not report["c"]
-    # a compiled object defining f3 with the wrong constant: it differs, and the rest still comes from the targets
-    data = bytearray(b"\xb8\x00\x00\x00\x00\xc3\x90\x90")
-    seg = omf.Segment("_TEXT", "CODE", 8, 16, data)
-    struct.pack_into("<I", data, 1, 8)
-    seg.relocs.append((1, omf.R_386_32, ("ext", 0)))
-    obj = omf.to_elf(omf.Module([seg], [("_func_00010020", 0, 0, True)], ["func_00010010_"]))
+    # f3's C: its code where it's the game's (pointing 4 bytes into f2), the target's where it isn't yet
     (root / "build" / "g" / "src" / "auto").mkdir(parents=True)
-    (root / "build" / "g" / "src" / "auto" / "text_00010000.o").write_bytes(obj)
+    for addend, from_c in ((8, []), (4, ["func_00010020"])):
+        data = bytearray(b"\xb8\x00\x00\x00\x00\xc3\x00\x00")
+        seg = omf.Segment("_TEXT", "CODE", 8, 16, data)
+        struct.pack_into("<I", data, 1, addend)
+        seg.relocs.append((1, omf.R_386_32, ("ext", 0)))
+        obj = omf.to_elf(omf.Module([seg], [("_func_00010020", 0, 0, True)], ["func_00010010_"]))
+        (root / "build" / "g" / "src" / "auto" / "text_00010000.o").write_bytes(obj)
+        report = rebuild.rebuild(root / "config" / "g" / "functions.json", root / "build" / "g", root)
+        assert report["identical"] and report["c"] == from_c
+    # a target cut wrong (f3 a byte longer than its object): that differs
+    info["units"]["text_00010000"][2]["size"] = 9
+    (root / "config" / "g" / "functions.json").write_text(json.dumps(info), encoding="utf-8")
     report = rebuild.rebuild(root / "config" / "g" / "functions.json", root / "build" / "g", root)
     assert not report["identical"] and report["differ"] == ["func_00010020"]
 
@@ -185,3 +191,52 @@ def test_twins_read_watcom_names_as_c_writes_them():
     assert _watcom_c_name("_func_0001A2B0") == "func_0001A2B0"
     assert _watcom_c_name("_D_0001A2B0") == "D_0001A2B0"
     assert _watcom_c_name("_TEXT") == "_TEXT"
+
+
+def test_a_watcom_of_your_own_is_found_with_its_version(tmp_path):
+    from decompnet.kits.watcom import WATCOM
+
+    copy = tmp_path / "WATCOM"
+    (copy / "binnt").mkdir(parents=True)
+    (copy / "h").mkdir()
+    (copy / "h" / "stdio.h").write_text("", encoding="utf-8")
+    # a 1990s compiler's banner, as its file holds it (stand-in bytes: no Watcom file here)
+    (copy / "binnt" / "wcc386.exe").write_bytes(b"MZ" + bytes(200) + b"WATCOM C32 Optimizing Compiler  Version 10.6\0")
+    assert WATCOM.locate(tmp_path) == copy.resolve()
+    assert WATCOM.build(copy) == "10.6"
+    [compiler] = WATCOM.compilers(copy)
+    assert compiler.version == "watcom-10.6" and compiler.runner == "wine" and compiler.includes == (copy / "h",)
+
+
+def test_watcoms_register_arguments_are_read_as_arguments():
+    from decompnet import structs as structs_mod
+    from decompnet.arch import x86_fields
+
+    # mov ecx, [eax+0x10]; mov [edx+4], ecx; ret: Watcom's first argument (eax) read at 0x10, its second (edx) at 4
+    code = bytes.fromhex("8b4810894a04c3")
+    terms = {(term, offset) for term, offset, _, _ in x86_fields.read_facts(0x10000, code, [], abi=x86_fields.WATCOM).accesses}
+    assert ((structs_mod.ARGUMENT, structs_mod.THIS), 0x10) in terms  # (eax: arg0 and `this` both)
+    assert ((structs_mod.ARGUMENT, 1), 4) in terms
+    # the stack convention reads neither register as an argument
+    cdecl = {term for term, *_ in x86_fields.read_facts(0x10000, code, []).accesses}
+    assert (structs_mod.ARGUMENT, 1) not in cdecl
+
+
+class _Fp:
+    def __init__(self, manifest):
+        self.manifest = manifest
+
+    def update_manifest(self, **keys):
+        self.manifest = {**self.manifest, **keys}
+        return self.manifest
+
+
+def test_a_source_file_keeps_a_compiler_of_its_own():
+    fp = _Fp({"compiler": "openwatcom-2.0"})
+    assert DOS.file_compiler(fp, "src/auto/a.c") == "openwatcom-2.0"
+    with pytest.raises(ForkError):
+        DOS.set_file_compiler(fp, "src/auto/a.c", "watcom-10.6")  # (not set up here)
+    fp.manifest["dos_compilers_map"] = {"src/auto/a.c": "watcom-10.6"}
+    assert DOS.file_compiler(fp, "src/auto/a.c") == "watcom-10.6"
+    DOS.set_file_compiler(fp, "src/auto/a.c", "openwatcom-2.0")  # back to the project's: no entry of its own
+    assert fp.manifest["dos_compilers_map"] == {}

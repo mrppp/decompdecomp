@@ -4,12 +4,15 @@
     python tools/compile.py --compiler wcc386 --include include --output OUT.o --source FILE.c -- FLAGS...
 
 wcc386 writes OMF; tools/omf2elf.py (decompnet.omf, copied in by decompdecomp) turns it into ELF32. WATCOM and
-INCLUDE are set from the compiler's own install (its h/ beside binl64/) unless already set. Standard library only.
+INCLUDE are set from the compiler's own install (its h/ beside binl64/) unless already set. A Watcom of your own
+(--runner wine: a Windows wcc386.exe on Linux or macOS) runs through wine, in the prefix decompdecomp gives it
+($DECOMPNET_WINE, $DECOMPNET_WINE_PREFIX), its paths as Windows reads them (Z: and backslashes). Standard library only.
 """
 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +20,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import omf2elf  # noqa: E402
+
+
+def windows(path: Path) -> str:
+    """A path as a Windows program under wine reads it: wine's Z: is /."""
+    return "Z:" + str(Path(path).resolve()).replace("/", "\\")
 
 
 def names_for_build(info: dict) -> dict:
@@ -40,19 +48,35 @@ def main() -> int:
     ap.add_argument("--output", required=True)
     ap.add_argument("--source", required=True)
     ap.add_argument("--config", default="", help="functions.json: its real names are renamed back to the targets'")
+    ap.add_argument("--runner", default="none", help="none, or wine: a Windows compiler on Linux or macOS")
+    ap.add_argument("--system-include", action="append", default=[], help="the compiler's own headers")
     ap.add_argument("flags", nargs="*")
     args = ap.parse_args()
     env = dict(os.environ)
     home = Path(args.compiler).resolve().parent.parent  # .../binl64/wcc386 -> the install
-    if (home / "h").is_dir():
-        env.setdefault("WATCOM", str(home))
-        env["INCLUDE"] = os.pathsep.join(p for p in (args.include, str(home / "h"), env.get("INCLUDE", "")) if p)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         obj = Path(tmp) / "out.obj"
-        run = subprocess.run([args.compiler, *args.flags, f"-i={args.include}", args.source, f"-fo={obj}"],
-                             env=env, capture_output=True, text=True)
+        if args.runner == "wine":
+            wine = env.get("DECOMPNET_WINE") or shutil.which("wine")
+            if not wine:
+                sys.stderr.write(f"{args.source}: this Watcom is a Windows program, run through wine, and this "
+                                 "computer has none\n")
+                return 1
+            if env.get("DECOMPNET_WINE_PREFIX"):
+                env["WINEPREFIX"] = env["DECOMPNET_WINE_PREFIX"]
+            env.update(WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=", WATCOM=windows(home))
+            headers = ";".join(windows(Path(p).resolve()) for p in (args.include, *args.system_include))
+            cmd = [wine, args.compiler, *args.flags, f"-i={headers}", windows(Path(args.source).resolve()),
+                   f"-fo={windows(obj)}"]
+        else:
+            if (home / "h").is_dir():
+                env.setdefault("WATCOM", str(home))
+                env["INCLUDE"] = os.pathsep.join(p for p in (args.include, str(home / "h"), env.get("INCLUDE", ""))
+                                                 if p)
+            cmd = [args.compiler, *args.flags, f"-i={args.include}", args.source, f"-fo={obj}"]
+        run = subprocess.run(cmd, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
         sys.stdout.write(run.stdout)
         sys.stderr.write(run.stderr)
         if run.returncode != 0 or not obj.is_file():

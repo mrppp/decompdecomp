@@ -196,12 +196,13 @@ def _registry() -> list[Kit]:
     from .owncompiler import OWN_COMPILERS
     from .ps3sdk import PS3SDK
     from .visualcpp import VISUALCPP
+    from .watcom import WATCOM
     from .xdk import XDK
     from .xdk360 import XDK360
     from .xextool import XEXTOOL
     from .xsdk import XSDK
 
-    return [XDK, XDK360, XEXTOOL, VISUALCPP, PS3SDK, XSDK, *OWN_COMPILERS]
+    return [XDK, XDK360, XEXTOOL, VISUALCPP, PS3SDK, XSDK, WATCOM, *OWN_COMPILERS]
 
 
 KITS: list[Kit] = _registry()

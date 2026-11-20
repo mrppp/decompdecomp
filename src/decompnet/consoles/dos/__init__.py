@@ -14,6 +14,9 @@ Files:
   project_template/ what every project gets: tools/configure.py, compile.py, delink.py, rebuild.py (omf2elf.py is
                     decompnet/omf.py, copied in)
 
+A Watcom of the user's own (kits/watcom.py: 9.5 to 11.0, Open Watcom 1.x) can build any source file instead, through
+wine: the old compilers keep registers OpenWatcom 2 doesn't.
+
 Its demo game is projects/demo-dos (a homemade program built with OpenWatcom into an LE executable).
 """
 
@@ -77,8 +80,45 @@ class Dos(Console):
         from . import scratch
         return scratch.game_info(game)
 
+    # Watcom C of the user's own (kits/watcom.py: 9.5 to 11.0, Open Watcom 1.x), per source file beside OpenWatcom 2
+    kits = ("watcom",)
+
     def tool_args(self) -> list[str]:
-        return []
+        """configure.py's --own for each Watcom of the user's own: VERSION=RUNNER,EXE,HEADERS..."""
+        from ... import kits
+        return [arg for c in kits.compilers(self.kits)
+                for arg in ("--own", ",".join([f"{c.version}={c.runner or 'none'}", str(c.exe), *map(str, c.includes)]))]
+
+    def build_env(self) -> dict[str, str]:
+        """wine and the app's prefix, for a Watcom of the user's own (a Windows program) to build a file with."""
+        from ... import kits, wine
+        return wine.build_env(always=True) if kits.compilers(self.kits) else {}
+
+    def file_compiler(self, fp, source: str) -> str | None:
+        """The compiler a source file builds with: its own (the manifest's dos_compilers_map), else the project's."""
+        manifest = fp.manifest or {}
+        return (manifest.get("dos_compilers_map") or {}).get(source) or manifest.get("compiler") or "openwatcom-2.0"
+
+    def set_file_compiler(self, fp, source: str, compiler: str) -> str:
+        if compiler not in {c.id for c in self.compilers}:
+            from ...forks.project import ForkError
+            raise ForkError(f"{compiler} isn't a compiler DOS projects have here (Setup: Watcom C, your own copy)")
+        manifest = fp.manifest or {}
+        own = dict(manifest.get("dos_compilers_map") or {})
+        if compiler == (manifest.get("compiler") or "openwatcom-2.0"):
+            own.pop(source, None)
+        else:
+            own[source] = compiler
+        fp.update_manifest(dos_compilers_map=own)
+        return ".decomp.wtf.json"
+
+    def set_own_compiler(self, fp, compiler: str, sources: list[str]) -> list[str]:
+        """`compiler` the project's, each of `sources` keeping the one it builds with."""
+        manifest = fp.manifest or {}
+        keep = {s: self.file_compiler(fp, s) for s in sources}
+        own = {s: c for s, c in keep.items() if c != compiler}
+        fp.update_manifest(compiler=compiler, dos_compilers_map=own)
+        return [".decomp.wtf.json"] if manifest != fp.manifest else []
 
     def real_names(self, fp, version: str) -> dict[str, str]:
         """How the source spells each function: Watcom's register convention spells C's `f` as `f_` (its stack
@@ -167,6 +207,12 @@ class Dos(Console):
         return {fn["symbol"]: fn["set_aside"] for fns in _functions_json(fp, version).get("units", {}).values()
                 for fn in fns if fn.get("set_aside")}
 
+    def structs(self, fp):
+        """guess_struct's layouts: every function's code read in its own convention (project.structs)."""
+        from . import project
+        version = self._version(fp)
+        return project.structs(Path(fp.root), version) if version else None
+
     # Ghidra's drafts of its target objects (drafts.py): briefs show them, autopilot tries them made compilable
     own_drafts = True
     own_tools = frozenset({"redraft", "search_flags"})
@@ -188,6 +234,23 @@ class Dos(Console):
         info = _functions_json(fp, self._version(fp))
         stack = {fn["name"] for fns in info.get("units", {}).values() for fn in fns if fn.get("convention") == "stack"}
         return compilable(draft, symbol, stack, known)
+
+    reimports = True  # the analysis again, from the project's own copy, matches kept (scratch.reanalyse)
+
+    def reimport(self, net, slug: str, game: Path, log=print) -> str | None:
+        """The functions found again as an import finds them now, from the project's own copy of the game (the one
+        it judges against: `game` isn't read again), every match, note and name kept (forkengine.reanalyse sets the
+        project up again, checks the rebuild, and takes the change back if either fails)."""
+        from . import scratch
+        _, fp, _ = net.forks.get(slug)
+        version = self._version(fp)
+        if changed := scratch.write_tools(Path(fp.root)):
+            log(f"updated this project's build tools ({', '.join(changed)})")
+        matched = {r["name"] for r in net.project_store(slug).all(
+            "SELECT name FROM functions WHERE project_id=? AND status='matched'", net.project_row(slug)["id"])}
+        log("finding this project's functions again from its own copy of the game")
+        return net.forks.reanalyse(slug, lambda fp: scratch.reanalyse(Path(fp.root), version, matched, log=log),
+                                   log=log)
 
     def check_rebuild(self, fp, version: str, log=print) -> dict:
         """The game's code rebuilt from what the project builds now (scratch.check_code)."""

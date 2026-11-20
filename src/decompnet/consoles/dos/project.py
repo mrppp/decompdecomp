@@ -207,3 +207,55 @@ def ranges(root: Path, version: str) -> dict[str, list[tuple[int, int]]]:
     _, _, info = load(root, version)
     return {f"src/auto/{u}.c": [(fns[0]["addr"], fns[-1]["addr"] + fns[-1]["size"])] for u, fns in info["units"].items()
             if fns}
+
+
+_STRUCTS: dict = {}
+
+
+def structs(root: Path, version: str):
+    """The struct layouts every function's code shows (structs.recover over arch/x86_fields.py), each function read
+    in its own convention (Watcom's registers, or the stack), with every name agents know its functions by. Cached
+    by the config's and image's times; reading them is most of the time."""
+    from ... import structs as structs_mod
+    from ...arch import x86_fields
+
+    path = config_path(root, version)
+    _, _, info = load(root, version)
+    image = root / info["image"]
+    key = (str(path), path.stat().st_mtime_ns, image.stat().st_mtime_ns)
+    if key in _STRUCTS:
+        return _STRUCTS[key]
+    code = image.read_bytes()
+    base = info["code_base"]
+    real = info.get("names") or {}
+    fns = [fn for _, fn in _functions(info)]
+    stack = {fn["addr"] for fn in fns if fn.get("convention") == "stack"}
+
+    def read(addr: int, body: bytes, relocs: list, datum) -> structs_mod.Facts:
+        abi = None if addr in stack else x86_fields.WATCOM
+        return x86_fields.read_facts(addr, body, relocs, datum=datum, abi=abi)
+
+    from ... import le
+    try:
+        exe = next((root / "orig").glob("*.exe"))
+        spans = [(o.base, o.base + o.size) for o in le.parse(exe.read_bytes()).objects if not o.executable]
+    except (StopIteration, OSError, le.LEError):
+        spans = []
+
+    def datum(addr: int) -> int | None:  # an address in the game's data objects is a datum of its own (D_<address>)
+        return addr if any(lo <= addr < hi for lo, hi in spans) else None
+    layouts = structs_mod.recover(((fn["addr"], code[fn["addr"] - base:fn["addr"] - base + fn["size"]], [])
+                                   for fn in fns), read, datum)
+    layouts.first_is_this = True  # (Watcom's eax: arg0 and `this` both)
+    symbols: dict[str, int] = {}
+    labels: dict[int, str] = {}
+    for fn in fns:
+        label = real.get(fn["name"], fn["name"])
+        labels[fn["addr"]] = label
+        for name in (fn["name"], fn["symbol"], label):
+            symbols[name] = fn["addr"]
+    data = {int(k[2:], 16): v for k, v in real.items() if k.startswith("D_")}
+    layouts.labels, layouts.symbols = {**data, **labels}, symbols
+    _STRUCTS.clear()
+    _STRUCTS[key] = layouts
+    return layouts

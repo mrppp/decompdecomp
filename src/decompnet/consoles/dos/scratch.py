@@ -102,14 +102,13 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
         raise ForkError(f"{game.name} has no code object")
     log(f"reading {game.name}: {len(mod.objects)} objects, {len(mod.fixups)} fixups, entry {mod.entry:#x}")
     found = dosfind.find(mod)
-    fns = dosdelink.functions(mod, found.functions)
+    main = _main_object(mod)
+    # the largest code object only (a second one's code is an address to it: D_XXXXXXXX), before the relocations
+    # are named, so no relocation names a function the project doesn't have
+    fns = dosdelink.functions(mod, [f for f in found.functions if main.base <= f[0] < main.base + main.size])
     groups = dosdelink.units(fns)
-    covered = sum(f.size for f in fns) / sum(o.size for o in code)
+    covered = sum(f.size for f in fns) / main.size
     log(f"{len(fns)} functions ({covered:.0%} of the code) in {len(groups)} source files")
-    main = max(code, key=lambda o: o.size)
-    if any(not (main.base <= f.addr < main.base + main.size) for f in fns):
-        fns = [f for f in fns if main.base <= f.addr < main.base + main.size]  # (one code object: a stub's left out)
-        groups = dosdelink.units(fns)
 
     root.mkdir(parents=True)
     (root / "orig").mkdir()
@@ -160,6 +159,11 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     if missing:
         raise ForkError(f"delink finished without writing every target object (e.g. {', '.join(missing[:3])})")
     log(f"{len(groups)} source files for agents to write into")
+    if shutil.which("git"):  # the project's history: every match a commit (.gitignore keeps orig/ and build/ out)
+        for cmd in (["git", "init", "-q", "-b", "main"], ["git", "add", "-A"],
+                    ["git", "-c", "user.name=decompdecomp", "-c", "user.email=noreply@decompdecomp.invalid", "commit",
+                     "-q", "-m", f"Start the {info['title']} decompilation (decompdecomp, OpenWatcom)"]):
+            subprocess.run(cmd, cwd=root, capture_output=True)
     return {"platform": "dos", "id": version, "title": info["title"], "compiler": chosen, "sources": len(groups),
             "sha1": info["sha1"]}
 
@@ -186,3 +190,64 @@ def check_code(root: Path, version: str, log=print) -> dict:
     return {"identical": True, "detail": f"identical: the code object ({report['size']:,} bytes); its {n:,} functions "
                                          f"({report['bytes']:,} bytes), {c:,} of them from C",
             "what": "The game's code, rebuilt from the project,"}
+
+
+def _main_object(mod):
+    code = [o for o in mod.objects if o.executable]
+    return max(code, key=lambda o: o.size)
+
+
+def reanalyse(root: Path, version: str, matched: set[str], log=print) -> str | None:
+    """The project's functions found again as an import finds them now (from its own copy, orig/VERSION.exe), every
+    matched function kept as it is, and every other one in the source file whose code it's in (a new one: its
+    neighbour's file), so the C in the files stays where it was. Real names, cut-off parts set aside and per-file
+    flags are kept. Returns what changed, as a sentence, or None."""
+    path = root / "config" / version / "functions.json"
+    info = json.loads(path.read_text(encoding="utf-8"))
+    mod = le.parse((root / "orig" / f"{version}.exe").read_bytes())
+    mod.relocated()
+    main = _main_object(mod)
+    if hashlib.sha1(main.data).hexdigest() != info["sha1"]:
+        raise ForkError(f"orig/{version}.exe isn't the copy this project was made from")
+    old = {fn["addr"]: (unit, fn) for unit, fns in info["units"].items() for fn in fns}
+    kept = {a: (u, fn) for a, (u, fn) in old.items() if {fn["name"], fn["symbol"]} & matched}
+    found = [f for f in dosfind.find(mod).functions if main.base <= f[0] < main.base + main.size]
+
+    def inside_kept(a: int, n: int) -> bool:
+        return any(k < a + n and a < k + fn["size"] for k, (_, fn) in kept.items())
+    spans = sorted([(a, n) for a, n in found if a not in kept and not inside_kept(a, n)]
+                   + [(a, fn["size"]) for a, (_, fn) in kept.items()])
+    fns = {f.addr: f for f in dosdelink.functions(mod, spans)}
+    order = list(info["units"])
+    units: dict[str, list] = {u: [] for u in order}
+    last = order[0]
+    for a, n in spans:
+        f = fns[a]
+        entry = {"name": f.name, "symbol": f.symbol, "convention": f.convention, "addr": a, "size": n,
+                 "relocs": [list(r) for r in f.relocs]}
+        if a in old:
+            last, before = old[a]
+            for key in ("set_aside", "generated"):
+                if key in before:
+                    entry[key] = before[key]
+            if a in kept:  # its symbol and relocations as they were: its C names them
+                entry = before
+        units[last].append(entry)
+    units = {u: group for u, group in units.items() if group}
+    before = {(fn["addr"], fn["size"], json.dumps(fn["relocs"])) for _, fn in old.values()}
+    after = {(fn["addr"], fn["size"], json.dumps(fn["relocs"])) for group in units.values() for fn in group}
+    if before == after:
+        return None
+    new_addrs = {fn["addr"] for group in units.values() for fn in group}
+    added = len(new_addrs - set(old))
+    gone = len(set(old) - new_addrs)
+    changed = len(after - before) - added
+    path.write_text(json.dumps({**info, "units": units}, indent=1), encoding="utf-8")
+    for u in units:  # a file only the new analysis has (none yet: new functions join their neighbour's)
+        src = root / "src" / "auto" / f"{u}.c"
+        if not src.exists():
+            src.write_text('#include "common.h"\n', encoding="utf-8")
+    sentence = (f"{len(new_addrs):,} functions found again: {added} new, {gone} gone, {max(changed, 0)} with other "
+                f"extents or references; {len(kept)} matched kept as they were")
+    log(sentence)
+    return sentence

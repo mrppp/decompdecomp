@@ -3,8 +3,9 @@
 
     python tools/rebuild.py config/VERSION/functions.json build/VERSION [OUT]
 
-Every function's code is put back at its address: from what its source file compiles to (build/VERSION/src/auto),
-where that defines the function, else from the delinked target (build/VERSION/target). Each relocation is filled in
+Every function's code is put back at its address: from what its source file compiles to (build/VERSION/src/auto)
+where that is the game's code (its C matches), else from the delinked target (build/VERSION/target): C still being
+worked on doesn't make the rebuild differ, and the targets' relocations, cuts and joins are what's checked. Each relocation is filled in
 with the address its symbol names: a function's (functions.json), the game's data D_XXXXXXXX's own address, a place
 in the function itself. The result is compared with orig/VERSION.code.bin. A function whose C compiles longer or
 shorter than the original, or calls something that isn't one of the game's symbols, comes out different. Prints a
@@ -82,45 +83,48 @@ def rebuild(config: Path, build: Path, root: Path = Path(".")) -> dict:
         for fn in fns:
             total += 1
             size += fn["size"]
-            own = fn["symbol"] in compiled
-            found = compiled.get(fn["symbol"]) or target.get(fn["symbol"])
-            if found is None or found[4] - found[3] != fn["size"]:
-                differ.append(fn["name"])
-                continue
-            data, relocs, symbols, start, end = found
-            if not data:
-                differ.append(fn["name"])
-                continue
-            code = bytearray(data[start:end])
-            ok = True
-            for off, rtype, k in relocs:
-                if not start <= off < end:
-                    continue
-                sym = symbols[k] if k < len(symbols) else {"name": ""}
-                name = sym["name"]
-                if name in address:
-                    s = address[name]
-                elif m := DATA.fullmatch(name):
-                    s = int(m.group(1), 16)
-                elif sym.get("defined"):  # a place in the object itself: this function's section, relative to it
-                    s = fn["addr"] - start + sym["value"]
-                else:
-                    ok = False
-                    break
-                at = off - start
-                addend, = struct.unpack_from("<i", code, at)
-                value = s + addend - (fn["addr"] + at if rtype == R_386_PC32 else 0)
-                struct.pack_into("<I", code, at, value & 0xFFFFFFFF)
-            if not ok:
+            want = original[fn["addr"] - base:fn["addr"] - base + fn["size"]]
+            code = _placed_code(fn, compiled.get(fn["symbol"]), address)
+            own = code == want
+            if not own:
+                code = _placed_code(fn, target.get(fn["symbol"]), address)
+            if code is None:
                 differ.append(fn["name"])
                 continue
             image[fn["addr"] - base:fn["addr"] - base + fn["size"]] = code
-            if bytes(code) != original[fn["addr"] - base:fn["addr"] - base + fn["size"]]:
+            if code != want:
                 differ.append(fn["name"])
             elif own:
                 from_c.append(fn["name"])
     return {"identical": not differ and bytes(image) == original, "differ": differ, "c": from_c,
             "functions": total, "bytes": size, "size": len(original), "image": bytes(image)}
+
+
+def _placed_code(fn: dict, found, address: dict[str, int]) -> bytes | None:
+    """A function's code from an object, its relocations filled in for its address; None where it isn't there, its
+    size isn't the function's, or it refers to something that isn't one of the game's symbols."""
+    if found is None or found[4] - found[3] != fn["size"]:
+        return None
+    data, relocs, symbols, start, end = found
+    code = bytearray(data[start:end])
+    for off, rtype, k in relocs:
+        if not start <= off < end:
+            continue
+        sym = symbols[k] if k < len(symbols) else {"name": ""}
+        name = sym["name"]
+        if name in address:
+            s = address[name]
+        elif m := DATA.fullmatch(name):
+            s = int(m.group(1), 16)
+        elif sym.get("defined"):  # a place in the object itself: this function's section, relative to it
+            s = fn["addr"] - start + sym["value"]
+        else:
+            return None
+        at = off - start
+        addend, = struct.unpack_from("<i", code, at)
+        value = s + addend - (fn["addr"] + at if rtype == R_386_PC32 else 0)
+        struct.pack_into("<I", code, at, value & 0xFFFFFFFF)
+    return bytes(code)
 
 
 def main() -> None:

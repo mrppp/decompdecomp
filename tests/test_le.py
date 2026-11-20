@@ -64,3 +64,13 @@ def test_what_a_dos_game_never_has_is_refused():
     struct.pack_into("<I", data, at + 0x74, 1)  # an import module
     with pytest.raises(le.LEError, match="imports"):
         le.parse(bytes(data))
+
+
+def test_a_fixup_listed_twice_is_applied_once():
+    """A field that straddles two pages is in both pages' records (a shareware game had six): relocating it twice
+    added its target twice, and the rebuild check caught those functions."""
+    code = bytes.fromhex("a1") + struct.pack("<I", 0x10) + bytes(11)
+    mod = le.parse(_bound(code, [(1, 0x10), (1, 0x10)]))
+    assert len(mod.fixups) == 1
+    mod.relocated()
+    assert struct.unpack_from("<I", mod.objects[0].data, 1)[0] == 0x20010

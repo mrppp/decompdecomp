@@ -78,6 +78,10 @@ class Abi:
 
 
 X86 = Abi(WORD, _REG, "esp", "ebp", "ecx", "eax", CALLER_SAVED, CALLEE_SAVED)
+# Watcom's register convention (a DOS game's own functions): arguments in eax, edx, ebx and ecx, and a callee keeps
+# every register but the one it returns in. eax is the first argument and `this` both, as rcx is on x64.
+WATCOM = Abi(WORD, _REG, "esp", "ebp", "eax", "eax", ("eax",), ("ebx", "ecx", "edx", "esi", "edi", "ebp"),
+             {"edx": 1, "ebx": 2, "ecx": 3})
 _REG_64 = {name: full for full, parts in (
     ("rax", ("eax", "ax", "al", "ah")), ("rbx", ("ebx", "bx", "bl", "bh")), ("rcx", ("ecx", "cx", "cl", "ch")),
     ("rdx", ("edx", "dx", "dl", "dh")), ("rsi", ("esi", "si", "sil")), ("rdi", ("edi", "di", "dil")),
@@ -134,12 +138,12 @@ def _memory(text: str) -> tuple[int, str | None, str | None, int, bool] | None:
 
 def read_facts(vram: int, code: bytes, relocs: list, big_endian: bool = False,
                datum: Callable[[int], int | None] = lambda a: None, pops: Mapping[int, int] | None = None,
-               wide: bool = False) -> Facts:
+               wide: bool = False, abi: Abi | None = None) -> Facts:
     """What the function at `vram` does with pointers. `datum(address)`: where the global containing an address
     starts, None when it's no data (code, or a number); `pops`: function address -> the bytes it pops on return
     (__stdcall's arguments). `relocs` aren't needed: the code is read at its own address, so its addresses are in it.
-    `wide`: a 64-bit program's code (X64)."""
-    abi = X64 if wide else X86
+    `wide`: a 64-bit program's code (X64); `abi`: another convention (WATCOM: a DOS game's register functions)."""
+    abi = abi or (X64 if wide else X86)
     WORD, _REG, CALLER_SAVED, CALLEE_SAVED = abi.word, abi.regs, abi.caller_saved, abi.callee_saved  # noqa: N806
     esp, ebp, ecx, eax = abi.sp, abi.fp, abi.this, abi.result
     instructions = [(at, mnemonic.split()[-1] if mnemonic else "", ops.split(", ") if ops else [])

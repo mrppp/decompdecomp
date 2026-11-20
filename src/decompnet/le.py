@@ -198,5 +198,8 @@ def parse(data: bytes) -> Module:
             target = mod.objects[target_obj - 1].base + target_off
             for s in sources:
                 mod.fixups.append(Fixup(page_base + s, kind, target, target_obj))
-    mod.fixups.sort(key=lambda f: f.source)
+    # A field that straddles two pages is listed in both pages' records (the second page's with a negative offset):
+    # one fixup, which relocating twice would add twice
+    unique = {(f.source, f.kind, f.target, f.target_object): f for f in mod.fixups}
+    mod.fixups = sorted(unique.values(), key=lambda f: f.source)
     return mod
