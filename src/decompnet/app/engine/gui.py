@@ -48,6 +48,16 @@ def _same_source(a: str | None, b: str | None) -> bool:
             and re.sub(r"\s+", " ", a).strip() == re.sub(r"\s+", " ", b).strip())
 
 
+
+def _real_name(row) -> str:
+    """What a function is shown as: its real name where the project gave it one (Console.real_names: a name kept by
+    address, as a DOS or PC project's are, while its symbol stays func_<address>), else its name."""
+    try:
+        real = json.loads(row["meta"] or "{}").get("real")
+    except (KeyError, IndexError, TypeError, ValueError):
+        real = None
+    return real or row["name"]
+
 class GuiMixin:
     def export_rom(self, slug: str, log=print, *, layout: bool | None = None) -> dict:
         """Write a rebuildable source tree (the base for ports and mods) and prove it rebuilds the game. `layout`:
@@ -578,7 +588,7 @@ class GuiMixin:
         sdk = {} if quick else identify(self,proj,self.sdk_functions(proj),include_asm=True)
         from ..source_assembly import detail as assembly_detail
         proofs={r['id']:assembly_detail(proj,self._function(r['name'],slug)) for r in rows if r['status']=='asm' and 'verified_assembly' in (r['meta'] or '')}
-        return [{"id": r["id"], "cross_project": r["id"] in cross_project, **name_state(r), **{k: recency.get(r["id"], {}).get(k) for k in ("last_checked", "last_improved")}, "sdk": sdk.get(r["id"]), "display_name": display_name(sdk.get(r["id"]),r["name"]), "assembly_verification":proofs.get(r["id"]), "name": r["name"], "vram": r["vram"], "size": r["size"], "insns": r["n_insns"], "unit": r["unit"],
+        return [{"id": r["id"], "cross_project": r["id"] in cross_project, **name_state(r), **{k: recency.get(r["id"], {}).get(k) for k in ("last_checked", "last_improved")}, "sdk": sdk.get(r["id"]), "display_name": display_name(sdk.get(r["id"]),_real_name(r)), "assembly_verification":proofs.get(r["id"]), "name": r["name"], "vram": r["vram"], "size": r["size"], "insns": r["n_insns"], "unit": r["unit"],
                  "status": r["status"] if r["status"] in ("matched", "asm") else "working" if (r["agent"] or key(r) in remote or r["name"] in searching) else "open",
                  "best": r["best_score"], "attempts": r["attempts"], "agent": r["agent"] or remote.get(key(r)) or searching.get(r["name"]),
                  "matched_at": r["matched_at"], "matched_by": r["matched_by"],
@@ -715,7 +725,7 @@ class GuiMixin:
         from ..sdk_identity import display_name, identify
         sdk = identify(self,proj,self.sdk_functions(proj),include_asm=True).get(fn['id'])
         if (fork := self.fork_slug(slug)):
-            return self.forks.function_detail(fork, name, include_hints=include_hints, function=fn) | name_state(fn) | polish_detail(self.project_store(fn['project_id']),fn) | {'sdk':sdk, 'display_name':sdk['names'][0] if sdk and len(sdk.get('names',[]))==1 else fn['name'], 'id':fn['id'], 'deep_pass': deep_pass, 'verification': bundle_status(self,fn), 'machine_draft_report': draft_report(self,fn['id'],project_id=fn['project_id'])}
+            return self.forks.function_detail(fork, name, include_hints=include_hints, function=fn) | name_state(fn) | polish_detail(self.project_store(fn['project_id']),fn) | {'sdk':sdk, 'display_name':sdk['names'][0] if sdk and len(sdk.get('names',[]))==1 else _real_name(fn), 'id':fn['id'], 'deep_pass': deep_pass, 'verification': bundle_status(self,fn), 'machine_draft_report': draft_report(self,fn['id'],project_id=fn['project_id'])}
         proj = self.project_store(fn['project_id']).one("SELECT * FROM projects WHERE id=?", fn["project_id"])
         from ..function_history import history
         saved_history = history(self.project_store(fn['project_id']), fn, net=self)
@@ -737,7 +747,7 @@ class GuiMixin:
             best_differs = not _same_source(fn["best_source"], newest["source"] if newest else None)
         return {
             **polish_detail(self.project_store(fn['project_id']),fn),
-            "sdk": sdk, "display_name":display_name(sdk,fn["name"]), "assembly_verification":assembly_detail(proj,fn),
+            "sdk": sdk, "display_name":display_name(sdk,_real_name(fn)), "assembly_verification":assembly_detail(proj,fn),
             "machine_draft_report": initial_report,
             **name_state(fn), "id":fn["id"], "name": fn["name"], "vram": fn["vram"], "rom_offset": fn["rom_offset"], "size": fn["size"],
             "insns": fn["n_insns"], "status": fn["status"], "best": fn["best_score"],

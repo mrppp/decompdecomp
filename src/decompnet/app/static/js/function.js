@@ -398,7 +398,9 @@ async function refreshFn(first) {
       : d.naming?.method === "exact_cross_game"
       ? `Name inferred from ${d.naming.source_project} · exact code match`
       : d.renamed ? `Renamed from ${d.naming.original_name}` : d.named ? "Named function" : "Generated name";
-    if (d.display_name && d.display_name !== d.name) $("fnNaming").textContent = `Source symbol: ${d.name} · SDK display name only`;
+    if (d.display_name && d.display_name !== d.name) $("fnNaming").textContent = d.sdk
+      ? `Source symbol: ${d.name} · SDK display name only`
+      : `Real name · its symbol stays ${d.name}, the address the build matches by`;
     const sdk = $("fnSdkEvidence");
     sdk.hidden = !d.sdk;
     $("fnSdkEvidenceText").textContent = sdkEvidenceText(d.sdk) + (d.assembly_verification ? "\n" + JSON.stringify(d.assembly_verification, null, 2) : "");
