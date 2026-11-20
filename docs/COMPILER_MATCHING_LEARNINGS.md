@@ -1,6 +1,105 @@
 # Compiler matching learning log
 
 
+### KMC GCC 2.7.2: switch case lifetimes, widened loop indices and a staged byte update
+
+The N64 function `func_8001E640` started from a saved 97.5% candidate with the verified
+three-argument `str_ncat` call. All stages used `gcc-2.7.2-kmc` with
+`-G0 -mips3 -mgp32 -mfp32 -O2 -g3`.
+
+| Source change | Running app score | What changed in the compiler output |
+| --- | ---: | --- |
+| Saved, call-correct starting point | 2,245 | The function had the right total size, with a shared switch tail and differences in three loops and the record setup. |
+| Reuse one signed-byte local for two successive character reads in one switch case. Finish each subtraction before loading the next byte. | 1,625 | The two switch cases got distinct shift-register assignments, so GCC stopped sharing their tails. The switch and all 24 linked jump-table entries matched. |
+| In both affected loops, store the unsigned conversion result with the current halfword index. Save that index in a word local before reading the flag, use it for the remaining stores, and increment the halfword counter at the loop latch. | 1,145 | Both loops recovered the target's halfword masks on the float-conversion paths and the original store schedule. |
+| Keep a scalar slot index across the calls and use it to address the distance field at its later read. In the other loop, assign the flag field directly before assigning the zero field. | 150 | The linked code had 907 instructions, and all referenced data passed. The remaining differences were register allocation and scheduling around the byte-counter update and the `str_len` delay slot. |
+| Store the increment in an unsigned-halfword local before assigning it to the byte counter. Use the ordinary distance-field store. | 0 | GCC kept the distance address live through the counter update and copied it in the call delay slot. The app accepted and saved all 3,628 linked bytes. |
+
+An isolated replay of the saved C and compiler profile confirmed the final result.
+Reverting only the signed-byte carrier restored the shared tail and shortened the
+function by 12 bytes. Removing the word snapshots or making them halfword locals
+lost the masks again. A named unsigned-byte counter temporary also matched. A word
+temporary and the direct addition-to-byte-store form both missed. These are
+retrospective observations on one private function. The table above records hand-selected checkpoints. A size match alone can
+hide a shortened block and a lengthened block elsewhere in the function. Here the
+constant-pool lookup errors cleared when the instruction offsets lined up.
+
+An automatic `passthrough_argument` trial lowered the display score to 2,060 by
+adding a leading argument to `str_ncat` and widening its candidate-local prototype.
+The target sets up its three arguments, including the length in the call delay slot.
+The extra argument shifted those values to the wrong registers. A quality report linked
+the call-correct revision as the alternative. Check reaching definitions at
+the call and its delay slot before treating a lower score from an ABI edit as progress.
+
+#### Deep permuter follow-up
+
+1. Add small, guarded generators in `decomp-repair`. Start with the signed-byte
+   carrier and the byte-store staging pair using byte and halfword temporaries.
+   Add the halfword loop-index rewrite next. Prove that each rewritten read uses
+   the same iteration and that moving the increment to the latch covers every
+   path. For address captures, save the scalar index and leave the field read at
+   its original use. For field-order changes, require independent fields and
+   evidence for any qualifier change.
+2. Use measured target regions to select those candidates before broad rewrites.
+   Build on `region_repairs` and `search_frontier` in the app. Prefer recovered
+   case and loop blocks even when moved branch destinations or constant-pool
+   references dominate the display diff. Reuse the existing frontier and compile
+   budget. Combine independently measured gains from disjoint edits on the same
+   source revision and recompile the whole function. The existing inert-pair
+   search handles unchanged compiler outputs and short source windows. Repairs
+   in distant loops here need bounded, explicit source spans and a shared
+   declaration when both edits introduce the same local. A block comparison
+   guides the search.
+3. Require evidence for a forwarded argument before an automatic repair can
+   select a candidate that changes arity. Check the caller's entry value at that
+   call site and respect confirmed callee declarations. Include the delay slot.
+   Apply the same gate to the deep permuter and automatic agent local passes,
+   which share the proposal generator. Keep ambiguous sites available for
+   explicit diagnosis.
+4. Replay the call-correct saved checkpoint and the switch, loop and final
+   scheduling checkpoints privately with the original profile. Compare stock and
+   enhanced search at equal compile and time budgets. Track exact verdicts,
+   corrected target regions and compiles to the first exact result. Add handmade
+   cases for signed input bytes, byte-counter wrap, loop exits and a three-argument
+   call with its last argument in the delay slot. Keep game code and ROM data out
+   of the repository. The ordinary linker and data checks decide every match.
+
+#### Controlled deep permuter replay
+
+Stock was app revision `8c1ebacc` with `decomp-repair 0.5.36`. Both versions ran the
+same Deep Permuter entry point with 192 candidate trials, 120 seconds, one
+selected compiler profile, one lane and one compile slot. Each run started in a fresh
+scratch project at its checkpoint with the original flags, shared header,
+target bytes, jump table and referenced ROM constants. The matched source was
+absent from the search inputs.
+
+| Frozen checkpoint | Stock best score and trials | Enhanced best score and trials |
+| --- | --- | --- |
+| 97.5%, score 2,245 | 1,890 after 192, open | **0 after 74**, matched |
+| Final scheduling, score 150 | 150 after 192, open | **0 after 61**, matched |
+
+The enhanced runs used 97 and 84 compiler invocations through the first exact result,
+including compiler and source preflight work. The early run saved scores 1,625,
+1,145, 1,085 and 70 on its way to zero.
+The scalar index rewrite earned a continuation by recovering target blocks
+despite raising the whole-function score. Recompiling a staged counter on that
+branch recovered the delay-slot schedule. The late run paired the staged
+counter with removal of an explicit volatile cast on the ordinary distance
+field. That latter hypothesis can only be saved after an exact result. Both
+matches passed a fresh check of all 3,628 linked instruction bytes and referenced
+data, including the original three-argument call. Stock's early search first
+saved the unsupported fourth argument. The new automatic gate checks the
+incoming register value through the delay slot on a proven entry path and
+declines calls with conflicting known declarations.
+
+Target branches written as local labels and jumps written as offsets from the
+current symbol now stay in the control-flow comparison. The search can also
+merge disjoint source changes when separately judged siblings restore distinct
+target blocks. A merged candidate must pass the source guards again and be
+judged as a whole. Handmade tests cover that path. This replay shows recovery
+from two checkpoints of one function.
+
+
 ### KMC GCC 2.7.2: narrow subtraction followed by a parameter-carrier cycle
 
 The exact V-Rally interpolation case used the original `-G0 -mips3 -mgp32 -mfp32
@@ -7601,6 +7700,11 @@ All under `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, adopted as exact by the 
   misplacement, never the game's.
 - **m2c's "irregular" `case 0: break;`** (240 → 0). Dropping the invented case, and keeping the two equal
   `case 0x38` / `case 0x37` bodies separate (not merged as fall-through labels), reproduces the game's compare tree.
+- Both are repair families since decomp-repair 0.5.31: `read_before_assign` moves a top-level assignment above the
+  first statement that reads its local (only when nothing it reads changes in between and no control flow
+  separates them); `irregular_case` drops a case whose body is only `break;` in a switch without `default`, when
+  the case before doesn't fall into it. Each regenerates its function's exact C from the m2c draft (235 and 240
+  points off before).
 - **A subtraction written as a negated add, subtrahend first** (`-(x >> 1) + (s32)f`): the last 30 points of a
   register swap closed. Same allocator rule as the operand-order findings: the result takes the first operand's
   register.
@@ -7625,3 +7729,536 @@ All under `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, adopted as exact by the 
   could have filled the gap (`lbu $v1,($a0); addiu $a0,1; lbu $v0,($a1); subu ...`). Scheduled gcc never leaves
   that. compiler_fingerprints reads it as "unscheduled loads"; a leaf without a frame shows no other habit.
 - **Evidence:** controlled, one function; byte-exact under the judge's linked verdict on a scratch copy.
+
+## KMC gcc 2.7.2: seven more hand matches from m2c drafts (N64, a game with about 1,600 functions)
+
+All under the game's own `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, adopted as exact by the judge; one function
+each unless noted.
+
+- **A display-list command's two words in the macro's order** (20 → 0). m2c wrote `w1` (the converted address)
+  before `w0`; the game's `gSPMatrix`-shaped code stores `w0 = 0xDA380003` first and `w1 = addr - 0x80000000`
+  second, the subtraction scheduled before both stores.
+- **Early returns instead of a result variable** (415 → 0, and a twin function the same). m2c's `v = 0; if (a) if (b)
+  v = p & -(c != 0); return v;` keeps `v` in `$v0` from the start, which moves the argument registers; writing
+  `if (c) return p; ... return 0;` lets gcc keep the argument where the game did. Writing the select as an `if` or
+  a ternary into the same variable doesn't help.
+- **if/else arms in the game's order** (410 → 0): the arm m2c put second (`field -= 9`) came first in the game,
+  with the inverted test; gcc 2.7.2 keeps source order for the fall-through arm.
+- **A `u16` loop counter** (430 → 0): m2c's `var = 0 & 0xFFFF; do { ... i += 1; var = i & 0xFFFF; } while ((i &
+  0xFFFF) < n)` is `for (u16 i = 0; i < n; i++)`.
+- **A `for` loop and an unsigned conversion written as one** (436 → 0): m2c's `f = (f64) x; if (x < 0) f += 2^32;`
+  is `(f32) (u32) x`; together with a `for` loop in place of `if (n) do ... while` the frame lost the 8 bytes m2c's
+  form cost.
+- **A global pointer read once into a local** (445 → 0): reading `D` again in the loop gave a second register and a
+  copy; a local `p = D;` used throughout matches, with the half-word global typed `u16` (`lhu`, m2c said `u8`) and
+  no temporary for `f & 0xF` (the game recomputes it).
+- **Two repair families since decomp-repair 0.5.31** (`read_before_assign`, `irregular_case`): see the earlier entry.
+
+Improved, not exact: `(u8)` mask on a shifted value held in a `u8` local (225 → 15; the last 15 are one
+register), a `u64` zero pair kept across a call with the call result in a temporary (285 → 140), a stack argument
+block as one struct (491 → 276). Tried without success: a flag copied into `$v0` before its test (`move $v0, $v1`,
+two functions: statement expressions, an inline helper, and moving the copy don't reproduce it), a library-style
+`f64` routine whose constants and compare come before the frame is made, and a `u8` global tested `== 0` then
+`< 0` (`lbu` then `bltz`).
+
+## KMC gcc 2.7.2: seven more hand matches from m2c drafts, round 9 (N64, a game with about 1,600 functions)
+
+All under the game's own `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, adopted as exact by the judge.
+
+- **A search loop written as a `static inline` helper** (620 → 0). m2c's `for (;;) { v = p; if (p->id != id) { p +=
+  p->size; v = NULL; if (*p != -1) continue; } break; }` is a small `find(base, id)` returning the chunk or `NULL`,
+  inlined. Written as one loop with `found = c; break;` it scored 710; only the inline helper gives the game's
+  `move $v0, $a1` on a hit and `move $v0, $zero` in the back-branch's delay slot.
+- **A `volatile` counter incremented as its own statement** (595 → 0). The game reloads a `u8` global for the bound
+  check, for the index and again after the increment (an `lbu` in a call's delay slot, unused). `extern volatile u8`
+  with `x++;` gives exactly that; `x += 1` and `x = x + 1` score 595 and 280.
+- **Early returns instead of an `else if` chain** (530 → 0): `if (a && b) { f = 0; return 0; } if (c && !d) { if
+  (!g()) { f = 0; return 0; } } h();` puts each store in a `j end` delay slot as the game does; m2c's chain gave
+  `beql` and a moved jump.
+- **One store after both arms, its value chosen in each** (530 → 0): `if (t & 0x7000) { ...; if (n >= 8) return; v =
+  x | 1; } else { v = t | 1; } x = v;` – the game's shared `sw` at the end, with the `ori` in each arm. Storing in each
+  arm, or `v = t; ... x = v | 1;`, misses.
+- **A switch whose cases share one call through a `goto`, each case setting both arguments** (595 → 0): the game
+  sets `$a0` in every case before the jump, so `var_a0 = arg0; var_a1 = K; goto call;` per case, not `f(arg0, a1)`.
+- **A `u16` loop counter over two `u16` arrays** (585 → 0): m2c's widened index and stored-before-increment copy
+  is `for (i = 0; i < 4; i++) { dst[i] = src[i]; f(i); }`.
+- **Stack arrays declared in frame order and filled just before the call that takes them** (643 → 0): `char
+  buf[0x30]; s16 s[3]; f32 v[3];` (in that order) and `s[0..2] = arg3..arg5;` written right before `f(s, buf)`.
+  m2c's three separate `s16` locals were dropped (only the first was passed by address), and the truncations moved.
+
+Improved, not exact (adopted live): a store pulled ahead of the arithmetic into its own pointer local (`p = &D; *p =
+...; f(D2, p, 4)`, the callee taking three arguments, 540 → 190); a global's address kept in a local for three byte
+reads (645 → 30, the last 30 two saved registers swapped); a pointer local for `obj + 0x84` made before the first
+call (two twin functions, 654 → 170); a `u8` field read from a table where m2c read an `s32` and a product left
+unmasked (670 → 180); a `goto` to a shared block after an early `return` (535 → 105); a `return` value's type (an
+`u8` declared callee returning `s32`, 535 → 270).
+
+Tried without success: a bitfield-shaped `lw`/`and`/`sw` whose store the game delays past two other stores (535),
+a 12-byte table walk whose offset the game copies each pass (540; a struct array scored 1665), and a nested
+switch whose tails the game keeps apart (560; one shared call block scored 900).
+
+### KMC gcc 2.7.2 `-O2`: round 10 hand matches in one N64 game (2026-11-20)
+
+Controlled: each result is the judge's linked verdict on a scratch copy, then adopted by the app's Try. Twenty-three
+new exact matches. Most came from rewriting m2c's pointer arithmetic as plain typed C (structs with the game's field
+offsets, prototypes with the right argument types); the notes below are what that alone did not give.
+
+- **A sound table's search loop is a `static inline` helper that the callers assign back into their argument**
+  (a family of eleven functions, 455–1790 → 0). The game walks eight 0xFF8-byte entries with a separate byte offset
+  (`addiu $v1, $v1, 0xFF8`), keeps the counter in the result's register and copies the argument first. All three
+  had to be written: `u32 i = 0; s32 key = id & 0x7FFFFFFF; s32 off = 0; for (; i < 8; i++, off += sizeof(E)) if
+  (*((u8 *)&tbl[0].busy + off) == 0 && *(s32 *)((u8 *)&tbl[0].id + off) == key) return i | (id & 0x80000000); return
+  -1;` and the caller `arg0 = find(arg0);`. Indexing `tbl[i]` left the multiply in the loop (900); a separate
+  result local lost the copy (660); declaring `key` before `i` or `off` before `i` cost 5. The locked variants are
+  `lock(); inline_body(arg0, ...); unlock();` with the unlocked function's body as a second `static inline`.
+  `return find(id) != -1;` is the whole of the query (`nor`/`sltu`).
+- **Reusing one local for two values** (two functions, 770 and 887 → 0). The game keeps the frequency a call
+  returned and the value later passed to another call in the same register: `v = f(); D = v; *p = v; if (...) v =
+  2; ... g(..., v);`. Separate locals put the second in `$a3` directly. Likewise `v = s->b30; if (v) v = tbl[v];
+  else { ...; v = s->b32; }` where m2c read the field twice.
+- **A switch's compare constant kept across a call** (887 → 0 with the previous fix): the game holds `1` in `$s3`
+  for both the switch dispatch and an `== 1` test after a call. `s32 one = 1;` compared with `v == one` gives it.
+- **An `if` whose arms are written in the game's order matters for `bnel`** (950 → 0): `if (!s->b2D) w |= 1; else
+  s->h30 = 0;`, not the negated form.
+- **Bitfields for masked word stores** (720 → 0): `p->w = (p->w & 0xFFFF0FFF) | 0x1000` then `& ~0xF00 | 0x100` is
+  two 4-bit fields of a `u32` set to 1 (`hi:16, b:4, c:4, lo:8`).
+- **A global byte reached as an element of its array** (960 → 0): the game hoists `&D_8010A4C2` into a saved
+  register in a loop; `D_8010A4C0[2] &= 0xDE` does it, `D_8010A4C2 &= 0xDE` reloads, a pointer local scored 320.
+- **A switch's cases written so that two identical cases stay apart** (1160 → 0): two cases with the same body
+  merge; one written `if (f) id = K; else id = rnd(); goto play;` and the other `id = K; if (!f) goto rnd; goto
+  play;` keep the game's two copies.
+- **`(a || b)` folded into one condition** (1125 → 0): `if (x == -1 && (y >= z || u < w)) return 1; return 0;`;
+  nested ifs or a returned expression miss.
+- **A `u16` parameter whose callers pass an `s32`** (700 → 0): the game passes the incoming register straight on
+  (`move`), so the parameter is `s32` even though it is stored with `sh`.
+
+Improved, not exact: a find loop whose result picks between two variables (1000 → 155), a task-setup loop whose
+two equal addresses the game loads twice (1000 → 515; `D_800AC1E0 - func_800AC110` and `D_800AC1E0` would need two
+symbol names for one address), an inlined guard returning a flag (940 → 420, 1062 → 640), a sound call whose last
+copy is `andi` instead of `move` (551 → 200), and a register swap that only the temporary's statement order moved
+(30 → 25).
+
+Wrong per-function settings, not changed: the release function of the sound-table family matches exactly under the
+project's default `-O2` with its saved C, but has an override that makes it miss (490). Two others score better under
+the default than under their override (a guard that reaches 300 instead of 420, and one that reached 285 instead of
+470 earlier).
+
+### KMC gcc 2.7.2 `-O2`: round 11 hand matches in one N64 game (2026-11-20)
+
+Controlled: each result is the judge's linked verdict on a scratch copy, then adopted by the app's Try. Eight new
+exact matches, all under the functions' own settings; most came from writing m2c's draft as plain typed C.
+
+- **A loop-invariant mask kept in its own local** (60 → 0): an inlined table search returning `i | (id &
+  0x80000000)` hoists the mask and the game initialises the byte offset after it; `s32 hi = id & 0x80000000;`
+  declared before `off = 0` gives that order, the inline expression or a later declaration does not.
+- **A float wrapper passed through int registers** (1702 → 0): `void f(f32 *out, f32 x, f32 y, f32 z)` with the
+  floats arriving in `$a1`-`$a3` because the first argument is a pointer; nested calls `g(y, h(x, z)) * K` match.
+- **A `u16` loop counter compared with an `s32` count** (1740 → 0), and a struct-array walk `D[i]` rather than
+  m2c's scaled offset.
+- **A struct copy for three words** (1236 → 0): `obj->pos = cam->pos;` gives the game's three `lw` then three `sw`.
+- **Early `return 0` before the final dereference** (1290 → 0): `r = f(...); G = r; if (r == NULL) return 0;
+  return *r;`, where `if (r != NULL) return *r;` or a result variable both miss; a pointer local for the stored
+  global (`s16 *p = &G; *p = arg0; f((u8 *)p - 4, ...)`) and a plain `s32` for a `u16` field avoid an extra `andi`.
+- **A switch with a single `return` per case** (1440 → 0): `switch (x) { case 7: return 0x76; case 4: return 0x9F;
+  case 9: return 0x75; }` followed by a `for` loop with both conditions in its header.
+- **Nested null checks** (1510 → 0): `if (buf != NULL) { if (obj != NULL) { ... } else { *buf = 0; } }`, and the
+  remainder taken of the `s16` value: `(s16)((s16)t % 60)`.
+- **A search loop written as `for` with the counter in the increment** (1379 → 0): the increment then fills the
+  null test's delay slot; the copied fields written in the game's order with the zero store after the second
+  field.
+
+Improved, not exact: a three-way chance switch (1470 → 410, `case 0: default:` last), a sin/cos vector (1255 →
+875, frame and store order left), a scaled float call (1720 → 45, `$f0`/`$f2` swapped) and a guarded update whose
+two float tails the game cross-jumps (1620 → 1265).
+
+Tried without a match: a sound-table setter whose search returns through a separate register copy (395), a display
+list built through a global pointer whose four updates the game stores last (1440), a matrix push (1540), an audio
+init whose symbol addresses the game recomputes instead of keeping in a saved register (1745), and a saved-register
+order difference (35).
+
+### KMC gcc 2.7.2 `-O2`: round 12 hand matches in one N64 game (2026-11-20)
+
+Controlled: each result is the judge's linked verdict on a scratch copy, then adopted by the app's Try. Four new
+exact matches (a fifth was already matched in the app), all under the functions' own settings.
+
+- **A row pointer cast from an integer sum** (1519 → 0): the game indexes 12-byte rows as
+  `(Row *)((k & 1) * 0xC + (s32)base)` and reads the row's `Vec3` at +4 with a struct copy, so the scaled index comes
+  first in the `addu`. `&base->v[k]`, a `u8 *` sum in either order and an array subscript each put the base first or
+  fold the +4 early. A `Vec3` out-parameter (not an `s32`) gives the 0x50 frame, and calling the same function in
+  both arms of an `if`/`else` gives the game's `move $a0` in both arms.
+- **An unsigned float-to-`u16` store** (1585 → 0): `s->h = 120.0f - t - 8.0f;` into a `u16` field produces the
+  `0x4F000000` compare and the `or 0x80000000` path; the rest was plain typed C.
+- **A table indexed through a byte offset** (1025 → 0): `u8 *base = off + D; ...
+  *(s32 *)(idx * 4 + (D + 0x70) + off)` keeps `D + 0x70` as its own `addiu` (written as a local
+  `u8 *tbl = D + 0x70` before the sum), and the pair is read as `(base + arg1 * 2)[1]`, recomputed at each use, not
+  through a pointer local.
+- **A sequence reader over 64 voices** (1393 → 0): `D->ents[i]` with `i < 64` gives the game's `+= 0x28` and
+  `< 0xA00`. Writing `if (start + now >= t) { ...advance... } else { done = 1; }` gives `bnel` to the done path, and
+  storing the advanced pointer before the time (`ents[i].ptr += n; ents[i].time = t; p = ents[i].ptr;`) gives the
+  reload. Reading the first two bytes as `D->ents[i].ptr[0]` and `[1]` (not through `p`) keeps them in `$v0`; the
+  7- and 15-bit signed deltas are `(s32)(b0 << 25) >> 25` and `(s32)((b1 | (b0 & 0x7F) << 8) << 17) >> 17`.
+
+Improved, adopted, not exact:
+- **A volatile global pointer** (1020 → 80, and a sibling 820 → 40): the game reloads `D->field` after each float
+  store but keeps `&D` in a saved register for the calls, which `extern T *volatile D;` with a `T *volatile *pp = &D`
+  local reproduces. The rest is one scheduling slot (`addiu $a2, 1` before the `lui`) and two swapped callee-saved
+  registers.
+- **A rotation matrix** (1450 → 85): its six zero stores written as one chained assignment
+  `m[7] = m[3] = m[11] = m[12] = m[13] = m[14] = 0.0f;` keep the float zero register (`swc1 $f2`) instead of
+  `sw $zero`. Two callee-saved FPU registers stay swapped.
+- **An envelope setter** (1300 → 355): the game passes `p - 2` where `p = &D_800FDB88` is a separate symbol from
+  `D_800FDB80`, and calls the same function in both arms of `if (!(flags & 0x200))` (constant 1 or 0), which gcc
+  cross-jumps into one `jal` with the constant set by a branch. A ternary or a flag variable becomes `sltiu`.
+- **A pitch lookup** (1364 → 190): an unused `s32 unused[4]` local gives the 0x38 frame, and the table blend is
+  written `(p[0] << 16) + d` with `d = (p[1] - p[0]) * lo`.
+- **A sound-id remap** (1490 → 1230): a 16-case switch whose three `beql id == K` tails the game cross-jumps into one
+  block; no case order tried reproduced the merged tail.
+- **A float scale** (45 → 40): computing `f = D[idx] * f; scale = f * arg2;` moves one register; `$f0`/`$f2` stay
+  swapped elsewhere.
+
+Tried without a match: a voice-slot loop that the game writes with a `goto` back-edge and a shared saved register
+for two disjoint values (1320, the rewrite scored worse), and a command-stream parser whose `switch` reads the byte
+before advancing the pointer (1355, the rewrite scored worse).
+
+### Round 13: an N64 game built with KMC gcc 2.7.2 (`-G0 -mips3 -mgp32 -mfp32 -O2`)
+
+Controlled hand rewrites against the judge's linked verdict on a scratch copy; each match was then accepted by the
+running app. Ten new matches:
+
+- **A small switch on a parameter** (830 → 0): with four cases 0..3 the game's tests run `== 1`, `== 0`, `== 2`,
+  `== 3` with no `slti` split. Declaring the parameter `u32` removes the signed range split gcc adds for an `s32`
+  operand; the ORed flag is a second variable (`w = v | 0x10` per case) stored once after the switch, with
+  `default: return;`.
+- **A switch whose `case 0` shares the default body** (1130 → 0): `case 0: default: f = 240.0f; break;` written
+  *first*, then `case 1:` and `case 2:` as separate bodies with the same constant, gives the game's `== 1`, `< 2`,
+  `== 2` tree and its block order. Merging `case 1: case 2:` or putting the default last scored 440–1130.
+- **Two range checks** (1069 → 0): `if (i < n) { if (i >= 0 && (tbl[i].flags & 0x200)) ... }` keeps the game's
+  `slt`/`beqz` then `bltz`; `if (i < n && i >= 0)` becomes a branch-free `nor`/`srl`/`and`.
+- **A key/count table walk** (1895 → 0): `s16 *base = TBL; s16 *np = base + 1; s16 *kp = base;` gives the game's
+  `addiu $t1, $v0, 2` and `move $t0, $v0`; the increments go `np += 2, i += 2, kp += 2`, the key is read once per
+  row into a local, and `-1` is held in a local before the loop.
+- **A nearest-object search** (1157 → 0): plain typed C, `s16 i` loop over a 6-pointer array.
+- **A particle spawner** (1185 → 0): the position copied as a `Vec3` struct assignment, a 12/16/4 bitfield for the
+  packed word at 0x1C, and the allocator called as `f(0x2C, arg1, 0)`: the function takes a second parameter it
+  only passes through (`$a1` is never set before the call).
+- **A linked-list initialiser** (1225 → 0): the allocator is a function-pointer global called through a local
+  `void *(**alloc)(s32, s32) = &D;` (the game keeps `&D` in `$s0`), and in the loop the statements go
+  `prev`, `next`, then `buf`; the other five orders scored 20–650.
+- **A view-frustum test** (826 → 0): early `return 0`s, and the dot product kept in a stack array element `d[2]` of
+  an `f32 d[3]`; gcc 2.7.2 keeps both dead stores to it (`swc1 $f2, 0x28($sp)` twice), which also gives the 0x50
+  frame.
+- **A mesh-vertex comparison** (1592 → 120 → 0): plain nested loops; the last 120 was assigning the second mesh
+  pointer after `hits = 0` so `lhu n` comes before `lw`.
+- **A refcount release** (881 → 0): plain typed C over `{ s32 data; u16 id; u16 ref; }` entries, shifting the tail
+  down with a struct assignment.
+
+Improved, adopted, not exact: a slot registry (1183 → 190, the loop counter passed to the callee is masked),
+a message flush (1100 → 300, the game reloads the count byte for the loop guard after testing it), a dialogue switch
+(850 → 330, the shared argument load is duplicated into both paths), an inventory transfer (1055 → 410, register
+choice), a string-table loader (1090 → 670, gcc splits the entry pointer into two givs).
+
+Tried without a match: two swapped-register near misses (a float scale, 40; a saved-register pair, 40) with
+declaration order, `register`, and separate result variables; a vector transform whose base `lui`/`addiu` pair gcc
+folds into each access however the base is written (`f32 *p = D`, a struct type, casts); a libm tangent whose
+divide is scheduled before the sign test (750, rewrites 765–940).
+
+### Round 14: an N64 racing game, KMC gcc 2.7.2 -O2 (2026-11-20)
+
+Controlled evidence: each score is the scratch judge's linked verdict under the project's own settings; matches were
+then adopted by the running app through Try. Two repair families came out of round 13's matches, decomp-repair
+0.5.32: `unsigned_switch` (a switch tested with one `sltiu` cast to `(u32)`; it rebuilds an 830-point draft exactly)
+and `volatile_reload` (an extern pointer global stored through twice declared `volatile`; 1030 → 40 on its draft,
+and it shaped the 3019 → 1520 below).
+
+Six new exact matches:
+- **A collision-flag pass over linked lists** (965 → 0): the three-word position copies are a `typedef struct
+  { s32 x, y, z; }` struct assignment (`*(V3i *)(p + 0x50) = *arg3`; the game loads all three words before
+  storing), and each branch keeps its own locals for the flag word (`w`, `r`, `q`): one shared `v` moved them from
+  `$v0` to `$v1` (70).
+- **A scissor display-list command** (2215 → 0): the four corner sums times 4.0f go into locals *before*
+  `Gfx *g = D++`, then `g->w0 = 0xED000000 | (((s32)ulx & 0xFFF) << 12) | ((s32)uly & 0xFFF)`. Locals for the
+  four offsets instead (1950) or the `0xED000000` or-ed last (400) both miss.
+- **A sprite refresh** (2035 → 0): m2c called the setter `f(2, arg1)` after the store, but the game stores the
+  bitfield first and calls `f(2)` with `$a1` untouched; the 6-bit field written `(arg1 == 0 ? 7 : 0) | 3`
+  gives gcc's `sltiu`/`negu`/`andi 7`/`ori`.
+- **Two menu-state handlers** (2010 → 0, 2055 → 0): a `switch (u16)` over 0/0x2000/0x4000/0x8000 with a `return`
+  in every arm (one result variable cost 2300); the callee in `case 0` is declared without parameters,
+  `u16 func()`, because the game calls it with `$a0` still holding the switch value. A prototyped `f(arg0)` makes
+  gcc pass a literal `$zero` (200).
+- **A closest-point-on-segment** (2236 → 0): `const Vec3 *` parameters, and the query point's three coordinates
+  read into locals *before* the zero-length test (the game keeps `p->z` in `$f26` across it).
+
+Improved, adopted, not exact:
+- a list-sweep with a `goto next` (855 → 25): `else if (sp18 != 0.0f) {...}` rewritten as `else { if (sp18 ==
+  0.0f) goto next; ... }` gave the game's `bc1tl` into the loop latch; the rest is one register.
+- a sound-bank lookup (2035 → 250): the bank table indexed by a byte offset, the two `& 0xFFFF` masks moved inside
+  the non-empty-table block, and the inner search written as `do { if (v == sub) {...return} e += 0x84; v = *e; }
+  while (v != 0xFFFF)`; the last 250 is two `0xFFFF` constants the game keeps in separate registers.
+- a four-entry count (2025 → 5): only `move $v1, $a1` (the loop index copied from the zeroed count) is left; no
+  declaration order or `i = n` form reproduced it.
+- a three-way getter (2565 → 600), an actor spawner (3019 → 1520, the `volatile` global plus `o = *p` before the
+  null test), a state machine (1375 → 1170, a `switch` on 5/6 for the follow-up value), a sequence compare
+  (2827 → 2204, the command word read into a local so gcc can't narrow `(w >> 8) & 0xFF` to `lbu`), a rotation
+  matrix (2475 → 2375).
+
+Needs a settings decision: **a modf-style splitter** is exact with `-O1` for that function only (its `e + 12`
+must not fold into `- 0x3F3`); under the game's `-O2` the best C scores 1850 (adopted). Settings were not changed.
+
+Tried without a match: a box-clip routine (1175; a clean rewrite scored 1995 because the game copies the hit flag
+into a second variable between the passes), a list-init (1364; gcc folds the loop guard to `blez` once it knows
+the counter is zero, the game keeps `slt` against the decremented value), a matrix builder (85, two FPU saved
+registers; statement order, `-(cy * sx)`, declaration order and call placement tried), a sibling of the
+volatile-reload pair (80; the `a2 = 1` argument is scheduled before the `lui`), a segment loader (2497; the game
+recomputes each segment symbol's address where gcc reuses the previous end address).
+
+### Round 15 (KMC gcc 2.7.2 `-O2`, one N64 game; hand fixes judged by the linked verdict, adopted live)
+
+Two new exact matches:
+- **A list sweep with a `goto next`** (25 → 0): the two values a flags word can take on a failed lookup were
+  written as `v = f | A; if (!(f & 2)) v = f | B;` (m2c's shape); `if (!(f & 2)) v = f | B; else v = f | A;` gives
+  the game's register (`$v0`, not `$a0`) for the value carried to the shared store. The earlier near-miss forms
+  (merging temporaries, moving the declaration, storing directly on each path) did not move it or made it worse.
+- **An actor-state reset** (180 → 0): after the game stores a computed float to `o->f74`, it reloads it at once and
+  copies it to a second field after three unrelated byte stores. Plain C forwards the stored value (220), and a
+  `const` read forwards it too (210); reading it through `volatile` into a local *right after the store*, then
+  storing the local after the byte stores, reproduces the reload and its position exactly. A `volatile` read placed
+  at the copy (180) does not: the reload's position is what was off.
+
+Improved, adopted, not exact (deep pass, 3 min / 800 variants, cleaned of permuter leftovers before submitting):
+an allocator wrapper and its twin (170 → 65 and 75: the call result is copied to `$s0` *before* the null test in
+the game, after it in ours; early-return, `if (p)` and hoisting `p + 0x84` all made it worse), a sound function
+(2640 → 2240), a lookup (190 → 185).
+
+Tried without a match: a four-entry count (5; `move $v1, $a1` — the loop index copied from the zeroed count —
+survives in the game, every `i = n` form is constant-folded), a bit-writer (15; giving the second field read its
+own temporary fixed that register but swapped the first two loads, 90), a flags handler (60; the game loads the
+flags word before materialising the `0x04000080` mask; declaration order, `s32`, `volatile`, and moving the
+pointer load did not change it), a velocity integrator (105; the game makes its 8-byte frame after four loads and
+keeps the product in `$f2`; `const` reads, operand order and a hoisted constant did not move either), a string
+scanner (155; the class-test exit jumps to the shared `move $v0, n` in the game and returns directly in ours), and a
+menu builder (2203 → 1950 on the scratch copy only, not submitted: a clean typed rewrite with a base-pointer local;
+the game reloads its `u16` mode global after storing it and hoists the loop constants before the first call's
+arguments).
+
+### Round 16 (KMC gcc 2.7.2 `-O2`, one N64 game; second pass with new forms, judged by the linked verdict, adopted live)
+
+Nine new exact matches; four of them are round 15's "tried without a match" near misses:
+- **The four-entry count** (5 → 0): the game's `move $v1, $a1` (loop index copied from the zeroed count) appears
+  only when a control-flow boundary sits between the count's initialisation and `i = n`. An empty
+  `i = n; while (i < 4) { break; }` before `for (i = n; ...)` reproduces it exactly; a bare label, `goto`, block
+  scope, `register` and every initialiser/declaration order (u16/s16/s32/u32) were folded to `move $v1, $zero`.
+- **The flags handler** (60 → 0): `u32 mask = 0x04000080;` declared *before* the flags load makes gcc materialise
+  the mask (`lui`/`ori`) ahead of the load, as the game does. The constant inline in the test, and `0x04000080 & f`,
+  leave the load first.
+- **The allocator wrapper and its twin** (65 and 75 → 0): `r = alloc(...); if (r != NULL) { p = r; ... }` (the
+  callee-saved copy made *inside* the guard) gives the game's `beqz $v0` with `move $s0, $v0` in the delay slot. The
+  twin's last 10 points were a wrong callee name in its saved C (`func_80016928` for `func_80016948`).
+- **A table lookup** (410 → 0): m2c's draft read an uninitialised byte; `s32 *tbl = D; u8 i = o->x4B;` with both
+  arms forming `p = &tbl[i]` / `&tbl[8]` and one `return *p;` is exact. Direct `D[i]` scores 530, early returns 1045.
+- **A list scan** (345 → 0): plain typed C with a `u16` loop counter, nested null checks and an early `return`
+  after the call. m2c's `& 0xFFFF` counter forms score 864, an `s16` counter 2130.
+- **A random-chance helper** (410 → 0): only the switch's case order mattered: `case 2:`, then `case 0: default:`,
+  then `case 1:` (three of the six orders are exact).
+- **A spawn helper** (465 → 0): the `lbu` then `bltz` on the same byte (a `u8` widened to `s32` and tested `< 0`,
+  which gcc 2.7.2 does not fold) needs the five tests as separate `if (...) goto make;` statements; the same tests
+  joined with `||` compile to `sltiu`/`or` set-on-condition code (1900–2570).
+- **A per-entry flag setter** (230 → 0): the 0x28-stride byte offset in its own local
+  (`s32 off = i * 0x28; ... (base + off)`) puts the offset computation before the array-pointer load, as in the game.
+  Struct indexing and every inline form keep 230.
+
+Improved, adopted, not exact: a string scanner (155 → 5: `!(tbl[s[i++]] & 1)` in the guard puts `i++` in the
+branch's delay slot; the last 5 is `addu $a0, $a1, $a0` operand order, which no form of `s + i` changed), a
+key-table search (575 → 60: plain `while` loops; the game loads the first table entry before setting the record
+pointer), and a pitch-envelope reader (410 → 210: the out-of-range path reads a byte, `t[hi] << 16`, not a word).
+
+Tried without a match: a bit-writer (15; every split of the shared temporary swaps the first two loads to 90), a
+velocity integrator (105; struct, inline helper, operand order and `1.0f / 30.0f` all keep the product in `$f0`), a
+0x28-stride struct reader (265; the offset lands in `$a0` not `$a1` whatever the index type), and a sound trigger
+(210; the stack-slot load is scheduled before the `move $a0, $v0`).
+
+### Round 17: a game's second passes (KMC GCC 2.7.2 `-O2`, controlled matches)
+
+Three new matches and one large improvement, all under the game's default `-O2`.
+
+- **A float argument the callee takes in an integer register.** A wrapper loaded a global flag, doubled two stack
+  float arguments when it was set, and passed `60.0f` as a call's second argument (`lui $a1, 0x4270`). Two
+  changes closed it (360 → 0): the callee declared `void f(void *, f32)` (an undeclared callee passes the constant
+  as a double in `$a2/$a3`), and the doubling written on the parameters themselves, before they are copied into
+  locals (`if (flag) { a *= 2.0f; b *= 2.0f; } x = b; y = a;`). Doubling the copies scheduled the stack loads
+  before the flag's load. The flag is `s32`, not the `s16` m2c guessed (`lw`, not `lh`).
+- **A load scheduled before an unrelated address.** In a table search the game loads `*t` right after `t` is set
+  and before the second table's address (`lui/addiu`). Only an explicit first read did it (60 → 0):
+  `t = A; p = *t; r = B; if (p != NULL) do { ... } while (*t != NULL);`. Swapping the two assignments, `for` loops,
+  `const` and `volatile` tables all kept the address first or moved the test into another block.
+- **A switch whose second arm calls with fewer arguments.** m2c read the arm's call as `f((s8)obj->ptr)`; the game
+  passes `obj` and lets `$a1` keep the pointer the loop just used. Declaring the callee `void f();` and calling
+  `f(obj)` there, with `f(obj, arg1, mode)` in the first arm, an explicit `case 0: case 33...38: break;` group (the
+  jump table covers 0-38) and the loop reloading `obj->sub` each pass, matched (551 → 0).
+- **A hoisted `-1` needs a variable.** A sequencer loop compares each event's time with `-1` held in `$s0` across a
+  call. Writing the constant inline never hoisted it (a `goto` loop has no loop notes; `while`/`do` forms rotate the
+  loop differently); `u32 end = -1;` before the `goto` loop label did (410 → 55). The last 55 are the product's
+  register (`mflo $v0` in the game): operand order, `*=` and casts didn't move it.
+
+Tried without a match: a 5-point add whose operand order no pointer or cast form changes, a bit-writer (15), a
+velocity integrator (105), an allocator (300; typed struct reached 525: the size round-up and loop rotation
+differ),
+a slot cleanup (366; a typed struct fixes the frame but not three copies), a matrix copy (390; same 390 under `-O1`
+and scheduling off, so not a settings difference), and a prologue that loads a global before the stack adjustment
+(410 → 360 with `const` reads). The empty-`while` fold blocker from round 16 was not released as a repair family:
+it fits one function, and inserting it after every copy would add many variants for no evidence.
+
+### Round 18: a game's second passes (KMC GCC 2.7.2 `-O2`, controlled matches)
+
+Two new matches and three large improvements, all under the game's default `-O2`.
+
+- **A shared exit reached by a goto, not a fall-through.** A clamp function had two paths ending in `return 0`:
+  one stores a clamped byte and jumps to the end of the other branch, one calls a helper. Writing the helper path as
+  `func(...); var = 0;` let gcc thread the first path's jump to the helper path's copy of the exit; writing it as
+  `func(...); goto block;` (the same label the store path jumps to) put both jumps on the label at the end of the
+  long branch, as the game has them (30 → 0). The `andi` the game repeats in each clamp's test and sum came from
+  testing `(u8)v != 0` and then computing `(v & 0xFF) - k`: the two forms aren't merged by CSE, while two `& 0xFF`
+  were. The third clamp's result register (`$v0`, not `$v1`) needed the sum assigned to the result variable and
+  overwritten in each arm (`r = (v & 0xFF) + 8; if (r >= 0) { if (r >= 0x31) r = 0x30; else r = v + 8; } else r = 0;`).
+- **A counter set before the `if` that guards its loop.** A menu builder's loop counter is zeroed in the delay slot
+  of the `beqz` that skips the loop; `var = 0;` written before `if (count) { do { ... } while (...); }`, instead of
+  inside the `if`, filled it (490 → 0). Its two identical switch arms stay separate (`case 1:` and `case 2:` each
+  `p = T; n = 6; break;`); merging them as `case 1: case 2:` scored 1905.
+- **A signed 15-bit delta cast at its use.** A sound-envelope stepper decodes a one- or two-byte delta and adds it to
+  a time (`sll 16; sra 16` right before the add): `t = time + (s16)delta;` with `delta` an `s32` holding the raw
+  value matched the shape (505 → 30); `s16 delta` or the cast at the assignment did not. The struct offsets of its
+  64-entry table were wrong in the earlier adapted C (the pointer at 0x14, the pitch at 0x1A).
+- **Loop invariants hoisted after the loop's own setup.** A proximity test loads a `double` threshold and a table
+  pointer before three hoisted constants. Writing the table entry as `p = &T + i` inside a `for (; i < 4; i++)`, with
+  `i = 0` set before the threshold, moved the pointer after the constants (510 → 120); the threshold still loads
+  before them in ours and after them in the game.
+
+Tried without a match: the product register of round 17's sequencer loop (now 40: the pointer bump written
+`next = next + 1; if (next->time != end)`), where operand order, `*=`, a `scale` local and casts all keep `mflo $v1`.
+
+### Round 19 (KMC gcc 2.7.2 `-O2`, an N64 game's second-pass functions)
+
+Two new exact matches, both under the game's default settings, judged by the running app's linked verdict:
+
+- **An element address formed from a byte offset** (410 → 0): `&s->stock[slot]` (a `s16` array at 0x1BC) puts the base
+  first (`addu t0, s2, s0`); the game's `addu s0, s0, s2` and its reuse of the index register came from
+  `(s16 *)((u8 *)s + slot * 2) + 0xDE` held in a pointer local, with the store and the item update moved inside
+  `if (flag == 0) { ... } return 1;` instead of an early `return 1`. Evidence: exact, controlled by the earlier forms
+  (180 with `&s->stock[slot]` in a local, 15 with only the `if` reshaped).
+- **A byte global stored with `sb`, and a byte argument used directly** (276 → 0): the draft declared a flag global as
+  `s32` (`sw`) and passed a stack copy of a byte argument (`u8 sp3F = arg5;` then `sp3F << 16`). Storing the flag as
+  `u8` (76) and passing `arg5 << 16` itself while keeping the dead stack copy (0) matched; the copy still produces the
+  game's `sb $t0, 0x3f($sp)`, and using it in the call makes gcc give the argument a saved register instead.
+
+Improved, not exact: a voice-envelope case with the two operands read into locals before `(0x7F - h) * w` (355 → 135; the
+tail's global still loads after the flag update), and a ratio of two unsigned counters written `(f32)u32 / (f32)u32`,
+which fixes the float registers (245 → 240; a `u8` state compare that the game masks with `andi 0xff` remains).
+
+Tried without gain: a 16-bit id built from two bytes that the game masks with `andi 0xffff` (u16/u32/s32 locals, casts on
+the call and the test all drop the mask); a mid-function copy of a flags word (an inline helper copies the accumulator
+instead, 640; a block-scoped copy is coalesced, 210); a search loop's result copied to `$v0` before its test (an inline
+helper returning the flag is propagated, 230); a 16-bit stack argument the game keeps unmasked in a saved register
+(`u16`, `u32`, `s32` parameter with a `(u16)` cast: 200–855); load order of a global after a read-modify-write
+(locals, pointer, adjacent-element forms: 135–330); and a per-function `-O1` override that scores worse than the
+default (420 against 300), left for the user to decide.
+
+### A staged signed half-offset in a store
+
+Controlled replay with gcc-2.7.2-kmc and `-G0 -mips3 -mgp32 -mfp32 -O2 -g3`.
+A saved near match computed an unsigned product, loaded a base, applied the sign
+bias and arithmetic shift, then stored the sum. Folding the base load and signed
+division by two into the store, with the base on the left, took 1,745 to zero on
+the first deep-permuter trial (4,304 linked bytes). Reversing the operands scored
+730. Replacing the shift alone left the score unchanged. Newly generated m2c
+output in both syntax modes failed to compile, including after draft refinement
+and macro expansion. Neither draft exposed the four-statement pattern.
+
+Follow-up controlled replay with the same compiler and flags. A newly generated
+valid-syntax m2c draft compiled after refinement with decomprepair 0.5.34 and
+scored 23,075. A store through a void pointer immediately followed the closing
+brace of a conditional. Recognizing the star as a dereference there allowed
+the existing refinement to cast the store address while preserving byte-based
+pointer arithmetic. Expanding the field macros gave the same linked score.
+
+### Round 20: loop preheader order, a getter twin and unsigned conversion (TWINE, gcc-2.7.2-kmc `-O2`)
+
+Twelve open functions of a 4,000-function N64 game were worked by hand with the game's own KMC
+`-G0 -mips3 -mgp32 -mfp32 -O2`. Three became exact and two improved; all were adopted through Try.
+
+- **A pointer walk whose start comes after the hoisted constants is an indexed loop** (470 → 0, 250 → 0): when the
+  target loads a loop's walking pointer or byte offset *after* the loop invariants gcc hoisted (constants such as `2`,
+  `2.5f` or `0xFFFF`), the pointer is a reduced induction variable of the counter, not a variable the C set before the
+  loop: loop.c emits a reduced giv's start value after the moved invariants. m2c's `p = &table; do { ... p++; }` put the
+  start first. Indexing the array by the counter (`D[i]`) or writing the byte offset from it (`*(T **)((i << 2) + D)`)
+  matched. In the second case `D + i * 4` (and `D[i]` on a typed array) still scored 415: only the shift-left form kept
+  the `lui; addu; lw %lo(D)` address shape.
+- **A sentinel constant reloaded for an inner loop comes from a `while` loop** (250 → 60 on the way to the match
+  above): when the target compares against `0xFFFF` with one register before an inner loop and loads `0xFFFF` again for
+  the inner loop's own test, the inner loop was `while ((v = *p) != 0xFFFF)`, not m2c's `if (v != 0xFFFF) do { }
+  while (...)`, whose two tests share one register.
+- **A getter twin of a matched setter** (635 → 0): a draft adapted from a setter in the same family was a different
+  function. The target ended in `lhu` of a field at 0xFC6 and returned it; the matched family's inline find helper plus
+  `return table[i].field;` matched at once. Read the target's last loads before trusting an adapted draft.
+- **`u32` from `f64` explains the "frame with no stores"** (1480 → 200): a leaf that allocates 8 bytes of stack it never
+  uses, with a `c.le.d` against a rodata constant and `| 0x80000000` on one arm, is gcc's expansion of a double-to-
+  unsigned conversion (`field = (u32)time;`). Writing the conversion out with the game's constant symbol scored worse
+  (1130–1220: no frame, the `0x80000000` in another register). The remaining 200 is where the table pointer is
+  loaded relative to the hoisted constants; the global pointer (not an array) can't be a reduced giv, since stores
+  through it may alias it.
+- **Two divisions kept apart** (1470 → 100): `rate * D / 1000 / 192` folds into one `/192000`; the game divides by
+  1000 into a `u32` local and then by 192 (`size = size / 192 * 192 + 192`). A signed local gives `sra` rounding fixes
+  (955). The last 100 is the size and the allocated record swapping `$s1`/`$s2`; declaration order, `register` and
+  moving the stores didn't change it.
+
+Tried without gain: an offset register copied at a loop's join (`move $a1, $v1`, 215; arrays, `s32`, scalings and
+goto forms); a leaf with an unused 0x18-byte frame computing a spherical vector (875; struct/array locals, operand
+orders: 1255–2805); a loop whose stored-through pointer splits into two induction variables (670); an RSP task setup
+where the game rematerialises a symbol after a subtraction (515); an inline check whose return value lives in `$a1`
+(640; nested ifs and gotos 850); a DMA call whose last stack argument is reloaded through the counter pointer after
+the previous stack store (615; `*p` gets CSE'd, 1370); and a switch whose `j` delay slots the game fills with the
+loads before them (600).
+
+## Round 21: m2c's cursor walk over a global array, and a separate rate local (KMC gcc 2.7.2, `-O2`)
+
+- **Cursor walk to indexed loop** (controlled, now the `pointer_walk_index` repair in decomp-repair 0.5.35): m2c writes
+  `for (i = 0; i < 4; i++) { p = ARR[i]; ... }` as `i = 0; cur = &ARR; do { p = *cur; ...; i += 1; cur += 1; } while (i < 4U);`
+  and declares the global as a scalar (`extern void *ARR;`). Writing the indexed `for` loop with `extern void *ARR[];`
+  took an N64 function from 470 to exact; the same rewrite took another from 835 to 225. Evidence: two functions, the
+  first exact under the linked judge.
+- **Intermediate in its own local** (one function, 100 -> 70): `rate = arg0->rate * K / 1000; size = (rate / 192) * 192 + 192;`
+  instead of reusing `size` for both steps moved the allocated pointer into the game's `$s2`. The last 70 are `size` and
+  `size * 2` in swapped saved registers; declaration order, `size << 1`, `u32`/`s32` for either, and passing `size * 2`
+  inline didn't move it.
+- **Failed, recorded so it isn't repeated** (a loop over 0x68-byte records, 200): the game loads the record pointer after
+  the constants the loop hoists. Indexed forms (`&D[i]`, `D + i`, a local base, a `const` global, a local count) all
+  scored 1300-2025, because gcc 2.7.2 keeps the `* 0x68` multiply when the base is a global it can't prove invariant.
+  The m2c cursor walk at 200 stays the best.
+
+### Keep an address live across a call while leaving the load in place
+
+- **Evidence:** Exact ROM-mode replay on one 875-instruction N64 function with
+  `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3`. The saved draft scored 25
+  with five register-only differences, two acyclic local register chains, and
+  a 360-byte frame on both sides.
+- **Source change:** Capture the fixed byte-array address in a dead pointer local
+  before the renderer reads its global camera pointer. Read through that local
+  at the subsequent call, preserving the position and type of the original
+  pointer load. The same local takes a different address in a later phase.
+- **Result:** The deep permuter's allocation search found and saved the linked
+  byte match at score 0 within 24 candidates. The frame and compiler profile
+  stayed the same. Testing alternate flags on the saved draft did not improve
+  its score. Stripping its one-iteration `do … while (0)` scopes raised the
+  score to 850, so startup recovery now preserves those scopes.
+
+### Repeated call-result lifetimes in a fresh machine draft
+
+Controlled ROM replay with gcc-2.7.2-kmc and
+`-G0 -mips3 -mgp32 -mfp32 -O2 -g3`. The refined m2c source scored 23,075.
+Reusing a previous scalar result slot for a later call to the same callee
+produced a 22,930-point candidate. Repeating the pass on that saved winner
+reached 22,600. Splitting another call result into its own local reached
+22,500. Independent two-worker searches from freshly generated drafts
+reproduced the same source and linked score. This is a partial improvement.
+With two workers, a one-minute run finished at 22,500 after 41 candidate
+checks. A four-minute run tested 81 candidates and reached 22,410 with a
+built-in random rewrite. Both saved results were independently recompiled and
+linked. The 22,410 result has one observed run.

@@ -73,6 +73,45 @@ def test_one_commit_per_function_uses_notes_and_removes_only_its_draft(automatic
     assert match_commits.status(net, net.project_row('game'))['pending'] == 0
 
 
+@pytest.mark.parametrize('change', ['polish', 'reopen'])
+def test_queue_wait_leaves_the_project_lock_free_and_keeps_the_recorded_verdict(automatic, monkeypatch, change):
+    from concurrent.futures import ThreadPoolExecutor
+
+    net, _, _, agent = automatic
+    enable(automatic)
+    enqueue = match_commits.enqueue
+    lock = net.progress._project_lock('game')
+    store = net.project_store('game')
+    original_source = 'void f(void) { return; }'
+    polished = 'void f(void) { /* polished */ return; }'
+
+    def update_before_enqueue():
+        assert lock.acquire(blocking=False)
+        try:
+            if change == 'reopen':
+                with store.tx() as db:
+                    db.execute("UPDATE functions SET status='open',matched_source=NULL WHERE name='f'")
+            else:
+                net._record(net._function('f', 'game'), agent, 0, polished, 1, matched=True)
+        finally:
+            lock.release()
+
+    with ThreadPoolExecutor(1) as pool:
+        def interleave(*args, **kwargs):
+            pool.submit(update_before_enqueue).result(timeout=10)
+            return enqueue(*args, **kwargs)
+
+        monkeypatch.setattr(match_commits, 'enqueue', interleave)
+        match(automatic)
+
+    job = store.one('SELECT snapshot FROM auto_match_commits')
+    if change == 'reopen':
+        assert job is None
+    else:
+        assert json.loads(job['snapshot'])['source'] == original_source
+        assert store.one("SELECT matched_source FROM functions WHERE name='f'")['matched_source'] == polished
+
+
 def test_missing_notes_use_fallback_without_repeating_after_late_notes(automatic):
     net, root, _, agent = automatic
     enable(automatic)
@@ -163,6 +202,28 @@ def test_autosave_drains_enabled_matches(automatic):
     assert git(root, 'log', '-1', '--format=%s') == 'Saved from the ordinary autosave worker'
 
 
+def test_automatic_commit_poll_only_syncs_when_capturing_a_pending_match(automatic, monkeypatch):
+    net, root, _, _ = automatic
+    enable(automatic)
+    autosave = saves.Autosave(net)
+    seen = []
+    sync = net.progress.sync
+
+    def record_sync(slug, **kwargs):
+        seen.append(kwargs.get('force', False))
+        return sync(slug, **kwargs)
+
+    monkeypatch.setattr(net.progress, 'sync', record_sync)
+    autosave._commit_once('game', lambda _: None)
+    assert not seen
+
+    match(automatic)
+    seen.clear()
+    autosave._commit_once('game', lambda _: None)
+    assert seen[0] and sum(seen) == 1
+    assert git(root, 'log', '-1', '--format=%s') == 'Match f'
+
+
 def test_gui_auto_commit_checkbox():
     from pathlib import Path
     subprocess.run(['node', str(Path(__file__).with_name('gui_match_commits.js'))], check=True, capture_output=True, timeout=30)
@@ -192,6 +253,53 @@ def test_disabling_during_snapshot_cancels_publication(automatic, monkeypatch):
     monkeypatch.setattr(match_commits, 'scoped_snapshot', disabled)
     match_commits.process(net, 'game')
     assert git(root, 'rev-parse', 'HEAD') == before
+
+
+@pytest.mark.parametrize('during_prepare', ['other_match', 'revoke', 'disable'])
+def test_git_preparation_leaves_judges_unblocked_and_rechecks_before_publication(
+        automatic, monkeypatch, during_prepare):
+    from concurrent.futures import ThreadPoolExecutor
+
+    net, root, _, _ = automatic
+    enable(automatic)
+    match(automatic)
+    before = git(root, 'rev-parse', 'HEAD')
+    lock = net.progress._project_lock('game')
+    store = net.project_store('game')
+
+    def concurrent_change():
+        assert lock.acquire(blocking=False)
+        try:
+            if during_prepare == 'revoke':
+                with store.tx() as db:
+                    db.execute("UPDATE functions SET status='open',matched_source=NULL WHERE name='f'")
+            elif during_prepare == 'disable':
+                match_commits.configure(net, 'game', False)
+            else:
+                match(automatic, 'g')
+        finally:
+            lock.release()
+
+    original = repository_progress.repository_git.git
+    with ThreadPoolExecutor(1) as pool:
+        def observe(path, *args, **kwargs):
+            if args[0] == 'write-tree':
+                pool.submit(concurrent_change).result(timeout=10)
+            if args[0] == 'update-ref':
+                assert lock._is_owned()
+            return original(path, *args, **kwargs)
+        monkeypatch.setattr(repository_progress.repository_git, 'git', observe)
+        match_commits.process(net, 'game')
+
+    if during_prepare == 'other_match':
+        manifest = json.loads(git(root, 'show', 'HEAD:decompdecomp.json'))
+        assert 'matched_by' in manifest['functions']['f']
+        assert 'matched_by' not in manifest['functions']['g']
+        assert match_commits.status(net, net.project_row('game'))['pending'] == 1
+    else:
+        assert git(root, 'rev-parse', 'HEAD') == before
+        assert match_commits.status(net, net.project_row('game'))['pending'] == 0
+        assert not (root/'.git/index.lock').exists()
 
 
 def test_layout_changes_require_a_manual_checkpoint(automatic):

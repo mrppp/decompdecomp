@@ -27,7 +27,8 @@ from ..network import NetworkError
 
 log = logging.getLogger('decompdecomp')
 METRIC_SECONDS = .5  # how often a child reports its compile counters (the pass's live rates)
-PROGRESS_SECONDS = .25  # the most often a turn's progress crosses to the app
+PROGRESS_SECONDS = .25
+IDLE_SECONDS = 60  # a lane with no turn for this long is closed (Lanes.trim); one starts again on demand  # the most often a turn's progress crosses to the app
 COUNTERS = ('considered', 'generated', 'invocations', 'requests', 'execute', 'queue', 'setup', 'generation',
             'proposal_generation', 'cleanup_generation', 'local_generation', 'link', 'history_write',
             'history_transactions', 'history_statements')
@@ -218,12 +219,36 @@ class Lanes:
                     return message['result']
         finally:
             if keep and lane.alive() and not self.closed:
+                lane.idle_since = time.monotonic()
                 self.idle.put(lane)
             else:
                 with self.lock:
                     self.started -= 1
                     self.lanes.discard(lane)
                 lane.close()
+
+    def trim(self, idle_seconds=IDLE_SECONDS):
+        """Close the lanes that have waited for a turn longer than `idle_seconds`, with their proposal workers.
+
+        A looping pass that waits for scored C or host claims, or runs fewer turns than it has lanes near its end, kept
+        every idle lane alive, each with its proposal worker processes: about 70 idle processes in one app. A closed
+        lane is started again when a turn needs it."""
+        now = time.monotonic()
+        kept = []
+        while True:
+            try:
+                lane = self.idle.get_nowait()
+            except queue.Empty:
+                break
+            if lane.alive() and now - getattr(lane, 'idle_since', now) < idle_seconds:
+                kept.append(lane)
+                continue
+            with self.lock:
+                self.started -= 1
+                self.lanes.discard(lane)
+            lane.close()
+        for lane in kept:
+            self.idle.put(lane)
 
     def close(self):
         """Close every child, idle or busy. A sweep that ended while lanes were working used to leave those lanes
@@ -233,6 +258,12 @@ class Lanes:
             self.closed = True
             lanes = list(self.lanes)
             self.lanes.clear()
+            self.started = 0
+        while True:  # (the idle queue's lanes are in self.lanes too: emptied so nothing hands one out again)
+            try:
+                self.idle.get_nowait()
+            except queue.Empty:
+                break
         for lane in lanes:
             lane.close()
 

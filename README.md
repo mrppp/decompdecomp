@@ -108,16 +108,24 @@ can contain both CI4 and RGBA32 textures.
 Open **Texture browser** for a thumbnail gallery, format/dimension filters and reference links.
 Select any frame, palette or mip level in a bank; animate frames at a chosen preview rate.
 Open **Audio browser** to filter detected samples, prepare WAV previews and listen with Play.
-N64 scans recognize supported B1 and libmus PtrTablesV2 sound banks and their sample tables.
+N64 scans recognize supported B1 sound banks, including wrapped banks with relocated control pointers,
+and libmus PtrTablesV2 banks and their sample tables.
 Banks without a stored rate use a labelled, editable preview rate. Archived sequence candidates
 are listed separately; music sequencing, pitch, mixing and loops are not rendered. Open an audio
 region to choose a sample and prepare a local WAV preview; playback starts only with Play.
-Supported indexed N64 geometry is detected automatically, including RNC-compressed models.
+Play supported Acclaim DEAN streams using codebooks verified in the ROM. Voice links from dialogue prepare the WAV preview.
+Find supported dialogue scripts in ROM Explorer and browse their cues by scene and speaker.
+Verified voice links open the audio inspector from individual cues. Related cutscene scripts open
+their command tables from the dialogue browser.
+Supported indexed N64 geometry is detected automatically, including EMsh meshes in byte-sum RNC and chained RNX streams. RNX can also contain descriptor banks
+and indexed tiles in a shared-palette archive. ROM Explorer can also inspect level sectors,
+path keyframes and cutscene commands.
 Open **Model browser** to rotate a local mesh or a supported assembled model, switch
 between textured, vertex-colour and wireframe rendering, follow related files and export
 a self-contained glTF. Supported PD3V cars use stored transforms; split scenery uses
 CRC-checked coordinate streams named by loader scripts. Texture matches require explicit
-loader-folder links. Missing or ambiguous links stay unresolved. First texture frames and
+loader-folder links for PD3V or matching effect resource tables for EMsh. Missing or
+ambiguous links stay unresolved. First texture frames and
 palettes are shown; animation, runtime lighting and special strip commands remain planned.
 A supported indexed cartridge directory is also recognized by structure: animations, collision,
 object placements, grid sections/bounds, music sequences and demo recordings gain typed labels
@@ -851,7 +859,7 @@ The installer uses uv and Python 3.12, installs the Cocoa/WebKit bridge, gets th
 `~/Applications/decompdecomp.app`. Open it from Finder or run `decomp`. Projects stay in `~/Decomp-RetroReversing`;
 toolchains live in `~/Library/Application Support/decompnet/toolchains`. Xcode Command Line Tools
 (`xcode-select --install`) are needed on Intel Macs for N64's MIPS binutils, and on both Mac architectures to
-build PS1 GCC 2.6.0, 2.6.3 and 2.8.0 from pinned source on first use. The ready-made 2.7.2 (PSX and CDK) and 2.8.1 compiler binaries are for
+build PS1 GCC 2.6.0, 2.6.3 and 2.8.0 and the native port’s wasm2c from pinned source on first use. The ready-made 2.7.2 (PSX and CDK) and 2.8.1 compiler binaries are for
 Apple Silicon. Finder launches preserve the PATH
 from installation so your installed Node and helper CLIs remain available; rerun `decomp shortcut` after
 changing their locations. This source install has no signed DMG.
