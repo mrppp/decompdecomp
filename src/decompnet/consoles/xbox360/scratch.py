@@ -701,6 +701,9 @@ def reanalyse_functions(root: Path, version: str, keep: set[str] = frozenset(), 
     written = {unit: _defined(root, unit, keep) for unit in info["units"]}
     last_c = {unit: max((fn["addr"] for fn in fns if fn["name"] in written[unit]), default=0)
               for unit, fns in info["units"].items()}
+    calls = pdata.branch_relocs(data[base_offset:base_offset + image_size], image_base, out)
+    for fn in out:  # (every function, a matched one too: its calls are named now, and its C renamed to match)
+        fn["relocs"] = calls.get(fn["name"], [])
     olds = sorted(old, key=lambda o: o["addr"])  # (code a file had: a new extent of it is no insertion)
     starts = [o["addr"] for o in olds]
     homeless: list[Function] = []
@@ -722,8 +725,8 @@ def reanalyse_functions(root: Path, version: str, keep: set[str] = frozenset(), 
         last_unit, last_end = fn["unit"], fn["addr"] + fn["size"]
         if not fn["unit"]:
             homeless.append(Function(fn["addr"], fn["offset"], fn["size"], fn["name"]))
-    if not homeless and [(f["addr"], f["size"], f["name"], f["unit"]) for f in out] == \
-            [(f["addr"], f["size"], f["name"], f["unit"]) for f in sorted(old, key=lambda f: f["addr"])]:
+    if not homeless and [(f["addr"], f["size"], f["name"], f["unit"], f["relocs"]) for f in out] == \
+            [(f["addr"], f["size"], f["name"], f["unit"], f.get("relocs", [])) for f in sorted(old, key=lambda f: f["addr"])]:
         return None  # (a file too: a function moved out of the way of a file's C is a change)
     added_units: dict[str, list[Function]] = {}
     for unit, fns in units(homeless).items():
@@ -1186,14 +1189,21 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
 
     conf = root / "config" / version
     conf.mkdir(parents=True)
+    from . import pdata
+
+    # each call out of a function names its callee (pdata.branch_relocs): a bare displacement made the judge read
+    # it from the object's layout, and the C name callees by an offset that changed with the layout
+    judged = (root / judge_rel).read_bytes()[judge_offset:judge_offset + xex["image_size"]]
+    calls = pdata.branch_relocs(judged, xex["image_base"],
+                                [{"name": f.name, "addr": f.addr, "size": f.size} for f in functions])
     write_atomic(conf / "functions.json", json.dumps({
         "target_format_version": 4, "elf": judge_rel, "sha1": judge_sha1,
         "image_base": xex["image_base"], "entry": xex.get("entry_point") or 0,
         # XEX2 approximation: the "text" is the whole image, not an ELF section. For a basic-compressed XEX2 this is
         # the expanded image in orig/ (offset 0); otherwise it is the raw payload.
         "text": {"va": xex["image_base"], "offset": judge_offset, "size": xex["image_size"]},
-        "units": {u: [{"name": f.name, "addr": f.addr, "offset": f.offset, "size": f.size, "relocs": []}
-                      for f in fns] for u, fns in groups.items()},
+        "units": {u: [{"name": f.name, "addr": f.addr, "offset": f.offset, "size": f.size,
+                       "relocs": calls.get(f.name, [])} for f in fns] for u, fns in groups.items()},
     }, indent=1))
     for u, fns in groups.items():
         src = root / "src" / "auto" / f"{u}.c"

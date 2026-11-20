@@ -1148,3 +1148,45 @@ def test_a_reimport_isnt_taken_back_for_sources_that_didnt_compile_before(per_fi
     # the same object, but its source changed with the analysis: its failure may be the analysis's doing
     assert net.forks.reanalyse(slug, lambda fp: found(fp, unit.source), paths=("tools",), log=lambda *_: None) is None
     (root / unit.source).write_text(original)
+
+
+def test_source_files_changed_after_a_reimport_come_back_with_it(per_file, monkeypatch):
+    """What a console does once the project is set up again (an Xbox 360 project renames its C's callees) is
+    taken back with the new analysis: its files come back too."""
+    net, slug, agent, root, state, lerp = per_file
+    config = root / "tools" / "reference" / "game.c"
+    before = config.read_bytes()
+    fp = net.forks.get(slug)[1]
+    unit = next(u for u in fp.units() if u.source and (root / u.source).exists())
+    source = root / unit.source
+    original = source.read_text()
+
+    def renamed(fp, before):
+        before[source] = original
+        source.write_text(original + "/* renamed */\n")
+        return "1 callee name renamed"
+
+    monkeypatch.setattr(ForkProject, "setup_commands", lambda self, version=None: [["ninja", "prepare"]])
+    monkeypatch.setattr(ForkProject, "run", lambda self, cmd, log=print, failed=None, **kw: (True, ""))
+    monkeypatch.setattr(type(net.forks), "_already_broken", lambda *a: [])
+    checks = []
+    monkeypatch.setattr(net.forks, "sync", lambda *a, **k: checks.append(1) or {})
+
+    def found(fp):
+        config.write_bytes(b"a new analysis")
+        return "more functions"
+    said = net.forks.reanalyse(slug, found, paths=("tools",), log=lambda *_: None, after=renamed)
+    assert said and "1 callee name renamed" in said and source.read_text().endswith("/* renamed */\n")
+    source.write_text(original)
+    committed = config.read_bytes()  # (the kept analysis is committed: what a take-back returns to)
+
+    def renamed_then_fails(fp, before):
+        before[source] = original
+        source.write_text(original + "/* renamed */\n")
+        raise OSError("couldn't judge")
+
+    def again(fp):
+        config.write_bytes(b"another analysis")
+        return "more functions again"
+    assert net.forks.reanalyse(slug, again, paths=("tools",), log=lambda *_: None, after=renamed_then_fails) is None
+    assert config.read_bytes() == committed and source.read_text() == original, "taken back, the C too"

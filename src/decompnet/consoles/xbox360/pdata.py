@@ -315,3 +315,88 @@ def leaves(image: bytes, image_base: int, known: list[tuple[int, int]], *, log=p
         log(f"{len(found)} leaf functions (no entry in the function table) found in the code between functions"
             + (f"; {unclear} stretches with no clear end left out" if unclear else ""))
     return found
+
+
+R_PPC64_REL24 = 10
+
+# MSVC's register save/restore routines: one body with an entry per register, which every prologue and epilogue
+# calls by name (`bl __savegprlr_28`). Known by their first instruction; an entry's register is read from its own.
+_MILLICODE = {
+    0xF9C1FF68: ("__savegprlr_", 62, 4),  # std r14,-0x98(r1)
+    0xE9C1FF68: ("__restgprlr_", 58, 4),  # ld r14,-0x98(r1)
+    0xD9CCFF70: ("__savefpr_", 54, 4),  # stfd f14,-0x90(r12)
+    0xC9CCFF70: ("__restfpr_", 50, 4),  # lfd f14,-0x90(r12)
+}
+_VMX = {0x7DCB61CE: "__savevmx_", 0x7DCB60CE: "__restvmx_"}  # li r11,-0x120 then stvx/lvx v14,r11,r12
+_VMX_REGS = [*range(14, 32), *range(64, 128)]  # its entries, 8 bytes apart: v14-v31, then VMX128's v64-v127
+
+
+def millicode(image: bytes, image_base: int, fn: dict) -> dict[int, str]:
+    """{entry address: MSVC name} when `fn` is one of the register save/restore routines, else {}."""
+    def word(va: int) -> int:
+        at = va - image_base
+        return struct.unpack_from(">I", image, at)[0] if 0 <= at <= len(image) - 4 else 0
+
+    first, lo = word(fn["addr"]), fn["addr"]
+    names = {}
+    if first in _MILLICODE:
+        prefix, opcode, _ = _MILLICODE[first]
+        for at in range(lo, lo + fn["size"], 4):
+            w = word(at)
+            if w >> 26 != opcode:
+                break
+            names[at] = f"{prefix}{(w >> 21) & 31}"
+    elif first == 0x3960FEE0 and word(lo + 4) in _VMX:
+        prefix = _VMX[word(lo + 4)]
+        for index, reg in enumerate(_VMX_REGS):
+            at = lo + 8 * index
+            if at + 8 > lo + fn["size"] or word(at) >> 16 != 0x3960:  # li r11,...: each entry starts with one
+                break
+            names[at] = f"{prefix}{reg}"
+    return names
+
+
+def branch_relocs(image: bytes, image_base: int, functions: list[dict]) -> dict[str, list[list]]:
+    """{function name: [[offset, R_PPC64_REL24, symbol, addend], ...]} for every b/bl that leaves its function.
+
+    A delinked function's call was its raw displacement, which says nothing once the function sits in an object of
+    its own: the judge had to read where the call landed from the object's layout, and the C named callees by that
+    offset (`DAT_006cfe34`), so a function added to a file moved every call after it (12 matches reopened on one
+    game). A relocation names the callee itself. A call into the middle of a function names that function with the
+    distance as addend; one to code no function holds names its address (FUN_xxxxxxxx), as an import thunk.
+    Branches within the function (its own loops and jumps) stay as they are.
+    """
+    ordered = sorted(functions, key=lambda fn: fn["addr"])
+    starts = [fn["addr"] for fn in ordered]
+    size = len(image)
+    entries: dict[int, str] = {}  # a save/restore routine's entries, by the names compiled code calls them
+    for fn in ordered:
+        if fn["size"] >= 64:
+            entries.update(millicode(image, image_base, fn))
+    out: dict[str, list[list]] = {}
+    for fn in ordered:
+        lo, hi = fn["addr"], fn["addr"] + fn["size"]
+        relocs = []
+        for at in range(lo, hi, 4):
+            if not 0 <= at - image_base <= size - 4:
+                break
+            w = struct.unpack_from(">I", image, at - image_base)[0]
+            if w >> 26 != 18 or w & 2:  # b/bl only, relative (an absolute branch is no displacement)
+                continue
+            d = w & 0x3FFFFFC
+            if d & 0x2000000:
+                d -= 0x4000000
+            target = at + d
+            if lo <= target < hi:
+                continue
+            if target in entries:
+                relocs.append([at - lo, R_PPC64_REL24, entries[target], 0])
+                continue
+            index = bisect.bisect_right(starts, target) - 1
+            owner = ordered[index] if index >= 0 and target < ordered[index]["addr"] + ordered[index]["size"] else None
+            if owner is not None:
+                relocs.append([at - lo, R_PPC64_REL24, owner["name"], target - owner["addr"]])
+            else:
+                relocs.append([at - lo, R_PPC64_REL24, f"FUN_{target:08x}", 0])
+        out[fn["name"]] = relocs
+    return out
