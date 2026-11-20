@@ -345,6 +345,8 @@ def compact_info_head(net, proj):
     itself from these parts and the database's totals (gateway/src/native.rs)."""
     cfg=net.cfg(proj)
     profile=cfg.get('compiler') or {}
+    if isinstance(profile, str):
+        profile = {'toolchain': profile}
     platform=consoles.get(cfg.get('platform'))
     compiler=profile.get('toolchain') if isinstance(profile,dict) else str(profile)
     compiler=compiler or 'set by the project build'
@@ -478,7 +480,14 @@ def _compile(net: RomNetwork, agent: Agent, slug: str, function: str, source: st
         repair_note=f'[Original category: {repair_category}] '+repair_note
         repair_category='other'
     if repair_note and len(names) != 1:
-        raise NetworkError('Repair notes require one function and a valid category. Use report_repair after a batch.')
+        # A small model put the function's callees and data in `function` ("func_A, func_B, D_8010...") with a
+        # note, and the old "Repair notes require one function" read as being about the note: it gave up on the
+        # function without compiling once. Say what was wrong with `function` and how to send it.
+        listed = ', '.join(names[:4]) + (', …' if len(names) > 4 else '')
+        raise NetworkError(f'`function` names {len(names)} things ({listed}): give only the one function you are '
+                           'compiling, and declare its callees and data inside `source`. Nothing was compiled; '
+                           'send it again. (A batch of several claimed functions takes no repair_note; use '
+                           'report_repair after it.)')
     previous = net.project_store(slug).one('SELECT MAX(id) AS id FROM repair_examples')['id'] or 0
     previous_diff = None
     previous_attempt = None
@@ -808,8 +817,8 @@ def _tool_foreground(net, agent, slug, name, args):
         'warnings', 'quality', 'history', 'notes', 'declarations', 'compiler', 'layouts'}
     # Polishing also judges current DB inputs and rechecks source/header/target
     # receipts before publication; claims may reuse such a verified plan.
-    allowed = function_read or name in {'compile_and_diff','compile_patch','compile_variants','add_note','get_assembly','get_context',
-                                       'claim_readable','polish_function','make_readable'} or (
+    allowed = function_read or name in {'compile_and_diff','compile_patch','compile_variants','compile_family','try_local_repairs',
+                                       'add_note','get_assembly','get_context','claim_readable','polish_function','make_readable'} or (
         name == 'get_candidate' and args.get('base','current') == 'current') or (
         name == 'release_function' and not args.get('needs','').strip() and not args.get('not_c',False))
     notes = allowed and name in {'add_note','release_function'}

@@ -16,7 +16,6 @@ import hashlib
 import json
 import re
 import shutil
-import subprocess
 from pathlib import Path
 
 import yaml
@@ -24,9 +23,10 @@ from elftools.elf.elffile import ELFFile
 
 from .. import toolchains
 from ..candidate_work import elf as candidate_elf
-from ..hostenv import NO_WINDOW, console_python
+from ..hostenv import console_python
 from ..project import compiler_for
-from . import match, split
+from ..readme_links import DECOMPDECOMP, START_YOUR_OWN
+from . import export_workers, match, split
 from .symbols import AUTO_NAME
 
 _ADDR_COMMENT = re.compile(r"/\*\s*([0-9A-F]+)\s+([0-9A-F]{8})\b")
@@ -315,6 +315,10 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     out.mkdir(parents=True, exist_ok=True)
 
     # 1. splat again, with the project's names
+    from .export_process import progress_step, run
+    from .export_process import verify as verify_build
+
+    progress_step(log, 1, "Extracting assembly and data")
     log("writing the assembly with the project's names (splat)")
     split_config = yaml.safe_load(configs[0].read_text(encoding='utf-8'))
     known = net.project_store(proj['id']).all('SELECT vram,size FROM functions WHERE project_id=?', proj['id'])
@@ -324,8 +328,7 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
         if (work / extra).exists():
             shutil.copyfile(work / extra, out / extra)
     (out / "symbol_addrs.txt").write_text("\n".join(_symbol_lines(net, proj)) + "\n", encoding="utf-8")
-    res = subprocess.run([console_python(), "-m", "splat", "split", "splat.yaml"], cwd=out, capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    res = run([console_python(), "-m", "splat", "split", "splat.yaml"], out, log)
     if res.returncode != 0:
         raise ExportError("splat failed:\n" + (res.stdout + res.stderr)[-1500:])
     for generated in (out / "src").glob("*.c"):
@@ -339,11 +342,12 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     rows = {address: dict(row) | ({"matched_source": sources[row['id']]['source'], "status": "matched"}
                                 if row['id'] in sources else {}) for address, row in rows.items()}
     units = net._unit_contexts(proj["id"])
-    header = net._context(proj["id"])["header"]
+    headers = {unit: context["header"] for unit, context in net._contexts(proj["id"], {*units, ""}).items()}
+    header = headers[""]
     (out / "include").mkdir(exist_ok=True)
     (out / "include" / "common.h").write_text(header, encoding="utf-8")
     for u in units:
-        (out / "include" / f"common_{u}.h").write_text(net._context(proj["id"], u)["header"], encoding="utf-8")
+        (out / "include" / f"common_{u}.h").write_text(headers[u], encoding="utf-8")
     for path in (out / "asm").glob("**/*.s"):  # what GNU as can't read as spimdisasm writes it, as raw words
         text = path.read_text(encoding="utf-8")
         if (raw := console.export_asm(text)) != text:
@@ -357,65 +361,74 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
                           "asm": path.relative_to(out).as_posix()})
     functions.sort(key=lambda f: f["vram"])
 
-    objects, private, as_fallback = [], [], []
-    for index, f in enumerate(functions):
-        if hasattr(log, 'check_cancel'):log.check_cancel()
-        if hasattr(log, 'progress'):
-            log.progress({'phase': 'Checking exported functions', 'done': index, 'total': len(functions), 'function': f['name']})
-        row = rows.get(f["vram"])
-        f["obj_asm"] = f"build/{Path(f['asm']).with_suffix('.o').as_posix()}"
-        if row is None or row["status"] != "matched" or not row["matched_source"]:
-            f["kind"] = "asm"
-            continue
-        from ..app.function_names import canonical_source
+    from ..app.function_names import canonical_source
+
+    matched_rows = {address: row for address, row in rows.items()
+                    if row["status"] == "matched" and row["matched_source"]}
+
+    def compile_match(row):
         row = dict(row) | {"matched_source": canonical_source(row, row["matched_source"])}
         unit = net._effective_unit(row, units)
-        hdr = net._context(proj["id"], unit)["header"]
+        hdr = headers[unit]
         try:
-            compiled = net._compile(proj, hdr, row["matched_source"], row)
+            return row, unit, hdr, net._compile(proj, hdr, row["matched_source"], row), None
         except toolchains.ToolchainError as error:
-            # A saved per-function profile may need an optional runner absent on this
-            # machine. Keep its original assembly; never substitute another compiler.
-            as_fallback.append((f["name"], f"compiler unavailable: {error}"))
-            f["kind"] = "asm"
-            continue
-        if not compiled.ok:
-            as_fallback.append((f["name"], "doesn't compile any more"))
-            f["kind"] = "asm"
-            continue
-        from ..app.compiler_context import verified
-        predecessor=None if _single_definition(compiled.obj,row['name']) else verified(net,proj,row,compiled.obj)
-        if not _single_definition(compiled.obj, row["name"]) and not predecessor:
-            as_fallback.append((f["name"], "its C also defines other functions; split their bodies into separate source files"))
-            f["kind"] = "asm"
-            continue
-        linked = match.link(compiled.obj, row["name"], net._rom_target(row), net.symbols(proj["id"]), net.reader(proj, row))
-        if not linked.exact:
-            as_fallback.append((f["name"], "no longer matches"))
-            f["kind"] = "asm"
-            continue
-        bases, problem = _section_bases(linked.placements)
-        if problem or predecessor:
-            # Recompile and judge this entry every build; the builder can retain
-            # scattered original pools without pretending they share one base.
-            from .export_entry import object_for
-            try:object_for(compiled.obj,row['name'],linked.linked_code)
-            except (ValueError,TypeError):
-                as_fallback.append((f['name'],problem));f['kind']='asm';continue
-            f['entry_only']=True
-            bases={}
-        src = out / "src" / f["seg"] / f"{f['name']}.{'cpp' if compiled.language == 'c++' else 'c'}"  # as it compiled
-        src.parent.mkdir(parents=True, exist_ok=True)
-        include = "common.h" if not unit else f"common_{unit}.h"
-        prelude = toolchains.source_prelude(toolchains.get(compiler_for(cfg, row["vram"], row)["toolchain"]), row["matched_source"]+"\n"+hdr)
-        src.write_text(exported_source(prelude, include, row["matched_source"]), encoding="utf-8")
-        f["kind"] = "c"
-        f["src"] = src.relative_to(out).as_posix()
-        f["obj"] = f"build/src/{f['seg']}/{f['name']}.o"
-        private += [(f["obj"], section, base) for section, base in bases.items()]
+            return row, unit, hdr, None, error
 
-    if hasattr(log, 'progress'):
-        log.progress({'phase': 'Writing data and layout', 'done': len(functions), 'total': len(functions)})
+    objects, private, as_fallback = [], [], []
+    check = getattr(log, 'check_cancel', lambda: None)
+    candidates = (matched_rows[f["vram"]] for f in functions if f["vram"] in matched_rows)
+    with export_workers.ordered(compile_match, candidates, check) as results:
+        for index, f in enumerate(functions):
+            check()
+            progress_step(log, 2, 'Checking exported functions', done=index, total=len(functions), function=f['name'])
+            f["obj_asm"] = f"build/{Path(f['asm']).with_suffix('.o').as_posix()}"
+            if f["vram"] not in matched_rows:
+                f["kind"] = "asm"
+                continue
+            row, unit, hdr, compiled, error = next(results)
+            if error is not None:
+                # Keep assembly when an optional compiler is unavailable.
+                as_fallback.append((f["name"], f"compiler unavailable: {error}"))
+                f["kind"] = "asm"
+                continue
+            if not compiled.ok:
+                as_fallback.append((f["name"], "doesn't compile any more"))
+                f["kind"] = "asm"
+                continue
+            from ..app.compiler_context import verified
+            single = _single_definition(compiled.obj, row["name"])
+            predecessor = None if single else verified(net, proj, row, compiled.obj)
+            if not single and not predecessor:
+                as_fallback.append((f["name"], "its C also defines other functions; split their bodies into separate source files"))
+                f["kind"] = "asm"
+                continue
+            linked = match.link(compiled.obj, row["name"], net._rom_target(row), net.symbols(proj["id"]), net.reader(proj, row))
+            if not linked.exact:
+                as_fallback.append((f["name"], "no longer matches"))
+                f["kind"] = "asm"
+                continue
+            bases, problem = _section_bases(linked.placements)
+            if problem or predecessor:
+                # Recompile and judge this entry every build; the builder can retain
+                # scattered original pools without pretending they share one base.
+                from .export_entry import object_for
+                try:object_for(compiled.obj,row['name'],linked.linked_code)
+                except (ValueError,TypeError):
+                    as_fallback.append((f['name'],problem));f['kind']='asm';continue
+                f['entry_only']=True
+                bases={}
+            src = out / "src" / f["seg"] / f"{f['name']}.{'cpp' if compiled.language == 'c++' else 'c'}"  # as it compiled
+            src.parent.mkdir(parents=True, exist_ok=True)
+            include = "common.h" if not unit else f"common_{unit}.h"
+            prelude = toolchains.source_prelude(toolchains.get(compiler_for(cfg, row["vram"], row)["toolchain"]), row["matched_source"]+"\n"+hdr)
+            src.write_text(exported_source(prelude, include, row["matched_source"]), encoding="utf-8")
+            f["kind"] = "c"
+            f["src"] = src.relative_to(out).as_posix()
+            f["obj"] = f"build/src/{f['seg']}/{f['name']}.o"
+            private += [(f["obj"], section, base) for section, base in bases.items()]
+
+    progress_step(log, 3, 'Writing data and layout')
 
     # 3. everything else splat wrote: entry code, data, bss, binary blobs
     config = yaml.safe_load((out / "splat.yaml").read_text(encoding="utf-8"))
@@ -588,8 +601,6 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
 
     # 6. prove it
     log("building the exported project to check it rebuilds the game byte for byte")
-    if hasattr(log, 'progress'):log.progress({'phase': 'Rebuilding exported image'})
-    from .export_process import run as verify_build
     proc = verify_build([console_python(), "build.py"], out, log)
     identical = proc.returncode == 0 and "identical" in proc.stdout
     if not identical:
@@ -603,9 +614,11 @@ def _write_docs(out: Path, title: str, console_name: str, base: str, matched: in
     notes = "".join(f"\n- `{n}`: kept as assembly, {why}" for n, why in fallback)
     (out / "README.md").write_text(f"""# {title} (decompilation)
 
-A matching decompilation of {title} for the {console_name}, started with [decompdecomp](https://github.com/RetroReversing/decompdecomp).
+A matching decompilation of {title} for the {console_name}, started with {DECOMPDECOMP}.
 {matched} of {total} functions are C that compiles to exactly the original code; the rest are still assembly.
 `build.py` rebuilds the game from this tree and checks it against your original, byte for byte.
+
+{START_YOUR_OWN}
 
 ## Build
 

@@ -12,17 +12,20 @@ import hashlib
 import json
 import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 from ...arch import arm
-from ...limits import capped
+from ...readme_links import DECOMPDECOMP, START_YOUR_OWN
+from ...rom import export_workers
+from ...rom.export_process import progress_step
+from ...rom.export_process import verify as verify_build
 from ...rom.symbols import AUTO_NAME
 from .split import BASE
 
 
 def export_gba(net, slug: str, out: Path, log=print) -> dict:
+    progress_step(log, 1, "Preparing export inputs")
     proj = net._project(slug)
     cfg = net.cfg(proj)
     work = Path(proj["root"])
@@ -36,26 +39,39 @@ def export_gba(net, slug: str, out: Path, log=print) -> dict:
     rows = net.project_store(proj['id']).all("SELECT * FROM functions WHERE project_id=? ORDER BY vram", proj["id"])
     syms = net.symbols(proj["id"])
     units = net._unit_contexts(proj["id"])
+    headers = net._contexts(proj["id"], {*units, ""})
     (out / "include").mkdir(exist_ok=True)
-    (out / "include" / "common.h").write_text(net._context(proj["id"])["header"], encoding="utf-8")
+    (out / "include" / "common.h").write_text(headers[""]["header"], encoding="utf-8")
 
     log("checking the matched functions and writing them as C")
     functions, fallback = [], []
-    for row in rows:
-        thumb = "arm_func_start" not in (row["asm"] or "")
-        f = {"name": row["name"], "addr": row["vram"], "size": len(row["target"]), "thumb": thumb}
-        functions.append(f)
-        if row["status"] != "matched" or not row["matched_source"]:
-            continue
-        why = _check_c(net, proj, row, thumb, units, f)
-        if why:
-            fallback.append((row["name"], why))
-            continue
-        src = out / "src" / f"{row['name']}.c"
-        src.parent.mkdir(exist_ok=True)
-        src.write_text(f'#include "common.h"\n\n{row["matched_source"].strip()}\n', encoding="utf-8")
-        f["c"] = src.relative_to(out).as_posix()
+    def has_match(row):
+        return row["status"] == "matched" and bool(row["matched_source"])
 
+    def check_match(row):
+        thumb = "arm_func_start" not in (row["asm"] or "")
+        header = headers[net._effective_unit(row, units)]["header"]
+        return _check_c(net, proj, row, thumb, header)
+
+    check = getattr(log, 'check_cancel', lambda: None)
+    with export_workers.ordered(check_match, filter(has_match, rows), check) as results:
+        for index, row in enumerate(rows):
+            check()
+            progress_step(log, 2, 'Checking exported functions', done=index, total=len(rows), function=row['name'])
+            thumb = "arm_func_start" not in (row["asm"] or "")
+            f = {"name": row["name"], "addr": row["vram"], "size": len(row["target"]), "thumb": thumb}
+            functions.append(f)
+            if not has_match(row):
+                continue
+            if why := next(results):
+                fallback.append((row["name"], why))
+                continue
+            src = out / "src" / f"{row['name']}.c"
+            src.parent.mkdir(exist_ok=True)
+            src.write_text(f'#include "common.h"\n\n{row["matched_source"].strip()}\n', encoding="utf-8")
+            f["c"] = src.relative_to(out).as_posix()
+
+    progress_step(log, 3, 'Writing data and layout')
     names = {f["name"] for f in functions}
     symbols = {s.name: s.address for s in syms.by_name.values() if s.name not in names and not AUTO_NAME.match(s.name)}
     # luvdis writes the project's names: every function by name, ARM or Thumb
@@ -75,8 +91,7 @@ def export_gba(net, slug: str, out: Path, log=print) -> dict:
     (out / ".gitignore").write_text("build/\nbaserom*\nasm/\n", encoding="utf-8")
 
     log("building the exported project to check it rebuilds the game byte for byte")
-    proc = subprocess.run(capped([sys.executable, "build.py"]), cwd=out, capture_output=True, text=True, timeout=3600,
-                          encoding="utf-8", errors="replace")
+    proc = verify_build([sys.executable, "build.py"], out, log)
     identical = proc.returncode == 0 and "identical" in proc.stdout
     if not identical:
         log((proc.stdout + proc.stderr)[-3000:])
@@ -84,14 +99,13 @@ def export_gba(net, slug: str, out: Path, log=print) -> dict:
             "fallback": fallback, "log": (proc.stdout + proc.stderr)[-3000:]}
 
 
-def _check_c(net, proj, row, thumb: bool, units, f: dict) -> str | None:
-    """Why a matched function can't be C in the tree (None: it can), recording where its own data goes."""
+def _check_c(net, proj, row, thumb: bool, header: str) -> str | None:
+    """Why a matched function can't be C in the tree (None: it can)."""
     if row["vram"] % 4:
         return "it starts halfway a word, where agbcc never puts a function"
-    hdr = net._context(proj["id"], net._effective_unit(row, units))["header"]
     if re.search(r"\bstatic\b[^;{]*\b" + re.escape(row["name"]) + r"\s*\(", row["matched_source"] or ""):
         return "a static function: kept as assembly so its callers link to its Thumb symbol"
-    compiled = net._compile(proj, hdr, row["matched_source"], row)
+    compiled = net._compile(proj, header, row["matched_source"], row)
     if not compiled.ok:
         return "doesn't compile any more"
     from io import BytesIO
@@ -123,9 +137,11 @@ def _docs(out: Path, title: str, matched: int, total: int, fallback) -> None:
     notes = "".join(f"\n- `{n}`: kept as assembly, {why}" for n, why in fallback)
     (out / "README.md").write_text(f"""# {title} (decompilation)
 
-A matching decompilation of {title} for the Game Boy Advance, started with [decompdecomp](https://github.com/RetroReversing/decompdecomp).
+A matching decompilation of {title} for the Game Boy Advance, started with {DECOMPDECOMP}.
 {matched} of {total} functions are C that agbcc compiles to exactly the original code; the rest is still assembly.
 `build.py` rebuilds the ROM from this tree and checks it against your original, byte for byte.
+
+{START_YOUR_OWN}
 
 ## Build
 

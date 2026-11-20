@@ -102,10 +102,22 @@ def test_export_rebuilds_the_game(tmp_path, platform):
         # The alias still has a fixed address in the original splat symbol file.
         with (Path(net._project(slug)["root"]) / "symbol_addrs.txt").open("a") as stream:
             stream.write("\nstartup_alias = 0x80000400; // type:func\n")
-    out = net.export_rom(slug, log=lambda *_: None)
+    events = []
+
+    def log(_):
+        pass
+
+    log.progress = events.append
+    out = net.export_rom(slug, log=log)
     assert out["identical"], out["log"]
+    assert [event["step"] for event in events] == sorted(event["step"] for event in events)
+    counts = [event for event in events if event["step"] == 4 and "total" in event]
+    assert counts and counts[-1]["total"] > counts[-1]["done"] > 0
     assert out["matched"] == len(matched(platform)) and not out["fallback"]
     tree = Path(out["path"])
+    readme = (tree / "README.md").read_text()
+    assert "https://github.com/RetroReversing/decompdecomp" in readme
+    assert "https://www.retroreversing.com/ai-assisted-n64-decompilation" in readme
     if platform == "n64":
         assert json.loads((tree / "build.json").read_text())["symbols"]["startup_alias"] == 0x80000400
     assert len(list((tree / "src").glob("*/*.c"))) == len(matched(platform))
@@ -445,6 +457,41 @@ def test_exported_ra_link_words_assemble_byte_exactly(tmp_path, platform):
     with (tmp_path / "raw.o").open("rb") as obj:
         assert ELFFile(obj).get_section_by_name(".text").data() == b"".join(
             word.to_bytes(4, order) for word in words)
+
+
+@pytest.mark.parametrize("platform", ["n64", "ps1", "ps2", "psp"])
+def test_export_keeps_same_register_jalr_bytes(tmp_path, platform):
+    from decompnet.consoles import get
+
+    console = get(platform)
+    order = "big" if console.big_endian else "little"
+    words = (9, (4 << 21) | (4 << 11) | 9, (4 << 21) | (31 << 11) | 9)
+    lines = [
+        f"/* {i*4:06X} {0x80001000+i*4:08X} {word.to_bytes(4, order).hex()} */ jalr {args}"
+        for i, (word, args) in enumerate(zip(words, ("$zero, $zero", "$a0, $a0", "$ra, $a0")))
+    ]
+    output = console.export_asm("\n".join(lines) + "\n")
+    assert [line.split("*/ ")[1] for line in output.splitlines()] == [
+        ".word 0x00000009", ".word 0x00802009", "jalr $ra, $a0"
+    ]
+    if toolchains.installed("binutils-mips") is None:
+        return
+    source = tmp_path / "raw.s"
+    source.write_text(".text\n.set noreorder\n" + output)
+    assembler = toolchains.binary("binutils-mips").parent / "mips-ps2-decompals-as"
+    subprocess.run([str(assembler), "-EB" if console.big_endian else "-EL", "-mips2",
+                    "-no-pad-sections", "-o", "raw.o", source.name], cwd=tmp_path, check=True, capture_output=True)
+    with (tmp_path / "raw.o").open("rb") as obj:
+        assert ELFFile(obj).get_section_by_name(".text").data() == b"".join(word.to_bytes(4, order) for word in words)
+
+
+@pytest.mark.parametrize("mnemonic,word", [("movz", 0x0000000A), ("movn", 0x0200000B)])
+def test_n64_export_preserves_words_that_decode_as_conditional_moves(mnemonic, word):
+    from decompnet.consoles import get
+
+    prefix = f"/* 000000 80001000 {word:08X} */ "
+    assert get("n64").export_asm(f"{prefix}{mnemonic} $zero, $zero, $s0\n") == f"{prefix}.word 0x{word:08X}\n"
+
 
 
 def test_assembly_naming_an_address_outside_the_game_links():
