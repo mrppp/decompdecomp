@@ -3,6 +3,7 @@
 import struct
 
 from decompnet import dosfind, le
+
 from .test_le import _bound
 
 
