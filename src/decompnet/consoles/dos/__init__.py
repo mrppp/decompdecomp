@@ -215,8 +215,14 @@ class Dos(Console):
 
     def generated_functions(self, fp, version: str) -> dict[str, str]:
         """The parts cut off a function that agents said aren't code (project.cut's set_aside): set aside."""
-        return {fn["symbol"]: fn["set_aside"] for fns in _functions_json(fp, version).get("units", {}).values()
-                for fn in fns if fn.get("set_aside")}
+        out = {}
+        for fns in _functions_json(fp, version).get("units", {}).values():
+            for fn in fns:
+                if fn.get("set_aside"):
+                    out[fn["symbol"]] = fn["set_aside"]
+                elif fn.get("library"):  # (scratch.apply_library: its code is the linked library's, byte for byte)
+                    out[fn["symbol"]] = f"Watcom's C library ({fn['library']}): linked, not the game's own code"
+        return out
 
     def structs(self, fp):
         """guess_struct's layouts: every function's code read in its own convention (project.structs)."""

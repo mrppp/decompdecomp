@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ... import dosdelink, dosfind, le
+from ... import dosdelink, dosfind, le, watcomlib
 from ...forks.project import ForkError
 
 TEMPLATE = Path(__file__).parent / "project_template"
@@ -72,6 +72,50 @@ def write_tools(root: Path) -> list[str]:
         shutil.copyfile(OMF, dest)
         changed.append("tools/omf2elf.py")
     return changed
+
+
+def library_folders(compiler: str = "") -> list[Path]:
+    """The user's Watcom copies whose libraries to look for in a game: the one the project builds with first."""
+    from ... import kits
+    copies = sorted(kits.compilers(("watcom",)), key=lambda c: c.version != compiler)
+    return list(dict.fromkeys(Path(c.exe).parent.parent for c in copies))
+
+
+def apply_library(info: dict, code: bytes, folders: list[Path], log=print) -> int:
+    """Mark the game's functions that are Watcom's library code (watcomlib.identify, with the libraries of the
+    copy among `folders` the game matches most: the Watcom that linked it): each gets "library" (set aside:
+    generated_functions) and its real name, and the library's data its names, where no other symbol has them yet.
+    Returns how many functions."""
+    fns = [fn for fns in info["units"].values() for fn in fns]
+    found, data, folder = {}, {}, None
+    for candidate in folders:
+        libs = watcomlib.load(candidate)
+        if libs:
+            f, d = watcomlib.identify(fns, code, info["code_base"], libs)
+            if len(f) > len(found):
+                found, data, folder = f, d, candidate
+    names = dict(info.get("names") or {})
+    taken = set(names.values())
+    for fn in fns:
+        lf = found.get(fn["symbol"])
+        if lf is None:
+            fn.pop("library", None)
+            continue
+        fn["library"] = f"{lf.library}: {lf.name}"
+        real = watcomlib.c_name(lf.name)
+        if fn["name"] not in names and real not in taken:
+            names[fn["name"]] = real
+            taken.add(real)
+    for sym, ext in data.items():
+        key, real = sym.lstrip("_"), watcomlib.c_name(ext)
+        if key not in names and real not in taken:
+            names[key] = real
+            taken.add(real)
+    info["names"] = dict(sorted(names.items()))
+    if found and folder is not None:
+        log(f"{len(found)} functions are Watcom's C library (your copy at {folder}), set aside and named; "
+            f"{len(data)} of the library's data named")
+    return len(found)
 
 
 def require_compiler() -> None:
@@ -137,12 +181,15 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     write_tools(root)
     conf = root / "config" / version
     conf.mkdir(parents=True)
-    (conf / "functions.json").write_text(json.dumps({
+    config = {
         "format": 1, "image": f"orig/{version}.code.bin", "sha1": hashlib.sha1(main.data).hexdigest(),
         "code_base": main.base, "entry": mod.entry,
         "units": {u: [{"name": f.name, "symbol": f.symbol, "convention": f.convention, **({"pops": f.pops} if f.pops else {}),
-                       "addr": f.addr, "size": f.size, "relocs": f.relocs} for f in group] for u, group in groups.items()},
-    }, indent=1), encoding="utf-8")
+                       "addr": f.addr, "size": f.size, "relocs": [list(r) for r in f.relocs]} for f in group]
+                  for u, group in groups.items()},
+    }
+    apply_library(config, main.data, library_folders(compiler or ""), log)
+    (conf / "functions.json").write_text(json.dumps(config, indent=1), encoding="utf-8")
     for u, group in groups.items():
         src = root / "src" / "auto" / f"{u}.c"
         src.parent.mkdir(parents=True, exist_ok=True)
@@ -246,20 +293,29 @@ def reanalyse(root: Path, version: str, matched: set[str], log=print) -> str | N
                 entry = before
         units[last].append(entry)
     units = {u: group for u, group in units.items() if group}
+    library_before = {fn["symbol"]: fn.get("library") for _, fn in old.values()}
+    names_before = dict(info.get("names") or {})
+    new_info = {**info, "units": units}
+    manifest = json.loads((root / ".decomp.wtf.json").read_text(encoding="utf-8"))
+    apply_library(new_info, main.data, library_folders(manifest.get("compiler", "")), log)
+    library_after = {fn["symbol"]: fn.get("library") for group in units.values() for fn in group}
     before = {(fn["addr"], fn["size"], fn["symbol"], json.dumps(fn["relocs"])) for _, fn in old.values()}
     after = {(fn["addr"], fn["size"], fn["symbol"], json.dumps(fn["relocs"])) for group in units.values() for fn in group}
-    if before == after:
+    if before == after and library_before == library_after and names_before == new_info.get("names", {}):
         return None
+    info = new_info
     new_addrs = {fn["addr"] for group in units.values() for fn in group}
     added = len(new_addrs - set(old))
     gone = len(set(old) - new_addrs)
     changed = len(after - before) - added
-    path.write_text(json.dumps({**info, "units": units}, indent=1), encoding="utf-8")
+    path.write_text(json.dumps(info, indent=1), encoding="utf-8")
     for u in units:  # a file only the new analysis has (none yet: new functions join their neighbour's)
         src = root / "src" / "auto" / f"{u}.c"
         if not src.exists():
             src.write_text('#include "common.h"\n', encoding="utf-8")
+    library = sum(1 for v in library_after.values() if v)
     sentence = (f"{len(new_addrs):,} functions found again: {added} new, {gone} gone, {max(changed, 0)} with other "
-                f"extents or references; {len(kept)} matched kept as they were")
+                f"extents or references; {len(kept)} matched kept as they were"
+                + (f"; {library} are Watcom's C library, set aside" if library else ""))
     log(sentence)
     return sentence

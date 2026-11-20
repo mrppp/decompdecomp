@@ -78,14 +78,19 @@ def parse(data: bytes) -> Module:
     groups = [""]
     last: tuple[int, int] | None = None  # (segment, offset) of the last LEDATA, which FIXUPP refers to
     threads: dict[tuple[str, int], tuple[int, int]] = {}  # (target/frame, number) -> (method, index)
+    # Easy OMF-386 (Phar Lap's, which Watcom wrote up to 10.x): the 16-bit record types with 32-bit offsets in
+    # them, announced by a COMENT of class 0xAA ("80386") after THEADR
+    easy = False
     at = 0
     while at < len(data):
         kind, length = data[at], struct.unpack_from("<H", data, at + 1)[0]
         body = _Reader(data[at + 3:at + 3 + length - 1])  # (the last byte is the checksum)
-        big = bool(kind & 1)
+        big = bool(kind & 1) or easy
         base = kind & 0xFE
         at += 3 + length
-        if base == 0x96:  # LNAMES
+        if kind == 0x88 and len(body.data) >= 2 and body.data[1] == 0xAA:  # COMENT, class 0xAA: Easy OMF-386
+            easy = True
+        elif base == 0x96:  # LNAMES
             while body.at < len(body.data):
                 lnames.append(body.name())
         elif base == 0x98:  # SEGDEF
@@ -165,7 +170,7 @@ def parse(data: bytes) -> Module:
                 else:
                     tmethod, tidx = fixdat & 3, body.index()
                 disp = 0 if fixdat & 0x04 else body.offset(big)
-                if loc not in (9, 13):  # 32-bit offset (9, or 13 for a loader-resolved one)
+                if loc not in (9, 13) and not (easy and loc == 5):  # 32-bit offset (9, 13 loader-resolved; 5 in Easy OMF)
                     raise OMFError(f"fixup location {loc} isn't a 32-bit offset")
                 seg, base_off = last
                 off = base_off + where
