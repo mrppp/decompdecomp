@@ -170,7 +170,7 @@ def migrate(fp, protected: set[str], before: dict, log=print) -> str | None:
             continue
         before.setdefault(src, text)
 
-        def keeps() -> bool:  # it builds, and every function that matched still does
+        def keeps(unit=unit, spans=spans) -> bool:  # it builds, and every function that matched still does
             return build(unit) and all(getattr(judged(unit, s), "matched", False) for s in spans if s in protected)
 
         src.write_text(rename(text, plans), encoding="utf-8")
