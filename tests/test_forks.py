@@ -1764,6 +1764,8 @@ def test_measuring_keeps_a_match_the_judge_confirms_though_objdiffs_rows_differ(
     assert {r["name"] for r in net.store.all("SELECT name FROM functions WHERE status='matched'")} == {"operand", "before", "really"}
     with net.store.tx() as db:  # one demoted by an earlier measure: its matched C kept
         db.execute("UPDATE functions SET status='open', matched_source='int before;' WHERE name='before'")
+        # one never matched whose C is written (a draft): the judge counts it too
+        db.execute("UPDATE functions SET status='open', best_source='int drafted;' WHERE name='never'")
     # objdiff's raw rows now say 99.x for three of them; the judge confirms "operand" and "before", not "really"
     for f in report["units"][0]["functions"][:3]:
         f["fuzzy_match_percent"] = 99.6
@@ -1771,12 +1773,12 @@ def test_measuring_keeps_a_match_the_judge_confirms_though_objdiffs_rows_differ(
 
     def diff(self, unit, symbol):
         judged.append(symbol)
-        return SimpleNamespace(matched=symbol in ("operand", "before"))
+        return SimpleNamespace(matched=symbol in ("operand", "before", "never"))
     monkeypatch.setattr(ForkProject, "diff", diff)
     net.forks.sync("p", log=lambda *_: None)
     status = {r["name"]: r["status"] for r in net.store.all("SELECT name, status FROM functions")}
-    assert status == {"operand": "matched", "before": "matched", "really": "open", "never": "open"}
-    assert sorted(judged) == ["before", "operand", "really"], "only matched (or once matched) functions are judged again"
+    assert status == {"operand": "matched", "before": "matched", "really": "open", "never": "matched"}
+    assert sorted(judged) == ["before", "never", "operand", "really"], "only functions with C written are judged"
 
 
 def test_a_unit_diff_keeps_a_match_the_judge_confirms_though_objdiffs_rows_differ(tmp_path, monkeypatch):
