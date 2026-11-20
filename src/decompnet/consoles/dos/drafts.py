@@ -126,7 +126,7 @@ def compilable(draft: str, symbol: str, stack: dict[str, str], known: str = "") 
         return None
     params = [p.strip() for p in head.group("params").split(",") if p.strip() not in ("", "void")]
     conv = head.group("conv") or ""
-    is_stack = symbol.startswith("_")
+    is_stack = symbol.startswith("_") or stack.get(f"func_{head.group('addr').upper()}") == ""  # (plain: -5s)
     if not is_stack and len(params) > 2 and conv.startswith("__regparm"):
         return None  # its third argument: GCC's ecx, Watcom's ebx
     if not is_stack:

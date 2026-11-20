@@ -34,3 +34,16 @@ def test_calls_data_and_conventions_become_what_watcom_objects_say():
 def test_source_files_are_runs_of_neighbouring_functions():
     fns = [dosdelink.Function(a, 0x100, f"func_{a:08X}") for a in (0x10000, 0x10100, 0x10200, 0x12000)]
     assert list(dosdelink.units(fns)) == ["text_00010000", "text_00012000"], "a big hole starts another file"
+
+
+def test_a_stack_convention_games_functions_are_named_as_watcom_names_them():
+    """-3s to -6s: Watcom's own stack convention names a function plainly (f), __cdecl _f, __stdcall _f@8."""
+    code = bytearray(0x20)
+    code[0x00:0x05] = b"\x8b\x44\x24\x04\xc3"  # mov eax, [esp+4]; ret: its own convention
+    code[0x10:0x16] = b"\x8b\x44\x24\x04\xc2\x04"  # ...; ret 4: __stdcall
+    code[0x16] = 0
+    mod = le.parse(_bound(bytes(code), []))
+    mod.relocated()
+    fns = {f.addr: f for f in dosdelink.functions(mod, [(0x10000, 5), (0x10010, 7)], default="stack")}
+    assert fns[0x10000].symbol == "func_00010000" and fns[0x10000].convention == "plain"
+    assert fns[0x10010].symbol == "_func_00010010@4"

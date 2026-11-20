@@ -252,10 +252,9 @@ class Dos(Console):
     def compilable_draft(self, fp, symbol: str, draft: str, known: str = "") -> tuple[str, str] | None:
         from .drafts import compilable
         info = _functions_json(fp, self._version(fp))
-        # a stack-convention game (-5s) needs no keyword for its own convention: __cdecl is another one
-        plain = "" if (fp.manifest or {}).get("dos_convention") == "stack" else "__cdecl"
-        stack = {fn["name"]: "__stdcall" if fn.get("pops") else plain for fns in info.get("units", {}).values()
-                 for fn in fns if fn.get("convention") == "stack"}
+        # __cdecl and __stdcall functions say so; a stack-convention game's own ("plain", -5s) need no keyword
+        stack = {fn["name"]: "__stdcall" if fn.get("pops") else ("" if fn.get("convention") == "plain" else "__cdecl")
+                 for fns in info.get("units", {}).values() for fn in fns if fn.get("convention") in ("stack", "plain")}
         return compilable(draft, symbol, stack, known)
 
     reimports = True  # the analysis again, from the project's own copy, matches kept (scratch.reanalyse)

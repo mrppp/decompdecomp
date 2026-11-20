@@ -229,7 +229,7 @@ def structs(root: Path, version: str):
     base = info["code_base"]
     real = info.get("names") or {}
     fns = [fn for _, fn in _functions(info)]
-    stack = {fn["addr"] for fn in fns if fn.get("convention") == "stack"}
+    stack = {fn["addr"] for fn in fns if fn.get("convention", "register") != "register"}  # (stack, plain: on the stack)
 
     def read(addr: int, body: bytes, relocs: list, datum) -> structs_mod.Facts:
         abi = None if addr in stack else x86_fields.WATCOM

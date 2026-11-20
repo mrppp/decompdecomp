@@ -38,7 +38,7 @@ class Function:
     addr: int
     size: int
     name: str  # C name: func_XXXXXXXX
-    convention: str = "register"  # Watcom's default; "stack": __cdecl, or __stdcall where `pops`
+    convention: str = "register"  # Watcom's default; "stack": __cdecl, or __stdcall where `pops`; "plain": -5s's own
     relocs: list[tuple[int, int, str | None, int]] = field(default_factory=list)  # (offset, R_386_*, symbol, addend)
     pops: int = 0  # the bytes of arguments a stack-convention function takes off as it returns (__stdcall: ret 8)
 
@@ -48,7 +48,11 @@ class Function:
 
 
 def watcom_symbol(name: str, convention: str, pops: int = 0) -> str:
-    """How Watcom spells a function's C name: name_ (register convention), _name (__cdecl), _name@8 (__stdcall)."""
+    """How Watcom spells a function's C name: name_ (register convention), _name (__cdecl), _name@8 (__stdcall),
+    and name as it is in a game built with the stack convention (-3s to -6s: "plain", Watcom's own stack-based
+    convention, the caller taking the arguments off)."""
+    if convention == "plain":
+        return name
     if convention != "stack":
         return f"{name}_"
     return f"_{name}@{pops}" if pops else f"_{name}"
@@ -91,10 +95,13 @@ def functions(mod: Module, found: list[tuple[int, int]], default: str = "registe
     """Functions with their names, conventions and relocations (`mod` relocated, `found` from dosfind). `default`:
     the convention the game was built with (its library code says: watcomlib.best). A stack-convention game's
     functions are all stack ones (most read their arguments from esp, with no frame to tell them by)."""
-    def conv_of(a: int, n: int) -> str:
-        return "stack" if default == "stack" else convention(mod, a, n)
-    out = [Function(a, n, f"func_{a:08X}", conv := conv_of(a, n), pops=pops(mod, a, n) if conv == "stack" else 0)
-           for a, n in sorted(found)]
+    def made(a: int, n: int) -> Function:
+        if default == "stack":  # its own convention's are plain; one that takes its arguments off is __stdcall
+            p = pops(mod, a, n)
+            return Function(a, n, f"func_{a:08X}", "stack" if p else "plain", pops=p)
+        conv = convention(mod, a, n)
+        return Function(a, n, f"func_{a:08X}", conv, pops=pops(mod, a, n) if conv == "stack" else 0)
+    out = [made(a, n) for a, n in sorted(found)]
     starts = [f.addr for f in out]
     by_addr = {f.addr: f for f in out}
     code = [o for o in mod.objects if o.executable]
