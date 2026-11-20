@@ -2134,8 +2134,9 @@ its column are features not yet run on it. Next, in order:
 - old Watcom's register saving: the shareware game's `void` functions keep eax (push edx; xor edx, edx; ... pop
   edx), as Watcom 9.5 to 10.6 did, where OpenWatcom 2 uses eax freely, and no flag or pragma of OpenWatcom's gives
   it back: those need the old compilers. A Watcom of your own (Setup, kits/watcom.py) builds them, through wine
-  (wibo lacks GetOEMCP); no 1990s copy has been tried, so its version reading (a version resource, else the banner
-  in its files) and its command line are unconfirmed for them;
+  (wibo lacks GetOEMCP). Watcom 10.0a (its CD's WATCOM folder, as it is) runs so and gives that register saving
+  byte for byte. A second difference it doesn't fix: the game loads a call's arguments in another order (eax first,
+  then edx) than 10.0a and OpenWatcom 2 both do, whatever the flags: Watcom 9.5, or something of the game's C;
 - a compiler map for DOS (which files are which Watcom flags: a frame kept or not, for size or speed), and twins
   across two games of one Watcom;
 - Watcom's own debug information, where a game shipped with it (names, types);

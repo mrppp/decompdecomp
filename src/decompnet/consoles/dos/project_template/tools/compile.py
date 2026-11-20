@@ -27,6 +27,16 @@ def windows(path: Path) -> str:
     return "Z:" + str(Path(path).resolve()).replace("/", "\\")
 
 
+# what wine says about the computer, not the compile (its graphics and desktop bus): left out of the compiler's messages
+WINE_NOISE = ("radv is not a conformant", "dbus", "D-Bus", "This is normally a bug in some application", "fixme:",
+              "err:", "wine: created the configuration directory")
+
+
+def quiet(text: str) -> str:
+    return "".join(line for line in text.splitlines(keepends=True)
+                   if line.strip() and not any(n in line for n in WINE_NOISE))
+
+
 def names_for_build(info: dict) -> dict:
     """{the symbol Watcom gives a real name: the address symbol the targets have} (decompnet's
     consoles/dos/project.py names_for_build, kept here so the project needs nothing of decompdecomp's)."""
@@ -81,7 +91,7 @@ def main() -> int:
             cmd = [args.compiler, *args.flags, f"-i={args.include}", args.source, f"-fo={obj}"]
         run = subprocess.run(cmd, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
         sys.stdout.write(run.stdout)
-        sys.stderr.write(run.stderr)
+        sys.stderr.write(run.stderr if args.runner != "wine" else quiet(run.stderr))
         if run.returncode != 0 or not obj.is_file():
             return run.returncode or 1
         try:

@@ -218,6 +218,13 @@ def test_a_watcom_of_your_own_is_found_with_its_version(tmp_path):
     assert WATCOM.build(copy) == "10.6"
     [compiler] = WATCOM.compilers(copy)
     assert compiler.version == "watcom-10.6" and compiler.runner == "wine" and compiler.includes == (copy / "h",)
+    # Watcom 10's CD: binnt/wcc386.exe a small launcher, the compiler (and its banner) in binb
+    (copy / "binnt" / "wcc386.exe").write_bytes(b"MZ" + bytes(200))
+    (copy / "binb").mkdir()
+    (copy / "binb" / "wcc386.exe").write_bytes(b"MZ" + bytes(100) + b"WATCOM C32 Optimizing Compiler  Version 10.0a\0")
+    assert WATCOM.build(copy) == "10.0a"
+    (copy / "binb" / "wcc386.exe").unlink()  # its version unread: offered all the same
+    assert WATCOM.compilers(copy)[0].version == "watcom-unknown"
 
 
 def test_watcoms_register_arguments_are_read_as_arguments():

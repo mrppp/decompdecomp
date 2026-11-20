@@ -4,10 +4,11 @@ descendant whose code differs in places: an old Watcom keeps eax in a `void` fun
 pop edx), where OpenWatcom 2 uses eax freely, and no flag or pragma of OpenWatcom 2's gives that back. A game's
 functions that differ that way match only with its own compiler.
 
-A copy is a Watcom folder as its installer laid it out: binnt/wcc386.exe (the Windows-hosted compiler; its core may be
-in binnt/wccd386.dll) and h/ (its headers). Its version is the one the compiler prints, read from those files
+A copy is a Watcom folder as its installer laid it out, or as its CD holds it (Watcom 10.0's has WATCOM/ uncompressed:
+that folder will do): binnt/wcc386.exe (the Windows-hosted compiler; Open Watcom's core is in binnt/wccd386.dll,
+Watcom 10's is binb/wcc386.exe, which the launcher in binnt loads) and h/ (its headers). Its version is the one the compiler prints, read from those files
 ("Watcom C32 Optimizing Compiler Version 10.6"). On Linux and macOS it runs through wine: wibo can't run it (it calls
-GetOEMCP, which wibo hasn't). Tried with OpenWatcom 2's own binnt build under wine; no 1990s copy has been tried.
+GetOEMCP, which wibo hasn't). Tried under wine with Watcom 10.0a (its CD) and OpenWatcom 2's own binnt build.
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ from pathlib import Path
 from . import Kit, OwnCompiler, file_version, find
 
 BANNER = re.compile(rb"(Open )?Watcom C(?:32| x86 32-bit) Optimizing Compiler\s*(?:Version\s+)?(\d+\.\d+[A-Za-z]?)", re.I)
-HOLDS_BANNER = ("binnt/wccd386.dll", "binnt/wcc386.exe")
+# where a copy's compiler keeps its banner: Open Watcom's in binnt, Watcom 10's in binb (the compiler itself, in
+# Watcom's own LX format: binnt/wcc386.exe is a small Windows launcher that loads it)
+HOLDS_BANNER = ("binnt/wccd386.dll", "binnt/wcc386.exe", "binb/wcc386.exe", "binw/wcc386.exe")
 
 
 class Watcom(Kit):
@@ -55,8 +58,9 @@ class Watcom(Kit):
 
     def compilers(self, folder: Path) -> list[OwnCompiler]:
         build, exe, h = self.build(folder), find(folder, "binnt/wcc386.exe"), find(folder, "h", dirs=True)
-        if build is None or exe is None:
+        if exe is None:
             return []
+        build = build or "unknown"  # (offered all the same: its version only names it)
         number = build.split()[-1]
         version, name = (f"ow-{number}", f"your {build}") if build.startswith("Open") else \
             (f"watcom-{number}", f"your Watcom C32 {build}")
