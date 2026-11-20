@@ -2121,3 +2121,21 @@ url = "https://releases.llvm.org/5.0.2/clang+llvm-5.0.2-x86_64-linux-gnu-ubuntu-
 sha256 = "15a97aa654b529793da7d115bcfdd8b93281d94f86ec98f0850aff7cf82cbb3f"
 subdir = "clang+llvm-5.0.2-x86_64-linux-gnu-ubuntu-16.04"
 platforms = ["linux-x86_64"]
+
+["openwatcom-2.0"]
+name = "OpenWatcom C 2.0 (32-bit DOS)"
+platform = "DOS"
+arch = "x86"
+license = "Sybase Open Watcom Public License 1.0"
+source = "open-watcom/open-watcom-v2 2026-11-01-Build"
+description = "Watcom's C compiler as its community keeps it: the compiler (and linker) a 32-bit DOS/4GW game of the mid-1990s was built with, or its descendant. Its objects are OMF, which decompnet.omf turns into the ELF objdiff reads."
+cc = ["{tc}/binl64/wcc386"]
+flags = ["-zq", "-bt=dos", "-mf", "-5r", "-ox"]
+[["openwatcom-2.0".parts]]
+# the Linux installer is a zip archive behind a small program: unpacked as one, only what a build needs
+url = "https://github.com/open-watcom/open-watcom-v2/releases/download/2026-11-01-Build/open-watcom-2_0-c-linux-x64"
+file = "open-watcom-2_0-c-linux-x64-2026-11-01.zip"
+sha256 = "9d9d823c2ee040a38484ad74ad4a594e904672184e4e8fff84b3bac7090c9f6c"
+keep = { "binl64" = "binl64", "h" = "h", "lib386" = "lib386" }
+executable = true
+platforms = ["linux-x86_64"]
