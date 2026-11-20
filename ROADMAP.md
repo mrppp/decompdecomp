@@ -2135,8 +2135,12 @@ its column are features not yet run on it. Next, in order:
   edx), as Watcom 9.5 to 10.6 did, where OpenWatcom 2 uses eax freely, and no flag or pragma of OpenWatcom's gives
   it back: those need the old compilers. A Watcom of your own (Setup, kits/watcom.py) builds them, through wine
   (wibo lacks GetOEMCP). Watcom 10.0a (its CD's WATCOM folder, as it is) runs so and gives that register saving
-  byte for byte. A second difference it doesn't fix: the game loads a call's arguments in another order (eax first,
-  then edx) than 10.0a and OpenWatcom 2 both do, whatever the flags: Watcom 9.5, or something of the game's C;
+  byte for byte, but loads a call's arguments edx first, as OpenWatcom 2 does. Watcom C/C++ 9.5b gives both as the
+  shareware game has them (eax first, then edx): the game was built with 9.5, and two of its functions OpenWatcom 2
+  couldn't make compile to its instructions with it. 9.5b came on floppies whose archives are an older WPACK than
+  Open Watcom's source reads; its own installer ran unattended in DOSBox-X (all disks in one folder as A:, its
+  INSTALL.SCR's questions answered by `set`), with the Windows NT host chosen, whose binnt compiler runs under wine.
+  A Setup action that does that from the user's floppy images would save them the steps;
 - a compiler map for DOS (which files are which Watcom flags: a frame kept or not, for size or speed), and twins
   across two games of one Watcom;
 - Watcom's own debug information, where a game shipped with it (names, types);

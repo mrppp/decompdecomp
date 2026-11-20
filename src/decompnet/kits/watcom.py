@@ -8,7 +8,9 @@ A copy is a Watcom folder as its installer laid it out, or as its CD holds it (W
 that folder will do): binnt/wcc386.exe (the Windows-hosted compiler; Open Watcom's core is in binnt/wccd386.dll,
 Watcom 10's is binb/wcc386.exe, which the launcher in binnt loads) and h/ (its headers). Its version is the one the compiler prints, read from those files
 ("Watcom C32 Optimizing Compiler Version 10.6"). On Linux and macOS it runs through wine: wibo can't run it (it calls
-GetOEMCP, which wibo hasn't). Tried under wine with Watcom 10.0a (its CD) and OpenWatcom 2's own binnt build.
+GetOEMCP, which wibo hasn't). Tried under wine with Watcom C/C++ 9.5b (installed with its own installer, NT host
+chosen), 10.0a (its CD) and OpenWatcom 2's own binnt build. A shareware game of 1993 was built with 9.5: its calls'
+arguments and its void functions' registers come out as 9.5b's, not 10.0a's or OpenWatcom 2's.
 """
 
 from __future__ import annotations
