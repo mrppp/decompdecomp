@@ -4,6 +4,7 @@ const source=fs.readFileSync(path.join(__dirname,'../src/decompnet/app/static/js
 const c={console,esc:s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;'),
  toasts:[],polls:0};
 c.toast=(m,kind)=>c.toasts.push([m,kind]);c.poll=()=>{c.polls++;};
+c.$=()=>({});  // the slice wires the Restart all button at its top level (#restartAll): not under test here
 vm.createContext(c);
 const a=source.indexOf('function limitAlternativeButton(');
 vm.runInContext(source.slice(a,source.indexOf('function renderSessions(',a)),c);
