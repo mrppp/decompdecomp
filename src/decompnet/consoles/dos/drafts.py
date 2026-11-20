@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 
 GHIDRA_HEADER = "ghidra.h"
-GHIDRA_H = """/* ghidra.h 2. Ghidra's names for the types and operations it can't tell yet, so its machine drafts compile as they are:
+GHIDRA_H = """/* ghidra.h 3. Ghidra's names for the types and operations it can't tell yet, so its machine drafts compile as they are:
  * autopilot tries them (`#include "ghidra.h"`). The game's own types are better: agents write those in common.h. */
 #ifndef GHIDRA_H
 #define GHIDRA_H
@@ -45,6 +45,12 @@ typedef unsigned long ulong;
 typedef unsigned int dword;
 typedef long double float10;
 typedef int code();
+
+/* Ghidra writes C99's booleans: C89 has none (while( true ), return false) */
+#ifndef true
+#define true 1
+#define false 0
+#endif
 
 #define CONCAT11(a, b) ((unsigned short)(((unsigned short)(unsigned char)(a) << 8) | (unsigned char)(b)))
 #define CONCAT22(a, b) ((unsigned int)(((unsigned int)(unsigned short)(a) << 16) | (unsigned short)(b)))
@@ -100,6 +106,12 @@ def _register_arguments(body: str, params: list[str]) -> tuple[str, list[str]]:
     return body, params
 
 
+def _definition(known: str, name: str) -> str | None:
+    """The prototype a definition of `name` in `known` gives it ("void func_0001A2B0(int a)"), or None."""
+    m = re.search(rf"^([A-Za-z_][\w \t\*]*?\b{name}\s*\([^;{{}}()]*\))\s*\{{", known, re.M)
+    return " ".join(m.group(1).split()) if m else None
+
+
 def compilable(draft: str, symbol: str, stack: dict[str, str], known: str = "") -> tuple[str, str] | None:
     """Ghidra's draft (as it gave it) as C that compiles in the function's source file, (prelude, definition), or None.
     `symbol`: its Watcom symbol (_func_X@8: __stdcall); `stack`: the C name of each of the game's stack-convention
@@ -134,7 +146,11 @@ def compilable(draft: str, symbol: str, stack: dict[str, str], known: str = "") 
     callees = sorted({m.group(1) for m in _FUNC.finditer(body)} - {name})
     lines = []
     for callee in callees:
-        if not re.search(rf"\b{callee}\s*\(", known):
+        defined = _definition(known, callee)
+        if defined is not None:  # (its definition's own prototype: an `int f();` would clash with it)
+            if not re.search(rf"^[^\n;{{}}]*\b{callee}\s*\([^;{{}}]*\)\s*;", known, re.M):
+                lines.append(defined + ";")
+        elif not re.search(rf"\b{callee}\s*\(", known):
             lines.append(f"int {stack[callee] + ' ' if callee in stack else ''}{callee}();")
     for g, kind in sorted(globals_.items()):
         if not re.search(rf"\b{g}\b", known):

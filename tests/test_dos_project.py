@@ -259,3 +259,14 @@ def test_a_source_file_keeps_a_compiler_of_its_own():
     assert DOS.file_compiler(fp, "src/auto/a.c") == "watcom-10.6"
     DOS.set_file_compiler(fp, "src/auto/a.c", "openwatcom-2.0")  # back to the project's: no entry of its own
     assert fp.manifest["dos_compilers_map"] == {}
+
+
+def test_a_drafts_callees_are_declared_as_their_file_defines_them():
+    # a draft calling a function its file defines `void f(void)`: an `int f();` before it would clash (E1062)
+    known = "void func_0002C780(void)\n{\n}\n"
+    prelude, definition = drafts.compilable(
+        "void func_0002C700_(void)\n{\n  while( true ) { func_0002C780_(); func_00099999_(); }\n}", "func_0002C700_",
+        {}, known)
+    assert "void func_0002C780(void);" in prelude and "int func_0002C780();" not in prelude
+    assert "int func_00099999();" in prelude  # (no C of it anywhere yet)
+    assert "#define true 1" in drafts.GHIDRA_H  # (C89 has no booleans; Ghidra writes them)
