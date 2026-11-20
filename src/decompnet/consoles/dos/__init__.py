@@ -9,7 +9,9 @@ objdiff's x86 is 32/64-bit only.
 Files:
   __init__.py       the console: its facts, sniffing an executable, and the parts the app asks for
   scratch.py        a project from the user's copy: config/VERSION/functions.json, orig/, src/ and the build
-  project_template/ what every project gets: tools/configure.py, compile.py, delink.py (omf2elf.py is
+  project.py        the edits the app makes to a project's config: real names, splits, joins, cuts, ranges
+  drafts.py         Ghidra's drafts in the project's C (briefs), and made compilable (autopilot)
+  project_template/ what every project gets: tools/configure.py, compile.py, delink.py, rebuild.py (omf2elf.py is
                     decompnet/omf.py, copied in)
 
 Its demo game is projects/demo-dos (a homemade program built with OpenWatcom into an LE executable).
@@ -20,7 +22,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .. import BETA, PROJECT, Compiler, Console
+from .. import BETA, PROJECT, REBUILD_CHECK, Compiler, Console
 
 
 def _functions_json(fp, version: str) -> dict:
@@ -42,13 +44,14 @@ class Dos(Console):
     layout = "LE + objdiff"
     compilers = (Compiler("openwatcom-2.0", "OpenWatcom C 2.0", "32-bit DOS/4GW games of the mid-1990s",
                           guess="Watcom"),)
-    compiler_config = (".decomp.wtf.json",)
+    compiler_config = (".decomp.wtf.json", "config/**/*")
     guides = ("x86",)
     compiler_guide = ""
     m2c = ""  # m2c has no x86 target
     ram = (0x10000, 0x1000000)  # a DOS/4GW game's objects are linked low (code at 0x10000 is common)
     demo = "demo-dos"
     demo_tools = ("openwatcom-2.0", "objdiff-cli")
+    own_features = frozenset({REBUILD_CHECK})
 
     def sniff(self, head: bytes, file) -> bool:
         """An MZ program with an LE module behind it (bound to DOS/4GW): the MZ header, then an LE header whose
@@ -89,6 +92,119 @@ class Dos(Console):
                 if c != fn["symbol"]:
                     out[fn["symbol"]] = c
         return out
+
+    # The game's names are its addresses: a real name is kept by address in functions.json's "names", and the report
+    # keeps the address symbol (tools/compile.py renames a compiled object's real-named symbols back to it)
+    renames_in_report = False
+    splits_sources = True  # a source file is a unit of functions.json
+    DEFAULT_FLAGS = ("-zq", "-bt=dos", "-mf", "-5r", "-ox")
+    # What search_flags tries: the processor Watcom tuned for (a game's code changes with it: one function matched
+    # with -5r or -4r, came out 77% with -3r) and how hard it optimised (-os: 48%). The calling convention (-5s) is
+    # left alone: it renames every symbol the targets were cut with.
+    CPUS = ("-5r", "-4r", "-3r", "-6r")
+    OPTIMISATIONS = ("-ox", "-oneatx", "-otexan", "-os", "-ot")
+
+    def _version(self, fp) -> str:
+        return (fp.manifest or {}).get("version") or ""
+
+    def rename_symbol(self, fp, version: str, old: str, new: str) -> dict:
+        from . import project
+        return project.rename(Path(fp.root), version, old, new)
+
+    def rename_pattern(self, old: str) -> str:
+        """func_0001A2B0 however the source spells it (the report's func_0001A2B0_ or _func_0001A2B0 is func_0001A2B0
+        there); a real name given before as itself."""
+        import re
+
+        from . import project
+        key = project.address_key(old)
+        return rf"\b{re.escape(key)}\b" if key else rf"\b{re.escape(old)}\b"
+
+    def split_source(self, fp, version: str, source: str, at: str, new: str) -> dict:
+        from . import project
+        return project.split(Path(fp.root), version, source, at, new)
+
+    def join_functions(self, fp, first: str, last: str, keep: set[str], log=print) -> str:
+        from . import project
+        return project.join(Path(fp.root), self._version(fp), first, last, keep)
+
+    def file_flags(self, fp, source: str) -> list[str] | None:
+        """A source file's Watcom flags: its own (the manifest's dos_flags_map), else the project's."""
+        from . import project
+        manifest = fp.manifest or {}
+        own = project.flags_of(manifest, source)
+        return own or (manifest.get("dos_flags") or " ".join(self.DEFAULT_FLAGS)).split()
+
+    def set_file_flags(self, fp, source: str, flags: list[str]) -> str:
+        manifest = fp.manifest or {}
+        default = (manifest.get("dos_flags") or " ".join(self.DEFAULT_FLAGS)).split()
+        own = dict(manifest.get("dos_flags_map") or {})
+        if list(flags) == default:
+            own.pop(source, None)
+        else:
+            own[source] = " ".join(flags)
+        fp.update_manifest(dos_flags_map=own)
+        return ".decomp.wtf.json"
+
+    def flag_variants(self, flags: list[str]) -> list[list[str]]:
+        out = [list(flags)]
+        for group in (self.CPUS, self.OPTIMISATIONS):
+            for choice in group:
+                variant = [choice if f in group else f for f in flags]
+                if choice not in variant:
+                    variant.append(choice)
+                if variant not in out:
+                    out.append(variant)
+        return out
+
+    def file_ranges(self, fp) -> dict[str, list[tuple[int, int]]]:
+        from . import project
+        version = self._version(fp)
+        return project.ranges(Path(fp.root), version) if version else {}
+
+    def generated_functions(self, fp, version: str) -> dict[str, str]:
+        """The parts cut off a function that agents said aren't code (project.cut's set_aside): set aside."""
+        return {fn["symbol"]: fn["set_aside"] for fns in _functions_json(fp, version).get("units", {}).values()
+                for fn in fns if fn.get("set_aside")}
+
+    # Ghidra's drafts of its target objects (drafts.py): briefs show them, autopilot tries them made compilable
+    own_drafts = True
+    own_tools = frozenset({"redraft", "search_flags"})
+
+    def prepare_drafts(self, fp) -> str | None:
+        from .drafts import GHIDRA_H, GHIDRA_HEADER
+        path = Path(fp.root) / "include" / GHIDRA_HEADER
+        if path.exists():
+            return None
+        path.write_text(GHIDRA_H, encoding="utf-8")
+        return path.relative_to(fp.root).as_posix()
+
+    def adapt_draft(self, text: str) -> str:
+        from .drafts import adapt
+        return adapt(text)
+
+    def compilable_draft(self, fp, symbol: str, draft: str, known: str = "") -> tuple[str, str] | None:
+        from .drafts import compilable
+        info = _functions_json(fp, self._version(fp))
+        stack = {fn["name"] for fns in info.get("units", {}).values() for fn in fns if fn.get("convention") == "stack"}
+        return compilable(draft, symbol, stack, known)
+
+    def check_rebuild(self, fp, version: str, log=print) -> dict:
+        """The game's code rebuilt from what the project builds now (scratch.check_code)."""
+        from . import scratch
+        fp.run(["ninja", "prepare"], log=lambda *_: None, timeout=600)
+        return scratch.check_code(Path(fp.root), version, log=log)
+
+    def on_start(self, net, slug: str, log=print) -> None:
+        """A project made before gets the tools it lacks (rebuild.py, the real-name renaming in compile.py)."""
+        from . import scratch
+        _, fp, _ = net.forks.get(slug)
+        if scratch.write_tools(Path(fp.root)) and (version := self._version(fp)):
+            fp.run(["python", "tools/configure.py", version], log=lambda *_: None, timeout=120)
+
+    def cut_function(self, fp, symbol: str, at: int, keep: set[str], why: str = "") -> str:
+        from . import project
+        return project.cut(Path(fp.root), self._version(fp), symbol, at, keep, why)
 
     def function_extent(self, fp, symbol: str) -> tuple[int, int] | None:
         version = (fp.manifest or {}).get("version") or ""

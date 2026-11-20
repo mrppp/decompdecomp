@@ -62,15 +62,20 @@ def main() -> None:
              f"\n  description = DELINK {config}\n  restat = 1"]
     for f in variants:
         command = q([sys.executable, "tools/compile.py", "--compiler", cc, "--include", "include", "--output", "$out",
-                     "--source", "$in", "--", *f.split()])
+                     "--source", "$in", "--config", str(config), "--", *f.split()])
         lines.append(f"rule {rule[f]}\n  command = {command}\n  description = CC $in")
     objects = [str(build / "src" / "auto" / f"{u}.o") for u in units]
     targets = [str(build / "target" / f"{u}.o") for u in units]
     lines.append(f"build {' '.join(targets)}: delink {config} tools/delink.py tools/omf2elf.py")
     for unit, obj in zip(units, objects):
         source = f"src/auto/{unit}.c"
-        lines.append(f"build {obj}: {rule[per_file.get(source) or flags]} {source} | tools/compile.py tools/omf2elf.py")
-    lines += ["build prepare-targets: phony " + " ".join(targets),
+        lines.append(f"build {obj}: {rule[per_file.get(source) or flags]} {source} | tools/compile.py tools/omf2elf.py "
+                     f"{config}")
+    rebuilt = build / "code.bin"
+    lines.append(f"rule rebuild\n  command = {q([sys.executable, 'tools/rebuild.py', str(config), str(build), str(rebuilt)])}"
+                 "\n  description = REBUILD (compared with your copy)")
+    lines.append(f"build {rebuilt}: rebuild {' '.join([*targets, *objects])} | tools/rebuild.py")
+    lines += [f"build rebuild: phony {rebuilt}", "build prepare-targets: phony " + " ".join(targets),
               "build prepare: phony " + " ".join(["prepare-targets", *objects]), "default prepare"]
     Path("build.ninja").write_text("\n".join(lines) + "\n", encoding="utf-8")
     objdiff = {

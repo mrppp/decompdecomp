@@ -756,13 +756,13 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Start from your own copy | ✓ bounded TLB boot-map recovery | ✓ | ✓ | ✓ decrypted EBOOT.ELF | ✓ decrypted ELF | ✓ unencrypted or decrypted program and modules (ISO, CSO, CHD) | ✓ ROM | ✓ | ✓ | ✓ default.xbe, .xiso or Redump .iso | ✓ | fork by address | ✓ DOS/4GW (LE) programs |
 | Called framed recovery inside dropped raw text | ✓ | ✓ | ✓ scalar MIPS | — | — | ✓ scalar MIPS | — | — build-owned adapter planned | — reader/build adapter planned | — | — ARM/build adapter planned | — own-build adapter planned | — |
 | Judge | link · compare | link · compare | link · compare | link · compare | objdiff | link · compare | link · compare | objdiff | objdiff | objdiff | objdiff | objdiff | objdiff |
-| Machine drafts (m2c, Ghidra for x86) | ✓ | ✓ | ✓ | — | ✓ Ghidra | ✓ | ✓ (m2c `gba-gcc-c`) | ✓ | ✓ Ghidra | ✓ Ghidra | — (no assembly to read) | by architecture | — |
+| Machine drafts (m2c, Ghidra for x86) | ✓ | ✓ | ✓ | — | ✓ Ghidra | ✓ | ✓ (m2c `gba-gcc-c`) | ✓ | ✓ Ghidra | ✓ Ghidra | — (no assembly to read) | by architecture | ✓ Ghidra |
 | Compile-tested draft refresh and saved diagnostics | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ m2c | ✓ Ghidra | — | — draft generator planned | ✓ supported draft generators | — |
 | Initial callback, forwarded-argument and overlapping-frame recovery | ✓ bounded MIPS | ✓ bounded MIPS | ✓ bounded MIPS | — | — | ✓ bounded MIPS | — | — processor reader planned | — processor reader planned | — | — processor reader planned | ✓ MIPS C; other readers planned | — |
-| Autopilot: free matches from drafts | ✓ | ✓ | ✓ | twins only | — | ✓ | ✓ (demo: 34 matches) | ✓ | ✓ exact drafts of tiny shapes (32-bit); Ghidra's made compilable | ✓ as PC | twins only (no drafts yet) | — | — |
+| Autopilot: free matches from drafts | ✓ | ✓ | ✓ | twins only | — | ✓ | ✓ (demo: 34 matches) | ✓ | ✓ exact drafts of tiny shapes (32-bit); Ghidra's made compilable | ✓ as PC | twins only (no drafts yet) | — | ✓ Ghidra's drafts made compilable (demo: 3 matches) |
 | Drafts follow the header, made in the background; `redraft` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ (m2c and `redraft`) | — | ✓ Ghidra's | ✓ Ghidra's | — | — | — |
 | C++ methods drafted as `Class::method` | ✓ | ✓ | ✓ | — | — | ✓ | — | — | ✓ (RTTI, and classes from the vtables constructors store) | ✓ (RTTI, vtables) | — | — | — |
-| Twins: free matches from identical code | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ (ran; no pairs in demo) | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| Twins: free matches from identical code | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ (ran; no pairs in demo) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (a shareware game: 25 groups) |
 | Resumable source/profile queue and explicit assembly reconsideration | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — owned-build adapter planned | — owned-build adapter planned | — | — owned-build adapter planned | — owned-build adapter planned | — |
 | Supplied assembly code/data verification | ✓ ROM driver | ✓ ROM driver | ✓ ROM driver | — | — | ✓ ROM driver | — | — own build adapter planned | — own build adapter planned | — | — own build adapter planned | — own build adapter planned | — |
 | Indexed SDK object assembly proof | ✓ MIPS ROM | ✓ MIPS ROM | ✓ MIPS ROM | — | — | ✓ MIPS ROM | — | — owned-build adapter planned | — owned-build adapter planned | — | — owned-build adapter planned | — owned-build adapter planned | — |
@@ -776,10 +776,10 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Separate function and export-layout checks | ✓ MIPS ROM | ✓ MIPS ROM | ✓ MIPS ROM | — | — | ✓ MIPS ROM | — | — own build | — own build | — | — own build | — own build | — |
 | Consumed-constant forward switch repair | ✓ proven C32 GCC ROM profiles | — real-profile validation planned | — invocation/validation planned | — | — | — invocation/validation planned | — | — external invocation proof planned | — external invocation proof planned | — | — external invocation proof planned | — external invocation proof planned | — |
 | Branch integer-one staging / measured loop combinations | ✓ proven C32 / known frame | — profile validation planned | — profile validation planned | — | — | — profile validation planned | — | — frame/invocation proof planned | — frame/invocation proof planned | — | — frame/invocation proof planned | MIPS known-frame lane; invocation/other frame proof planned | — |
-| Permuter on near misses | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | — |
-| Hand-written assembly set aside | ✓ | ✓ | ✓ | ✓ (`sc` stubs) | — | ✓ | ✓ (`_call_via` helpers, `svc`/`swi` stubs) | ✓ | Visual C++'s exception-handling stubs (64-bit: the funclets its exception data names) | Visual C++'s exception-handling stubs | BIOS call stubs, pieces of functions | MIPS, PowerPC, ARM's BIOS stubs and pieces of functions | — |
-| Source splitting (`split_file`) | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | by project | — |
-| Pieces of functions joined to their function | — | — | — | — | — | — | — | — | ✓ (`scratch.merge_pieces`; 64-bit: .pdata's extents, none to join) | ✓ (`scratch.merge_pieces`) | ✓ (`recover.merge_pieces`) | — | — |
+| Permuter on near misses | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Hand-written assembly set aside | ✓ | ✓ | ✓ | ✓ (`sc` stubs) | — | ✓ | ✓ (`_call_via` helpers, `svc`/`swi` stubs) | ✓ | Visual C++'s exception-handling stubs (64-bit: the funclets its exception data names) | Visual C++'s exception-handling stubs | BIOS call stubs, pieces of functions | MIPS, PowerPC, ARM's BIOS stubs and pieces of functions | — agents' verdict only (Watcom's intrinsics and `#pragma aux` put any instruction in C) |
+| Source splitting (`split_file`) | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | by project | ✓ |
+| Pieces of functions joined to their function | — | — | — | — | — | — | — | — | ✓ (`scratch.merge_pieces`; 64-bit: .pdata's extents, none to join) | ✓ (`scratch.merge_pieces`) | ✓ (`recover.merge_pieces`) | — | ✓ agents' joins (`join_functions`); none automatic |
 | Agents' verdict "no C makes this" (3 agents of 2 models: set aside, red in the map) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Check again (and before helpers start, once after each update) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | partly: code no C makes set aside; no new analysis yet | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Kernel stubs set aside and named | — | set aside (BIOS calls) | ✓ | ✓ import stubs (NIDs) and `sc` calls | — | set aside, named by library and NID | set aside (BIOS calls) | — | ✓ import thunks | ✓ import thunks, named from the kernel export list | — (BIOS calls set aside, not named) | — | — |
@@ -795,11 +795,11 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Function entries seen running in Play, taken by the next import | ✓ | — | — | — | — | — | — | — | — | — | — | — | — |
 | Automatic proven framed/leaf boundary repair on import/reimport | ✓ | ✓ | ✓ (scalar decoder) | — | — | ✓ | — | — | — | — | — | — | — |
 | Guided boundary repair and advisory agent investigation (local mapped ROM) | ✓ | ✓ | ✓ (scalar decoder) | — | — | ✓ | — | — | — | — | — | — | — |
-| Function-end reports (`report_boundary`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ (2-byte boundaries) | — | ✓ (agents agree, the rebuild checks) | ✓ | — | — | — |
+| Function-end reports (`report_boundary`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ (2-byte boundaries) | — | ✓ (agents agree, the rebuild checks) | ✓ | — | — | ✓ (`cut_function`) |
 | Your own compiler (Setup: another build of one it has) | ✓ | ✓ | ✓ | ✓ your SDK | — | ✓ | ✓ | — | ✓ your Visual C++, for 32-bit games (64-bit ones build with the pack's 2017) | ✓ your XDK | — | the project's own build | — |
 | Compiler ranges and suggestions | ✓ | ✓ | ✓ | ✓ (ps3dev GCC, your SDK's) | — | ✓ | — | from scratch: per source file (`try_compiler`, Settings); else the project's build | per source file (`try_compiler`, Settings) | per source file (`try_compiler`, Settings): Visual C++ 7.0 / 7.1, your XDK's own | from scratch: per source file (`try_compiler`, Settings); else the project's build | the project's build | — |
 | Verified cleanup of rare compiler profiles | ✓ ROM mode | ✓ ROM mode | ✓ ROM mode | — | — | ✓ ROM mode | — | — | — | — | — | — | — |
-| Flag search (`search_flags`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | — (the project's flags only) | per source file (/Oy- on 32-bit, /O1, /Ob1) | per source file | — (the project's flags only) | the project's build | — |
+| Flag search (`search_flags`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | — (the project's flags only) | per source file (/Oy- on 32-bit, /O1, /Ob1) | per source file | — (the project's flags only) | the project's build | per source file (-3r to -6r, -ox to -os) |
 | Compiler map and the judge's survey | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | ✓ per source file, Rich header | the XDK build's compiler (no Rich header: one per game) | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | — | — |
 | Range checks: a range applies after its neighbours confirm it | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ from scratch: per source file; else the project's build | ✓ over source files | ✓ | ✓ from scratch: per source file; else the project's build | — | — |
 | C++ classes from the code (`get_class`) | ✓ | ✓ | ✓ | — | — | ✓ | — | — | ✓ (named by RTTI where the program has it) | ✓ (RTTI where the program has it) | — | — | — |
@@ -815,12 +815,12 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Tidy each source file once it's polished (shared types in one header, names, dead declarations) | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Polish matched code (still matching) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Small polish plans, prepared evidence and verified identical-helper reuse | ✓ shared path | ✓ shared path | ✓ shared path | — | — | ✓ shared path | — | ✓ shared path | ✓ shared path | — | ✓ shared path | ✓ shared path | — |
-| Real names for the game's symbols (`rename_symbol`) | ✓ | ✓ | ✓ | ✓ | ✓ functions | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | dtk and ds-decomp projects | — |
+| Real names for the game's symbols (`rename_symbol`) | ✓ | ✓ | ✓ | ✓ | ✓ functions | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | dtk and ds-decomp projects | ✓ |
 | Save and restore (`progress/`, Open a saved project); remember each project's save destination | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | partly: the project's git, best attempts saved; a new copy starts without them | partly: the project's git, best attempts saved; a new copy starts without them | the project's git; best attempts saved; the PE view made again from your XBE or disc | partly: the project's git, best attempts saved; a new copy starts without them | the project's git; best attempts saved | — |
 | Pause and resume automatic rechecks of saved matches | ✓ ROM | ✓ ROM | ✓ ROM | ✓ ROM | — | ✓ ROM | ✓ ROM | — uses project build | — uses project build | — uses project build | — uses project build | — uses project build | — |
 | Saved README preserves notes, with completion bar and function map | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Reimport: a new split, matched work kept (Settings) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | — | ✓ (Ghidra again, the newest rules) | ✓ | — | — | — |
-| Rebuildable export | ✓ | ✓ | ✓ | — | — | ✓ | ✓ | the project | the project (`ninja rebuild`) | the project (`ninja rebuild` writes your default.xbe back, byte for byte) | the project | the project | — |
+| Rebuildable export | ✓ | ✓ | ✓ | — | — | ✓ | ✓ | the project | the project (`ninja rebuild`) | the project (`ninja rebuild` writes your default.xbe back, byte for byte) | the project | the project | the code object (`ninja rebuild`) |
 | Set up as a project folder (import checkbox or Export panel; guessed `units.json`; edits to `src/<segment>/<function>.c` judged by the ROM judge on Refresh) | ✓ demo: 14 of 16 files found | ✓ demo: 1 of 18 files found (no padding between objects) | ✓ demo: 1 of 18 files found (functions padded like files) | — | — | — offered; demo not run (no PSP compiler build for Apple Silicon) | — | the project | the project | — | the project | the project | — |
 | The reversing emulator for agents (`watch_in_emulator`: which code writes an address, what a function is called with, on the user's ROM) | ✓ mupenRE (Linux, macOS) | — no emulator pinned yet | — no emulator pinned yet | — | — | — no emulator pinned yet | — | — no emulator pinned yet | — no emulator pinned yet | — | — no emulator pinned yet | — no ROM to run | — |
 | Code the game loads, found by running it (import and Reimport, consoles/n64/loaded_code.py) | ✓ when mupenRE is installed | — no emulator pinned yet | — no emulator pinned yet | — | — | — no emulator pinned yet | — | — no emulator pinned yet | — no emulator pinned yet | — | — no emulator pinned yet | — no ROM to run | — |
@@ -2117,17 +2117,23 @@ reuse the saved map. See [ROM Explorer](docs/ROM_EXPLORER.md) for support and li
 ### DOS (32-bit): run every feature on it, and the parts it still lacks
 
 The DOS console (on the experimental branch) starts a project from a DOS/4GW program's LE module, finds functions from
-its code and fixups, cuts them with named relocations, and builds with OpenWatcom: the judge, recording matches and
-Check again run (a shareware Watcom game's random-number function matched 100% through `net.attempt`; Demo Quest DOS
-passes tests/test_consoles.py's matching and wrong-C checks). The "—"s in its column are features not yet run on it.
-Next, in order:
-- run each row of the table on Demo Quest DOS and a real game (twins, the permuter, autopilot, assembly set aside,
-  splitting and joining, polishing with `rename_symbol`, saves, reimport) and fill the column in;
-- machine drafts: the PC console's Ghidra drafts are x86 already, so the DOS console should reach them;
-- code a game built with GCC (a shareware Watcom game's sound library came from it: its prologues are GNU as's
-  55 89 E5) needs a DOS GCC (DJGPP) toolchain for those files, and a per-file compiler (`set_file_compiler`);
-- Watcom versions: OpenWatcom descends from Watcom 11; games of 1993-96 used 9.5, 10.0 and 10.6, whose code
-  differs a little (a compiler pack like the Xbox 360 XDK's, when someone has them);
+its code and fixups, cuts them with named relocations, and builds with OpenWatcom. Run on Demo Quest DOS and a
+shareware Watcom game (20 November 2026): the judge and recording matches, Ghidra's drafts in briefs and made
+compilable for autopilot (3 free matches on the demo), twins (25 groups in the shareware game; a match gave its twin
+one), the permuter (a near miss from 53 to 11), splitting, joining and cutting functions, real names, a flag search
+per file, and the rebuild check (`ninja rebuild`: the code object byte for byte, a renamed function's C included).
+The "—"s in its column are features not yet run on it. Next, in order:
+- the rest of the table on a real game (saves, reimport, polishing, rooms) and fill the column in;
+- old Watcom's register saving: the shareware game's `void` functions keep eax (push edx; xor edx, edx; ... pop
+  edx), as Watcom 9.5 to 10.6 did, where OpenWatcom 2 uses eax freely, and no flag or pragma of OpenWatcom's gives
+  it back: those need the old compilers (a compiler pack like the Xbox 360 XDK's, when someone has them);
+- drafts: Ghidra has no Watcom convention and reads register arguments as GCC's __regparm3 (eax, edx, ecx), so a
+  draft with a third is set aside (an unaff_EBX it reads is taken as Watcom's third); a function without a frame
+  that takes stack arguments (GCC's code) is named as a register one (`func_X_`), so its C can't match yet;
+- the instruction count project sync uses (size / 4) undercounts x86 code, so the permuter's near-miss bar is
+  stricter on DOS (and PC) than on fixed-width processors;
+- code a game built with GCC (a shareware game's sound library: GNU as's 55 89 E5 prologues) needs a DOS GCC
+  (DJGPP) toolchain for those files, and a per-file compiler (`set_file_compiler`);
 - 16-bit (real-mode) DOS: objdiff's x86 is 32/64-bit only, and those compilers write segmented OMF.
 
 ### Deep passes that climb under a closer compiler profile

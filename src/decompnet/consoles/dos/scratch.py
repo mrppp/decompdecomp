@@ -25,7 +25,7 @@ from ...forks.project import ForkError
 
 TEMPLATE = Path(__file__).parent / "project_template"
 OMF = Path(__file__).resolve().parents[2] / "omf.py"
-TOOLS = ("tools/configure.py", "tools/compile.py", "tools/delink.py")
+TOOLS = ("tools/configure.py", "tools/compile.py", "tools/delink.py", "tools/rebuild.py")
 TYPES_H = """\
 /* Types for this decompilation (32-bit x86, Watcom C). Agents add structs and prototypes here or in new headers.
  * The game's functions are func_XXXXXXXX and its data D_XXXXXXXX (their addresses): write them with those names
@@ -152,7 +152,8 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
         "DOS/4GW module lists, and objdiff compares each source file with the original.\n\n"
         f"1. Your copy of the program is `orig/{version}.exe` (never commit it).\n"
         f"2. `python tools/configure.py {version}` and `ninja` build it with OpenWatcom.\n"
-        "3. Decompiled code goes in `src/`; `objdiff.json` shows each function's progress.\n", encoding="utf-8")
+        "3. Decompiled code goes in `src/`; `objdiff.json` shows each function's progress.\n"
+        "4. `ninja rebuild` puts the game's code back together from the project and checks it against your copy.\n", encoding="utf-8")
     _run([sys.executable, "tools/configure.py", version], root, "the first build", log)
     _run([_ninja(), "prepare-targets"], root, "cutting the targets", log)
     missing = [u for u in groups if not (root / "build" / version / "target" / f"{u}.o").is_file()]
@@ -161,3 +162,27 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     log(f"{len(groups)} source files for agents to write into")
     return {"platform": "dos", "id": version, "title": info["title"], "compiler": chosen, "sources": len(groups),
             "sha1": info["sha1"]}
+
+
+def check_code(root: Path, version: str, log=print) -> dict:
+    """The rebuild check: the game's code object rebuilt from the project (tools/rebuild.py: every function from what
+    src/ compiles to where that defines it, else from its delinked target, relocations filled in), compared with
+    the user's copy byte for byte: {"identical", "detail", "what"}. A join or cut that took the wrong bytes comes out
+    different too."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("dos_rebuild", root / "tools" / "rebuild.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    report = tool.rebuild(Path("config") / version / "functions.json", Path("build") / version, root)
+    if not report["identical"]:
+        differ = report["differ"] or ["the code outside its functions"]
+        detail = (f"{len(differ)} functions rebuilt from the project differ from your copy: "
+                  f"{', '.join(differ[:8])}{'…' if len(differ) > 8 else ''}")
+        log(f"note: {detail}")
+        return {"identical": False, "detail": detail}
+    c, n = len(report["c"]), report["functions"]
+    log(f"the game's code rebuilt from the project ({c:,} of its {n:,} functions from C) is your copy, byte for byte")
+    return {"identical": True, "detail": f"identical: the code object ({report['size']:,} bytes); its {n:,} functions "
+                                         f"({report['bytes']:,} bytes), {c:,} of them from C",
+            "what": "The game's code, rebuilt from the project,"}

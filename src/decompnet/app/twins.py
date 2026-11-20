@@ -36,10 +36,10 @@ from .purpose_work import Executor
 log = logging.getLogger("decompdecomp")
 IDENT = re.compile(r"^[A-Za-z_]\w*$")
 _MACHINE = {"EM_PPC": ("ppc", "big"), "EM_PPC64": ("ppc64", "big"), "EM_MIPS": ("mips", None), "EM_ARM": ("arm", "little"),
-            "EM_X86_64": ("x86_64", "little")}
-_CACHE_VERSION = 7  # of twins.json: 2 added why code is hand-written assembly, 3 ARM's BIOS call stubs, 4 ARM's
+            "EM_X86_64": ("x86_64", "little"), "EM_386": ("x86", "little")}
+_CACHE_VERSION = 8  # of twins.json: 2 added why code is hand-written assembly, 3 ARM's BIOS call stubs, 4 ARM's
 # system instructions, 5 COFF objects (PC) and the C names of their symbols, 6 MIPS NOP-only targets, 7 x86-64 ELF
-# objects (PS4)
+# objects (PS4), 8 32-bit x86 ELF objects (DOS)
 # A twin's code that didn't match isn't tried again for this long while neither function's code changes (the
 # same source gives the same result): every agent start's pass would otherwise redo hundreds of compiles (Mario
 # Party 6: about 900, 15 minutes beside the agents). After a while it's tried again: a header can have changed.
@@ -110,6 +110,16 @@ def coff_prints(data: bytes) -> dict[str, Print]:
     return out
 
 
+_WATCOM = re.compile(r"_?((?:func|D)_[0-9A-Fa-f]{8})_?")
+
+
+def _watcom_c_name(name: str) -> str:
+    """A DOS project's symbol as its C writes it: Watcom's func_0001A2B0_ (register convention), _func_0001A2B0
+    (stack) and _D_0001A2B0 (data) are func_0001A2B0 and D_0001A2B0."""
+    m = _WATCOM.fullmatch(name)
+    return m.group(1) if m else name
+
+
 def object_prints(data: bytes) -> dict[str, Print]:
     """Fingerprints of every function an object file defines, by symbol, with whether its code is hand-written
     assembly where its processor tells that without its console's facts (PowerPC: arch/)."""
@@ -163,8 +173,14 @@ def object_prints(data: bytes) -> dict[str, Print]:
             if arch_id == "arm":  # its mode: bit 0, else the mapping symbol it starts under (dsd's objects)
                 at = [t for a, t in section_modes if a <= lo]
                 facts["thumb"] = True if s["st_value"] & 1 else (at[-1] if at else None)
+            refs = [n for _, _, n in mine]
+            name = ""
+            if arch_id == "x86":  # Watcom's spellings (DOS) as C writes them, a jump table's labels as the file's own
+                sections = {elf.get_section(k).name for k in by_section}
+                refs = [".L" if n in sections else _watcom_c_name(n) for n in refs]
+                name = _watcom_c_name(s.name)
             out[s.name] = Print(_key(bytes(code[lo:lo + s["st_size"]]), [(o, t) for o, t, _ in mine]),
-                                [n for _, _, n in mine], s["st_size"],
+                                refs, s["st_size"], name=name,
                                 asm=(reason(raw[lo:lo + s["st_size"]], order == "big", **facts) or "") if reason else "")
     return out
 
