@@ -2136,6 +2136,17 @@ its column are features not yet run on it. Next, in order:
   moved for over 18 minutes (the lock diagnostics logged it every minute) until the app was restarted. The switch
   also never got the tree while eight helpers and a deep permutation pass kept compiling. Take the locks in one
   order, and let a whole-game switch pause the helpers and background passes while it runs;
+- source files written with NUL bytes (20 November 2026): runs of zero bytes (5 to 1,933) appeared inside C files
+  of three projects (two DOS games and the shareware one), files no tool outside the app had touched; the file
+  then stops building and every function in it reopens, matched ones included. Two of the app's writers (a
+  helper's attempt, autopilot's or a deep pass's trial that writes a file and puts it back) overlapping on one
+  file would do it: one truncating while the other writes at an offset. Write source files whole (a temporary
+  file, then a rename), and take the unit's lock for every trial's write and restore;
+- a way to repair a file that doesn't build from inside the app: a file broken by drafts written into it (bodies
+  that no longer agree with headers added since, `int f();` clashing with its definition) stays broken until a
+  helper fixes it, and repairs made outside the app race autopilot's and the deep passes' trials, which put a
+  file's old text back after trying theirs. Take out the unmatched bodies that break the build, under the unit's
+  lock, keeping each as its function's attempt;
 - what needs real agent sessions on a DOS game (rooms, shared knowledge, the repair and evidence lanes of the
   agent loop, tidying files, named accounts), and the progress bars in the GUI;
 - old Watcom's register saving: the shareware game's `void` functions keep eax (push edx; xor edx, edx; ... pop
