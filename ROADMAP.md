@@ -2129,6 +2129,13 @@ and a Watcom of your own (kits/watcom.py) per source file through try_compiler. 
 fixed two import bugs: an LE fixup that straddles two pages is listed in both (applied twice, six functions came out
 wrong), and a reference into the game's second code object named a function the project doesn't have. The "—"s in
 its column are features not yet run on it. Next, in order:
+- a deadlock in the shared engine, met switching a shareware game to a Watcom of your own (20 November 2026):
+  Settings' "the whole game" compiler (forkengine.set_compiler_everywhere, set_file_compiler_by_hand) takes the
+  source tree exclusively, then waits for the project lock; a helper's release in the meantime (judging.release >
+  forkengine.release > leave_best > attempt > _attempt) holds the project lock and waits for the tree. Neither
+  moved for over 18 minutes (the lock diagnostics logged it every minute) until the app was restarted. The switch
+  also never got the tree while eight helpers and a deep permutation pass kept compiling. Take the locks in one
+  order, and let a whole-game switch pause the helpers and background passes while it runs;
 - what needs real agent sessions on a DOS game (rooms, shared knowledge, the repair and evidence lanes of the
   agent loop, tidying files, named accounts), and the progress bars in the GUI;
 - old Watcom's register saving: the shareware game's `void` functions keep eax (push edx; xor edx, edx; ... pop
