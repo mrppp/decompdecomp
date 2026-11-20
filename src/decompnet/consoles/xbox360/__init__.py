@@ -197,7 +197,16 @@ class Xbox360(Console):
         matched = {r["name"] for r in net.project_store(slug).all(
             "SELECT name FROM functions WHERE project_id=? AND status='matched'", net.project_row(slug)["id"])}
         log("finding this project's functions again from its own image: its function table (.pdata), then Ghidra")
+        # a project whose targets don't name their calls yet gets them now, and its C's callees renamed to match
+        # (callees.migrate), once the project builds with them; one that has them has nothing to rename
+        config = fp.root / "config" / version / "functions.json"
+        named = any(fn.get("relocs") for fns in json.loads(config.read_text(encoding="utf-8"))["units"].values()
+                    for fn in fns)
+        from . import callees
+
+        after = None if named else (lambda fp, before: callees.migrate(fp, matched, before, log=log))
         return net.forks.reanalyse(slug, lambda fp: scratch.reanalyse_functions(fp.root, version, matched, log=log),
+                                   after=after,
                                    log=log)
 
     def on_start(self, net, slug: str, log=print) -> None:

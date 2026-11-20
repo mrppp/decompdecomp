@@ -1080,7 +1080,7 @@ class ForkEngine:
             stale.append(source)
         return sorted(set(stale))
 
-    def reanalyse(self, slug: str, step, paths=("config",), fix=False, log=print) -> str | None:
+    def reanalyse(self, slug: str, step, paths=("config",), fix=False, log=print, after=None) -> str | None:
         """A console's improved analysis of its games, applied to a project made before it (Console.on_start): `step`
         changes the project's `paths` (its config, its build tools; its source files keep their ranges, so the work in
         them stays) and may add files (source files for code it found), and says what it found, as a sentence, or None
@@ -1111,7 +1111,11 @@ class ForkEngine:
 
         snapshot = {} if versioned else {f: f.read_bytes() for d in paths for f in (fp.root / d).rglob("*") if f.is_file()}
 
+        restored: dict = {}  # source files `after` changed: {path: their text before}
+
         def undo() -> None:  # the files the step added go too (agents can't add any: the tree is the step's)
+            for path, text in restored.items():
+                path.write_text(text, encoding="utf-8")
             if versioned:
                 fp.git("checkout", "HEAD", "--", *paths)
             else:
@@ -1143,6 +1147,16 @@ class ForkEngine:
                     setup = [True]
                     said += (f"; {len(stale)} source file{'s' if len(stale) != 1 else ''} that didn't compile before "
                              f"still don't: {', '.join(stale[:5])}")
+                if after is not None and all(setup):
+                    # what the console does once the project is set up again (an Xbox 360 project renames the
+                    # callees its C named by offset); the files it changes come back if the change is taken back
+                    try:  # (it notes each file's text in `restored` before it writes it: an error midway is put back)
+                        note = after(fp, restored)
+                    except (ForkError, NetworkError, OSError) as e:
+                        note, setup = None, [False]
+                        log(f"after the new analysis: {e}")
+                    if note:
+                        said += f"; {note}"
                 after = console.check_rebuild(fp, version, log=log) if checks and all(setup) else {"identical": None}
                 # the config says more about the same bytes: a rebuild that differs where it didn't is its doing
                 kept = all(setup) and (not checks or after.get("identical") or not before.get("identical") and (
