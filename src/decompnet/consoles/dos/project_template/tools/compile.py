@@ -73,8 +73,15 @@ def main() -> int:
                 sys.stderr.write(f"{args.source}: this Watcom is a Windows program, run through wine, and this "
                                  "computer has none\n")
                 return 1
-            if env.get("DECOMPNET_WINE_PREFIX"):
-                env["WINEPREFIX"] = env["DECOMPNET_WINE_PREFIX"]
+            prefix = env.get("DECOMPNET_WINE_PREFIX")
+            if not prefix:  # run by ninja outside the app: the app's prefix, never ~/.wine
+                try:
+                    from decompnet import wine as app_wine
+                    prefix = str(app_wine.prefix())
+                except Exception:
+                    prefix = ""
+            if prefix:
+                env["WINEPREFIX"] = prefix
             env.update(WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=", WATCOM=windows(home))
             headers = ";".join(windows(Path(p).resolve()) for p in (args.include, *args.system_include))
             cmd = [wine, args.compiler, *args.flags, f"-i={headers}", windows(Path(args.source).resolve()),

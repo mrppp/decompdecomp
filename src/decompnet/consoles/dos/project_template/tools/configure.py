@@ -50,7 +50,15 @@ def main() -> None:
     os.chdir(ROOT)
     cc = find_compiler()
     own = {}
-    for spec in args.own:
+    specs = list(args.own)
+    if not specs:  # run again by ninja (build.ninja's own rule) or by hand: the app's Watcom copies, where it is
+        try:
+            from decompnet import kits
+            specs = [f"{c.version}={c.runner or 'none'}," + ",".join([str(c.exe), *map(str, c.includes)])
+                     for c in kits.compilers(("watcom",))]
+        except Exception:
+            specs = []
+    for spec in specs:
         version, _, rest = spec.partition("=")
         runner, exe, *headers = rest.split(",")
         own[version] = (runner, exe, headers)
@@ -67,12 +75,9 @@ def main() -> None:
     project_compiler = manifest.get("compiler") or "openwatcom-2.0"
 
     def compiler_of(source: str) -> str:
-        chosen = compilers.get(source) or project_compiler
-        if chosen != "openwatcom-2.0" and chosen not in own:
-            print(f"warning: {source} builds with {chosen}, which isn't set up here (decompdecomp's Setup: Watcom "
-                  "C, your own copy): OpenWatcom 2 builds it meanwhile", file=sys.stderr)
-            return "openwatcom-2.0"
-        return chosen
+        """A file's compiler: one that isn't set up here builds nothing (a rule that says so), never another in its
+        place, which would pass for it."""
+        return compilers.get(source) or project_compiler
     units_sources = [f"src/auto/{u}.c" for u in units]
     variants = sorted({(compiler_of(src), per_file.get(src) or flags) for src in units_sources},
                       key=lambda v: (v != ("openwatcom-2.0", flags), v))
@@ -85,6 +90,12 @@ def main() -> None:
         compiler, f = v
         if compiler == "openwatcom-2.0":
             how = ["--compiler", cc]
+        elif compiler not in own:
+            why = (f"{compiler} isn't set up on this computer: add your copy in decompdecomp's Setup (Watcom C, your own "
+                   "copy), then set the project up again")
+            lines.append(f"rule {rule[v]}\n  command = {q([sys.executable, '-c', f'import sys; sys.exit({why!r})'])}"
+                         f"\n  description = CC $in ({compiler}: not set up)")
+            continue
         else:
             runner, exe, headers = own[compiler]
             how = ["--compiler", exe, "--runner", runner, *(a for h in headers for a in ("--system-include", h))]
