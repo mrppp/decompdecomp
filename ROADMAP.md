@@ -2136,7 +2136,7 @@ its column are features not yet run on it. Next, in order:
   moved for over 18 minutes (the lock diagnostics logged it every minute) until the app was restarted. The switch
   also never got the tree while eight helpers and a deep permutation pass kept compiling. Take the locks in one
   order, and let a whole-game switch pause the helpers and background passes while it runs;
-- source files written with NUL bytes (20 November 2026): runs of zero bytes (5 to 1,933) appeared inside C files
+- (fixed 21 November 2026: forkengine._rewrite writes whole and swaps in) source files written with NUL bytes (20 November 2026): runs of zero bytes (5 to 1,933) appeared inside C files
   of three projects (two DOS games and the shareware one), files no tool outside the app had touched; the file
   then stops building and every function in it reopens, matched ones included. Two of the app's writers (a
   helper's attempt, autopilot's or a deep pass's trial that writes a file and puts it back) overlapping on one
