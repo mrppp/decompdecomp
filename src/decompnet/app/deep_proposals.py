@@ -102,7 +102,7 @@ class Pool:
         self.background=background
         self.executor = Executor(max_workers=count, purpose='Repair proposal generation',thread_name_prefix='deep-proposals')
         self.capacity = threading.BoundedSemaphore(count*2)
-        self.local = threading.local()
+        self.idle = []  # workers between requests, taken by whichever thread runs the next one
         self.workers = []
         self.lock = threading.RLock()
         self.cache = OrderedDict()
@@ -114,11 +114,19 @@ class Pool:
 
     def work(self, request, check):
         with self.lock:self.running += 1
+        worker = None
         try:
-            worker = getattr(self.local,'worker',None)
-            if worker is None or worker.closed.is_set():
-                worker = self.local.worker = Worker()
-                with self.lock:
+            # A worker is borrowed for one request and handed back, not kept per thread: the executor replaces
+            # its threads, and each new thread started a process while the old thread's stayed open, idle, until
+            # the pass ended. One game's six-lane pass left 457 of them (13 GB) after five hours.
+            with self.lock:
+                while self.idle and worker is None:
+                    worker = self.idle.pop()
+                    if worker.closed.is_set():
+                        worker = None
+                if worker is None:
+                    if self.stop.is_set():raise RuntimeError('Proposal generation stopped')
+                    worker = Worker()
                     self.workers = [w for w in self.workers if not w.closed.is_set()]+[worker]
             def checkpoint():
                 from .purpose_work import checkpoint as check_owner
@@ -128,7 +136,16 @@ class Pool:
             result = worker.run(request,checkpoint)
             return result
         finally:
-            with self.lock:self.running -= 1
+            surplus = None
+            with self.lock:
+                self.running -= 1
+                if worker is not None and not worker.closed.is_set():
+                    if self.stop.is_set() or len(self.idle) >= self.count:
+                        surplus = worker
+                    else:
+                        self.idle.append(worker)
+            if surplus is not None:
+                surplus.close()
 
     def submit(self, args, kwargs, check):
         if self.background:kwargs = {**kwargs, '_background':True}
@@ -206,4 +223,6 @@ class Pool:
     def close(self):
         self.stop.set()
         self.executor.shutdown(wait=True,cancel_futures=True)
-        for worker in self.workers:worker.close()
+        with self.lock:
+            workers, self.workers, self.idle = self.workers, [], []
+        for worker in workers:worker.close()
