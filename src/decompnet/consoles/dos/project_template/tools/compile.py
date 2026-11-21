@@ -21,6 +21,28 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import omf2elf  # noqa: E402
 
+# how long one compile may take: a file compiles in well under a second, but an old Watcom's optimiser can search
+# for minutes on some C (Watcom 10.0a, -os -of, 192 s on a game's goto-heavy function before failing), and every
+# attempt that builds the file waited on it, a project's helpers for 15 minutes a try
+COMPILE_SECONDS = 60
+
+
+def _run_limited(cmd: list[str], env: dict) -> subprocess.CompletedProcess:
+    """The compiler run, stopped (its whole process group: wine's too) after COMPILE_SECONDS."""
+    proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=COMPILE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, 9)
+        except OSError:
+            proc.kill()
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 # how long wine's server stays after the last compile: Watcom under wine takes 0.8 s a file started cold and 0.02 s
 # with its server there (OpenWatcom 2 natively: 0.006 s). It leaves by itself after this long, however the app ended
 SERVER_IDLE_SECONDS = 600
@@ -115,7 +137,13 @@ def main() -> int:
                 env["INCLUDE"] = os.pathsep.join(p for p in (args.include, str(home / "h"), env.get("INCLUDE", ""))
                                                  if p)
             cmd = [args.compiler, *args.flags, f"-i={args.include}", args.source, f"-fo={obj}"]
-        run = subprocess.run(cmd, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        try:
+            run = _run_limited(cmd, env)
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f"{args.source}: the compiler didn't finish in {COMPILE_SECONDS} s and was stopped. Some C "
+                             "sends an old Watcom's optimiser into a very long search (a tangle of gotos, under -os -of): "
+                             "write that function more plainly, or try the file's other flags\n")
+            return 1
         sys.stdout.write(run.stdout)
         sys.stderr.write(run.stderr if args.runner != "wine" else quiet(run.stderr))
         if run.returncode != 0 or not obj.is_file():

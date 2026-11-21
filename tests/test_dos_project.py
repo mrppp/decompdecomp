@@ -270,3 +270,14 @@ def test_a_drafts_callees_are_declared_as_their_file_defines_them():
     assert "void func_0002C780(void);" in prelude and "int func_0002C780();" not in prelude
     assert "int func_00099999();" in prelude  # (no C of it anywhere yet)
     assert "#define true 1" in drafts.GHIDRA_H  # (C89 has no booleans; Ghidra writes them)
+
+
+def test_a_compile_that_runs_too_long_is_stopped(tmp_path, monkeypatch):
+    """An old Watcom's optimiser searched for minutes on a game's goto-heavy function: the compile is stopped after
+    COMPILE_SECONDS, its process group with it, instead of every attempt that builds the file waiting on it."""
+    compile_tool = _tool("compile")
+    monkeypatch.setattr(compile_tool, "COMPILE_SECONDS", 1)
+    with pytest.raises(compile_tool.subprocess.TimeoutExpired):
+        compile_tool._run_limited([sys.executable, "-c", "import time; time.sleep(30)"], {})
+    done = compile_tool._run_limited([sys.executable, "-c", "print('ok')"], {})
+    assert done.returncode == 0 and done.stdout.strip() == "ok"
