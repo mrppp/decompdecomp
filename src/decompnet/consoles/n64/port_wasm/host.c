@@ -525,9 +525,9 @@ void port_vi_features(uint32_t f);
 void w2c_env_osViSetMode(struct w2c_env *e, u32 mode) {
     (void)e; LOG("osViSetMode(%08X)", mode); port_vi_mode(mode);
 #ifndef PORT_WEB
-    if (getenv("PORT_RT64") && (mode & 0x1FFFFFFFu) <= 0x800000u - 60) {
-        uint32_t words[14], address = 0x80000000u | (mode & 0x1FFFFFFFu);
-        for (unsigned i = 0; i < 14; i++) words[i] = be32(address + 4 + i * 4);
+    if (getenv("PORT_RT64") && (mode & 0x1FFFFFFFu) <= 0x800000u - 4 - 4 * PORT_RT64_VI_MODE_WORDS) {
+        uint32_t words[PORT_RT64_VI_MODE_WORDS], address = 0x80000000u | (mode & 0x1FFFFFFFu);
+        for (unsigned i = 0; i < PORT_RT64_VI_MODE_WORDS; i++) words[i] = be32(address + 4 + i * 4);
         port_rt64_mode(words);
     }
 #endif
@@ -539,7 +539,12 @@ void w2c_env_osViSetYScale(struct w2c_env *e, f32 s) {
 #endif
 }
 void w2c_env_osViBlack(struct w2c_env *e, u32 on) { (void)e; (void)on; }
-void w2c_env_osViSetSpecialFeatures(struct w2c_env *e, u32 f) { (void)e; port_vi_features(f); }
+void w2c_env_osViSetSpecialFeatures(struct w2c_env *e, u32 f) {
+    (void)e; port_vi_features(f);
+#ifndef PORT_WEB
+    if (getenv("PORT_RT64")) port_rt64_features(f);
+#endif
+}
 void port_frame_shown(uint32_t fb, unsigned long n); /* render.c: saves it when asked */
 void port_vi_swap(uint32_t fb) { /* (games/: a game's own name) */
     frame_buffer = fb; swaps++; port_frame_shown(fb, swaps);
@@ -581,6 +586,9 @@ static void port_audio_interrupts(void) {
 }
 static void retrace(void) {
     vi_count++;
+#ifndef PORT_WEB
+    if (getenv("PORT_RT64")) port_rt64_retrace(vi_count & 1);
+#endif
     ram_dumps("PORT_RAM_DUMPS", vi_count);
     port_timers();
     port_audio_interrupts();

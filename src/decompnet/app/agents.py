@@ -502,6 +502,8 @@ class Session:
                 "focus_tries_used":self.options.get("focus_tries_used", 0),
                 "per_session": self.options.get("per_session", PER_SESSION),
                 "automatic_assignment": self.options.get("automatic_assignment", False),
+                "focus_near_matches": self.options.get("focus_near_matches", False),
+                "focus_converted": bool(self.options.get("focus_converted")),
                 "task": self.options.get("task") or "",  # "readable": it polishes matched code
                 "slug": self.slug, "agent": self.agent_name, "model": self.model, "state": self.state, "why": self.why,
                 "provider_waiting": self.provider_waiting, "provider_retry_requested": self.provider_retry_requested,
@@ -820,6 +822,10 @@ class Manager:
         options = data_agents.configure(self.net,slug,options,count)
         from . import port_agents
         options = port_agents.configure(self.net,slug,options,count)
+        if type(options.get('focus_near_matches', False)) is not bool:
+            raise ValueError('Focusing on stuck near-matches must be true or false.')
+        if not options.get('focus_near_matches') or options.get('task') or options.get('focus_function'):
+            options.pop('focus_near_matches', None)
         if type(options.get('automatic_assignment', False)) is not bool:
             raise ValueError('Automatic assignment must be true or false.')
         if not automatic_assignment.configured(options):
@@ -829,6 +835,13 @@ class Manager:
             kind = agent.id
             if not agent.alias_model_compatible:
                 options.pop("model", None)  # a legacy Gemini CLI model name may mean nothing to Antigravity
+        if options.get('focus_id'):
+            # a focused run with no model or effort chosen starts on the connector's strongest (Agent.focus_model)
+            if not options.get('model') and agent.focus_model and not agent.config_model():
+                options['model'] = agent.focus_model
+            if (agent.takes_effort and agent.focus_effort and not options.get('effort')
+                    and '#' not in str(options.get('model') or '')):
+                options['effort'] = agent.focus_effort
         configured = str(options.get('model') or agent.config_model() or '')
         resolved = agent.resolve_known_model(configured, agent.models(_which(agent.command), run=False) if agent.command else [])
         if why := agent.validate_model(resolved):
@@ -1552,6 +1565,7 @@ class Manager:
         self.net.set_selection(s.slug, agent.name, s.options.get("selection"))
         self.assignments[agent.id] = s.slug
         focused_agents.bind(self.net,s,agent)
+        focused_agents.bind_conversion(self, s, agent)
         automatic_assignment.bind(self.net, agent, s)
         from . import asset_agents, boundary_investigations
         boundary_investigations.bind(self.net,s,agent)

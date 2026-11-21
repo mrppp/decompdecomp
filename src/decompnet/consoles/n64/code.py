@@ -184,6 +184,37 @@ def _supports_mapping(rom, lo, expected, current, targets):
 GAP_LIMIT = 0x10000  # the longest function a gap between two pieces of one segment can be
 
 
+def _scheduled_wide_gap(rom, left_start, seam, right_start, mapping):
+    """Recognize a missed text run from called entries on its established mapping."""
+    import rabbitizer
+
+    from ...arch.mips_code_recovery import _lead
+    from ...arch.mips_references import references
+
+    if right_start - seam > 2 * GAP_LIMIT or rom[right_start - 8:right_start - 4] != JR_RA.to_bytes(4, 'big'):
+        return None
+    entry = next((seam - lead for lead in (4, 8)
+                  if seam - lead - 8 >= left_start
+                  and rom[seam - lead - 8:seam - lead] == JR_RA.to_bytes(4, 'big') + bytes(4)
+                  and _lead(rom, seam - lead, right_start, 'big', 'vr4300') == lead), None)
+    if entry is None:
+        return None
+    calls = {target - mapping for target, _, kind in references(rom, left_start, entry, left_start + mapping)
+             if kind == 'call' and entry <= target - mapping < right_start}
+    if entry not in calls or any(entry < target <= seam for target in calls) or len(calls) < 8:
+        return None
+    framed = [target for target in calls if _lead(rom, target, right_start, 'big', 'vr4300') is not None]
+    if len(framed) < 6 or max(framed) - seam < (right_start - seam) // 2:
+        return None
+    if any(target not in framed and rom[target - 8:target - 4] != JR_RA.to_bytes(4, 'big') for target in calls):
+        return None
+    gap = rom[entry:right_start]
+    if bytes(256) in gap or any(not rabbitizer.Instruction(word).isValid()
+                                for word, in struct.iter_unpack('>I', gap)):
+        return None
+    return entry
+
+
 def close_gaps(rom: bytes, found: list[tuple[int, int, int]], taken=()) -> list[tuple[int, int, int]]:
     """Neighbouring segments placed at the same mapping (address minus ROM offset), joined with what lies between
     them when it ends in a return: one function longer than the search's quiet stretch (2 blocks with no return and
@@ -193,12 +224,17 @@ def close_gaps(rom: bytes, found: list[tuple[int, int, int]], taken=()) -> list[
     for start, end, vram in sorted(found):
         if out:
             p = out[-1]
-            gap = rom[p[1]:start]
-            if (vram - start == p[2] - p[0] and 0 < start - p[1] <= GAP_LIMIT and start % 4 == 0 and p[1] % 4 == 0
-                    and JR_RA in struct.unpack(f">{len(gap) // 4}I", gap[:len(gap) // 4 * 4])
-                    and not any(a < start and p[1] < b for a, b, _ in taken)):
-                p[1] = end
-                continue
+            if (vram - start == p[2] - p[0] and 0 < start - p[1] <= 2 * GAP_LIMIT and start % 4 == 0
+                    and p[1] % 4 == 0 and not any(a < start and p[1] < b for a, b, _ in taken)):
+                gap = rom[p[1]:start]
+                if len(gap) <= GAP_LIMIT and JR_RA in struct.unpack(f">{len(gap) // 4}I", gap):
+                    p[1] = end
+                    continue
+                if len(gap) > GAP_LIMIT:
+                    entry = _scheduled_wide_gap(rom, p[0], p[1], start, vram - start)
+                    if entry is not None:
+                        p[1] = entry
+                        out.append([entry, start, entry + vram - start])
         out.append([start, end, vram])
     return [tuple(x) for x in out]
 
@@ -483,6 +519,7 @@ def add_segments(config: Path, workdir: Path, image: str, log=print) -> str:
         from . import rare_overlays
         if result := rare_overlays.add(config,workdir,original,original_rom,packed,found,locations,log):
             return result
+    loaded = {}
     if taken:  # what the game loads that the search couldn't place: found by running it (when the emulator's here)
         from .loaded_code import find as run_and_find
 
@@ -512,7 +549,19 @@ def add_segments(config: Path, workdir: Path, image: str, log=print) -> str:
         (workdir/image).write_bytes(rom)
         cfg.setdefault("options", {})["target_path"] = image
         cfg["sha1"] = hashlib.sha1(rom).hexdigest()
+    from . import inferred_overlays
+
+    found, runtime = inferred_overlays.runtime_mappings(rom, found, loaded.get('moved_ranges', ()), taken)
+    if runtime:
+        log(f'Corrected {len(runtime)} inferred code ranges using RAM-observed bytes and their internal calls.')
+    found, scoped = inferred_overlays.recover(rom, found, taken, getattr(log, 'check_cancel', lambda: None),
+                                             changed=runtime)
     insert_segments(config, cfg, found, len(rom))
+    if scoped:
+        cfg = yaml.safe_load(config.read_text(encoding='utf-8'))
+        inferred_overlays.scope(cfg, found, scoped)
+        config.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8')
+        log('Recovered overlapping code-bank addresses from their independent internal calls.')
     kib = sum(en - st for st, en, _ in found) // 1024
     log(f"found {len(found)} more code segment{'s' if len(found) != 1 else ''} the game loads later ({kib} KiB)")
     return image

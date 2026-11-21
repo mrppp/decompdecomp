@@ -7,13 +7,13 @@ Goal: C that the game's own compiler turns into exactly the bytes in the ROM. No
 2. Read `get_context`: the shared header every compile includes (types, structs, prototypes).
 3. Write the function, then `compile_and_diff`. Your object is linked at the function's real address
    and compared with the ROM. Score 0 = byte-identical = matched and saved.
-4. Iterate. Change one thing at a time and watch the score. Keep the best saved draft, but retain a small alternative when its frame, spill offsets or register mapping improves despite a worse score.
+4. Iterate in small recorded steps: keep a numbered edit list with each result in `add_note` ("#3 sink v to the join: 14 -> 14, new diff"), and combine edits that are individually neutral (`compile_variants(combine=true)`, `score_permutations`): a late match is usually several of them together. Near-match (a few `r`/`o` rows left)? Read `guide("near-match")` and use `compiler_passes`. Keep the best saved draft, but retain a small alternative when its frame, spill offsets or register mapping improves despite a worse score.
 5. Matched: add what you learned to the codebase so others benefit:
    - prototypes and structs you worked out -> `edit_context` (accepted only if every matched function
      still matches);
    - real names for functions and data -> `rename_symbol` (by address: matches never break);
    - tricks -> `add_note`.
-6. `compile_and_diff` says when to move on: no better score in N compiles in a row, where N is the function's own number: its brief names it, and every compile_and_diff result shows where you stand, as in "no better in 2/6 compiles (move on at 6)".
+6. `compile_and_diff` says when to move on: no better score in N compiles in a row, where N is the function's own number: its brief names it, and every compile_and_diff result shows where you stand, as in "no better in 2/6 compiles (move on at 6)"; a near-match (best score 50 or less) gets at least 20, and a new diff at the best score counts as progress. Stalled on a near-match? Combine your individually neutral edits with `compile_variants(combine=true)` before releasing.
    Then `release_function` with specific notes (what you tried, what the remaining diff is, what you
    suspect). The next agent starts from your best attempt.
 

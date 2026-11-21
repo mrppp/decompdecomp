@@ -360,6 +360,30 @@ class Search(Permuter):
                  # m2c's byte offsets beside guarded counters, indexed by the counter again (and one shared
                  # counter, guarded on itself), the pseudo layout GCC 2.x's strength reduction gives
                  (L + 'guarded_offset_index.variants', (source, name, arch, asm)),
+                 # a record loop's byte offset recomputed from its counter, a global pointer held in a local from
+                 # the call before it, a float literal staged through a local (decomp-repair 0.5.257, in the pinned 0.5.258)
+                 (L + 'record_init_shapes.variants', (source, name, arch, asm)),
+                 # a temporary stored to a global and read back, written as the global (cse's forwarding)
+                 (L + 'global_store_forward.variants', (source, name)),
+                 # a store before a branch in both ways out and the leave block's stores swapped (together:
+                 # neither alone moves a list insertion, and without it the head-store blocks cross-jump), and a
+                 # global read in the loop instead of a local copy (loop.c then hoists the copy past the entry test)
+                 (L + 'arm_store_sink.variants', (source, name)),
+                 (L + 'global_copy_forward.variants', (source, name)),
+                 # a byte array's address added to an index in a nested loop's guarded block: the base set twice
+                 # (so the loop pass leaves it) after the index (the lui/addiu where the target has it)
+                 (L + 'loop_symbol_base_block.variants', (source, name)),
+                 # a switch case's temporaries split and its flag update folded in one child, and record
+                 # field stores beside a scalar global's store written raw (MEM_IN_STRUCT_P keeps their order)
+                 (L + 'case_split_combinations.variants', (source, name)),
+                 # a clamp function's four steps as one child (chained zero stores split, a float temporary one
+                 # name across sibling arms given its own local, identical returns collapsed, the packed return
+                 # reassigned behind a scheduling barrier): 525 -> 665 -> 255 -> 765 -> 0 one at a time
+                 (L + 'arm_local_return_fold.variants', (source, name)),
+                 (L + 'struct_store_raw_offsets.variants', (source, name, header)),
+                 # a float field advanced by a call's product: call result, product in its own scheduling
+                 # boundary, field re-read, sum field first (the allocation the one-line form can't give)
+                 (L + 'float_sum_split.variants', (source, name, arch, asm, header)),
                  (L + 'stack_byte_loop_base.variants', (source, name, arch, asm, header)),
                  (L + 'unsigned_rate_division_scope.variants', (source, name, arch, asm, header)),
                  (L + 'join_initializer_sink_repairs.variants', (source, name)),
@@ -491,7 +515,11 @@ class Search(Permuter):
                     # a do { } while (0) boundary in the last straight-line run (decomp-repair 0.5.187): a display
                     # list function stuck at 60 under every source order matched once split, only with its call's
                     # global hoisted first, so the proposals are the pair, not two steps a beam would drop
-                    ('decomprepair.scheduling_scope.variants', (parent, fn['name'], proj['arch']))])
+                    ('decomprepair.scheduling_scope.variants', (parent, fn['name'], proj['arch'])),
+                    # a guard body's constant initializer hoisted before the guard in its own one-shot scope, with
+                    # the copies that preceded the guard sunk into the body (decomp-repair 0.5.284): 10 -> 0 as one
+                    # child, 60 and 120 as its halves
+                    ('decomprepair.branch_slot_scope.variants', (parent, fn['name'], proj['arch']))])
                     for pair in generation_calls.pairs(result)]
                 for family, child in proposals:
                     if child in seen or budget <= 0:
@@ -507,6 +535,86 @@ class Search(Permuter):
                         lowest = min(lowest, score)
                         children.append((score, child))
             frontier = sorted(children, key=lambda item: item[0])[:3]
+        return lowest
+
+    NEUTRAL_DEPTH = 3     # score-neutral steps kept below one state before a step must pay off
+    NEUTRAL_WIDTH = 6     # neutral children expanded per level, one per family first
+    NEUTRAL_STATE = 64    # compiles spent below one state
+    NEUTRAL_BUDGET = 240  # compiles for the whole pass
+
+    @staticmethod
+    def neutral_frontier(children, width):
+        """The neutral children worth expanding: one per family first (a plateau is usually one family's many
+        spellings), then the rest in the order they came, up to `width`."""
+        picked, families = [], set()
+        for family, child in children:
+            if family not in families:
+                picked.append((family, child))
+                families.add(family)
+        picked += [item for item in children if item not in picked]
+        return picked[:width]
+
+    def neutral_plateau_pass(self, agent, proj, fn, best, fork):
+        """Search through score-neutral rewrites to the step that pays off after them, from every state that improved.
+
+        The other passes keep a child only when it scores better, so a step that pays off only after one or two
+        same-score steps is never reached, and the first improvement wins even when it leads nowhere. A 312-byte N64
+        voice-list walk at 623 needed its loop-invariant call arguments written at the call sites (623 -> 623) before
+        its staged table product matched (-> 0), while the quickest improvement (its loop as `goto`, 280) ended at
+        200. Each state keeps its same-score children for up to NEUTRAL_DEPTH levels (their children scored in
+        turn, one of each before the second of any); every child that beats its state becomes a state, and the
+        lowest-scoring state is searched next. Every child is judged normally."""
+        import heapq
+        import itertools
+
+        source = _candidate_source(fn, best)
+        if not best or not source:
+            return best
+        flags = [] if fork else compiler_for(self.net.cfg(proj), fn['vram'], fn).get('flags', [])
+        context = None if fork else self.net._context(proj['id'], fn['unit'])
+        header = self.net.forks.permuter_header(fork, fn['name']) if fork else (context['header'] if context else '')
+        budget = min(self.NEUTRAL_BUDGET, max(0, (self.limit - self.tested) // 2))
+        scored, done, order = {source: best}, set(), itertools.count()
+        states, lowest = [(best, next(order), source, ())], best
+
+        def children(parent):
+            labels = {}
+            try:
+                found = draft_repairs.variants(parent, fn['name'], proj['arch'], dict(fn).get('asm') or '', flags,
+                                               labels, limit=None, header=header)
+            except Exception:  # noqa: BLE001 - a family that fails on an edited source must not end the search
+                return []
+            return [(labels.get(child, 'local_repair'), child) for child in found]
+
+        while states and budget > 0 and lowest:
+            level, _, state, path = heapq.heappop(states)
+            if state in done:
+                continue
+            done.add(state)
+            frontier, allowance = [(state, path)], min(budget, self.NEUTRAL_STATE)
+            for _ in range(self.NEUTRAL_DEPTH):
+                rows = [[(family, child, trail) for family, child in children(parent)] for parent, trail in frontier]
+                neutral = []
+                for family, child, trail in (item for row in itertools.zip_longest(*rows) for item in row if item):
+                    if allowance <= 0 or not lowest:
+                        break
+                    if child not in scored:
+                        allowance -= 1
+                        budget -= 1
+                        self.check()
+                        with repair_trial({'kind': 'deep local repair', 'family': '+'.join(trail + (family,))}):
+                            scored[child] = self._score(agent, proj, fn, child, lowest, fork)
+                    score = scored[child]
+                    if score is None or child in done:
+                        continue
+                    if score < level:
+                        heapq.heappush(states, (score, next(order), child, trail + (family,)))
+                        lowest = min(lowest, score)
+                    elif score == level:
+                        neutral.append((family, (child, trail + (family,))))
+                if allowance <= 0 or not lowest or not neutral:
+                    break
+                frontier = [item for _, item in self.neutral_frontier(neutral, self.NEUTRAL_WIDTH)]
         return lowest
 
     def loop_cursor_pass(self, agent, proj, fn, best, fork):
@@ -780,7 +888,7 @@ class Search(Permuter):
             self.register_focus = True
         return best
 
-    PAIRED_ROUNDS = 3
+    PAIRED_ROUNDS = 8  # each round returns at its first improvement (paired_moves.FIRST_BEAM), so rounds are cheap steps
 
     def paired_move_pass(self, agent, proj, fn, state, best, fork):
         """Two statement moves at once, judged exactly in parallel (paired_moves).
@@ -804,10 +912,11 @@ class Search(Permuter):
             self.phase = 'two-move search'
             self.log('Searching two statement moves at once: every single move is judged, then a second move on '
                      'the least-different results.')
+            rank = self._allocation_rank(proj, fn, source, rows, fork)
             with judge_pool.JudgePool(proj['slug'], fn, own['toolchain'], flags) as pool:
                 score, candidate, judged = paired_moves.search(
                     pool.judge_many, source, fn['name'], header, best, seen=self.local_seen, check=self.check,
-                    log=self.log)
+                    log=self.log, rank=rank)
                 if pool.errors:
                     self.log('Two-move search could not judge here: ' + pool.errors[0][:200])
             self.tested += max(1, judged // 50)
@@ -827,6 +936,31 @@ class Search(Permuter):
             if best == 0:
                 return 0
         return best
+
+    def _allocation_rank(self, proj, fn, source, rows, fork):
+        """An order for the two-move search's single moves from the GCC allocation evidence of a register swap
+        (allocation_moves), or None when there is no swap, no evidence or no variable to name."""
+        from . import allocation_moves, allocation_priority, allocation_search
+        if fork or not allocation_priority.swaps(rows) or not getattr(self.net, 'is_rom', lambda _: False)(proj):
+            return None
+        try:
+            evidence = allocation_search.saved(self.net, proj, fn, source)
+            if evidence is None and self.tested + 2 < self.limit and time.monotonic() + 40 < self.deadline:
+                def charged():
+                    self.check()
+                    self.tested += 1
+                    self.report()
+                evidence = allocation_search.capture(self.net, proj, fn, source, on_compile=charged, rows=rows)
+        except SearchLimit:
+            raise
+        except (OSError, ValueError, KeyError, RuntimeError):
+            return None
+        pairs = allocation_moves.rivals((evidence or {}).get('allocation'), rows, source)
+        if not pairs:
+            return None
+        self.log('Two-move search: judging first the moves that change the live ranges deciding '
+                 + ', '.join(f'{w} over {l}' for w, l in pairs) + ' (GCC allocation priority).')
+        return lambda singles: allocation_moves.order(source, singles, pairs)
 
     def allocation_choices(self, proj, fn, source, rows, choices, labels, header, fork):
         """One bounded lane before broad mutation, charged to the same global limit/deadline."""
@@ -1921,6 +2055,9 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
                     local_trials = max(1, (search.limit-search.tested)//2)
                     best, _ = search.local_repairs(agent, proj, net._function(name, slug), baseline, fork,
                                                    max_trials=local_trials, phase_deadline=local_deadline)
+                    if best and (lane is None or lane.index == 0) and not relabel:
+                        search.phase = 'neutral steps'
+                        best = search.neutral_plateau_pass(agent, proj, net._function(name, slug), best, fork)
                     if best == 0:
                         reason = 'Matched'
             finally:
