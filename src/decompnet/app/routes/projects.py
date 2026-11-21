@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import secrets
 import shutil
+import sys
 import threading
 import time
 from contextlib import nullcontext
@@ -53,9 +54,19 @@ def register(app: App) -> None:
             started = time.monotonic()
             try:
                 def perform():
+                    if request.url.path == "/api/polishing-checklist":
+                        with net.progress.view():
+                            return fn(slug, request, data)
+                    if request.url.path in ('/api/knowledge/merge', '/api/knowledge/profile'):
+                        # Finding metadata is independent of saved code and its compiler.
+                        with net.progress.view():
+                            return fn(slug, request, data)
                     if request.url.path in ('/api/priority', '/api/variants'):
                         return fn(slug, request, data)  # Metadata is published by autosave, without another recheck here.
-                    if request.url.path in ('/api/try', '/api/cross-game/run', '/api/reconcile-matches') or (request.method=='POST' and request.url.path=='/api/reimport'):
+                    if request.method == "POST" and request.url.path in (
+                        '/api/try', '/api/cross-game/run', '/api/reconcile-matches', '/api/reimport',
+                        '/api/permuter/function', '/api/deep-permuter', '/api/play', '/api/play-export', '/api/port-export-options', '/api/recompile',
+                    ):
                         return fn(slug, request, data)  # The worker synchronizes; return its job without waiting.
                     if request.method == "GET" or request.url.path == "/api/permuter/pass":
                         # Deep-pass controls schedule local workers; the workers synchronize before judging.
@@ -95,7 +106,9 @@ def register(app: App) -> None:
                         return response(perform, started, JSONResponse, request.url.path)
                     finally:current_project.reset(token)
                 execute=(reader or call) if request.method=="GET" else call
-                if request.url.path == '/api/cross-game/run':
+                if request.url.path in ('/api/cross-game/run', '/api/port-export-options') or (
+                    request.url.path == '/api/recompile' and 'preview' not in request.query_params
+                ) or (request.url.path == '/api/play-export' and not data.get('show')):
                     execute=app.control
                 if request.url.path=='/api/rom-explorer/discovery' and (request.query_params.get('view')=='activity' or data.get('action')=='stop'):
                     execute=app.control  # Discovery admission/cancellation must not queue behind builds.
@@ -312,29 +325,56 @@ def register(app: App) -> None:
         from ...port import call_fixes
         return {"job": jobs.start("fix-calls", lambda log: call_fixes.fix(net, slug, log), project=slug)}
 
+    def require_port_build(data):
+        if data.get("build_mode", "compatibility") != "compatibility" or data.get("runtime", "wasm") != "wasm":
+            raise NetworkError("Choose N64 compatibility and the decompdecomp runtime to play or export today.")
+
     def p_play(slug, request, data):
         """Build the game for the PC and run it with its live view in the browser (port/wasm/play.py), in the
         background; Stop ends it."""
         from ...port.wasm import play
         if data.get("stop"):
             return {"stopped": play.stop(slug)}
-        if data.get("runtime", "wasm") != "wasm":
-            raise NetworkError(f"Play runs the WebAssembly build only for now; {data['runtime']} is planned "
-                               "(ROADMAP.md, Ports): choose WebAssembly")
-        if (url := play.running(slug)):
-            return {"url": url}
+        runtime = data.get("runtime", "wasm")
+        if data.get("build_mode", "compatibility") != "compatibility":
+            require_port_build(data)
+        adapter = play.native_adapter(net, slug, runtime) if runtime != "wasm" else None
+        if (view := play.running_result(slug)):
+            if bool(adapter) == view.get("native", False):
+                return view
+            raise NetworkError("Stop the running game before switching runtimes.")
         if (building := jobs.active(("play",), project=slug)):  # a second click, or another window: the same build
             return {"job": building["id"]}
-        return {"job": jobs.start("play", lambda log: play.play(net, slug, log), project=slug)}
+        def launch(log):
+            return play.play(net, slug, log, adapter=adapter) if adapter else play.play(net, slug, log)
+
+        return {"job": jobs.start("play", launch, project=slug)}
+
+    def port_export_options(slug, request, data):
+        """Save export targets in the project database and discover an active export before port readiness scans."""
+        from ...port.wasm.export import target_selection
+
+        project = net.project_row(slug, sync=False)
+        store = net.project_store(project["id"])
+        key = f"port-export-options:{project['id']}"
+        if request.method == "POST":
+            selected = target_selection(data.get("targets"))
+            with store.tx() as db:
+                db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (key, json.dumps(selected)))
+            return {"targets": selected}
+
+        row = store.one("SELECT value FROM settings WHERE key=?", key)
+        return {"targets": json.loads(row["value"]) if row else [], "available": net.is_rom(project),
+                "mac": sys.platform == "darwin", "job": jobs.active(("play-export",), project=slug)}
 
     def p_play_export(slug, request, data):
-        """Export the game (port/wasm/export.py): a standalone app for this computer ("app") or a browser build
-        ("web"), in the background; `show` opens the last export's folder."""
+        """Build the selected targets in one cancellable job, or open an existing export's folder."""
         from ...port.wasm import export, play
+
         kind = str(data.get("kind") or "")
-        if kind not in export.KINDS:
-            raise ValueError("Choose what to export: a standalone app or a browser build.")
         if data.get("show"):
+            if kind not in export.KINDS:
+                raise ValueError("Choose an exported target to open.")
             repo, _, _ = play.game(net, slug)
             folder = repo / "port" / "wasm" / "export" / kind
             if not folder.is_dir():
@@ -343,10 +383,24 @@ def register(app: App) -> None:
                 return {"ok": False, "message": f"The export is on the server, in {folder}"}
             why = hostenv.open_folder(folder)
             return {"ok": why is None, "message": why}
-        if (running := jobs.active(("play-export",), project=slug)):  # another click, or another window
-            return {"job": running["id"]}
-        simd = bool(data.get("simd")) and kind == "web"  # the browser build's faster modules, as well (web.SIMD)
-        return {"job": jobs.start("play-export", lambda log: export.export(net, slug, kind, log, simd=simd), project=slug)}
+
+        require_port_build(data)
+        if "targets" in data:
+            targets = export.target_selection(data["targets"])
+            if not any(target in export.KINDS for target in targets):
+                raise ValueError("Select at least one export target.")
+            def run(log):
+                return export.export_selected(net, slug, targets, log)
+        else:
+            if kind not in export.KINDS:
+                raise ValueError("Choose what to export.")
+            def run(log):
+                return export.export(net, slug, kind, log, simd=bool(data.get("simd")) and kind == "web")
+
+        with jobs._lock:
+            if running := jobs.active(("play-export",), project=slug):
+                return {"job": running["id"]}
+            return {"job": jobs.start("play-export", run, project=slug, cancel_message="Export stopped.")}
 
     def p_asset_map(slug, request, data):
         """Write the ROM's data as the kit's extractor config into the project's folder (port/asset_map.py)."""
@@ -360,11 +414,37 @@ def register(app: App) -> None:
         from ...port import asset_map
         return {"job": jobs.start("asset-extract", lambda log: asset_map.extract(net, slug, log), project=slug)}
 
-    def p_recompile(slug, request, data):
-        """The game's own instructions as C by the console's static recompiler (app/recompile.py), in the background:
-        the first run builds it from source."""
-        from .. import recompile
-        return {"job": jobs.start("recompile", lambda log: recompile.run(net, slug, log), project=slug)}
+    def port_recompile(slug, request, data):
+        """Check the ROM split using the console's static recompiler, with a job the panel can reattach to."""
+        from .. import recompile, recompile_review
+
+        project = net.project_row(slug, sync=False)
+        rom = net.is_rom(project)
+        available = rom and net.console(project).recompiler is not None
+        if request.method == "GET" and "preview" in request.query_params:
+            if not available:
+                raise NetworkError("Assembly review needs a supported ROM project.")
+            try:
+                revision = float(request.query_params.get("revision", ""))
+                address = int(request.query_params["preview"])
+            except ValueError:
+                raise NetworkError("Choose a function from the latest N64Recomp report.") from None
+            return recompile_review.preview(net, project, revision, address)
+        with jobs._lock:
+            running = jobs.active(("recompile", "recompile-review"), project=slug)
+            if request.method == "GET":
+                return {"recomp_available": available, "mode": "rom" if rom else "project", "job": running}
+            if not available:
+                raise NetworkError("Recompilation needs an imported ROM and a static recompiler for its console.")
+            if running:
+                return {"job": running["id"]}
+            if "addresses" in data:
+                def apply(log):
+                    return recompile_review.add(net, slug, data.get("revision"), data["addresses"], log)
+                return {"job": jobs.start("recompile-review", apply, project=slug,
+                                          cancel_message="Adding functions stopped. Refresh to check the split.")}
+            return {"job": jobs.start("recompile", lambda log: recompile.run(net, slug, log), project=slug,
+                                      cancel_message="Recompilation stopped.")}
 
     def p_behaviour_check(slug, request, data):
         """Check behaviour: every matched function's first call through its recompiled and decompiled C
@@ -405,8 +485,8 @@ def register(app: App) -> None:
         # Reserve discovery and start atomically: double clicks and two windows
         # must attach to the same project job rather than launch duplicate scans.
         with jobs._lock:
-            active = rom_explorer.status(net,slug,jobs)['job']
-            if active and active['state']=='running':return {'job':active['id']}
+            active = jobs.active(('rom-explorer',), project=slug)
+            if active:return {'job':active['id']}
             return {'job':jobs.start('rom-explorer',lambda log:rom_explorer.run(net,slug,log),project=slug,
                                      cancel_message='ROM scan stopped. The previous completed map and notes are retained.')}
 
@@ -455,6 +535,30 @@ def register(app: App) -> None:
 
     def p_missed_functions(slug, request, data):
         return {"job": jobs.start("missed-functions", lambda log: net.find_missed_functions(slug, log), project=slug)}
+
+    def donor_recovery(slug, request, data):
+        from .. import donor_reanalysis
+
+        kinds = ('donor-code-preview', 'donor-code-apply')
+        if request.method == 'GET':
+            if job := jobs.active(kinds, project=slug):
+                return {'job': job}
+            return {'donors': donor_reanalysis.donors(net, slug)}
+        action = data.get('action')
+        donor = data.get('donor')
+        if action == 'preview':
+            work = lambda log: donor_reanalysis.preview(net, slug, donor, log)
+        elif action == 'apply':
+            work = lambda log: donor_reanalysis.apply(net, slug, donor, data.get('token'), log,
+                                                      include_overlays=data.get('include_overlays') is True)
+        else:
+            raise NetworkError('Choose Preview or Add verified functions.')
+        with jobs._lock:
+            if active := jobs.active(kinds, project=slug):
+                return {'job': active['id'], 'kind': active['kind']}
+            kind = 'donor-code-' + action
+            job = jobs.start(kind, work, project=slug, cancel_message='Donor recovery stopped.')
+            return {'job': job, 'kind': kind}
 
     def p_recover_code(slug, request, data):
         from ..reviewed_code import run
@@ -617,7 +721,7 @@ def register(app: App) -> None:
             name = str(data.get('name', ''))
             observer = watch(name, log.progress) if log is not None else nullcontext()
             with observer, net.progress.foreground():
-                agent, _ = net.local_agent("you")
+                agent, _ = net.local_agent(_holder(data))
                 res = net.attempt(agent, name, str(data.get("source", "")), slug, publish=False)
                 return {"score": res["score"], "matched": res["matched"], "exact": res.get('exact',False),
                         "new_match": res.get('new_match',False), "adopted": res.get('adopted',False),
@@ -644,8 +748,28 @@ def register(app: App) -> None:
                 if snapshot['state']!='running':raise NetworkError(snapshot.get('error') or 'Attempt ended without a result.')
             time.sleep(.05)
 
+    def _holder(data):
+        """Who a CLI judges as: "you" (the window), or a named holder such as one match-function session
+        ("claude-<id>"), so two sessions working at once each hold their own claim instead of sharing yours."""
+        holder = str(data.get("holder") or "")
+        if not holder:
+            return "you"
+        if len(holder) > 40 or not all(c.isalnum() or c in "-_." for c in holder):
+            raise NetworkError("A holder is up to 40 letters, digits, '-', '_' or '.'.")
+        return holder
+
+    def p_claim(slug, request, data):
+        """A CLI claims a function, as "you" or a named holder (_holder): the named one, or with no name an open
+        function nobody holds, picked by `strategy` (random by default), so parallel sessions never share one."""
+        agent, _ = net.local_agent(_holder(data))
+        name = str(data.get("name") or "") or None
+        fn = net.claim_row(agent, slug, name, str(data.get("strategy") or "random"))
+        if fn is None:
+            raise NetworkError("No open function is left to claim in this project.")
+        return {"name": fn["name"], "holder": agent.name}
+
     def p_release(slug, request, data):
-        agent, _ = net.local_agent("you")
+        agent, _ = net.local_agent(_holder(data))
         try:
             net.release(agent, str(data.get("name", "")), "", slug)
         except NetworkError:
@@ -684,6 +808,26 @@ def register(app: App) -> None:
     def p_claim_order(slug, request, data):
         net.set_claim_order(slug, str(data.get("order", "")))
         return net.overview(slug)
+
+    def p_routing_experiment(slug, request, data):
+        from ... import routing_experiment
+
+        budget = data.get('budget')
+        if type(budget) is not int or not 0 <= budget <= routing_experiment.LIMIT:
+            raise NetworkError(f'Choose a claim limit from 1 to {routing_experiment.LIMIT}, or stop the experiment.')
+        proj = net.project_row(slug, sync=False)
+        store = net.project_store(proj['id'])
+
+        def change(cfg):
+            current = cfg.get('routing_experiment') or {}
+            counts = store.one('SELECT COUNT(*) AS used,SUM(ended_at IS NULL) AS pending '
+                               'FROM claim_routing_experiments WHERE project_id=? AND run=?',
+                               proj['id'], current['run']) if budget and current.get('enabled') else None
+            routing_experiment.configure(cfg, budget, **dict(counts) if counts else {})
+
+        net._update_cfg(slug, change, synchronize=False)
+        with net.progress.view():
+            return net.overview(slug)
 
     def p_title(slug, request, data):
         net.set_title(slug, str(data.get("title", "")))
@@ -775,6 +919,13 @@ def register(app: App) -> None:
     def p_boundary(slug, request, data):
         net.resolve_boundary(slug, int(data.get("id", 0)), data.get("action") == "apply")
         return net.overview(slug)
+
+    def p_polish_checklist(slug, request, data):
+        from .. import polish_checklist
+        project_id = net.project_row(slug, sync=False)["id"]
+        if request.method == "GET":
+            return polish_checklist.read(net, project_id)
+        return polish_checklist.save(net, project_id, data.get("selected"), data.get("name_format"))
 
     def p_source_preparation(slug, request, data):
         from .. import source_preparation
@@ -891,12 +1042,20 @@ def register(app: App) -> None:
     def start_search(slug, name, minutes, variants, **options):
         """One deep search per function, however it was asked for: a second ask joins the running one."""
         from .. import deep_permuter
+        def run(log):
+            # Source preparation can wait for a project check or compiler slot.
+            # Publish the job first so the drawer can follow it or request Stop.
+            log.progress({'phase': 'Preparing function'})
+            deep_permuter.validate(net, slug, name, minutes, variants)
+            log.check_cancel()
+            return deep_permuter.run(net, slug, name, minutes, variants, log, **options)
+
         with jobs._lock:
             previous = function_searches.get((slug, name))
             if previous and jobs.jobs.get(previous, {}).get('state') == 'running':
                 return previous
-            deep_permuter.validate(net, slug, name, minutes, variants)
-            job = jobs.start('deep-permuter', lambda log: deep_permuter.run(net, slug, name, minutes, variants, log, **options),
+            deep_permuter.validate_limits(minutes, variants)
+            job = jobs.start('deep-permuter', run, project=slug,
                              cancel_message='Deep permuter stopped. Verified improvements are saved.')
             jobs.jobs[job].update({'slug': slug, 'function': name})
             function_searches[slug, name] = job
@@ -911,7 +1070,11 @@ def register(app: App) -> None:
             with jobs._lock:
                 last = jobs.jobs.get(function_searches.get((slug, name)))
             return {'job': last['id'] if last and last['state'] == 'running' else None, 'last': last}
-        return {'job': start_search(slug, str(data.get('name', '')), data.get('minutes', 10), data.get('variants', 500))}
+        # The older /api/permuter/function route spells these `function` and `max_variants`. Sending those here used to
+        # start a search on function '' or silently cap it at 500 variants, so both spellings mean the same thing.
+        name = data.get('name') or data.get('function') or ''
+        variants = data.get('variants', data.get('max_variants', 500))
+        return {'job': start_search(slug, str(name), data.get('minutes', 10), variants)}
 
     def p_finish_near(slug, request, data):
         from .. import finish_near
@@ -1177,6 +1340,17 @@ def register(app: App) -> None:
     def p_knowledge_verify(slug, request, data):
         return net.knowledge.request_verification(slug,int(data.get('id') or 0),list(manager.sessions.values()))
 
+    def p_knowledge_profile(slug, request, data):
+        if request.method == "POST":
+            net.knowledge.move_to_profile(slug, data.get("ids"))
+            return {"message": "Finding moved to Compiler profile evidence."}
+        return net.knowledge.listing(slug, profile=True)
+
+    def p_knowledge_merge(slug, request, data):
+        net.knowledge.merge(slug, data.get("target"), data.get("sources"), data.get("text"),
+                            profile=data.get("profile") is True)
+        return {"message": "Findings merged with their votes and supporting examples."}
+
     def p_knowledge(slug, request, data):
         """What agents learned: GET lists it; POST accepts or rejects one ({id, accept}), or sets whether agreed
         knowledge is added by itself ({auto})."""
@@ -1215,6 +1389,8 @@ def register(app: App) -> None:
         "/api/project": (p_overview, ["GET"]),
         "/api/split-rom": (p_split_rom, ["POST"]),
         "/api/join-rom": (p_join_rom, ["POST"]),
+        "/api/knowledge/profile": (p_knowledge_profile, ["GET", "POST"]),
+        "/api/knowledge/merge": (p_knowledge_merge, ["POST"]),
         "/api/knowledge/verify": (p_knowledge_verify, ["POST"]),
         "/api/knowledge": (p_knowledge, ["GET", "POST"]),
         "/api/modelcosts": (lambda s, r, d: manager.costs(s), ["GET"]),
@@ -1233,12 +1409,13 @@ def register(app: App) -> None:
         "/api/project-layout": (p_project_layout, ["POST"]), "/api/open": (p_open, ["POST"]),
         "/api/reimport": (p_reimport, ["GET", "POST"]), "/api/code-audit": (p_code_audit, ["POST"]),
         "/api/recover-code": (p_recover_code, ["POST"]), "/api/missed-functions": (p_missed_functions, ["POST"]),
+        "/api/donor-code": (donor_recovery, ["GET", "POST"]),
         "/api/data-regions": (p_data_regions, ["GET", "POST"]),
         "/api/agent-reviews": (g_agent_reviews, ["GET"]), "/api/agent-review": (p_agent_review, ["POST"]),
         "/api/code-audit-results": (g_code_audit, ["GET"]), "/api/code-audit-review": (p_code_audit_review, ["POST"]),
         "/api/delete": (p_delete, ["POST"]),
         "/api/try/status": (g_try_status, ["GET"]),
-        "/api/try": (p_try, ["POST"]), "/api/release": (p_release, ["POST"]), "/api/claim/handover": (p_claim_handover, ["POST"]), "/api/reopen": (p_reopen, ["POST"]), "/api/setaside": (p_set_aside, ["POST"]),
+        "/api/try": (p_try, ["POST"]), "/api/release": (p_release, ["POST"]), "/api/claim": (p_claim, ["POST"]), "/api/claim/handover": (p_claim_handover, ["POST"]), "/api/reopen": (p_reopen, ["POST"]), "/api/setaside": (p_set_aside, ["POST"]),
         "/api/recheck": (p_recheck, ["POST"]),
         "/api/finish-near": (p_finish_near, ["POST"]),
         "/api/reconcile-matches": (p_reconcile_matches, ["POST"]),
@@ -1246,6 +1423,7 @@ def register(app: App) -> None:
         "/api/permuter/pass": (p_deep_sweep, ["GET", "POST"]),
         "/api/permuter/function": (p_deep_permuter, ["POST"]),
         "/api/deep-permuter": (p_deep_search, ["GET", "POST"]),
+        "/api/polishing-checklist": (p_polish_checklist, ["GET", "POST"]),
         "/api/source-preparation": (p_source_preparation, ["GET", "POST"]),
         "/api/drafts": (p_machine_drafts, ["GET", "POST"]), "/api/autopilot": (p_autopilot, ["POST"]), "/api/instructions": (p_instructions, ["POST"]), "/api/title": (p_title, ["POST"]),
         "/api/cross-game": (lambda s, r, d: {"results": net.twins.cross_game_results(s, all_matches=r.query_params.get("all_matches") == "1"),
@@ -1261,6 +1439,7 @@ def register(app: App) -> None:
         "/api/rename-function": (p_rename_function, ["POST"]),
         "/api/cross-game/functions": (p_project_functions, ["GET"]),
         "/api/claim-order": (p_claim_order, ["POST"]),
+        "/api/routing-experiment": (p_routing_experiment, ["POST"]),
         "/api/priority": (p_priority, ["POST"]), "/api/note": (p_note, ["POST"]), "/api/scope": (p_scope, ["POST"]),
         "/api/unanalysed": (p_unanalysed, ["POST"]),
         "/api/suggestion": (p_suggestion, ["POST"]), "/api/boundary": (p_boundary, ["POST"]),
@@ -1273,11 +1452,12 @@ def register(app: App) -> None:
         "/api/asset-map": (p_asset_map, ["POST"]),
         "/api/play": (p_play, ["POST"]),
         "/api/play-export": (p_play_export, ["POST"]),
+        "/api/port-export-options": (port_export_options, ["GET", "POST"]),
         "/api/rename-calls": (p_rename_calls, ["POST"]),
         "/api/fix-calls": (p_fix_calls, ["POST"]),
         "/api/port-identity": (p_port_identity, ["POST"]),
         "/api/asset-extract": (p_asset_extract, ["POST"]),
-        "/api/recompile": (p_recompile, ["POST"]),
+        "/api/recompile": (port_recompile, ["GET", "POST"]),
         "/api/behaviour-check": (p_behaviour_check, ["POST"]),
         "/api/compilermap": (p_compilermap, ["GET", "POST"]),
         "/api/verification": (p_verification, ["POST"]),

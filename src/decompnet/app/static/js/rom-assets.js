@@ -1,5 +1,11 @@
 /* Local, bounded asset previews and inspectable buffer chains. No autoplay. */
 const ROM_ASSET_FORMATS=[['auto','Detect asset / bank'],['rgba8888','RGBA 8888'],['rgb888','RGB 888'],['rgba5551-be','RGBA 5551 (big endian)'],['rgb565-le','RGB 565 (little endian)'],['rgb565-be','RGB 565 (big endian)'],['ia4','Intensity + alpha 4-bit'],['ia8','Intensity + alpha 8-bit'],['ia16','Intensity + alpha 16-bit'],['i4','Intensity 4-bit'],['i8','Intensity 8-bit'],['ci4','Indexed 4-bit + palette'],['ci8','Indexed 8-bit + palette'],['palette-rgba5551','Palette RGBA 5551'],['palette-ia16','Palette intensity + alpha'],['pcm-s16le','PCM signed 16-bit little endian'],['pcm-s16be','PCM signed 16-bit big endian'],['pcm-u8','PCM unsigned 8-bit']];
+function romAssetForView(region, kind) {
+  const primary=region.detected_asset;
+  if(primary?.kind===kind || (kind==='3d model' && primary?.media==='model'))return primary;
+  return region.evidence?.find(asset=>asset.kind===kind && asset.preview_settings);
+}
+
 function stopRomAssetAudio(root=$('dialogBody')) {
   root._romAnimationStop?.();root._romCancelPreview?.();
   root._romAnimationStop=null;root._romCancelPreview=null;root._romPreviewFrame=null;
@@ -29,9 +35,17 @@ function romDialogueHTML(region) {
     <label class="field"><span>Speaker</span><select data-dialogue-speaker><option value="">All speakers</option>${speakers}</select></label>
   </div>`;
 }
+function romCanPreloadAsset(region) {
+  if(Object.keys(region.annotation?.preview_settings || {}).length)return true;
+  const asset=region.detected_asset;
+  if(asset)return asset.audio_kind!=='libmus sequence'
+    && !(asset.audio_kind==='dean stream' && asset.samples?.[0]?.preview_available===false);
+  return region.evidence?.some(clue=>clue.confidence==='validated' && ['image','audio'].includes(clue.kind));
+}
+
 function romAssetHTML(region) {
   const saved=region.annotation?.preview_settings || {},get=(key,fallback)=>esc(saved[key] ?? fallback);
-  return `<section class="rom-asset-preview"><h3>Asset preview</h3>${region.detected_asset && !['audio','model','metadata'].includes(region.detected_asset.media) ? `<p class="small muted">Detected ${esc(region.detected_asset.preview_settings.format.toUpperCase())} texture bank · ${region.detected_asset.preview_settings.width} × ${region.detected_asset.preview_settings.height} · ${region.detected_asset.frames} frame(s) · ${region.detected_asset.palettes} palette(s). Select frames, palettes and mip levels below.</p>` : ''}${typeof romTextureControlsHTML==='function' ? romTextureControlsHTML(region) : ''}${romNativeModelHTML(region)}${romResourceHTML(region)}${romDialogueHTML(region)}${typeof romAudioHTML==='function' ? romAudioHTML(region) : ''}<p class="small muted">${region.detected_asset?.media==='metadata' ? 'Inspect validated resource counts and headers. Raw format controls let you explore another interpretation.' : 'Inspect detected models and image/audio banks, recognized images, PCM WAVE and mono VAGp audio, or choose a raw row-major texture, palette or PCM layout. Raw settings are your interpretation. Limits: 4 MiB, 1,048,576 pixels or 30 seconds. Audio plays only when you press Play.'}</p><div class="rom-asset-fields"><label class="field"><span>Source</span><select data-asset-source><option value="rom"${!['decoded','archive'].includes(saved.source) ? ' selected' : ''}>ROM bytes</option><option value="decoded"${saved.source==='decoded' ? ' selected' : ''}>Decompressed block</option>${region.detected_asset?.archive ? `<option value="archive"${saved.source==='archive' ? ' selected' : ''}>Decoded archive member</option>` : ''}</select></label><label class="field" data-asset-block-field><span>Compressed block ROM offset</span><input data-asset-block_offset value="${get('block_offset','0x'+region.start.toString(16))}" spellcheck="false"></label><label class="field"><span>Format</span><select data-asset-format>${ROM_ASSET_FORMATS.map(([id,label])=>`<option value="${id}"${(saved.format || 'auto')===id ? ' selected' : ''}>${label}</option>`).join('')}</select></label><label class="field"><span data-asset-offset-label>Data ROM offset</span><input data-asset-offset value="${get('offset','0x'+region.start.toString(16))}" spellcheck="false"></label><label class="field" data-asset-image-field><span>Width (1–2048)</span><input data-asset-width type="number" min="1" max="2048" value="${get('width',32)}"></label><label class="field" data-asset-image-field><span>Height (1–2048)</span><input data-asset-height type="number" min="1" max="2048" value="${get('height',32)}"></label><label class="field" data-asset-palette-field><span>Palette offset (same source)</span><input data-asset-palette_offset value="${get('palette_offset',0)}" spellcheck="false"></label><label class="field" data-asset-palette-field><span>Palette format</span><select data-asset-palette_format>${[['rgba5551-be','RGBA 5551 big endian'],['ia16','Intensity + alpha 16-bit'],['rgba8888','RGBA 8888']].map(([id,label])=>`<option value="${id}"${(saved.palette_format || 'rgba5551-be')===id ? ' selected' : ''}>${label}</option>`).join('')}</select></label><label class="field" data-asset-audio-field><span>Channels (1–2)</span><input data-asset-channels type="number" min="1" max="2" value="${get('channels',1)}"></label><label class="field" data-asset-audio-field><span>Sample rate (1000–192000 Hz)</span><input data-asset-rate type="number" min="1000" max="192000" value="${get('rate',22050)}"></label><label class="field" data-asset-audio-field><span>Audio byte length (max 4 MiB / 30 s)</span><input data-asset-length type="number" min="1" max="4194304" value="${get('length',Math.min(region.size,44100))}"></label></div><button type="button" class="primary small-btn" data-asset-preview>${region.detected_asset?.dialogue ? 'Browse dialogue' : region.detected_asset?.media==='metadata' ? 'Inspect resource' : 'Preview asset'}</button><pre class="joblog" data-asset-work hidden></pre><div data-asset-result aria-live="polite"></div>${romDiscoveryHTML(region)}<p class="small muted">Save notes below to retain these preview settings. Preview data stays on this device and never changes the ROM.</p></section>`;
+  return `<section class="rom-asset-preview"><h3>Asset preview</h3><pre class="joblog" data-asset-work hidden></pre><div data-asset-result aria-live="polite"></div>${region.detected_asset && !['audio','model','metadata'].includes(region.detected_asset.media) ? `<p class="small muted">Detected ${esc(region.detected_asset.preview_settings.format.toUpperCase())} texture bank · ${region.detected_asset.preview_settings.width} × ${region.detected_asset.preview_settings.height} · ${region.detected_asset.frames} frame(s) · ${region.detected_asset.palettes} palette(s). Select frames, palettes and mip levels below.</p>` : ''}${typeof romTextureControlsHTML==='function' ? romTextureControlsHTML(region) : ''}${romNativeModelHTML(region)}${romResourceHTML(region)}${romDialogueHTML(region)}${typeof romAudioHTML==='function' ? romAudioHTML(region) : ''}<details><summary>Preview settings</summary><p class="small muted">${region.detected_asset?.media==='metadata' ? 'Inspect validated resource counts and headers. Raw format controls let you explore another interpretation.' : 'Inspect detected models and image/audio banks, recognized images, PCM WAVE and mono VAGp audio, or choose a raw row-major texture, palette or PCM layout. Raw settings are your interpretation. Limits: 4 MiB, 1,048,576 pixels or 30 seconds. Audio plays only when you press Play.'}</p><div class="rom-asset-fields"><label class="field"><span>Source</span><select data-asset-source><option value="rom"${!['decoded','archive'].includes(saved.source) ? ' selected' : ''}>ROM bytes</option><option value="decoded"${saved.source==='decoded' ? ' selected' : ''}>Decompressed block</option>${region.detected_asset?.archive ? `<option value="archive"${saved.source==='archive' ? ' selected' : ''}>Decoded archive member</option>` : ''}</select></label><label class="field" data-asset-block-field><span>Compressed block ROM offset</span><input data-asset-block_offset value="${get('block_offset','0x'+region.start.toString(16))}" spellcheck="false"></label><label class="field"><span>Format</span><select data-asset-format>${ROM_ASSET_FORMATS.map(([id,label])=>`<option value="${id}"${(saved.format || 'auto')===id ? ' selected' : ''}>${label}</option>`).join('')}</select></label><label class="field"><span data-asset-offset-label>Data ROM offset</span><input data-asset-offset value="${get('offset','0x'+region.start.toString(16))}" spellcheck="false"></label><label class="field" data-asset-image-field><span>Width (1–2048)</span><input data-asset-width type="number" min="1" max="2048" value="${get('width',32)}"></label><label class="field" data-asset-image-field><span>Height (1–2048)</span><input data-asset-height type="number" min="1" max="2048" value="${get('height',32)}"></label><label class="field" data-asset-palette-field><span>Palette offset (same source)</span><input data-asset-palette_offset value="${get('palette_offset',0)}" spellcheck="false"></label><label class="field" data-asset-palette-field><span>Palette format</span><select data-asset-palette_format>${[['rgba5551-be','RGBA 5551 big endian'],['ia16','Intensity + alpha 16-bit'],['rgba8888','RGBA 8888']].map(([id,label])=>`<option value="${id}"${(saved.palette_format || 'rgba5551-be')===id ? ' selected' : ''}>${label}</option>`).join('')}</select></label><label class="field" data-asset-audio-field><span>Channels (1–2)</span><input data-asset-channels type="number" min="1" max="2" value="${get('channels',1)}"></label><label class="field" data-asset-audio-field><span>Sample rate (1000–192000 Hz)</span><input data-asset-rate type="number" min="1000" max="192000" value="${get('rate',22050)}"></label><label class="field" data-asset-audio-field><span>Audio byte length (max 4 MiB / 30 s)</span><input data-asset-length type="number" min="1" max="4194304" value="${get('length',Math.min(region.size,44100))}"></label></div><button type="button" class="primary small-btn" data-asset-preview>${romCanPreloadAsset(region) ? 'Update preview' : 'Preview asset'}</button></details>${romDiscoveryHTML(region)}<p class="small muted">Save notes below to retain these preview settings. Preview data stays on this device and never changes the ROM.</p></section>`;
 }
 function romAssetOptions(body) {
   const keys=['source','block_offset','format','offset','width','height','palette_offset','palette_format','channels','rate','length'];
@@ -51,7 +65,7 @@ function romAssetOptions(body) {
   options.record_page=body._romRecordPage || 0;
   return options;
 }
-function setupRomAsset(body,region,slug,imageHash,active,inspect=false) {
+function setupRomAsset(body,region,slug,imageHash,active,preload=false,assetView) {
   const get=key=>body.querySelector(`[data-asset-${key}]`),button=get('preview'),work=get('work'),result=get('result');
   let busy=false,previewEpoch=0,controller=null;
   body._romCancelPreview=()=>{previewEpoch++;controller?.abort();};
@@ -72,23 +86,50 @@ function setupRomAsset(body,region,slug,imageHash,active,inspect=false) {
     const inspecting=region.detected_asset?.media==='metadata' && get('format').value==='auto';
     const finish=beginWork(work,inspecting ? 'Inspecting resource' : 'Preparing asset preview',[...body.querySelectorAll('input,select,button')].filter(control=>!control.hasAttribute?.('data-texture-play')),inspecting ? 'Resource details ready.' : 'Asset preview ready.');showJobError(work,'');
     try {
-      const preview=await api('/api/rom-explorer/preview',{method:'POST',signal:controller?.signal,body:{slug,region:region.id,image_hash:imageHash,options:romAssetOptions(body)}});
+      const preview=await api('/api/rom-explorer/preview',{method:'POST',signal:controller?.signal,body:{slug,region:region.id,image_hash:imageHash,asset_view:assetView,options:romAssetOptions(body)}});
       if(!current())return false;
       const inspect=()=>renderRomResource(result,preview,page=>{body._romRecordPage=page;return renderPreview(false);},current,body);
       if(preview.media==='metadata'){inspect();return true;}
-      if(preview.media==='model'){renderRomModel(result,preview,current);inspect();return true;}
+      if(preview.media==='model'){
+        renderRomModel(result,preview,current);inspect();
+        const asset=region.detected_asset;
+        if(preview.surfaces?.length){
+          const exportButton=document.createElement('button');
+          exportButton.type='button';exportButton.className='primary small-btn';
+          exportButton.textContent=preview.animation?'Export frame 0 glTF':'Export glTF';
+          const name=region.annotation?.name || asset?.label || 'Model';
+          exportButton.onclick=()=>exportRomModel(preview.animation?{...preview,vertices:nativeModelPose(preview,0),animation:undefined}:preview,name,exportButton,work,current);
+          result.append(exportButton);
+        }
+        if(asset?.media==='model')renderRomModelRelationships(result,asset,preview,romView(slug).report,current);
+        return true;
+      }
       if(!/^data:(image\/(png|jpeg)|audio\/wav);base64,/.test(preview.data_url))throw new Error('The preview returned an unsupported media type. Refresh the map and try again.');
       const media=document.createElement(preview.media==='audio' ? 'audio' : 'img');
       media.className='rom-preview-media';
       if(preview.media==='audio'){media.controls=true;media.preload='none';}else{media.alt='Asset preview using the selected format and layout';const width=Number(preview.details?.width),height=Number(preview.details?.height);if(width>0 && height>0)media.width=Math.min(512,width*Math.max(1,Math.floor(256/Math.max(width,height))));}
-      media.src=preview.data_url;media.onerror=()=>{if(active())showJobError(work,'This browser could not decode the preview. Check its format or choose another layout.');};
+      media.src=preview.data_url;media.onerror=()=>{if(current())showJobError(work,'This browser could not decode the preview. Check its format or choose another layout.');};
       const details=document.createElement('p');details.className='small muted';
       details.textContent=Object.entries(preview.details || {}).map(([key,value])=>`${key}: ${value}`).join(' · ')+(preview.decoded ? ` · ${preview.decoded.codec} → ${preview.decoded.bytes.toLocaleString()} bytes` : '');
       result.append(media,details);return true;
     }catch(error){if(current())showJobError(work,error.message);return false;}finally{busy=false;if(active())body._romAssetBusy=false;finish();}
   };
-  const mesh=body.querySelector('[data-native-model-mesh]');if(mesh)mesh.onchange=()=>{if(busy || body._romAssetBusy || !active())return;get('source').value='rom';get('format').value='auto';get('offset').value='0x'+region.start.toString(16);layout();renderPreview(false);};
-  const component=body.querySelector('[data-resource-component]');if(component)component.onchange=()=>{body._romRecordPage=0;};
+  const modelControls=body.querySelectorAll('[data-native-model-mesh],[data-native-assembly],[data-native-animation]');
+  for(const control of modelControls)control.onchange=()=>{
+    if(busy || body._romAssetBusy || !active())return;
+    if(control.hasAttribute('data-native-model-mesh')){
+      const assembly=body.querySelector('[data-native-assembly]');if(assembly)assembly.value='mesh';
+    }
+    if(control.hasAttribute('data-native-animation'))body.querySelector('[data-native-assembly]').value='animated';
+    get('source').value='rom';get('format').value='auto';
+    get('offset').value='0x'+region.detected_asset.offset.toString(16);
+    layout();renderPreview(false);
+  };
+  const component=body.querySelector('[data-resource-component]');
+  const resourceFrame=body.querySelector('[data-resource-frame]');
+  for(const control of [component,resourceFrame]){
+    if(control)control.onchange=()=>{body._romRecordPage=0;renderPreview(false);};
+  }
   for(const control of body.querySelectorAll('[data-dialogue-scene],[data-dialogue-speaker]')){
     control.onchange=()=>{
       if(busy || body._romAssetBusy || !active())return;
@@ -100,11 +141,7 @@ function setupRomAsset(body,region,slug,imageHash,active,inspect=false) {
   button.onclick=()=>renderPreview(false);body._romPreviewFrame=()=>renderPreview(true);
   if(typeof setupRomTextureControls==='function')setupRomTextureControls(body,region,active);
   if(typeof setupRomAudio==='function')setupRomAudio(body,region,active);
-  if(inspect){
-    get('source').value='rom';get('format').value='auto';
-    get('offset').value='0x'+region.detected_asset.offset.toString(16);
-    layout();renderPreview(false);
-  }
+  if(preload)renderPreview(true);
 }
 let romRoleEpoch=0;
 async function loadRomLoaderRoles() {
@@ -130,8 +167,24 @@ async function loadRomLoaderRoles() {
 
 function romNativeModelHTML(region) {
   const asset=region.detected_asset;if(asset?.media!=='model')return '';
-  const selected=Number(region.annotation?.preview_settings?.mesh || 0);
-  return `<p class="small muted">Detected model geometry · ${asset.nodes} nodes · ${asset.meshes.length} meshes · ${asset.vertices} vertices · ${asset.triangles} polygon commands. Preview one local mesh here, or use Model browser for assemblies, textured surfaces, related files and glTF export. Native assemblies can play linked animations at an adjustable preview rate.</p>${asset.native_animations?.length ? `<label class="field"><span>Native view</span><select data-native-assembly><option value="mesh">Local mesh</option><option value="animated"${region.annotation?.preview_settings?.assembly==='animated' ? ' selected' : ''}>Animated assembly · first part variant</option></select></label><label class="field"><span>Animation</span><select data-native-animation>${asset.native_animations.map((a,i)=>`<option value="${i}"${Number(region.annotation?.preview_settings?.animation || 0)===i ? ' selected' : ''}>${esc(a.label)} · ${a.frames} frames</option>`).join('')}</select></label>` : ''}<label class="field"><span>Model mesh</span><select data-native-model-mesh>${asset.meshes.map((mesh,i)=>`<option value="${i}"${i===selected ? ' selected' : ''}>${esc(mesh.name || `Node ${mesh.node} / part ${mesh.part} / section ${mesh.section}`)} · ${mesh.vertices} vertices · ${mesh.triangles} polygons</option>`).join('')}</select></label>`;
+  const saved=region.annotation?.preview_settings,selected=Number(saved?.mesh || 0);
+  const assembly=saved?.assembly || (asset.assembled?'assembled':'mesh');
+  const modes=[['mesh','Local mesh']];
+  if(asset.assembled)modes.push(['assembled',asset.scenery?'Whole scenery (supported surfaces)':'Assembled model']);
+  if(asset.native_animations?.length)modes.push(['animated','Animated native assembly']);
+  return `<p class="small muted">Detected model geometry · ${asset.nodes} nodes · ${asset.meshes.length} meshes · ${asset.vertices} vertices · ${asset.triangles} polygon commands.</p>${modes.length>1?`<label class="field"><span>Native view</span><select data-native-assembly>${modes.map(([value,label])=>`<option value="${value}"${assembly===value?' selected':''}>${label}</option>`).join('')}</select></label>`:''}${asset.native_animations?.length?`<label class="field"><span>Animation</span><select data-native-animation>${asset.native_animations.map((a,i)=>`<option value="${i}"${Number(saved?.animation||0)===i?' selected':''}>${esc(a.label)} · ${a.frames} frames</option>`).join('')}</select></label>`:''}<label class="field"><span>Model mesh</span><select data-native-model-mesh>${asset.meshes.map((mesh,i)=>`<option value="${i}"${i===selected?' selected':''}>${esc(mesh.name || `Node ${mesh.node} / part ${mesh.part} / section ${mesh.section}`)} · ${mesh.vertices} vertices</option>`).join('')}</select></label>`;
+}
+
+function renderRomModelRelationships(host,asset,result,report,active) {
+  const details=document.createElement('details'),summary=document.createElement('summary');
+  const materials=result.materials||[],linked=materials.filter(m=>m.image).length;
+  summary.textContent=`Asset relationships · ${linked}/${materials.length} textures ready${result.omitted_commands?' · '+result.omitted_commands+' special commands omitted':''}`;details.append(summary);
+  const targets=[...(asset.relationships||[]).map(r=>({offset:r.archive.offset,name:r.archive.name,reason:r.basis+(r.line?' · line '+r.line:'')})),...materials.map(m=>({offset:m.offset,name:m.name,reason:'Texture · '+m.state+(m.error?' · '+m.error:'')}))];
+  for(const target of targets){const line=document.createElement('p');line.className='small';const region=report?.regions.find(r=>target.offset!=null&&r.start<=target.offset&&target.offset<r.end);
+    if(region){const button=document.createElement('button');button.type='button';button.className='link-btn';button.textContent=target.name;button.onclick=()=>{if(active())openRomRegion(region.id);};line.append(button);}else{const text=document.createElement('span');text.textContent=target.name;line.append(text);}
+    const text=document.createElement('span');text.textContent=' · '+target.reason;line.append(text);details.append(line);
+  }
+  if(!targets.length){const line=document.createElement('p');line.textContent='No explicit file relationships were recorded.';details.append(line);}host.append(details);
 }
 
 function romResourceHTML(region) {
@@ -149,7 +202,7 @@ function renderRomResource(host,preview,onPage=()=>{},active=()=>true,state=host
   if(preview.inspection_warning){const warning=document.createElement('p');warning.className='small muted';warning.textContent=preview.inspection_warning;host.append(warning);}
   if(preview.object_bounds){const bounds=document.createElement('p');bounds.className='small';bounds.textContent='Object bounds: '+preview.object_bounds.minimum.join(', ')+' → '+preview.object_bounds.maximum.join(', ');host.append(bounds);}
   if(preview.material){const material=document.createElement('p');material.className='small';material.textContent='Material: '+Object.entries(preview.material).map(([key,value])=>key.replaceAll('_',' ')+': '+(Array.isArray(value) ? value.join(', ') : String(value))).join(' · ');host.append(material);}
-  const links=(parent,items)=>{for(const item of items || []){const button=document.createElement('button');button.type='button';button.className='link-btn';button.textContent=item.label;button.onclick=()=>{if(active())openRomRegion(item.region,item.inspect);};parent.append(button);}};
+  const links=(parent,items)=>{for(const item of items || []){const button=document.createElement('button');button.type='button';button.className='link-btn';button.textContent=item.label;button.onclick=()=>{if(active())openRomRegion(item.region);};parent.append(button);}};
   links(host,preview.links);
   if(preview.cutscene_links?.length){
     const group=document.createElement('details'),heading=document.createElement('summary'),items=document.createElement('div');

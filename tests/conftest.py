@@ -21,6 +21,7 @@ os.environ["DECOMP_HOME"] = tempfile.mkdtemp(prefix="decomp-tests-")
 # and the app looks for installed agents in the background as it starts: here it only looks where they are, and
 # never runs one (agents.detect)
 os.environ["DECOMP_DETECT_AGENTS"] = "off"
+os.environ["DECOMP_AUTO_TOOLS"] = "off"  # no test downloads a tool (permute.ensure_available)
 # nothing a test runs opens a window on the user's screen (app/window.py), a browser tab (webbrowser), or a tray icon
 os.environ["DECOMP_WINDOW"] = "0"
 # helpers connect to the app itself; tests/test_mcp_gateway.py starts the gateway by hand
@@ -28,6 +29,7 @@ os.environ["DECOMP_MCP_GATEWAY"] = "0"
 # tests count compiler invocations; one test's stored objects must not answer another's (tests/test_compile_cache.py
 # turns the persistent object cache on for itself)
 os.environ["DECOMP_OBJECT_CACHE_MB"] = "0"
+os.environ["DECOMP_ATTEMPT_WORKERS"] = "0"  # tests can opt into real worker execution
 os.environ["DECOMP_RENDER_WORKERS"] = "0"  # progress renders in this process, except tests/test_render_worker.py
 os.environ["DECOMP_DEEP_LANES"] = "0"  # deep passes judge in this process (patched searches), except tests/test_deep_lanes.py
 # PS1/PS2 imports would download libretro's title lists (consoles/playstation_titles): tests read an empty folder,
@@ -35,6 +37,7 @@ os.environ["DECOMP_DEEP_LANES"] = "0"  # deep passes judge in this process (patc
 os.environ["DECOMPNET_PLAYSTATION_TITLES"] = tempfile.mkdtemp(prefix="decomp-tests-titles-")
 os.environ.setdefault("BROWSER", "true")
 os.environ.setdefault("DECOMP_TRAY", "0")
+os.environ.setdefault("DECOMP_OFFLOAD", "0")  # tests that want the proposal subprocess install it themselves
 # nor the wine prefix the user's app runs Visual C++ 2017 in (toolchains/.wine, a development copy's .wine-dev: #146):
 # a test that names no prefix of its own (the own_wine_prefix fixture) gets this one, so a wine program it starts,
 # or the server it leaves running, is never in the app's prefix (review of #138: three tests used it). One set before
@@ -189,3 +192,8 @@ def _no_shutdown_deadline_left_behind():
     yield
     left = [t for t in threading.enumerate() if t.name == 'shutdown-deadline' and t.ident not in before]
     assert not left, "this test left the app's quit deadline timer running: stub server.exit_after"
+
+
+if os.environ.get("DECOMP_TEST_OFFLOAD") == "1":  # a whole run with the repair families in the proposal subprocess
+    from decompnet.app import offload as _offload
+    _offload.install()

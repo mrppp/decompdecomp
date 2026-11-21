@@ -613,6 +613,27 @@ def quiet(monkeypatch):
     monkeypatch.setattr(agents.Manager, "_run", lambda self, s: None)
 
 
+@pytest.mark.parametrize("field", ["error", "content"])
+def test_missing_assigned_compiler_pauses_only_the_affected_helper(tmp_path, quiet, field):
+    net = _game(tmp_path)
+    manager = agents.Manager(net, tmp_path, URL)
+    sid, other_sid = manager.start("codex", "game", 2, {})
+    helper, other = manager.sessions[sid], manager.sessions[other_sid]
+    actor, _ = net.local_agent(helper.agent_name)
+    helper.record = lambda *_: None
+    helper.state = other.state = "working"
+    message = "toolchain 'gcc-2.7.2-kmc' is not installed: install it in decompdecomp, under Compilers & tools"
+    response = {field: ("error: " if field == "content" else "") + message}
+    manager.record_agent(actor, "game", "tool_response", {"name": "try_compiler", **response})
+    assert helper.state == "working"
+    manager.record_agent(actor, "game", "tool_response", {"name": "compile_and_diff", **response})
+    assert helper.state == "paused"
+    assert helper.stop.is_set()
+    assert helper.why == message
+    assert other.state == "working"
+    assert not other.stop.is_set()
+
+
 def test_helpers_are_records_that_outlive_the_app(tmp_path, quiet):
     """After a restart the Agents view showed opencode-20 with only "agents running": helpers lived in the app's memory
     and their claims in the database, so a dead helper's claim showed as a "connected agent" with no stop button, and
@@ -2395,3 +2416,50 @@ def test_slow_function_ordering_does_not_block_agent_start_or_stop(tmp_path, qui
         finally:
             ordered.set()
             session.stop.set()
+
+
+@pytest.mark.parametrize('failure,expected', [
+    (None, False),
+    ({'message': 'The MCP session limit was reached.'}, False),
+    ({'message': "You've hit your usage limit. Try again in 20 minutes."}, True),
+    ({'code': 'usage_limit_reached', 'message': 'Try again in 20 minutes.'}, True),
+])
+def test_codex_quota_cooldown_requires_provider_error(tmp_path, monkeypatch, failure, expected):
+    from decompnet.app import session_followups
+
+    manager = agents.Manager(RomNetwork(tmp_path/'app.db', tmp_path), tmp_path, URL)
+    monkeypatch.setattr(manager, '_preflight_tools', lambda *a, **kw: True)
+    monkeypatch.setattr(manager.net, 'selection_counts', lambda *a, **kw: {'available': 1})
+    helper = manager._record('game', 'codex', 'helper', 'helper', {'model': 'gpt-6-luna'})
+    peer = manager._record('game', 'codex', 'peer', 'peer', {'model': 'gpt-6-luna'})
+    agent, token = manager.net.local_agent(helper.agent_name)
+    events = [
+        {'type': 'item.started', 'item': {'type': 'mcp_tool_call', 'tool': 'project_info'}},
+        {'type': 'item.completed', 'item': {'type': 'agent_message',
+         'text': 'I’m moving to a third eligible function within the session limit.'}},
+        {'type': 'turn.completed'},
+    ]
+    if failure:
+        events[-1] = {'type': 'turn.failed', 'error': failure}
+    output = '\n'.join(map(json.dumps, events))
+    command = [sys.executable, '-c', f'print({output!r}); raise SystemExit({int(bool(failure))})']
+    def launch(*args):
+        manager.net._pending_tool_handshakes.discard((agent.id, helper.slug))
+        return command, dict(os.environ), ''
+
+    monkeypatch.setattr(manager, '_command', launch)
+
+    # Ignore account-wide cooldowns persisted by versions that scanned assistant prose.
+    with manager.net.store.tx() as db:
+        db.execute('INSERT INTO settings VALUES(?, ?)',
+                   (session_followups.account_key(helper), str(time.time() + 3600)))
+    assert session_followups.cooldown(manager, helper) is None
+
+    assert manager._run_cli(helper, token, tmp_path) is (failure is None)
+    assert helper.limited is expected
+    assert session_followups.cooldown(manager, peer) is None
+    if expected:
+        assert 1190 < helper.limit_until - time.time() <= 1200
+        assert session_followups.active_limit(manager, helper)
+    else:
+        assert session_followups.cooldown(manager, helper) is None

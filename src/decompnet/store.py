@@ -90,9 +90,53 @@ CREATE TABLE IF NOT EXISTS agent_selection(
   project TEXT NOT NULL, agent TEXT NOT NULL, policy TEXT NOT NULL, PRIMARY KEY(project, agent));
 CREATE TABLE IF NOT EXISTS claims(
   function_id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL, claimed_at REAL, expires_at REAL);
+CREATE TABLE IF NOT EXISTS claim_routing_samples(
+  project_id INTEGER NOT NULL, function_id INTEGER NOT NULL, agent_id INTEGER NOT NULL,
+  claimed_at REAL NOT NULL, profile TEXT NOT NULL, band TEXT NOT NULL,
+  tested INTEGER NOT NULL DEFAULT 0, won INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(function_id,agent_id,claimed_at));
+CREATE INDEX IF NOT EXISTS idx_claim_routing_recent ON claim_routing_samples(project_id,claimed_at DESC);
+CREATE TRIGGER IF NOT EXISTS claim_routing_function_delete AFTER DELETE ON functions BEGIN
+  DELETE FROM claim_routing_samples WHERE function_id=OLD.id;
+END;
+CREATE TABLE IF NOT EXISTS matching_focus(
+ function_id INTEGER PRIMARY KEY, focus TEXT NOT NULL, inputs TEXT NOT NULL, context_version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS claim_routing_focus(
+ function_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, claimed_at REAL NOT NULL, focus TEXT NOT NULL,
+ inputs TEXT NOT NULL, context_version INTEGER NOT NULL,
+ PRIMARY KEY(function_id,agent_id,claimed_at));
+CREATE TRIGGER IF NOT EXISTS drop_claim_routing_focus AFTER DELETE ON claim_routing_samples BEGIN
+ DELETE FROM claim_routing_focus WHERE function_id=OLD.function_id AND agent_id=OLD.agent_id AND claimed_at=OLD.claimed_at;
+END;
+CREATE TRIGGER IF NOT EXISTS drop_matching_focus_on_edit AFTER UPDATE OF best_source,target,relocs,unit,vram ON functions
+ WHEN OLD.best_source IS NOT NEW.best_source OR OLD.target IS NOT NEW.target OR OLD.relocs IS NOT NEW.relocs
+ OR OLD.unit IS NOT NEW.unit OR OLD.vram IS NOT NEW.vram BEGIN
+ DELETE FROM matching_focus WHERE function_id=OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS drop_matching_focus_on_delete AFTER DELETE ON functions BEGIN
+ DELETE FROM matching_focus WHERE function_id=OLD.id;
+END;
+CREATE TABLE IF NOT EXISTS claim_routing_experiments(
+  project_id INTEGER NOT NULL, run TEXT NOT NULL, function_id INTEGER NOT NULL, agent_id INTEGER NOT NULL,
+  claimed_at REAL NOT NULL, arm TEXT NOT NULL, budget_key TEXT NOT NULL,
+  profile TEXT NOT NULL, band TEXT NOT NULL, won INTEGER NOT NULL DEFAULT 0, ended_at REAL,
+  PRIMARY KEY(project_id,run,function_id));
+CREATE INDEX IF NOT EXISTS idx_routing_experiment_lease ON claim_routing_experiments(function_id,agent_id,claimed_at);
+CREATE TRIGGER IF NOT EXISTS claim_routing_experiment_end AFTER DELETE ON claims BEGIN
+  UPDATE claim_routing_experiments SET ended_at=(julianday('now')-2440587.5)*86400.0,
+    won=COALESCE((SELECT won FROM claim_routing_samples WHERE function_id=OLD.function_id
+                  AND agent_id=OLD.agent_id AND claimed_at=OLD.claimed_at),0)
+  WHERE function_id=OLD.function_id AND agent_id=OLD.agent_id AND claimed_at=OLD.claimed_at AND ended_at IS NULL;
+END;
 CREATE TABLE IF NOT EXISTS attempts(
   id INTEGER PRIMARY KEY, function_id INTEGER, agent_id INTEGER, score INTEGER, compiled INTEGER,
   context_version INTEGER, source TEXT, created_at REAL);
+CREATE TABLE IF NOT EXISTS matching_milestones(
+ function_id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, scope TEXT NOT NULL, kind TEXT NOT NULL,
+ target_index INTEGER NOT NULL, source_digest TEXT NOT NULL, recorded_at REAL NOT NULL);
+CREATE TRIGGER IF NOT EXISTS delete_matching_milestone AFTER DELETE ON functions BEGIN
+ DELETE FROM matching_milestones WHERE function_id=OLD.id;
+END;
 CREATE TABLE IF NOT EXISTS attempt_hints(
   attempt_id INTEGER PRIMARY KEY, function_id INTEGER NOT NULL, summary TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_attempt_hints_fn ON attempt_hints(function_id,attempt_id);
@@ -245,6 +289,8 @@ MIGRATIONS = [
     ("attempts", "score_before", "INTEGER"),
     ("attempts", "score_improved", "INTEGER"),
     ("notes", "session_id", "INTEGER"),
+    ("attempts", "handoff_inputs", "TEXT"),
+    ("notes", "handoff_inputs", "TEXT"),
     ("notes", "score_before", "INTEGER"),
     ("notes", "score_after", "INTEGER"),
     ("reuse_trials", "feedback", "TEXT NOT NULL DEFAULT '{}'"),
@@ -771,6 +817,8 @@ class Store:
         install_large_text(self.conn)
         from .shard_ids import remember
         remember(self.conn)
+        from .polish_names import install as install_polish_names
+        install_polish_names(self.conn)
         self._optimize()
         self.lock = threading.RLock()
         self._local = threading.local()  # per thread: the reading connection it borrowed, and whether it's inside tx()

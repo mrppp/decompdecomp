@@ -13,17 +13,23 @@ import logging
 import threading
 import time
 from contextlib import contextmanager
+from functools import wraps
 
 from .network import NetworkError
 from .project import compiler_for
+from .repair_changes import NO_FAILED_BASELINE
 from .repair_comparison import differences as settings_differences
 
-CATEGORIES = ('unclassified', 'types', 'casts', 'constants', 'addresses', 'signatures', 'layout',
-              'temporaries', 'expression_order', 'control_flow', 'compiler_settings', 'other')
+AGENT_CATEGORIES = ('types', 'casts', 'constants', 'addresses', 'signatures', 'layout',
+                    'temporaries', 'expression_order', 'memory_access_order', 'control_flow', 'compiler_settings', 'other')
+CATEGORIES = ('unclassified', *AGENT_CATEGORIES, NO_FAILED_BASELINE)
+BASELINE_MIGRATION = 'repair-baseline-category-v1'
 STATES = ('new', 'reviewed', 'implemented', 'dismissed')
 SCHEMA = (
     '''CREATE TABLE IF NOT EXISTS repair_attempt_settings(
         attempt_id INTEGER PRIMARY KEY REFERENCES attempts(id) ON DELETE CASCADE, settings TEXT NOT NULL)''',
+    '''CREATE TABLE IF NOT EXISTS repair_attempt_mismatches(
+        attempt_id INTEGER PRIMARY KEY REFERENCES attempts(id) ON DELETE CASCADE, signature TEXT NOT NULL)''',
     '''CREATE TABLE IF NOT EXISTS repair_attempt_provenance(
         attempt_id INTEGER PRIMARY KEY REFERENCES attempts(id) ON DELETE CASCADE, provenance TEXT NOT NULL)''',
     '''CREATE TABLE IF NOT EXISTS repair_examples(
@@ -34,12 +40,80 @@ SCHEMA = (
         category TEXT NOT NULL DEFAULT 'unclassified', explanation TEXT NOT NULL DEFAULT '',
         automation TEXT NOT NULL DEFAULT '', review_note TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'new')''',
     'CREATE INDEX IF NOT EXISTS idx_repair_examples_project ON repair_examples(project_id,id)',
+    '''CREATE TABLE IF NOT EXISTS repair_example_votes(
+        example_id INTEGER NOT NULL REFERENCES repair_examples(id) ON DELETE CASCADE,
+        agent_id INTEGER NOT NULL, PRIMARY KEY(example_id,agent_id))''',
+    "CREATE INDEX IF NOT EXISTS idx_repair_examples_category ON repair_examples(project_id,category,id DESC) "
+    "WHERE status!='dismissed'",
     'CREATE INDEX IF NOT EXISTS idx_repair_examples_attempt ON repair_examples(attempt_id)',
     'CREATE INDEX IF NOT EXISTS idx_repair_examples_function ON repair_examples(function_id,id)',
 )
 
 
 _TRIAL = contextvars.ContextVar('repair_trial', default=None)
+_ANNOTATION = contextvars.ContextVar('repair_annotation', default=None)
+_MATCHES = contextvars.ContextVar('repair_matches', default=None)
+_SKIP_CAPTURE = contextvars.ContextVar('skip_repair_capture', default=False)
+
+
+def capture_suppressed():
+    return _SKIP_CAPTURE.get()
+
+
+@contextmanager
+def without_capture(enabled=True):
+    if not enabled:
+        yield
+        return
+    token = _SKIP_CAPTURE.set(True)
+    try:
+        yield
+    finally:
+        _SKIP_CAPTURE.reset(token)
+
+
+def inherit_capture_policy(fn):
+    if not capture_suppressed():
+        return fn
+
+    @wraps(fn)
+    def run(*args, **kwargs):
+        with without_capture():
+            return fn(*args, **kwargs)
+    return run
+
+
+@contextmanager
+def submission(fn, agent_id, category, change, automation, suggested_category):
+    """Attach advisory metadata to the explicitly submitted function, including in project builds."""
+    label = (category or ('other' if change or suggested_category else '')).strip()
+    if label and label not in ('unclassified', *AGENT_CATEGORIES):
+        suggested_category = suggested_category or label
+        change = f'[Original category: {label[:80]}] {change}' if change else ''
+        label = 'other'
+    proposal = _suggestion(label, suggested_category)
+    saved = []
+    token = _ANNOTATION.set(((fn['project_id'], fn['id'], agent_id),
+                             (label or 'unclassified', change.strip()[:3000], automation.strip()[:3000], proposal), saved))
+    try:
+        yield saved
+    finally:
+        _ANNOTATION.reset(token)
+
+
+@contextmanager
+def track_matches(slug, agent_id):
+    matches = []
+    token = _MATCHES.set((slug, agent_id, matches))
+    try:
+        yield matches
+    finally:
+        _MATCHES.reset(token)
+
+
+def _suggestion(category, text):
+    return ' '.join((text or '').split())[:80] if category == 'other' else ''
+
 
 
 @contextmanager
@@ -102,6 +176,9 @@ class RepairFeedback:
         with self.store.tx() as db:
             for statement in SCHEMA:
                 db.execute(statement)
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(repair_examples)')}
+            if 'suggested_category' not in columns:
+                db.execute("ALTER TABLE repair_examples ADD COLUMN suggested_category TEXT NOT NULL DEFAULT ''")
             from .repair_corpus import SCHEMA as corpus_schema
             db.execute(corpus_schema)
             from .payload_storage import install as install_payloads
@@ -111,6 +188,14 @@ class RepairFeedback:
             self.store._track_reads('repair_examples', 'repair_profiles', 'evidence,project_id')
             from .repair_profile_index import install
             install(db)
+            if not db.execute('SELECT 1 FROM settings WHERE key=?', (BASELINE_MIGRATION,)).fetchone():
+                # An archived baseline can outlive the attempt row it came from.
+                db.execute("UPDATE repair_examples SET category=? WHERE category IN ('other','unclassified') "
+                           "AND before_attempt_id IS NULL AND CASE WHEN json_valid(evidence) "
+                           "THEN json_type(evidence,'$.after')='object' AND "
+                           "COALESCE(json_type(evidence,'$.before'),'null')='null' ELSE 0 END",
+                           (NO_FAILED_BASELINE,))
+                db.execute("INSERT INTO settings VALUES(?,'1')", (BASELINE_MIGRATION,))
             # Older automatic captures predate their implemented default. Preserve deliberate
             # reviews and agent annotations; only move untouched, provenance-backed captures.
             db.execute("UPDATE repair_examples SET status='implemented',review_note=? WHERE status='new' "
@@ -151,9 +236,9 @@ class RepairFeedback:
                 'WHERE e.evidence_archive IS NOT NULL'))
         self.net.store.conn.repair_archive.export(path,reviews)
 
-    def attempt(self, db, fn, attempt_id, context_version, effective_settings=None):
+    def attempt(self, db, fn, attempt_id, context_version, effective_settings=None, mismatch_rows=()):
         owner = self.for_project(fn['project_id'])
-        if owner is not self:return owner.attempt(db,fn,attempt_id,context_version,effective_settings)
+        if owner is not self:return owner.attempt(db,fn,attempt_id,context_version,effective_settings,mismatch_rows)
         proj = db.execute('SELECT * FROM projects WHERE id=?', (fn['project_id'],)).fetchone()
         settings = _settings(proj, fn)
         if effective_settings and settings['mode']=='rom':
@@ -170,12 +255,28 @@ class RepairFeedback:
         settings['scoring_revision'] = scoring_revision()
         settings['context_sha256'] = hashlib.sha256(header['header'].encode()).hexdigest() if header and settings['mode'] == 'rom' else None
         db.execute('INSERT INTO repair_attempt_settings VALUES(?,?)', (attempt_id, json.dumps(settings)))
+        if mismatch_rows:
+            from .repair_comparison import mismatch_signature
+            signature = mismatch_signature(mismatch_rows)
+            if signature:
+                db.execute('INSERT INTO repair_attempt_mismatches VALUES(?,?)', (attempt_id, json.dumps(signature)))
 
     def capture(self, db, fn, source, agent_id, via, context_version, attempt_id=None):
+        if capture_suppressed() or fn['status'] == 'matched' or not source:
+            return
         owner = self.for_project(fn['project_id'])
         if owner is not self:return owner.capture(db,fn,source,agent_id,via,context_version,attempt_id)
-        if fn['status'] == 'matched' or not source:
-            return  # polishing an existing match is not a new matching repair
+        agent = self.net.store.one('SELECT name,owner,origin FROM agents WHERE id=?',agent_id) if agent_id else None
+        if agent:
+            origin = agent['origin'] or ''
+            in_room = origin.startswith('collab:')
+            if origin == 'local' or in_room:
+                from .permuter_claims import worker_name
+                name = worker_name(agent['name'], agent['owner'])
+                # Room verification can outlive the job, and room names can truncate the lane suffix.
+                deep = name == 'deep-permuter' or (name.startswith('permuter-') and name.split('-', 2)[1].isdigit())
+                if deep or (in_room and name in {'autopilot', 'autopilot-named-donors'}):
+                    return
         proj = db.execute('SELECT * FROM projects WHERE id=?', (fn['project_id'],)).fetchone()
         before = db.execute('SELECT * FROM attempts WHERE function_id=? AND compiled=1 AND score>0 AND (source_hash IS NOT NULL OR source IS NOT NULL) '
                             'AND (? IS NULL OR id<?) ORDER BY score,id DESC LIMIT 1',
@@ -203,7 +304,6 @@ class RepairFeedback:
                     'settings':json.loads(settings['settings']) if settings else None}
         provenance = db.execute('SELECT provenance FROM repair_attempt_provenance WHERE attempt_id=?',(attempt_id,)).fetchone()
         meta = json.loads(fn['meta'] or '{}')
-        agent = self.net.store.one('SELECT name FROM agents WHERE id=?',agent_id) if agent_id else None
         session = None
         if agent and db.execute("SELECT 1 FROM sqlite_master WHERE name='helper_sessions'").fetchone():
             session = db.execute('SELECT id,helper_id,model,kind FROM helper_sessions WHERE agent=? AND project=? '
@@ -231,6 +331,11 @@ class RepairFeedback:
             'comparable_settings':bool(comparable),
             'comparison': 'closest comparable-settings failed attempt when available, otherwise closest historical failure; previous retains last own failed trial',
         }
+        if before:
+            mismatch = db.execute('SELECT signature FROM repair_attempt_mismatches WHERE attempt_id=?',
+                                  (before['id'],)).fetchone()
+            if mismatch:
+                evidence['before']['mismatch_signature'] = json.loads(mismatch['signature'])
         # Progress rechecks can reopen and rematch the same frozen input many times. Keep
         # the original review and avoid scheduling identical analysis again. Imported builds
         # do not yet capture complete per-file inputs, so never suppress their evidence here.
@@ -247,31 +352,56 @@ class RepairFeedback:
         # rule as new work. Agent explanations still cannot mark their own hypotheses implemented.
         attribution=evidence.get('provenance') or {}
         automated = attribution.get('kind') in AUTOMATIC and bool(attribution.get('family'))
-        captured = db.execute('INSERT INTO repair_examples(project_id,function_id,attempt_id,before_attempt_id,agent_id,created_at,evidence,status,review_note) '
-                   'VALUES(?,?,?,?,?,?,?,?,?)', (fn['project_id'], fn['id'], attempt_id, before['id'] if before else None,
-                                             agent_id, time.time(), json.dumps(evidence), 'implemented' if automated else 'new',
-                                             'Installed deterministic repair, verified by the normal judge.' if automated else ''))
+        category, explanation, automation, suggestion = 'unclassified', '', '', ''
+        annotation = _ANNOTATION.get()
+        annotated = False
+        if not automated and via == 'agent' and attempt_id and annotation and annotation[0] == (fn['project_id'], fn['id'], agent_id):
+            category, explanation, automation, suggestion = annotation[1]
+            annotated = category != 'unclassified'
+        if not before and category == 'unclassified':
+            category = NO_FAILED_BASELINE
+        captured = db.execute(
+            'INSERT INTO repair_examples(project_id,function_id,attempt_id,before_attempt_id,agent_id,created_at,'
+            'evidence,status,review_note,category,explanation,automation,suggested_category) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (fn['project_id'], fn['id'], attempt_id, before['id'] if before else None,
+             agent_id, time.time(), json.dumps(evidence), 'implemented' if automated else 'new',
+             'Installed deterministic repair, verified by the normal judge.' if automated else '',
+             category, explanation, automation, suggestion))
+        if annotated:
+            annotation[2].append(captured.lastrowid)
+        tracking = _MATCHES.get()
+        if (tracking and tracking[:2] == (proj['slug'], agent_id) and not automated and via != 'saved_recheck'
+                and category == 'unclassified' and before):
+            tracking[2].append((captured.lastrowid, fn['name']))
 
         from .app.repair_outcomes import schedule
-        try:schedule(self,captured.lastrowid,evidence['after']['source_sha256'])
+        try:schedule(self,captured.lastrowid,evidence['after']['source_sha256'], via == 'agent' and not automated)
         except Exception as error:
             logging.getLogger('decompdecomp').warning('Repair analysis scheduling failed: %s',error)
 
-    def report(self, agent, slug, function, change, category='other', automation='', case_id=0):
+    def report(self, agent, slug, function, change='', category='other', automation='', case_id=0, suggested_category=''):
         fn = self.net._function(function, slug)
-        if category not in CATEGORIES or not change.strip():
-            raise NetworkError('Give a short change explanation and a valid repair category: ' + ', '.join(CATEGORIES))
+        if category not in AGENT_CATEGORIES:
+            raise NetworkError('Choose a repair category: ' + ', '.join(AGENT_CATEGORIES))
+        if suggested_category.strip() and category != 'other':
+            raise NetworkError('Use category="other" to suggest a new repair category.')
         owner = self.for_project(fn['project_id'])
-        if owner is not self:return owner.report(agent,slug,function,change,category,automation,case_id)
+        if owner is not self:
+            return owner.report(agent, slug, function, change, category, automation, case_id, suggested_category)
         with self.store.tx() as db:
-            row = db.execute('SELECT id FROM repair_examples WHERE project_id=? AND function_id=? AND agent_id=? '
+            row = db.execute('SELECT id FROM main.repair_examples WHERE project_id=? AND function_id=? AND agent_id=? '
                              'AND (?=0 OR id=?) ORDER BY id DESC LIMIT 1',
                              (fn['project_id'], fn['id'], agent.id, case_id, case_id)).fetchone()
             if not row:
                 raise NetworkError('No captured matching repair by you exists for this function. Match it first.')
-            db.execute("UPDATE repair_examples SET explanation=?,category=?,automation=?,status='new' WHERE id=?",
-                       (change.strip()[:3000], category, automation.strip()[:3000], row['id']))
-        return f"Repair example #{row['id']} annotated for review. This does not add or enable an automatic rule."
+            db.execute("UPDATE repair_examples SET explanation=COALESCE(NULLIF(?,''),explanation),category=?,"
+                       "automation=COALESCE(NULLIF(?,''),automation),suggested_category=CASE WHEN ?!='other' THEN '' "
+                       "ELSE COALESCE(NULLIF(?,''),suggested_category) END,status='new' WHERE id=? AND (?=0 OR status='new')",
+                       (change.strip()[:3000], category, automation.strip()[:3000], category,
+                        _suggestion(category, suggested_category), row['id'], case_id))
+            if not db.execute('SELECT changes()').fetchone()[0]:
+                raise NetworkError('This repair example has already been reviewed.')
+        return f"Repair example #{row['id']} classified as {category} for review."
 
     def _where(self, slug='', category='', status='', comparable=False):
         clauses, args = ['1=1'], []
@@ -289,43 +419,67 @@ class RepairFeedback:
             clauses.append("e.before_attempt_id IS NOT NULL AND json_extract(e.evidence,'$.comparable_settings')=1 AND json_extract(e.evidence,'$.before.source_sha256') != json_extract(e.evidence,'$.after.source_sha256')")
         return ' AND '.join(clauses), args
 
-    def listing(self, slug='', category='', status='', before=0, comparable=False, *, _metrics=True, _chronological=False, _boundary=None):
-        if self.project is None:
+    def listing(self, slug='', category='', status='', before=0, comparable=False, *, sort='recent',
+                before_votes=None, _metrics=True, _chronological=False, _boundary=None):
+        if sort not in ('recent', 'upvotes'):
+            raise NetworkError('Choose Newest or Most upvoted for repair examples.')
+        by_votes = sort == 'upvotes'
+        if self.project is None and not _chronological:
             if slug:
                 owner = self.for_project(slug)
-                if owner is not self:return owner.listing(slug,category,status,before,comparable,_metrics=_metrics)
+                if owner is not self:
+                    return owner.listing(slug,category,status,before,comparable,sort=sort,
+                                         before_votes=before_votes,_metrics=_metrics)
             else:
                 services = self.services()
                 if services != [self]:
                     boundary = None
                     if before:
-                        owner = self.owner(before)
-                        anchor = owner.store.one('SELECT created_at FROM main.repair_examples WHERE id=?',before)
-                        boundary = (anchor['created_at'],before)
-                    parts = [service.listing('',category,status,0,comparable,_metrics=False,_chronological=True,_boundary=boundary) for service in services]
-                    examples = sorted((row for part in parts for row in part['examples']),key=lambda r:(r['created_at'],r['id']),reverse=True)
+                        boundary = self.owner(before)._listing_boundary(before, by_votes, before_votes)
+                    parts = [service.listing('',category,status,0,comparable,sort=sort,_metrics=False,
+                                             _chronological=True,_boundary=boundary) for service in services]
+                    def key(row):
+                        return (row['upvotes'] if by_votes else 0, row['created_at'], row['id'])
+                    examples = sorted((row for part in parts for row in part['examples']),key=key,reverse=True)
                     groups = {}
                     for part in parts:
                         for row in part['groups']:
-                            key = (row['category'],row['status'])
-                            groups[key] = groups.get(key,0)+row['count']
+                            key_group = (row['category'],row['status'])
+                            groups[key_group] = groups.get(key_group,0)+row['count']
                     from .app.adaptive_repairs import coverage
                     return {'examples':examples[:25],'more':len(examples)>25 or any(p['more'] for p in parts),
                             'total':sum(p['total'] for p in parts),'groups':[{'category':k[0],'status':k[1],'count':v} for k,v in groups.items()],
                             'categories':CATEGORIES,'states':STATES,'metrics':coverage(self.net) if _metrics else None}
         where, args = self._where(slug, category, status, comparable)
+        filter_where = where
         partition = "project_id,category,status,CASE WHEN json_extract(evidence,'$.via')='unit diff' THEN 'build:' || COALESCE(json_extract(evidence,'$.unit'),'') || ':' || CAST(created_at/60 AS INTEGER) ELSE 'function:' || function_id END,CASE WHEN json_extract(evidence,'$.via')!='unit diff' OR json_extract(evidence,'$.via') IS NULL THEN json_extract(evidence,'$.target_sha256') END,CASE WHEN json_extract(evidence,'$.via')!='unit diff' OR json_extract(evidence,'$.via') IS NULL THEN json_extract(evidence,'$.after.source_sha256') END,json_extract(evidence,'$.after.settings'),json_extract(evidence,'$.after.context_version')"
-        prefix = ('WITH grouped AS (SELECT e.*,ROW_NUMBER() OVER (PARTITION BY ' + partition +
-                  ' ORDER BY id DESC) AS position,COUNT(*) OVER (PARTITION BY ' + partition +
-                  ') AS repetitions FROM main.repair_examples e WHERE ' + where + ') ')
-        if _chronological:
-            pagination = '' if _boundary is None else ' AND (e.created_at<? OR (e.created_at=? AND e.id<?))'
-            page_args = () if _boundary is None else (_boundary[0],_boundary[0],_boundary[1])
-            ordering = 'e.created_at DESC,e.id DESC'
+        vote_count = '(SELECT COUNT(*) FROM repair_example_votes v WHERE v.example_id=e.id)'
+        candidates = ''
+        representative = 'id DESC'
+        table = 'main.repair_examples'
+        if by_votes:
+            # Keep the voted capture as the visible representative of its equivalent group.
+            candidates = f'voted AS (SELECT e.*, {vote_count} AS upvotes FROM main.repair_examples e WHERE {where}), '
+            representative = 'upvotes DESC,id DESC'
+            table, where = 'voted', '1=1'
+        prefix = (f'WITH {candidates}grouped AS (SELECT e.*,ROW_NUMBER() OVER (PARTITION BY {partition}'
+                  f' ORDER BY {representative}) AS position,COUNT(*) OVER (PARTITION BY {partition}'
+                  f') AS repetitions FROM {table} e WHERE {where}) ')
+        if by_votes or _chronological:
+            boundary = _boundary
+            if by_votes and before:
+                boundary = self._listing_boundary(before, True, before_votes)
+            columns = 'e.upvotes,e.created_at,e.id' if by_votes else 'e.created_at,e.id'
+            placeholders = '?,?,?' if by_votes else '?,?'
+            pagination = '' if boundary is None else f' AND ({columns}) < ({placeholders})'
+            page_args = boundary or ()
+            ordering = 'e.upvotes DESC,e.created_at DESC,e.id DESC' if by_votes else 'e.created_at DESC,e.id DESC'
         else:
             pagination,page_args,ordering = ' AND (?=0 OR e.id<?)',(before,before),'e.id DESC'
-        rows = self.store.all(prefix + 'SELECT e.id,e.created_at,e.category,e.explanation,e.automation,e.status,e.repetitions,'
-                              "CASE WHEN json_extract(e.evidence,'$.via')='unit diff' THEN 'build report' WHEN e.before_attempt_id IS NULL THEN 'no failed baseline' WHEN json_extract(e.evidence,'$.before.source_sha256')=json_extract(e.evidence,'$.after.source_sha256') THEN 'same source / settings' WHEN json_extract(e.evidence,'$.comparable_settings')=1 THEN 'source repair' ELSE 'settings also changed' END AS evidence_kind,"
+        display_votes = 'e.upvotes' if by_votes else vote_count
+        rows = self.store.all(prefix + 'SELECT e.id,e.created_at,e.category,e.explanation,e.automation,e.suggested_category,e.status,e.repetitions,'
+                              + f'{display_votes} AS upvotes,'
+                              "CASE WHEN json_extract(e.evidence,'$.via')='unit diff' THEN 'build report' WHEN e.before_attempt_id IS NULL AND COALESCE(json_type(e.evidence,'$.before'),'null')='null' THEN 'no failed baseline' WHEN json_extract(e.evidence,'$.before.source_sha256')=json_extract(e.evidence,'$.after.source_sha256') THEN 'same source / settings' WHEN json_extract(e.evidence,'$.comparable_settings')=1 THEN 'source repair' ELSE 'settings also changed' END AS evidence_kind,"
                               "(json_extract(e.evidence,'$.provenance.kind') IN ('deterministic draft repair','automatic agent local pass') AND "
                               "(json_extract(e.evidence,'$.provenance.source_sha256') IS NULL OR "
                               "json_extract(e.evidence,'$.provenance.source_sha256')=json_extract(e.evidence,'$.after.source_sha256'))) AS automation_known,"
@@ -336,12 +490,20 @@ class RepairFeedback:
         from .app.project_labels import label
         rows = label(self.net,rows,{'agent':'agent_id'})
         total = self.store.one(prefix + 'SELECT COUNT(*) AS n FROM grouped e JOIN projects p ON p.id=e.project_id JOIN functions f ON f.id=e.function_id WHERE e.position=1', *args)['n']
-        groups = self.store.all('SELECT e.category,e.status,COUNT(*) AS count FROM main.repair_examples e WHERE ' + where +
+        groups = self.store.all('SELECT e.category,e.status,COUNT(*) AS count FROM main.repair_examples e WHERE ' + filter_where +
                                 ' GROUP BY e.category,e.status', *args)
         from .app.adaptive_repairs import coverage
         return {'examples': [dict(r) | {'review_group': ('build' if r['evidence_kind']=='build report' else 'first' if r['evidence_kind']=='no failed baseline' else 'context' if r['evidence_kind'] in ('same source / settings','settings also changed') else 'source')} for r in rows[:25]], 'more': len(rows) > 25,
                 'total': total, 'groups': [dict(r) for r in groups], 'categories': CATEGORIES, 'states': STATES,
                 'metrics': coverage(self.net) if _metrics else None}
+
+    def _listing_boundary(self, case_id, by_votes, before_votes):
+        row = self.store.one('SELECT created_at,(SELECT COUNT(*) FROM repair_example_votes v WHERE v.example_id=e.id) upvotes '
+                             'FROM main.repair_examples e WHERE e.id=?',case_id)
+        if not row:
+            raise NetworkError('This page of repair examples has changed. Refresh the list.')
+        recent = (row['created_at'],case_id)
+        return (row['upvotes'] if before_votes is None else before_votes, *recent) if by_votes else recent
 
     def detail(self, slug, case_id, include_source=True):
         owner = self.for_project(slug) if slug else self.owner(case_id)

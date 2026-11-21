@@ -5,6 +5,12 @@ checks the current image and mappings. Unchanged inputs reuse the saved map, kee
 entry quick. **Refresh** repeats the input check; **Stop** retains the last complete map.
 No compiler, agent, external service or game code is run by this analysis.
 
+Each scan runs in its own process. The app checks that the image and layout still match
+before it publishes the map and merges any notes saved during the scan. In a Git checkout,
+edits or a worker-only update to `rom_scan_worker.py` take effect on the next scan. Any scan
+already in progress finishes with the code it started with. The completed map stays visible
+until a new scan publishes its replacement.
+
 ## Loader source groups
 
 The MIPS reader follows constants, incoming arguments, saved registers, stack arguments
@@ -571,5 +577,38 @@ ROM Explorer recognizes the relative model and level index and exposes its textu
 model and companion resource tables. The Texture browser previews indexed images
 with their stored palettes. The Model browser previews local meshes from supported
 commands. Animation and scene indices expose record locations and metadata. The
-dialogue tables expose localized strings. MusyX samples and MORT speech clips are
-listed in Audio browser. These audio records can be inspected while playback is unavailable.
+dialogue tables expose localized strings. Prepare and play MusyX ADPCM samples in the
+Audio tab using the sample rate and predictor book stored in the ROM. Prepare MORT dialogue clips as WAV in the same tab.
+MusyX songs with a verified instrument and sample bank support a stereo WAV preview
+for the first 30 seconds. The preview uses the cartridge samples and the song
+arrangement. Runtime effects and macro timing can differ.
+
+USO texture banks with validated Yay0 sections and paired texel and palette
+relocations appear under Textures. Square preview dimensions are inferred from
+the stored extents.
+Relocated USO polygon shapes appear under Models. Local previews apply the
+stored vertex remap when present. Material textures and scene transforms are
+separate from these previews.
+USO sound banks expose VADPCM samples in Audio when the loader tables identify
+the wave bank or the sample descriptors establish a unique wave placement.
+The sample preview rate is adjustable. Stored EAD sequences also appear under
+Audio when the loader tables resolve the sequence, instrument and wave data.
+Prepare a sequence and press Play for up to 30 seconds of stereo audio rendered
+from the cartridge samples. Runtime effects, branches and envelopes can differ.
+
+Packed UVMD models with validated vertex loads and triangle indices appear under
+Models. The preview shows the first level of detail in local coordinates.
+
+UV sound banks with paired control and wave chunks expose their samples under
+Audio. The adjacent compact MIDI music directory also offers stereo previews
+from the music bank, capped at 30 seconds. The player makes one pass through
+sequence loops and reports notes that it could not play.
+
+F3DEX meshes appear under Models when stored pointers corroborate the display
+list mapping and all triangle slots resolve to loaded vertices. The preview
+shows each list in local coordinates. A standalone compact MIDI directory
+immediately after its verified sound bank can use the same Audio player.
+
+Borg archives expose textures, local meshes, PCM samples and DCM sequences.
+Texture and mesh previews support the archive's LZB compression. DCM previews
+mix the stored samples for up to 30 seconds in one pass through the sequence.

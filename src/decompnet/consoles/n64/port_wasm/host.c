@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "game.h"
+#include "rt64/adapter.h"
 #define SP_STATUS 0xA4040010u /* the RSP's status register: libultra waits for its halt bit */
 #include "wasm-rt-exceptions.h"
 #include "wasm-rt-impl.h"
@@ -447,11 +448,49 @@ enum { EV_SP = 4, EV_SI = 5, EV_AI = 6, EV_VI = 7, EV_PI = 8, EV_DP = 9 };
 int port_ai_register(uint32_t addr, int write, uint32_t value, uint32_t *read); /* audio.c */
 static int si_register(uint32_t addr, int write, uint32_t value, uint32_t *read); /* below, with the PIF */
 static uint32_t rom32(size_t o); /* below, with the boot */
+/* Raw PI transfers bypass the libultra host imports. The bootstrap wasm stack is in the
+   first 64 KiB (build.py's stack-first), so give it a bus address outside console RAM. */
+#define BOOT_STACK_SIZE 0x10000u
+#define BOOT_STACK_BUS 0x15000000u
+static uint32_t stack_end(uint32_t addr) {
+    if (addr >= 0x1000u && addr < BOOT_STACK_SIZE) return BOOT_STACK_SIZE;
+    if (addr >= SHADOW_STACKS && addr < SHADOW_STACKS + 32 * SHADOW_SIZE) return SHADOW_STACKS + 32 * SHADOW_SIZE;
+    if (addr >= 0x14000000u && addr < BOOT_STACK_BUS) return BOOT_STACK_BUS;
+    return 0;
+}
+uint32_t port_stack_bus(uint32_t addr) {
+    if (!stack_end(addr)) return 0;
+    return addr < BOOT_STACK_SIZE ? BOOT_STACK_BUS + addr : addr;
+}
+static int pi_register(uint32_t addr, int write, uint32_t value, uint32_t *read) {
+    static uint32_t dram, cart;
+    switch (addr) {
+    case 0xA4600000u: if (write) dram = value; else *read = dram; return 1;
+    case 0xA4600004u: if (write) cart = value; else *read = cart; return 1;
+    case 0xA4600010u: if (!write) *read = 0; return 1; /* synchronous: never busy */
+    case 0xA4600008u: if (!write) *read = 0; return 1; /* cartridge writes are ignored */
+    case 0xA460000Cu: {
+        if (!write) { *read = 0; return 1; }
+        uint32_t size = (value & 0x00FFFFFFu) + 1;
+        uint32_t dest = dram >= BOOT_STACK_BUS ? dram - BOOT_STACK_BUS : dram;
+        uint32_t end = dram >= 0x00800000u ? stack_end(dest) : 0x80800000u;
+        if (dram < 0x00800000u) dest = 0x80000000u | (dram & 0x007FFFFEu);
+        if (dram >= BOOT_STACK_BUS && dest >= BOOT_STACK_SIZE) end = 0;
+        uint32_t offset = cart & 0x0FFFFFFEu;
+        if (cart >= 0x10000000u && cart < 0x1FC00000u && dest < end
+                && size <= end - dest && (uint64_t)offset + size <= rom_size)
+            memcpy(M + dest, rom + offset, size);
+        post_event(EV_PI);
+        return 1;
+    }
+    default: return 0;
+    }
+}
 uint64_t port_io_load(uint64_t addr) {
     if (addr < 0xA0800000u) return addr - 0x20000000u; /* RAM, uncached: the same RAM */
     if (addr == SP_STATUS) { wbe32(IO_SCRATCH, 1); return IO_SCRATCH; } /* halted: a task finishes at once */
     uint32_t v;
-    if (port_ai_register((uint32_t)addr, 0, 0, &v) || si_register((uint32_t)addr, 0, 0, &v)) { wbe32(IO_SCRATCH, v); return IO_SCRATCH; }
+    if (port_ai_register((uint32_t)addr, 0, 0, &v) || si_register((uint32_t)addr, 0, 0, &v) || pi_register((uint32_t)addr, 0, 0, &v)) { wbe32(IO_SCRATCH, v); return IO_SCRATCH; }
     if (addr >= 0xB0000000u && addr < 0xBFC00000u) { /* the cartridge, read directly (a racing game checks its own word) */
         wbe32(IO_SCRATCH, rom32((size_t)((addr - 0xB0000000u) & ~3u)));
         return IO_SCRATCH + (addr & 3);
@@ -461,7 +500,8 @@ uint64_t port_io_load(uint64_t addr) {
 uint64_t port_io_store(uint64_t addr, uint64_t value) {
     if (addr < 0xA0800000u) return addr - 0x20000000u;
     if (addr == SP_STATUS) return IO_SCRATCH + 4; /* a command (clear halt, set a signal): nothing to keep */
-    if (port_ai_register((uint32_t)addr, 1, (uint32_t)value, NULL) || si_register((uint32_t)addr, 1, (uint32_t)value, NULL))
+    if (port_ai_register((uint32_t)addr, 1, (uint32_t)value, NULL) || si_register((uint32_t)addr, 1, (uint32_t)value, NULL)
+            || pi_register((uint32_t)addr, 1, (uint32_t)value, NULL))
         return IO_SCRATCH + 4;
     return IO_FAR(addr);
 }
@@ -482,12 +522,31 @@ void w2c_env_osViSetEvent(struct w2c_env *e, u32 mq, u32 msg, u32 every) {
 void port_vi_mode(uint32_t mode);
 void port_vi_yscale(float s);
 void port_vi_features(uint32_t f);
-void w2c_env_osViSetMode(struct w2c_env *e, u32 mode) { (void)e; LOG("osViSetMode(%08X)", mode); port_vi_mode(mode); }
-void w2c_env_osViSetYScale(struct w2c_env *e, f32 s) { (void)e; port_vi_yscale(s); }
+void w2c_env_osViSetMode(struct w2c_env *e, u32 mode) {
+    (void)e; LOG("osViSetMode(%08X)", mode); port_vi_mode(mode);
+#ifndef PORT_WEB
+    if (getenv("PORT_RT64") && (mode & 0x1FFFFFFFu) <= 0x800000u - 60) {
+        uint32_t words[14], address = 0x80000000u | (mode & 0x1FFFFFFFu);
+        for (unsigned i = 0; i < 14; i++) words[i] = be32(address + 4 + i * 4);
+        port_rt64_mode(words);
+    }
+#endif
+}
+void w2c_env_osViSetYScale(struct w2c_env *e, f32 s) {
+    (void)e; port_vi_yscale(s);
+#ifndef PORT_WEB
+    if (getenv("PORT_RT64")) port_rt64_yscale(s);
+#endif
+}
 void w2c_env_osViBlack(struct w2c_env *e, u32 on) { (void)e; (void)on; }
 void w2c_env_osViSetSpecialFeatures(struct w2c_env *e, u32 f) { (void)e; port_vi_features(f); }
 void port_frame_shown(uint32_t fb, unsigned long n); /* render.c: saves it when asked */
-void port_vi_swap(uint32_t fb) { frame_buffer = fb; swaps++; port_frame_shown(fb, swaps); } /* (games/: a game's own name) */
+void port_vi_swap(uint32_t fb) { /* (games/: a game's own name) */
+    frame_buffer = fb; swaps++; port_frame_shown(fb, swaps);
+#ifndef PORT_WEB
+    if (getenv("PORT_RT64")) port_rt64_screen(M + 0x80000000u, fb);
+#endif
+}
 void w2c_env_osViSwapBuffer(struct w2c_env *e, u32 fb) { (void)e; port_vi_swap(fb); }
 u32 w2c_env_osViGetCurrentFramebuffer(struct w2c_env *e) { (void)e; return frame_buffer; }
 u32 w2c_env_osViGetNextFramebuffer(struct w2c_env *e) { (void)e; return frame_buffer; }
@@ -516,10 +575,15 @@ static void ram_dumps(const char *var, unsigned long now) {
         p = next ? next + 1 : path + n;
     }
 }
+unsigned port_ai_completions(void); /* audio.c */
+static void port_audio_interrupts(void) {
+    for (unsigned n = port_ai_completions(); n; n--) post_event(EV_AI);
+}
 static void retrace(void) {
     vi_count++;
     ram_dumps("PORT_RAM_DUMPS", vi_count);
     port_timers();
+    port_audio_interrupts();
     if (vi.queue && vi_count % vi.every == 0) put(vi.queue, vi.msg, 0, 0);
 }
 
@@ -532,10 +596,13 @@ u32 w2c_env_osPiStartDma(struct w2c_env *e, u32 mb, u32 pri, u32 dir, u32 dev, u
     dmas++;
     if (getenv("PORT_DMA")) fprintf(stderr, "osPiStartDma(mb %08X, pri %u, dir %u, dev %08X, dram %08X, size %X, mq %08X)\n", mb, pri, dir, dev, dram, size, mq);
     if (dram < 0x80000000u) { fprintf(stderr, "osPiStartDma to %08X, outside the console's RAM\n", dram); port_trace(); }
+    /* The PI uses a cartridge bus address. Some callers pass the full address returned by osRomBase,
+       including the KSEG bits, while others pass a byte offset into the ROM. Keep dev intact in OSIoMesg. */
+    u32 offset = dev & 0x0FFFFFFFu;
     if (dir != 0) LOG("osPiStartDma: a write to the cartridge (%08X), ignored", dev);
-    else if (dev + (uint64_t)size > rom_size) LOG("osPiStartDma: %08X+%X is past the ROM's end", dev, size);
-    else memcpy(M + dram, rom + dev, size);
-    if (dmas <= 20 || dmas % 500 == 0) LOG("DMA %lu: ROM %06X -> %08X, %X bytes", dmas, dev, dram, size);
+    else if (offset + (uint64_t)size > rom_size) LOG("osPiStartDma: %08X+%X is past the ROM's end", dev, size);
+    else memcpy(M + dram, rom + offset, size);
+    if (dmas <= 20 || dmas % 500 == 0) LOG("DMA %lu: ROM %06X -> %08X, %X bytes", dmas, offset, dram, size);
     if (mb) { wbe32(mb + 8, dram); wbe32(mb + 12, dev); wbe32(mb + 16, size); }
     if (mq) put(mq, mb, 0, 0);
     return 0;
@@ -556,7 +623,7 @@ u32 w2c_env_osCartRomInit(struct w2c_env *e) {
 }
 u32 w2c_env_osEPiStartDma(struct w2c_env *e, u32 handle, u32 mb, u32 dir) {
     (void)handle;
-    return w2c_env_osPiStartDma(e, mb, 0, dir, be32(mb + 12) & 0x0FFFFFFFu, be32(mb + 8), be32(mb + 16), be32(mb + 4));
+    return w2c_env_osPiStartDma(e, mb, 0, dir, be32(mb + 12), be32(mb + 8), be32(mb + 16), be32(mb + 4));
 }
 u32 w2c_env_osEPiReadIo(struct w2c_env *e, u32 handle, u32 dev, u32 data) {
     (void)e; (void)handle;
@@ -576,7 +643,13 @@ void w2c_env_osSpTaskStartGo(struct w2c_env *e, u32 task) {
     uint32_t type = be32(task);
     if (type == 1) gfx_tasks++; else audio_tasks++;
     if (type == 1) ram_dumps("PORT_FRAME_DUMPS", gfx_tasks);
-    if (type == 1) port_render_task(task);
+    if (type == 1) {
+#ifndef PORT_WEB
+        if (getenv("PORT_RT64"))
+            port_rt64_task(M + 0x80000000u, be32(task + 16), be32(task + 24), be32(task + 48));
+#endif
+        port_render_task(task);
+    }
     if (type == 2) port_audio_task(task);
     if (gfx_tasks + audio_tasks <= 4) LOG("RSP task type %u: data %08X, %X bytes", type, be32(task + 48), be32(task + 52));
     if (type == 1 && gfx_tasks == 2 && getenv("PORT_TASK")) {
@@ -1108,6 +1181,21 @@ __attribute__((export_name("port_web_retrace_ms"))) double port_web_retrace_ms(v
 __attribute__((import_module("port_web"), import_name("trace"))) void port_web_trace(void);
 void port_trace(void) { port_web_trace(); }
 #else
+static uint64_t monotonic_us(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000 + (uint64_t)t.tv_nsec / 1000;
+}
+/* The audio interface can drain several buffers between VI interrupts. Give the game a chance to refill them. */
+static void wait_retrace(void) {
+    uint64_t deadline = monotonic_us() + (unsigned)retrace_us();
+    uint64_t time;
+    while ((time = monotonic_us()) < deadline) {
+        uint64_t left = deadline - time;
+        usleep((useconds_t)(left < 1000 ? left : 1000));
+        port_audio_interrupts();
+    }
+}
 static uint8_t *read_file(const char *path, size_t *size) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -1251,7 +1339,7 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&lock);
     /* the VI retrace: 50 a second for PAL, 60 for NTSC */
     for (int frame = 0; seconds <= 0 || frame < seconds * 1000000 / retrace_us(); frame++) {
-        usleep((useconds_t)retrace_us());
+        wait_retrace();
         retrace();
         port_live_pump();
         if (getenv("PORT_SAMPLE") && frame % 10 == 5) sample();

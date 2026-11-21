@@ -85,6 +85,14 @@ Stage-by-stage detail is in the `console/xbox360` branch's commit messages.
   stand-in for a model that hands in the demo's own C; the app compiles and judges every function for real.</sub>
 </p>
 
+## Polish matched code for porting
+
+In a game’s **Agents → Polishing checklist**, set the checks helpers see on their next polishing claim.
+A human-readable function name is required by default, with camelCase for new names. You can change the
+format or turn off the requirement. Optionally check 64-bit PC compilation and fix casts between pointers
+and 32-bit integers. The built-in 64-bit compiler check is available in ROM mode. In project mode, helpers depend on
+the project’s own 64-bit build. Polishing still verifies each rewrite against the original game.
+
 ## Explore the rest of a ROM
 
 Open a ROM project → **ROM Explorer**. Opening the tab automatically scans the image;
@@ -105,9 +113,10 @@ vertex/index buffers as a rotatable wireframe. N64 scans also recognize supporte
 including RNC-compressed banks, CI8 banks with mixed 16/256-colour palettes, direct-color RGBA32, supported RGBA16 mipmaps and
 trailer-count texture packs inside embedded ZIP archives. Banks inside byte-sum RNC blocks
 can contain both CI4 and RGBA32 textures.
-Open **Texture browser** for a thumbnail gallery, format/dimension filters and reference links.
+Below **ROM Map**, open **Asset Browser** and choose Textures, Models or Audio. Each tab supports Icons and Table views.
+Textures can be filtered by format and dimensions and show links to recorded references.
 Select any frame, palette or mip level in a bank; animate frames at a chosen preview rate.
-Open **Audio browser** to filter detected samples, prepare WAV previews and listen with Play.
+Use the **Audio** tab to filter detected samples, prepare WAV previews and listen with Play.
 N64 scans recognize supported B1 sound banks, including wrapped banks with relocated control pointers,
 and libmus PtrTablesV2 banks and their sample tables.
 Banks without a stored rate use a labelled, editable preview rate. Archived sequence candidates
@@ -115,7 +124,8 @@ are listed separately; music sequencing, pitch, mixing and loops are not rendere
 region to choose a sample and prepare a local WAV preview; playback starts only with Play.
 Play supported Acclaim DEAN streams using codebooks verified in the ROM. Voice links from dialogue prepare the WAV preview.
 ROM Explorer also reads indexed Eurocom EDL archives, with separate texture and local-mesh previews.
-It lists the associated animation, scene, multilingual dialogue, MusyX and MORT speech indices.
+It lists the associated animation, scene, and multilingual dialogue indices.
+The Audio tab prepares WAV previews for MusyX samples and MORT dialogue clips.
 Find supported dialogue scripts in ROM Explorer and browse their cues by scene and speaker.
 Verified voice links open the audio inspector from individual cues. Related cutscene scripts open
 their command tables from the dialogue browser.
@@ -427,8 +437,21 @@ still has to pass; isolated matches alone do not establish a rebuildable checkpo
 
 In **Start agents → Work selection**, choose a queue for the workers you are starting. Launch an expensive
 model with **Largest first**, then start a cheaper model with **Untried first** or **Easiest first**. You can also
-choose **Closest to matching**, **Finish source files**, or **Random**. **Automatic** keeps the existing adaptive
-scheduler and model routing.
+choose **Closest to matching**, **Finish source files**, or **Random**. **Automatic** can give a stalled function
+to a model with a better exact-match record on similarly sized starting candidates built with the same compiler
+profile. When comparable results are sparse, the ordinary queue order applies.
+
+When starting matching agents, enable **Automatically assign the next function after a match or release**
+to have the app hand each new worker one function at a time. The next brief comes back with the match or
+accepted release. The worker follows its work selection and functions-per-session limit and waits without
+model requests when there is no eligible work. The option starts unchecked, so you can run workers in
+both modes on the same project.
+
+To keep an agent on a single function, open the function’s **Focused agent** panel and set **Maximum tries**.
+The app manages the assignment and ends the run on a verified match or when the budget is spent.
+Each recorded candidate submission uses one try, including compile errors and each judged variant in a batch.
+Cached repeats and compiler diagnostics use no tries. You can also set a time limit.
+The function panel shows the live count, and saved improvements are kept when the run ends.
 
 **Only functions below match %** restricts automatic claims to functions whose best recorded match percentage is
 strictly below the threshold, plus functions with no scored attempt. For example, 80 includes unscored functions
@@ -795,7 +818,7 @@ the free compilers and keeps decompdecomp up to date:
 curl -fsSL https://raw.githubusercontent.com/RetroReversing/decompdecomp/main/site/public/install.sh | bash -s -- --source branch:main
 ```
 
-Upstream Linux packages remain available from the [releases](https://github.com/n-delic/decompdecomp/releases):
+Linux packages are available from the [releases](https://github.com/RetroReversing/decompdecomp/releases):
 
 ```
 sudo apt install ./decompdecomp_*_amd64.deb        # Debian, Ubuntu, Pop!_OS, Mint
@@ -803,7 +826,7 @@ sudo dnf install ./decompdecomp-*.x86_64.rpm       # Fedora
 chmod +x decompdecomp-*-x86_64.AppImage && ./decompdecomp-*-x86_64.AppImage   # any other distribution
 ```
 
-On **Windows**, download and open `decompdecomp-<version>-windows-x64-setup.exe` from the [releases](https://github.com/n-delic/decompdecomp/releases). Setup
+On **Windows**, download and open `decompdecomp-<version>-windows-x64-setup.exe` from the [releases](https://github.com/RetroReversing/decompdecomp/releases). Setup
 installs the Microsoft Edge WebView2 Runtime and .NET Framework 4.8 when they are missing, then opens the
 app installer. It may ask for administrator permission and needs an internet connection to download missing
 Microsoft components. The app installer lets you choose where decompdecomp goes and whether to add a
@@ -812,7 +835,7 @@ desktop shortcut (selected by default); it always adds a shortcut to Start.
 To install from source with [uv](https://docs.astral.sh/uv/getting-started/installation/) instead, open a new PowerShell window and run:
 
 ```powershell
-uv tool install --python 3.12 "decompnet @ https://github.com/n-delic/decompdecomp/archive/refs/heads/main.tar.gz"
+uv tool install --python 3.12 "decompnet @ https://github.com/RetroReversing/decompdecomp/archive/refs/heads/main.tar.gz"
 decomp setup
 decomp shortcut
 decomp
@@ -909,9 +932,10 @@ app and leaves this one running. Neither copies/migrates data nor alters the ins
 New managed agent sessions and jobs are held until existing work finishes. Continuous background
 passes may need to be stopped from their own panels. You can cancel while waiting. Once idle, the
 app fast-forwards main, runs locked dependency sync, checks imports, then restarts with the chosen
-home. If only the permuter worker's Python files changed, the source app fast-forwards the checkout
-and restarts that worker while the server and other jobs continue. Local changes, another branch, a
-different origin or failed preparation stop the handoff.
+home. For changes confined to the permuter, tool reader, saved-progress renderer, ROM Explorer
+scanner or compile and judge worker, the source app fast-forwards the checkout while agents,
+their claims and other jobs continue.
+Local changes, another branch, a different origin or failed preparation stop the handoff.
 The checkout and selected data remain separate from packaged code: to return to the packaged app,
 quit the source app before opening the installed app using the same data. External AI clients do
 not participate in this managed session drain; finish their work before switching runtimes.
@@ -922,9 +946,16 @@ function, disclosures and main scroll position are restored. Backend workers and
 rooms continue running. Edited text or an open dialog/agent launcher delays the
 page reload and shows a **Reload interface** button; save or copy edits before
 using it. Set `DECOMP_LIVE_RELOAD=0` before launching to disable this behavior.
-Packaged apps do not watch files. In a checkout, edits to the permuter worker's Python code restart
-only that worker; a turn in progress may be retried. Other Python backend changes require a restart.
-Existing running copies need one restart to pick up this file-watching feature.
+Packaged apps do not watch files. In a checkout, edits to the watched permuter files restart the
+permuter worker, and edits to `tool_reader_worker.py` replace the tool reader on the same port.
+A permuter turn may be retried. The app can serve the tool reader's requests during the handoff.
+After an edit to `render_worker_child.py`, each render worker finishes its current save and picks
+up the new code on its next save. ROM Explorer starts a fresh process for each scan, so edits to
+`rom_scan_worker.py` take effect on the next scan and any scan already running can finish.
+Edits to `attempt_worker_child.py` take effect on the next ROM or project-mode attempt.
+An active attempt keeps its original worker code through result recording.
+Changes shared with the main Python backend require an app restart. Running copies need an
+initial restart to pick up worker reload support.
 
 On a Mac desktop, `DECOMP_TEST_COCOA=1 uv run pytest -q tests/test_macos.py` also exercises a hidden
 WKWebView against a fresh app, including authentication, external links and close confirmation.
@@ -1162,7 +1193,7 @@ game's code is its rights holder's: keep it to yourself.
 | 3DS, Switch, Xbox 360 | Community decomps only |
 
 1.0.3 rewrote most of the app, so every platform needs testing again, Nintendo 64 too. Try it on a game you own and
-[tell us how it went](https://github.com/n-delic/decompdecomp/issues): what worked, what didn't, what was confusing. Reports are how a platform goes
+[tell us how it went](https://github.com/RetroReversing/decompdecomp/issues): what worked, what didn't, what was confusing. Reports are how a platform goes
 from beta to recommended.
 
 Proprietary compilers (CodeWarrior, Visual C++, IDO) are installed only after you accept their licenses in the app.
@@ -1212,7 +1243,8 @@ void add_score(s32 points) {
 Agents do that second step too: once half a game matches, **Start agents** offers **Polish matched code**. Helpers
 name functions, globals and parameters, describe structs in the shared header and add a comment, and a change is
 kept only when the function still matches byte for byte. Names are the agent's reading of the code: the bytes
-prove what a function does, not what its author called it.
+prove what a function does, not what its author called it. A function needs a descriptive name to count as
+polished. The default polishing prompt asks for camelCase when replacing a generated function name.
 
 Polishing briefs include callers, callees, existing declarations, data previews and nearby naming styles.
 For small edits, helpers use `polish_function`: a JSON map of local names, existing type aliases and a short
@@ -1236,7 +1268,7 @@ A polished function keeps its **matched** badge and adds a badge in the map’s 
 New polishes retain that original in the local database. Older functions use their earliest saved matching attempt
 when available; if no earlier C was retained, the drawer says so. Switching versions protects unsaved editor changes.
 
-**How do I save and commit progress?** This fork creates a **full rebuildable decompilation repository**, with source and build scripts at its root and all app progress in `progress/`. In **Settings → Save your progress**, choose **Create rebuildable repository**, then **Commit saved progress**, or enable automatic commits. Creation verifies a complete byte-identical rebuild first; unsupported or failed exports report an error instead of creating a progress-only repository. Existing portable Git saves can be upgraded in place without replacing their history or origin. ROMs, extracted assembly/data and build output remain local and ignored by a source-file allowlist. Open the repository through **New project → Open a saved project**, supplying your own game copy; matches, drafts, names, notes, headers and compiler settings are restored and verified. Automatic commits update nested app progress while retaining the standalone build checkpoint. **Update build files → Verify, commit and push** integrates subsequent matches into the standalone source tree after another byte-identical full rebuild. Manual source edits remain protected. Commits stay local unless pushing is enabled.
+**How do I save and commit progress?** This fork creates a **full rebuildable decompilation repository**, with source and build scripts at its root and all app progress in `progress/`. New ROM imports create the local repository automatically where rebuildable export is supported. Creation verifies a complete byte-identical rebuild first. Use **Create rebuildable repository** in **Settings → Save your progress** for older projects or to retry a failed setup. Choose **Commit saved progress** to make the first commit, or enable automatic commits. Existing portable Git saves can be upgraded in place without replacing their history or origin. ROMs, extracted assembly/data and build output remain local and ignored by a source-file allowlist. Open the repository through **New project → Open a saved project**, supplying your own game copy; matches, drafts, names, notes, headers and compiler settings are restored and verified. Automatic commits update nested app progress while retaining the standalone build checkpoint. **Update build files → Verify, commit and push** integrates subsequent matches into the standalone source tree after another byte-identical full rebuild. Manual source edits remain protected. Commits stay local unless pushing is enabled.
 
 **How do I pause saved match rechecks?** In **Settings → Saved progress**, turn on **Pause automatic rechecks of matched functions**. Automatic syncs across ROM projects keep judging new code and queue existing matches for later, including matches affected by saved source, header or compiler changes. The setting applies from the next sync. Turn it off to let the next sync process the queue.
 
@@ -1255,7 +1287,7 @@ touches the projects of the decompdecomp you have installed.
 
 - [The guide](docs/GUIDE.md): how it works, agents, teams, platforms and the export.
 - [ROADMAP.md](ROADMAP.md): what's planned, and which feature works on which platform.
-- [Issues](https://github.com/n-delic/decompdecomp/issues): problems and requests.
+- [Issues](https://github.com/RetroReversing/decompdecomp/issues): problems and requests.
 - [Discord](https://discord.gg/hhEm3zZagB): questions, progress on your games, and talking with the people building it.
 
 ## Use it responsibly

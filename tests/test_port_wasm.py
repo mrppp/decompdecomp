@@ -461,11 +461,65 @@ def test_callers_that_disagree_on_an_unprototyped_return_get_one_signature(tmp_p
     two.write_text("declare void @func_8021FCA4(...)\n")
     known = tmp_path / "known.sigs"
     known.write_text("")
+    aliases = tmp_path / "renames.txt"
+    aliases.write_text("")
     out = tmp_path / "sigs.txt"
-    subprocess.run([sys.executable, str(Path(build.HERE) / "sigs.py"), str(out), str(known), str(one), str(two)],
-                   check=True, capture_output=True, text=True)
+    subprocess.run([sys.executable, str(Path(build.HERE) / "sigs.py"), str(out), str(known), str(aliases),
+                    str(one), str(two)], check=True, capture_output=True, text=True)
     rows = dict(line.split("\t", 1) for line in out.read_text().splitlines())
     assert rows == {"func_8021FCA4": "i32\t"}  # a value over none, no parameters known
+
+
+def test_renamed_library_calls_share_a_signature(tmp_path):
+    """A game's two callers of a renamed library import used different argument counts and failed to link."""
+    import subprocess
+    import sys
+
+    from decompnet.port.wasm.build import HERE
+
+    typed = tmp_path / "typed.ll"
+    typed.write_text("declare double @libraryLog(double)\n"
+                     "define double @typed(double %x) {\n"
+                     "  %r = call double @libraryLog(double %x)\n  ret double %r\n}\n")
+    loose = tmp_path / "loose.ll"
+    loose.write_text("declare double @oldLog(...)\n"
+                     "define double @loose(double %x) {\n"
+                     "  %r = call double @oldLog()\n  ret double %r\n}\n")
+    aliases = tmp_path / "renames.txt"
+    aliases.write_text("libraryLog log\noldLog log\n")
+    known = tmp_path / "known.sigs"
+    known.write_text("")
+    sigs = tmp_path / "sigs.txt"
+    subprocess.run([sys.executable, HERE / "sigs.py", sigs, known, aliases, typed, loose],
+                   check=True, capture_output=True, text=True)
+
+    for source in (typed, loose):
+        placed = source.with_suffix(".be.ll")
+        subprocess.run([sys.executable, HERE / "beir.py", source, placed, "--renames", aliases, "--signatures", sigs],
+                       check=True, capture_output=True, text=True)
+        ir = placed.read_text()
+        assert "declare double @log(double)" in ir
+        assert "call double @log(double " in ir
+        assert "call double @log()" not in ir
+        assert ("call double @log.port_thunk_" in ir) == (source == loose)
+
+
+def test_renamed_strlen_uses_the_host_signature(tmp_path):
+    """A legacy declaration of a renamed import must not change the ABI of the host's strlen."""
+    import subprocess
+    import sys
+
+    from decompnet.port.wasm.build import HERE
+
+    source = tmp_path / "caller.ll"
+    source.write_text("declare i16 @string_length(ptr, i32, i32, i32)\n")
+    aliases = tmp_path / "renames.txt"
+    aliases.write_text("string_length strlen\n")
+    sigs = tmp_path / "sigs.txt"
+    known = get("n64").port_kit.wasm / "libultra.sigs"
+    subprocess.run([sys.executable, HERE / "sigs.py", sigs, known, aliases, source],
+                   check=True, capture_output=True, text=True)
+    assert "strlen\ti32\tptr" in sigs.read_text().splitlines()
 
 
 def test_library_code_with_no_c_is_called_by_its_library_name(tmp_path):
@@ -643,6 +697,8 @@ def test_an_endless_empty_loop_parks_its_thread():
     for loop in ("for (;;) {}", "for(;;);", "while (1) { }", "while(1);"):
         out = ido_c(f"void idle(void) {{ start(); {loop} }}")
         assert "for (;;) port_idle_forever();" in out and out.startswith("void port_idle_forever(void);"), loop
+    assert "again:\n    for (;;) port_idle_forever();" in ido_c("void idle(void) {\nagain:\n    goto again;\n}")
+    assert ido_c("void f(void) {\nagain:\n    work(); goto again;\n}") == "void f(void) {\nagain:\n    work(); goto again;\n}"
     assert ido_c("void f(void) { for (;;) { work(); } }") == "void f(void) { for (;;) { work(); } }"
 
 
@@ -659,3 +715,14 @@ def test_a_bitfield_shares_its_unit_with_the_members_after_it():
     # a unit that closes the struct, or isn't whole bytes, is laid out in reverse as before
     assert "int : 0;" in big_endian_bitfields("struct s {\n  int a:8;\n};")
     assert "int : 0;" in big_endian_bitfields("struct s {\n  int a:3;\n  char b;\n};")
+
+
+def test_compatibility_stack_buffers_keep_eight_byte_alignment_for_rom_calls():
+    from decompnet.port.wasm.beir import align_stack_objects
+
+    ir = """  %hdr = alloca { i32, i32 }, align 4
+  %buffer = alloca i8, i32 %size, align 1, !dbg !22
+  %matrix = alloca [4 x i32], align 16
+  %word = load i32, ptr %hdr, align 4
+"""
+    assert align_stack_objects(ir) == ir.replace("}, align 4", "}, align 8").replace("align 1,", "align 8,")

@@ -282,7 +282,8 @@ def _replace_text(path: Path, text: str) -> None:
 
 
 def _publish(folder: Path, files: dict[str, str], previous: dict[str, str] | None = None,
-             expected: dict[str, str] | None = None, *, chosen: bool = False, guarded=()) -> bool:
+             expected: dict[str, str] | None = None, *, chosen: bool = False, guarded=(),
+             write_before_remove: bool = False) -> bool:
     """Only change owned files whose contents changed; keep git and contributors' other files intact.
 
     `chosen`: the progress folder is the one the user saved to or configured, so a link at its own path is theirs to
@@ -322,20 +323,32 @@ def _publish(folder: Path, files: dict[str, str], previous: dict[str, str] | Non
     written = {}
     removed = set()
     complete = False
+    obsolete = (previous or {}).keys() - files.keys()
+
+    def remove_obsolete():
+        for name in obsolete:
+            (folder / name).unlink(missing_ok=True)
+            removed.add(name)
+
     try:
         for watcher in list(publish_watchers):
             receipt = watcher.publish_begin(folder)
             if receipt is not None:receipts.append((watcher, receipt))
-        for name in (previous or {}).keys() - files.keys():
-            (folder / name).unlink(missing_ok=True)
-            removed.add(name)
-        for name, text in files.items():
+        if not write_before_remove:
+            remove_obsolete()
+        # A rename must copy any edits before removing the file they came from.
+        # Publish its layout after writing the replacement C, so a retry can
+        # still recognize the old filename if writing a new source fails.
+        entries = sorted(files.items(), key=lambda entry: entry[0] == MANIFEST) if write_before_remove else files.items()
+        for name, text in entries:
             path = folder / name
             if path.exists() and path.read_text(encoding="utf-8") == text:
                 continue
             path.parent.mkdir(parents=True, exist_ok=True)
             _replace_text(path, text)
             written[name] = text
+        if write_before_remove:
+            remove_obsolete()
         complete = True
     finally:
         for watcher, receipt in receipts:
@@ -676,7 +689,7 @@ def _knowledge_store(net, project):
 # a few projects, valid while the notes' own revision (`read_progress_notes`, a Store read-revision trigger installed
 # on first use) and the function-name revision (`read_naming`: a note shows its function's name) are unchanged.
 NOTE_CACHE_PROJECTS = 4
-NOTE_COLUMNS = "project_id,function_id,agent_id,text,created_at,score_before,score_after"
+NOTE_COLUMNS = "project_id,function_id,agent_id,text,created_at,score_before,score_after,handoff_inputs"
 _note_cache: dict = {}
 _note_lock = threading.Lock()
 
@@ -685,13 +698,14 @@ def _notes_revision(store, pid):
     """What the project's note rows depend on, read before the rows (so a write in between is seen next time), or
     None when it can't be known yet: the triggers aren't installed and the writer isn't free to install them."""
     from ..store import in_transaction
-    trigger = store.one("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='read_progress_notes_notes_update'")
-    if trigger is None:
+    trigger = store.one("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='read_progress_notes_notes_update'")
+    if trigger is None or 'handoff_inputs' not in trigger['sql']:
         if in_transaction():
             return None
         with store.try_tx() as db:
             if db is None:
                 return None
+            db.execute("DROP TRIGGER IF EXISTS read_progress_notes_notes_update")
             store._track_reads("notes", "progress_notes", NOTE_COLUMNS)
     # The count and newest ID guard against a database replaced underneath (its counters start again).
     shape = store.one("SELECT count(*) AS n,max(id) AS newest FROM notes WHERE project_id=?", pid)
@@ -724,14 +738,14 @@ def _note_rows(store, pid):
 def _read_note_rows(store, pid):
     """Transport note metadata in bounded pages without per-row SQLite/GIL handoffs."""
     batches = store.all("""WITH numbered AS (
-        SELECT n.id,n.text,n.created_at,n.score_before,n.score_after,n.agent_id,f.name AS fn,
+        SELECT n.id,n.text,n.created_at,n.score_before,n.score_after,n.handoff_inputs,n.agent_id,f.name AS fn,
                row_number() OVER (ORDER BY n.id) AS ordinal
         FROM notes n LEFT JOIN functions f ON f.id=n.function_id WHERE n.project_id=?)
         SELECT json_group_array(json_object(
             'id',id,'text',text,'created_at',CASE WHEN typeof(created_at)='real'
                 THEN printf('%!.17g',created_at) ELSE created_at END,
             'real_time',typeof(created_at)='real','score_before',score_before,
-            'score_after',score_after,'agent_id',agent_id,'fn',fn)) AS batch
+            'score_after',score_after,'handoff_inputs',handoff_inputs,'agent_id',agent_id,'fn',fn)) AS batch
         FROM numbered GROUP BY (ordinal-1)/128 ORDER BY min(ordinal)""", pid)
     rows = []
     while batches:
@@ -768,9 +782,12 @@ def _manifest_from_rows(net, proj, cfg: dict, rows, folder: Path) -> tuple[dict,
     units = {""} | net._unit_contexts(pid)
     notes = [{"function": r["fn"], "text": r["text"], "by": names.get(r['agent_id'], ''),
               "created_at": r["created_at"], "score_before": r["score_before"],
-              "score_after": r["score_after"]} for r in note_rows]
+              "score_after": r["score_after"], **({"handoff_inputs": r["handoff_inputs"]} if r["handoff_inputs"] else {})}
+             for r in note_rows]
     knowledge = [r["text"] for r in store.all("SELECT text FROM knowledge WHERE project_id=? AND status='accepted' "
                                                   "ORDER BY id", pid)]
+    from .knowledge import saved_evidence
+    knowledge_evidence = saved_evidence(net, store, pid)
     manifest = {
         "format": FORMAT, "saved_at": time.time(), "revision": _next_revision(net, proj, folder),
         "title": proj["name"], "platform": cfg.get("platform"),
@@ -778,6 +795,7 @@ def _manifest_from_rows(net, proj, cfg: dict, rows, folder: Path) -> tuple[dict,
         "compiler": cfg.get("compiler"), "compiler_ranges": cfg.get("compiler_ranges") or [],
         "function_compilers": cfg.get('function_compilers') or {},
         "instructions": cfg.get("instructions") or "", "knowledge": knowledge,
+        **({"knowledge_evidence": knowledge_evidence} if knowledge_evidence else {}),
         "claim_order": cfg.get("claim_order") or "",
         "priority": cfg.get("priority") or [],
         "auto_compiler": cfg.get("auto_compiler"),
@@ -874,8 +892,9 @@ function again: a match counts because it matches, not because a file says so.
 ## Collaborate
 
 This folder is the source of truth. Edit its C, headers, names, notes or settings and pull or merge contributions
-here. decompdecomp picks up changes automatically and judges changed code again. Deleted sources reopen their
-functions. Keep git conflict markers out of these files; unresolved conflicts pause synchronization.
+here. decompdecomp picks up changes automatically and judges changed code again. Deleting a matched source reopens
+its function. A missing draft file is restored from the last scored C. Keep git conflict markers out of these
+files; unresolved conflicts pause synchronization.
 """
     folder.mkdir(parents=True, exist_ok=True)
     save_readme.update(net, proj, folder, readme, len(functions) - matched, details)
@@ -1245,6 +1264,8 @@ def _context_agents(net, store, manifest: dict, check_cancel=lambda: None, *, re
     names = {'restored'}
     if restore_notes:
         names.update(note.get('by') or 'restored' for note in manifest.get('notes') or [])
+    from .knowledge import saved_rows
+    names.update(row['by'] or 'restored' for _, _, row in saved_rows(manifest))
     agents = {}
     for name in sorted(names):
         check_cancel()
@@ -1329,14 +1350,22 @@ def _apply_context(net, slug: str, folder: Path, manifest: dict, log,
                 db.execute("UPDATE functions SET unit=? WHERE project_id=? AND name=?", (unit, pid, name))
         for text in manifest.get("knowledge") or []:
             check_cancel()
-            if not db.execute("SELECT 1 FROM knowledge WHERE project_id=? AND text=?", (pid, text)).fetchone():
+            exists = db.execute("SELECT id,status FROM knowledge WHERE project_id=? AND text=? "
+                                "ORDER BY status='accepted' DESC,id LIMIT 1", (pid, text)).fetchone()
+            if not exists:
                 db.execute("INSERT INTO knowledge(project_id, text, status, created_at, decided_at) VALUES(?,?,?,?,?)",
                            (pid, text, "accepted", time.time(), time.time()))
+            elif exists['status'] != 'accepted':
+                db.execute("UPDATE knowledge SET status='accepted',decided_at=? WHERE id=?", (time.time(), exists['id']))
+        from .knowledge import restore_evidence
+        restore_evidence(db, pid, manifest, agents, check_cancel)
     # Restored notes are historical records, not new agent handoffs. Going through add_note
     # recalculates attempt/session history once per note and can hold the writer for minutes.
     # Resolve the small identity/function sets once; old saves without measurements stay unknown.
     functions = {r["name"]: r["id"] for r in store.all(
         "SELECT id,name FROM functions WHERE project_id=?", pid)}
+    from ..agent_notes import valid_inputs
+
     with store.tx() as db:
         for note in (manifest.get("notes") or []) if restore_notes else []:
             check_cancel()
@@ -1350,9 +1379,9 @@ def _apply_context(net, slug: str, folder: Path, manifest: dict, log,
             at = note.get("created_at")
             if type(at) not in (int, float):
                 at = time.time()
-            db.execute("INSERT INTO notes(project_id,function_id,agent_id,text,created_at,score_before,score_after) "
-                       "VALUES(?,?,?,?,?,?,?)", (pid, functions.get(name), agents[author], note["text"],
-                                               at, before, after))
+            db.execute("INSERT INTO notes(project_id,function_id,agent_id,text,created_at,score_before,score_after,handoff_inputs) "
+                       "VALUES(?,?,?,?,?,?,?,?)", (pid, functions.get(name), agents[author], note["text"],
+                                               at, before, after, valid_inputs(note.get('handoff_inputs'))))
     by_name = {r["name"]: r for r in store.all("SELECT name,vram FROM functions WHERE project_id=?", pid)}
     return by_name, manifest.get("functions") or {}
 
@@ -1381,7 +1410,7 @@ def _saved_current(store, project_id, name, kind):
                      "FROM functions WHERE project_id=? AND name=?", kind == 'best', project_id, name)
 
 
-def _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code, check_cancel, verifying=()):
+def _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code, check_cancel, verifying=(), rejudge_best=()):
     """Compile a bounded window ahead; only the caller may judge or change project state."""
     store = net.project_store(proj['id'])
     from .restore_compilation import Pool
@@ -1424,12 +1453,12 @@ def _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code,
                 if judge_code and name is not None and text is not None:
                     current = _saved_current(store, proj["id"], name, kind)
                     if name in verifying or (current["status"] != "matched"
-                                             and not (kind == "best" and current["best_source"] == text)):
+                                             and not (kind == "best" and name not in rejudge_best and current["best_source"] == text)):
                         fn = dict(store.one("SELECT * FROM functions WHERE project_id=? AND name=?", proj["id"], name))
                         # A foreground result can arrive between the narrow read and
                         # the full compiler snapshot. Recheck against that fresh row.
                         if name in verifying or (fn["status"] != "matched"
-                                                 and not (kind == "best" and fn["best_source"] == text)):
+                                                 and not (kind == "best" and name not in rejudge_best and fn["best_source"] == text)):
                             ctx = net._context(proj["id"], fn["unit"])
                             if ctx is not None:
                                 snapshot = net._compile_snapshot(proj, fn, ctx["header"], text)
@@ -1455,7 +1484,7 @@ def _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code,
 
 @restore_batch
 def _judge_saved(net, slug: str, folder: Path, manifest: dict, by_name: dict, saved: dict, log,
-                 files: dict[str, str] | None = None, judge_code: bool = True, verifying=None) -> dict:
+                 files: dict[str, str] | None = None, judge_code: bool = True, verifying=None, rejudge_best=()) -> dict:
     verifying = verifying or {}
     store = net.project_store(slug)
     check_cancel = getattr(log, "check_cancel", lambda: None)
@@ -1494,7 +1523,7 @@ def _judge_saved(net, slug: str, folder: Path, manifest: dict, by_name: dict, sa
     guard = {entry[0]: entry[1:] for entry in active.signature} if active and verifying else {}
     last_update = 0
     judge_agent=None;credits={}
-    checks = _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code, check_cancel, verifying)
+    checks = _saved_checks(net, proj, folder, files, by_name, by_vram, saved, judge_code, check_cancel, verifying, rejudge_best)
     with closing(checks):
         for index, (old_name, info, kind, text, name, prepared) in enumerate(checks):
             # Compile workers do no writes. Wait outside the lock so a slow compiler cannot
@@ -1521,7 +1550,7 @@ def _judge_saved(net, slug: str, folder: Path, manifest: dict, by_name: dict, sa
                                    _saved_current(store, pid, name, kind) if judge_code else current_rows[name])
                         needs_attempt = (judge_code and name not in verifying and current is not None
                                          and current['status'] != 'matched'
-                                         and not (kind == 'best' and current['best_source'] == text))
+                                         and not (kind == 'best' and name not in rejudge_best and current['best_source'] == text))
                         if needs_attempt and not yielded_autopilot:
                             # Only entries needing a verdict may wait for a claim.
                             # Leave the lock first, then recheck eligibility: the
@@ -1574,7 +1603,7 @@ def _judge_saved(net, slug: str, folder: Path, manifest: dict, by_name: dict, sa
                         if current["status"] == "matched":
                             matched += kind == "src"
                             break
-                        if judge_code and kind == "best" and current["best_source"] == text:
+                        if judge_code and kind == "best" and name not in rejudge_best and current["best_source"] == text:
                             best += 1
                             break
                         if not judge_code:
@@ -1604,8 +1633,7 @@ def _judge_saved(net, slug: str, folder: Path, manifest: dict, by_name: dict, sa
                         except (NetworkError, toolchains.ToolchainError) as e:
                             check_cancel()  # A paused/cancelled check is not a failed match; abort and roll back instead.
                             # A claim or tool failure is no verdict. Do not acknowledge
-                            # the import: its cleared rows would make the next save
-                            # delete the only remaining C. Keep disk inputs for retry.
+                            # the import. Keep disk inputs for retry.
                             raise NetworkError(f"Could not verify saved C for {name}: {e}. "
                                                "Saved files are retained. Resolve the error and retry synchronization.") from e
                         finally:
@@ -1668,7 +1696,9 @@ def _restore_set_aside(store, project_id: int, items: list[dict]) -> None:
     addresses = sorted({item["vram"] for item in items})
     with store.tx() as db:
         rows = db.execute(
-            "SELECT id,name,vram,status,meta FROM functions WHERE project_id=? "
+            "SELECT id,name,vram,status,meta,CASE WHEN "
+            "json_extract(meta,'$.verified_assembly.verification_method')='builtin-sdk-digest' "
+            "THEN target END AS sdk_target FROM functions WHERE project_id=? "
             "AND status IN ('open','asm') AND vram IN (SELECT value FROM json_each(?))",
             (project_id, json.dumps(addresses))).fetchall()
         by_address = {}
@@ -1688,7 +1718,18 @@ def _restore_set_aside(store, project_id: int, items: list[dict]) -> None:
             meta = pending.get(identity)
             if meta is None:
                 meta = json.loads(row["meta"] or "{}")
-            merged = meta | restored_aside(item)
+            incoming = restored_aside(item)
+            proof = meta.get('verified_assembly')
+            target = row['sdk_target']
+            # A saved verdict is unverified on this machine. Keep the evidence
+            # the importer already verified locally for these exact SDK bytes.
+            if ('verified_assembly' in incoming and target and isinstance(proof, dict)
+                    and proof.get('verification_method') == 'builtin-sdk-digest'
+                    and proof.get('verified') is True and proof.get('kind') == 'sdk'
+                    and proof.get('bytes') == len(target)
+                    and proof.get('target_sha256') == hashlib.sha256(target).hexdigest()):
+                incoming.pop('verified_assembly')
+            merged = meta | incoming
             if row["status"] != "asm" or merged != meta:
                 pending[identity] = merged
         if pending:

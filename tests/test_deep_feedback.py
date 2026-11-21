@@ -196,3 +196,112 @@ def test_losing_local_trials_do_not_replace_evidence_for_the_next_random_batch(m
     search._after_improvement(AGENT,net.project_row('game'),net.function(),State(),None,20,'winner')
     assert net._last_diffs[AGENT.id,1][0]==['winner']
     assert net._agent_outcomes[AGENT.id,1]['source']=='winner'
+
+
+def test_failed_baseline_rejudges_distinct_saved_attempts(monkeypatch):
+    baseline = deep_permuter.Search._baseline
+    net = setup(monkeypatch)
+    monkeypatch.setattr(deep_permuter.Search, '_baseline', baseline)
+    net._project = net.project_row
+    broken = 'int f(int x) { return retired(x); }'
+    fallback = 'int f(int x) { return x * 3; }'
+    with net.store.tx() as db:
+        db.execute('UPDATE functions SET best_source=?', (broken,))
+        db.executemany('INSERT INTO attempts(function_id,score,compiled,source) VALUES(1,?,1,?)',
+                       [(15, broken), (20, fallback), (25, fallback)])
+    monkeypatch.setattr(Permuter, '_baseline', lambda *args: (None, 1))
+    attempts = []
+    history = []
+    net._record = lambda fn, agent, score, source, *args, **kwargs: history.append((score, source))
+
+    def judge(self, agent, proj, fn, source, best, fork):
+        attempts.append(source)
+        return 80 if source == fallback else None
+
+    monkeypatch.setattr(Permuter, '_score', judge)
+    search = deep_permuter.Search(net, 1, 10, Log(), net.function())
+    assert search._baseline(AGENT, net.project_row('game'), net.function(), State(), None) == (80, 2)
+    assert attempts == [fallback]
+    assert history == [(None, broken)]
+    assert net.function()['best_source'] == fallback
+    assert net.function()['best_score'] == 80
+
+
+def test_better_historical_scores_are_rejudged_before_promotion(monkeypatch):
+    from decompnet.app import source_preparation
+
+    net = setup(monkeypatch)
+    current = 'int f(int x) { return x; }'
+    unlinked = 'int f(int x) { return x + 1; }'
+    better = 'int f(int x) { return x + 2; }'
+    weaker = 'int f(int x) { return x + 3; }'
+    with net.store.tx() as db:
+        db.execute('UPDATE functions SET best_source=?,best_score=40', (current,))
+        db.executemany('INSERT INTO attempts(function_id,score,compiled,source) VALUES(1,?,1,?)',
+                       [(5, unlinked), (10, better), (55, weaker)])
+    net.cfg = lambda proj: {'compiler': {'toolchain': 'example', 'flags': ['-O2']}}
+    monkeypatch.setattr(source_preparation, 'inputs', lambda net, proj, fn: fn['best_source'])
+    judged = []
+
+    def rejudge(proj, fn, toolchain, flags, source):
+        judged.append(source)
+        if source == unlinked:
+            return False, SimpleNamespace(score=5), 'unplaced relocation'
+        return False, SimpleNamespace(score=20), ''
+
+    def score(self, agent, proj, fn, source, threshold, fork):
+        assert source == better and threshold == 40
+        with net.store.tx() as db:
+            db.execute('UPDATE functions SET best_source=?,best_score=20', (source,))
+        return 20
+
+    net._judge_with = rejudge
+    monkeypatch.setattr(deep_permuter.Search, '_score', score)
+    search = deep_permuter.Search(net, 1, 10, Log(), net.function())
+    assert search.better_saved_baseline(AGENT, net.project_row('game'), net.function(), State(), 40) == 20
+    assert judged == [unlinked, better]
+    assert net.function()['best_source'] == better
+
+
+@pytest.mark.parametrize(('rule', 'toolchain'), [
+    ('ido_switch_reply', 'ido-7.1'),
+    ('ido_stack_iterators', 'ido-7.1'),
+    ('ido_mapped_poll', 'ido-7.1'),
+    ('heap_span_drafts', 'gcc-2.7.2-kmc'),
+    ('kmc_cartridge_io', 'gcc-2.7.2-kmc'),
+    ('ido_matrix_copy', 'ido-7.1'),
+    ('ido_packed_stack_word', 'ido-7.1'),
+])
+def test_failed_mips_baseline_tries_measured_repairs_before_saved_attempts(monkeypatch, rule, toolchain):
+    from importlib import import_module
+
+    from decompnet.repair_feedback import current_trial
+
+    repair = import_module(f'decomprepair.{rule}')
+    baseline = deep_permuter.Search._baseline
+    net = setup(monkeypatch)
+    monkeypatch.setattr(deep_permuter.Search, '_baseline', baseline)
+    monkeypatch.setattr(Permuter, '_baseline', lambda *args: (None, 1))
+    net.cfg = lambda proj: {'compiler': {'toolchain': toolchain, 'flags': ['-O1']}}
+    net._project = net.project_row
+    broken = 's32 f(void) { return sp34; }'
+    repaired = 's32 f(void) { return 0; }'
+    with net.store.tx() as db:
+        db.execute('UPDATE functions SET best_source=?', (broken,))
+
+    def rewrite(source, name, asm, header, resolve=None):
+        assert source == broken
+        return repaired
+
+    def judge(self, agent, proj, fn, source, best, fork):
+        assert source == repaired
+        assert current_trial()['family'] == repair.FAMILY
+        with net.store.tx() as db:
+            db.execute("UPDATE functions SET best_source=?, best_score=0, status='matched'", (source,))
+        return 0
+
+    monkeypatch.setattr(repair, 'rewrite', rewrite)
+    monkeypatch.setattr(Permuter, '_score', judge)
+    search = deep_permuter.Search(net, 1, 10, Log(), net.function())
+    assert search._baseline(AGENT, net.project_row('game'), net.function(), State(), None) == (0, 2)
+    assert net.function()['status'] == 'matched'

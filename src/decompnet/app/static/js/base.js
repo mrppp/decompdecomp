@@ -245,6 +245,8 @@ if (typeof MutationObserver !== "undefined" && typeof document !== "undefined" &
 /* Keep the indicator and controls tied to this panel's elements: a dialog can be closed or replaced while its
    request is pending. Call the returned cleanup in finally, including when starting the job fails. */
 function beginWork(log, label, controls = [], completed = "Finished.") {
+  log._appRepairButton?.remove();
+  log._appRepairButton = null;
   let status = log._workStatus;
   if (!status) {
     status = document.createElement("p");
@@ -348,6 +350,8 @@ async function followJob(id, logEl, onUpdate, active = () => true) {
     if (onUpdate) onUpdate(job.log, job);
     if (job.state === "done") return job.result;
     if (job.state === "error" || job.state === "cancelled") {
+      if (logEl && job.state === "error" && job.kind !== "app-repair" && S.st?.app_repair
+          && typeof attachAppRepair === "function") attachAppRepair(logEl, id);
       const err = new Error(job.error || (job.state === "cancelled" ? "Cancelled." : "The job failed. Try again."));
       err.job = job; throw err;
     }
@@ -537,8 +541,7 @@ function show(view) {
   window.scrollTo(0, 0);
 }
 function leaveProject() {
-  if(typeof stopRomAudioBrowser==='function')stopRomAudioBrowser();
-  if(typeof stopRomModelBrowser==='function')stopRomModelBrowser();
+  if(typeof stopRomAssetBrowser==='function')stopRomAssetBrowser();
   if (typeof cancelProjectLoad === "function") cancelProjectLoad();
   stopPolling();
   S.gen++;  // what its polls bring back now is dropped

@@ -99,6 +99,30 @@ def test_builtin_cli_renames_are_resolved_before_body_isolation(tmp_path, monkey
     assert set(refused) == {'bad_switch'}
 
 
+def test_cli_name_resolution_does_not_exhaust_the_body_probe_budget(tmp_path, monkeypatch):
+    setup(tmp_path)
+    path = tmp_path / 'syms.toml'
+    sections = tomllib.loads(path.read_text())['section']
+    names = {f'library_{i}' for i in range(12)}
+    aliases = [dict(name=name, vram=0x80000500 + 4*i, size=4) for i, name in enumerate(sorted(names))]
+    functions = sections[0]['functions'] + aliases
+    path.write_text(recomp.symbols(
+        SEGMENTS, [dict(f, rom=0x1000 + f['vram'] - 0x80000400) for f in functions]))
+    monkeypatch.setattr(recomp, 'MAX_PROBE_RUNS', 8)
+
+    def run(argv, **kwargs):
+        stubs = set(tomllib.loads((tmp_path / 'recomp.toml').read_text())['patches']['stubs'])
+        if unresolved := sorted(stubs & names):
+            return subprocess.CompletedProcess(
+                argv, 1, '', f'Function {unresolved[0]} is stubbed out in the config file but does not exist!')
+        return subprocess.CompletedProcess(argv, -signal.SIGSEGV if 'bad_switch' not in stubs else 0, '', '')
+
+    monkeypatch.setattr(recomp.subprocess, 'run', run)
+    refused = {}
+    recomp._translate('tool', tmp_path, Path('rom'), None, refused, set(), lambda: False, lambda *a: None)
+    assert set(refused) == {'bad_switch'}
+
+
 def test_a_crash_requiring_two_bodies_is_not_guessed_to_be_one_body(tmp_path, monkeypatch):
     names = setup(tmp_path)
     def run(argv, **kwargs):
@@ -183,11 +207,26 @@ def test_bad_generated_c_is_retranslated_as_an_explicit_stub(tmp_path, monkeypat
         (folder/'funcs/unit.c').write_text('RECOMP_FUNC void listed(void) {\n goto missing;\n}\n')
     def check(folder, include, stop):
         errors = [] if calls[-1] else [f'{folder}/funcs/unit.c:2:2: error: use of undeclared label']
-        return [], set(), errors
+        return [], set(), errors, {"listed"} if not errors else set()
     monkeypatch.setattr(recomp, '_translate', translate)
     monkeypatch.setattr(recomp, 'check', check)
     summary = recomp.recompile(Path('tool'), image, SEGMENTS, SPLIT, out, log=lambda *a:None)
     assert len(calls) == 2 and 'listed' in calls[-1]
-    assert summary['error_count'] == 0
+    assert summary['error_count'] == summary['succeeded'] == 0
     assert summary['refused'][0]['name'] == 'listed'
     assert 'generated C does not compile' in summary['refused'][0]['why']
+
+
+def test_c_check_only_counts_bodies_in_successful_files(tmp_path, monkeypatch):
+    folder = tmp_path / "funcs"
+    folder.mkdir()
+    (folder / "passing.c").write_text("RECOMP_FUNC void usable(void) {}\n")
+    (folder / "failing.c").write_text("RECOMP_FUNC void unverified(void) {}\n")
+
+    def compile_file(args, **kwargs):
+        good = args[-1].endswith("passing.c")
+        return subprocess.CompletedProcess(args, 0 if good else 1, "", "")
+
+    monkeypatch.setattr(recomp.subprocess, "run", compile_file)
+    _, _, _, passed = recomp.check(tmp_path, tmp_path)
+    assert passed == {"usable"}

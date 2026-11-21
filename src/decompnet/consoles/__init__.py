@@ -56,13 +56,15 @@ class Compiler:
 
 @dataclass(frozen=True)
 class PortRuntime:
-    """One way to run a finished game on a PC (docs/PORTING.md), offered in the Porting tab's Play step: the
-    WebAssembly build runs the game's C as the console's, the native runtimes need the checklist's steps first."""
+    """Host services for a port, with the build modes it can or is planned to support."""
     id: str  # "wasm", what Play is asked for
     name: str  # "libultraship"
     summary: str  # one sentence: what it is, what it gives
     needs: tuple = ()  # the readiness steps it waits for: "code", "compiles", "links", "assets" (port/readiness.py)
-    built: bool = False  # decompdecomp builds and plays the game on it; False: planned (ROADMAP.md, Ports)
+    modes: tuple[str, ...] = ("direct",)  # Build modes offered in the runtime picker
+    built_for: tuple[str, ...] = ()  # Build modes currently supported by decompdecomp
+    native_adapter: object = None  # () -> path to the optional desktop adapter, or None when unavailable
+    compatibility_summary: str = ""  # Host services used only by the compatibility build
 
 
 @dataclass(frozen=True)
@@ -86,7 +88,7 @@ class PortKit:
     wasm: object = None  # the WebAssembly build's console part (port/wasm/): a folder with host.c, the host that
     # runs the game's translated C (threads, DMA, the hardware's registers), and the library's prototypes
     # (libultra.sigs: each a name, a return type and parameter types, tab-separated); None: no such build yet
-    runtimes: tuple = ()  # PortRuntime each, the order the Play step offers them; the first playable one is chosen
+    runtimes: tuple = ()  # PortRuntime each, the order the Porting runtime picker offers them
 
 
 class Console:
@@ -127,6 +129,7 @@ class Console:
     layout = ""  # what a game started from scratch becomes, for the GUI: "splat", "dtk-template"
     compilers: tuple[Compiler, ...] = ()  # the first is the default, unless default_compiler says another
     import_note = ""  # compiler/setup guidance before importing a project
+    donor_layout = False  # review exact same-ROM donor function spans and locally decoded overlays
     import_error = ""  # a host restriction that prevents importing on this computer
     packs: tuple[tuple[str, str], ...] = ()  # (toolchain, what it's for): more that Setup offers for it
     kits: tuple[str, ...] = ()  # the kits users bring that it takes (kits/: an SDK, a compiler only it came in)
@@ -241,12 +244,14 @@ class Console:
         return False
 
     def import_game(self, net, file: bytes | Path, *, toolchain: str | None = None, flags: list[str] | None = None,
-                    name: str = "", log=print, scope: str | None = None, options: dict | None = None) -> str:
+                    name: str = "", log=print, scope: str | None = None, options: dict | None = None,
+                    on_new_rom=None) -> str:
         """Start a project from the user's own copy of the game; returns its slug. The mode's way by default.
         `scope`: what the project covers, where the console sets library code aside (`sets_aside`); else ignored.
         `options`: answers to `import_options` (others are ignored)."""
         if self.mode == ROM:
-            return net.import_split(self, self.read_game(file, name), toolchain=toolchain, flags=flags, log=log)
+            return net.import_split(self, self.read_game(file, name), toolchain=toolchain, flags=flags, log=log,
+                                    on_new_rom=on_new_rom)
         if self.mode == PROJECT:
             path = Path(file) if isinstance(file, (str, Path)) else net.saved_file(file, name or self.upload_name(file))
             known = toolchain if toolchain in {c.id for c in self.compilers} else None  # (a ROM console's id: not ours)
@@ -298,11 +303,23 @@ class Console:
         Returns the image splat reads."""
         return image
 
+    def donor_text_regions(self, image: bytes) -> list:
+        """Original code regions with separate module-relative addresses."""
+        return []
+
     def missed_functions(self, config: Path, image: bytes, log=print) -> list[tuple[int, int, int]] | None:
         """ROM mode: in a project that exists, the functions its split left as data that an import would now find,
         written into splat's `config` as code segments and returned as (rom_start, rom_end, vram), one function each
         (N64: consoles/n64/code.py). None when the console has no such search yet (ROADMAP.md)."""
         return None
+
+    def import_table_ranges(self, image, segments):
+        """Additional load mappings for jump-table evidence during ROM import."""
+        return ()
+
+    def import_pointer_is_data(self, image, offset):
+        """Recognise a word whose native container gives it a data role."""
+        return False
 
     def split_game(self, workdir: Path, picked: Picked, *, symbols: list[str] | None = None, log=print):
         """ROM mode: split the program into functions and data (splat, rom/split.py); a console whose games another
@@ -339,6 +356,16 @@ class Console:
 
         return match.link(obj, name, target, symbols, read)
 
+    def export_overlay(self, target):
+        """Return the checked cartridge placement for an independently loaded function."""
+        return None
+
+    def rebuild_overlays(self, image, entries):
+        """Put compiled overlay text back in the cartridge using its loader format."""
+        if entries:
+            raise ValueError('This console cannot rebuild exported overlays.')
+        return image
+
     def function_asm(self, fn) -> str:
         """ROM mode: a function's assembly, as the project stores and shows it."""
         from ..rom import split
@@ -351,11 +378,17 @@ class Console:
 
     def function_meta(self, fn) -> dict:
         """ROM mode: what a function's row must keep besides its bytes (GBA: whether it's Thumb)."""
+        if getattr(fn,'entry_aliases',None):
+            return {'asm_code': 'The closed body has an independent assembly entry inside its extent.'}
+        return {}
+
+    def function_target_meta(self, fn) -> dict:
+        """Additional target facts that require rejudging saved C when they change."""
         return {}
 
     def function_status(self, fn) -> str:
         """ROM mode: the status a just-split function starts with (GBA: hand-written helpers are 'asm')."""
-        return "open"
+        return "asm" if getattr(fn,'entry_aliases',None) else "open"
 
     def instruction_size(self, fn) -> int:
         """ROM mode: how many bytes one of a function's instructions is (MIPS 4; GBA 2 in Thumb, 4 in ARM)."""
@@ -441,6 +474,14 @@ class Console:
 
     def sdk_assembly_identity(self, code: bytes, big_endian: bool = True) -> dict | None:
         """Exact self-contained handwritten SDK bodies only; no heuristic C exclusion."""
+        return None
+
+    sdk_entry_stub: bool = False  # the cartridge's entry stub is SDK boot code (sdk_assembly_identity tells it by shape)
+
+    sdk_linked_sizes: tuple[int, ...] = ()
+
+    def sdk_linked_identity(self, code: bytes, image_sha1: str) -> dict | None:
+        """Exact SDK library identities bound to their linked analysis image."""
         return None
 
     def scan_sdk(self, net, proj, job=None) -> None:
@@ -677,6 +718,12 @@ class Console:
         return None
 
     # for agents
+
+    known_assembly_sizes: tuple[int, ...] = ()
+
+    def known_assembly_name(self, code: bytes) -> str | None:
+        """Descriptive name for an exact, non-SDK assembly signature."""
+        return None
 
     def asm_reason(self, code: bytes) -> str | None:
         """Why a function's code can't come from a compiler (hand-written assembly), or None."""

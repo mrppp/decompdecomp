@@ -28,8 +28,15 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Compiler output from ad hoc builds
+/*.ll
+/*.o
+/src/decompnet/port/wasm/web/*.o
+
 # DecompNet
 decompnet.db*
+/match-library.sqlite3
+/match-library.sqlite3.writer.lock
 projects/*/target/*.o
 export/
 .pytest_cache/
@@ -51,3 +58,7 @@ launch-dev.ps1
 /gateway/target/
 /src/decompnet/bin/decomp-mcp-gateway
 /src/decompnet/bin/decomp-mcp-gateway.exe
+
+# the skills' own helper scripts are source, not generated output
+!.claude/skills/*/scripts/
+!.claude/skills/*/scripts/**

@@ -85,11 +85,29 @@ vm.runInContext(source.slice(source.indexOf("let deepSweepFollowing"), source.in
   assert.doesNotMatch(element('deepSweepAttentionList').innerHTML,/>no function 'This function'/);
 
   assert.equal(element("deepSweepStart").hidden, false);
-  ctx.renderDeepQueueState({state:"running",progress:{preparation:{checked:250,total:2000,eligible:125,done:false}}});
-  assert.match(element("deepSweepQueueTitle").textContent,/checking candidates/);
-  assert.match(element("deepSweepPreparationText").textContent,/250 \/ 2,000 · 12%/);
-  assert.equal(element("deepSweepPreparationBar").value,250);
-  assert.equal(element("deepSweepPreparation").hidden,false);
+  element("deepSweepMetricEligible").onclick();
+  assert.match(element("dialogBody").innerHTML,/Start a search to check candidates/);
+  ctx.renderDeepQueueState({state:"running", progress:{phase:"Rechecking saved matches", completed:3, total:9, matched:2}});
+  assert.match(element("deepSweepProgressText").textContent, /Rechecking saved matches: 3 \/ 9 · 2 recovered/);
+  assert.equal(element("deepSweepBar").hidden, false);
+  assert.equal(element("deepSweepBar").value, 3);
+  assert.equal(element("deepSweepBar").max, 9);
+  assert.equal(element("deepSweepStop").hidden, false);
+  const preparation = {checked:77,total:298,eligible:2,candidates:["first","second"],done:false};
+  ctx.renderDeepQueueState({state:"running",loop:true,has_activity:true,queue_done:22,queue_left:240,awaiting_source:35,
+    progress:{cycle:1,functions_tested:62,workers:[{function:"first"}],preparation}});
+  assert.equal(element("deepSweepQueueTitle").textContent,"");
+  assert.equal(element("deepSweepEligible").textContent,"2");
+  assert.equal(element("deepSweepQueueReason").hidden,true);
+  assert.equal(element("deepSweepProgressText").textContent,
+    "Saved progress: 22 of 262 search turns completed · 240 remaining · Pass 1 (looping): 62 functions checked · 35 waiting for saved C");
+  assert.match(element("dialogBody").innerHTML,/Checking candidates · 77 \/ 298 · 25% · 2 eligible so far/);
+  assert.match(element("dialogBody").innerHTML,/<progress[^>]+max="298" value="77"/);
+  ctx.renderDeepQueueState({state:"running",progress:{preparation:{...preparation,checked:298,done:true}}});
+  assert.match(element("dialogBody").innerHTML,/Candidates checked · 298 \/ 298 · 100% · 2 eligible/);
+  element("dialogBody").querySelectorAll("[data-deep-metric-function]")[1].onclick();
+  assert.equal(opened.at(-1),"second");
+  assert.equal(element("dialog").hidden,true);
   ctx.renderDeepQueueState({state:"running",progress:{phase:"waiting for host claims or scored C"}});
   assert.match(element("deepSweepQueueReason").textContent, /Waiting for available functions/);
   assert.equal(element("deepSweepStart").hidden, true);
@@ -98,7 +116,7 @@ vm.runInContext(source.slice(source.indexOf("let deepSweepFollowing"), source.in
   assert.equal(element("deepSweepLogSection").hidden,false);
   element("deepSweepStatus").textContent = "Deep pass stopped: Deep pass stopped.";
   ctx.renderDeepQueueState({state:"running",error:"Deep pass stopped.",progress:{workers:[{}]}});
-  assert.match(element("deepSweepQueueTitle").textContent,/Running/);
+  assert.equal(element("deepSweepQueueTitle").textContent,"");
   assert.doesNotMatch(element("deepSweepQueueReason").textContent,/stopped/);
   assert.equal(element("deepSweepStatus").hidden,true);
   assert.equal(element("deepSweepStatus").textContent,"");
@@ -194,16 +212,16 @@ vm.runInContext(source.slice(source.indexOf("let deepSweepFollowing"), source.in
   oldFollower.callback([], {progress:{workers:[{},{}],functions_tested:156,matches:0}});
   assert.equal(element("deepSweepActive").textContent,"2");
   assert.doesNotMatch(element("deepSweepStatus").textContent,/functions active|functions tested/);
-  assert.match(element("deepSweepQueueTitle").textContent,/Running — searching 2 functions/);
-  assert.equal(element("deepSweepRunChecked").textContent,"This run: 156 functions checked");
+  assert.equal(element("deepSweepQueueTitle").textContent,"");
+  assert.match(element("deepSweepProgressText").textContent,/This run: 156 functions checked/);
   ctx.renderDeepQueueState({state:"done",has_activity:true,queue_done:4,queue_left:0,progress:{workers:[{},{}],functions_tested:9}});
   assert.equal(element("deepSweepActive").textContent,"0");
   assert.equal(element("deepSweepStop").hidden,true);
   assert.equal(element("deepSweepStart").textContent,"Run again");
   assert.equal(element("deepSweepPausedGroup").hidden,true);
   assert.equal(element("deepSweepBlockedGroup").hidden,true);
-  assert.equal(element("deepSweepWaitingGroup").hidden,true);
-  assert.match(element("deepSweepRunChecked").textContent,/Last run: 9/);
+  assert.doesNotMatch(element("deepSweepProgressText").textContent,/waiting for saved C/);
+  assert.match(element("deepSweepProgressText").textContent,/Last run: 9/);
   oldFollower.callback([], {progress:{workers:[{},{}],functions_tested:156}});
   assert.equal(element("deepSweepActive").textContent,"0", "late progress cannot revive a finished search");
   ctx.S.slug="game-b";
@@ -264,7 +282,7 @@ vm.runInContext(source.slice(source.indexOf("let deepSweepFollowing"), source.in
   follower.callback([], {state:'running',progress:{workers:[{},{}],functions_tested:4}});
   rejectTotals(Error('Statistics are slow'));
   await totalsPending;
-  assert.match(element('deepSweepQueueTitle').textContent,/Running/);
+  assert.equal(element('deepSweepQueueTitle').textContent, '');
   assert.equal(element('deepSweepStop').hidden,false);
   assert.equal(element('deepSweepMatched').textContent,'—');
   assert.match(element('deepSweepQueueReason').textContent,/automatically/);
@@ -286,13 +304,19 @@ vm.runInContext(source.slice(source.indexOf("let deepSweepFollowing"), source.in
   await oldRetry.fn();
   assert.equal(reads,beforeSwitch,'old project retries cannot query or update another project');
   ctx.renderDeepQueueState({state:'running',loop:true,progress:{cycle:3,functions_tested:8}});
-  assert.match(element('deepSweepRunChecked').textContent,/Pass 3 · looping/);
+  assert.match(element('deepSweepProgressText').textContent,/Pass 3 \(looping\)/);
+
+  ctx.renderDeepQueueState({state:"running", runtime_seconds:3661});
+  assert.equal(element("deepSweepRuntime").textContent,"Total runtime: 1h 1m 1s");
+  ctx.renderDeepQueueState({state:"cancelled", runtime_seconds:3668});
+  ctx.renderDeepQueueState({state:"cancelled", runtime_seconds:3661});
+  assert.equal(element("deepSweepRuntime").textContent,"Total runtime: 1h 1m 8s");
   element('deepSweepLoop').checked=true;
   element('deepSweepThreads').value='2';
   element('deepSweepFunctionThreads').value='4';
   ctx.api=async(url, options)=>{assert.equal(element('deepSweepSettings').disabled,true,'lock settings before starting request resolves'); assert.equal(options.body.loop,true);assert.equal(options.body.threads,2);assert.equal(options.body.threads_per_function,4);throw new Error('A deep pass is already running');};
   vm.runInContext(source.slice(source.indexOf('$("deepSweepStart").onclick'),source.indexOf('$("deepSweepStop").onclick')),ctx);
-  await element('deepSweepStart').onclick();
+  await ctx.startDeepSweep();
   assert.equal(element('deepSweepSettings').disabled,false);
   assert.equal(element('deepSweepLogSection').hidden,true);
   assert.match(element('deepSweepQueueTitle').textContent,/could not start/);
@@ -326,7 +350,11 @@ for (const id of ['deepSweepMinutes','deepSweepVariants','deepSweepProfiles','de
 assert.match(panel,/<fieldset class="local-search-options"[\s\S]*?id="deepSweepProfiles"[^>]*min="1"[^>]*max="16"[\s\S]*?<\/fieldset>/);
 assert.match(panel,/<div class="deep-dashboard">/);
 
-assert.ok(panel.indexOf('id="deepSweepMetricMatched"') < panel.indexOf('id="deepSweepOptions"'));
+assert.ok(panel.indexOf('id="deepSweepOptions"') < panel.indexOf("</summary>"));
 assert.doesNotMatch(html,/id="deepSweepResults"/);
 
 assert.doesNotMatch(panel, /deepSweepStatusRetry|Retry status/);
+
+assert.match(panel, /id="deepSweepCounts"[\s\S]*?id="deepSweepMetricEligible"/);
+assert.doesNotMatch(panel, /deepSweepPreparation|deepSweepRunChecked|deepSweepWaitingGroup/);
+assert.ok(html.indexOf('id="deepActivitySection"') < html.indexOf('id="deepSweepThroughput"'));

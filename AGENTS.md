@@ -6,7 +6,7 @@ How to work in this repository. Read README.md for what decompdecomp does from a
 
 decompdecomp: AI agents decompile games the user owns into C that compiles, with the game's original compiler, to
 the exact same bytes. Python 3.12+, managed with uv. A continuation of decomp.wtf (Sam Wolfs, i12bp8/decomp.wtf,
-archived at 0.10.6): `origin` is n-delic/decompdecomp, `upstream` the archived original.
+archived at 0.10.6): `origin` is RetroReversing/decompdecomp, `upstream` the archived original.
 
 Naming: the project is **decompdecomp** in everything users read. Internal names stay as decomp.wtf left them, so
 existing installs and projects keep working: the `decomp` command, the `decompnet` package and data folder,
@@ -335,6 +335,11 @@ linting). In short:
 ## RetroReversing contribution workflow
 
 Always submit decompdecomp changes on a feature or fix branch through a pull request; do not commit directly to main.
+
+Keep the primary checkout on `main`. Start each change in its own Git worktree based on the latest
+`origin/main`, and make edits and run tests from that worktree. After the PR is merged and any local
+work you still need is safely saved, remove the task worktree. In Codex, archive managed worktrees to
+preserve a recoverable snapshot. Leave other tasks' worktrees alone.
 
 The user has asked that completed PRs be merged to main right after creation, once any required checks pass,
 until they revoke this preference. The user updates their running app themselves: merging a PR does not authorize

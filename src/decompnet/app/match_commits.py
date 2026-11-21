@@ -71,7 +71,8 @@ def status(net, proj):
         json.dumps(sorted({item['agent_id'] for item in items if item['agent_id'] is not None})))}
     for item in items:
         item['agent'] = names.get(item.pop('agent_id'))
-    return {'enabled': enabled, 'polished_enabled': polished, 'pending': pending, 'items': items, 'error': error['error'] if error else '',
+    return {'enabled': enabled, 'polished_enabled': polished, 'awaiting_checkout': enabled and not cfg.get('auto_commit_folder'),
+            'pending': pending, 'items': items, 'error': error['error'] if error else '',
             'last_commit': last['commit_sha'] if last else ''}
 
 
@@ -149,8 +150,9 @@ def enqueue(net, proj, function_id, *, restored=False, polished=False, verdict=N
         snapshot = {'details': json.loads(row['details']), 'source': row['source'], 'header': row['header'],
                     'name': row['name'], 'info': {'vram': row['vram'], 'matched_by': credited['name'] if credited else '', 'readable': bool(row['readable'])}}
         snapshot['kind'] = 'polished' if polished else 'match'
-        snapshot['origin'] = match_commit_notes.origin(net, row['attempt_id'], snapshot['info']['matched_by'], restored=restored, project_id=proj['id'])
-        if polished:snapshot['origin'].update(agent=agent['name'] if agent else 'unknown', method='polishing')
+        snapshot['origin'] = match_commit_notes.origin(net, row['attempt_id'], agent['name'] if agent else '', restored=restored, project_id=proj['id'])
+        snapshot['actor_frozen'] = True
+        if polished:snapshot['origin']['method'] = 'polishing'
         frozen = json.dumps(snapshot)
         with store.tx() as db:
             fresh = db.execute('SELECT config FROM projects WHERE id=?', (proj['id'],)).fetchone()
@@ -346,6 +348,23 @@ def process(net, slug, output=log.info):
         capture_lock = ExitStack()
         capture_lock.callback(project_lock.release)
         try:
+            if not cfg.get('auto_commit_folder'):
+                # A new project can queue matches before it has its first Git checkpoint.
+                root = repository_setup.root_at(saves.default_folder(net, slug).resolve())
+                if root is None or not repository_progress.linked_checkout(net, slug, root):
+                    return
+                _, _, manifest_path = _manifest_path(net, slug, root)
+                if not repository_git.git(root, 'rev-parse', '--verify', '--quiet', 'HEAD:' + manifest_path, missing=True):
+                    return
+                root, branch = checkout_settings(net, slug, root)
+
+                def bind_checkout(current, setting=setting, root=root, branch=branch):
+                    if current.get(setting) and not current.get('auto_commit_folder'):
+                        current.update(auto_commit_folder=str(root), auto_commit_branch=branch)
+
+                cfg = net._update_cfg(slug, bind_checkout, synchronize=False)
+                if not cfg.get(setting):
+                    return
             root = repository_sync.checkout(cfg['auto_commit_folder'], clean=False)
             with repository_operations.operation(root, slug, 'Committing a polished function' if kind == 'polished' else 'Committing a verified match', output) as log:
                 if log is None:return

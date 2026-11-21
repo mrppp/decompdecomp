@@ -1,5 +1,6 @@
 """Separate a TLB boot stub from code splat mistakenly placed at the boot address."""
 import collections
+import re
 import struct
 from pathlib import Path
 
@@ -72,4 +73,92 @@ def recover(config: Path, rom: bytes, found, log=print) -> bool:
     config.write_text(yaml.safe_dump(cfg,sort_keys=False,default_flow_style=None),encoding='utf-8')
     log(f'Separated TLB boot code from {main.rom_end-start} bytes at 0x{vram:08X}; '
         f'{hits} distinct calls agree with the later code mapping.')
+    return True
+
+
+def extend_startup_trap(config: Path, rom: bytes, log=print) -> bool:
+    """Keep a break after the boot stub's final call in handwritten startup."""
+    cfg = yaml.safe_load(config.read_text(encoding='utf-8'))
+    by_name = {s.get('name'):s for s in cfg['segments'] if isinstance(s, dict)}
+    entry, main = by_name.get('entry'), by_name.get('main')
+    if not entry or not main or main.get('follows_vram') != 'entry':
+        return False
+    lo, at = entry['start'], main['start']
+    if (not 0x1000 <= lo < at-8 < at+8 < min(0x2000,len(rom))
+            or entry.get('subsegments') != [[lo,'hasm']] or main.get('subsegments') != [[at,'c','main']]
+            or entry['vram']-lo != main['vram']-at):
+        return False
+    call, delay, trap, padding = struct.unpack_from('>4I', rom, at-8)
+    vram = main['vram']
+    entry_words = [word for word, in struct.iter_unpack('>I',rom[lo:at])]
+    callers = set(jal_targets(entry_words,entry['vram']))
+    if (call>>26 != 3 or delay or trap&0xfc00003f != 0xd or padding or vram+8 not in callers
+            or vram in callers or vram+4 in callers):
+        return False
+    main.update(start=at+8,vram=vram+8,subsegments=[[at+8,'c','main']])
+    config.write_text(yaml.safe_dump(cfg,sort_keys=False,default_flow_style=None),encoding='utf-8')
+    log('Kept the trap after the startup call in the boot assembly.')
+    return True
+
+
+def extend_startup_data(config: Path, rom: bytes, log=print) -> bool:
+    """Keep the terminator of a boot data string on the data side of the split."""
+    from ...arch.mips_code_recovery import called_extent
+
+    cfg = yaml.safe_load(config.read_text(encoding='utf-8'))
+    layout = segments_from_config_data(cfg)
+    entry = next((segment for segment in layout if segment.name == 'entry'), None)
+    main = next((segment for segment in layout if segment.name == 'main'), None)
+    if entry is None or main is None or entry.rom_end != main.rom_start:
+        return False
+    raw_entry, raw_main = (next(row for row in cfg['segments']
+                               if isinstance(row, dict) and row.get('name') == name) for name in ('entry', 'main'))
+    at, end, address = main.rom_start, main.rom_end, main.vram
+    data = raw_entry.get('subsegments', [])[-1:]
+    if (not 0x1000 < at < 0x2000 or (address+4)%16 or end > len(rom)
+            or raw_main.get('follows_vram') != 'entry' or raw_main.get('subsegments') != [[at, 'c', 'main']]
+            or not data or not isinstance(data[0], list) or data[0][1:2] != ['data']
+            or not data[0][0] <= at-4 or entry.vram-entry.rom_start != address-at
+            or not re.fullmatch(rb'[A-Za-z]{3}\x00', rom[at:at+4])
+            or address.to_bytes(4, 'big') in rom):
+        return False
+    targets = set(jal_targets((word for word, in struct.iter_unpack('>I', rom[at:end])), address))
+    if address in targets or address+4 not in targets:
+        return False
+    if not called_extent(rom, at+4, end, address+4, cpu='vr4300'):
+        return False
+    raw_main.update(start=at+4, vram=address+4, subsegments=[[at+4, 'c', 'main']])
+    config.write_text(yaml.safe_dump(cfg, sort_keys=False, default_flow_style=None), encoding='utf-8')
+    log('Kept the boot data string before the first called frame.')
+    return True
+
+
+_VERSION_DATE = re.compile(rb'Version date +[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4} +[0-9]{2}:[0-9]{2}:[0-9]{2}\0')
+
+
+def mark_boot_version(config: Path, rom: bytes, log=print) -> bool:
+    """Keep a version stamp after the startup trap out of the function list."""
+    cfg = yaml.safe_load(config.read_text(encoding='utf-8'))
+    by_name = {row.get('name'):row for row in cfg['segments'] if isinstance(row, dict)}
+    entry, raw_main = by_name.get('entry'), by_name.get('main')
+    if not entry or not raw_main or raw_main.get('follows_vram') != 'entry':
+        return False
+    main = next((segment for segment in segments_from_config_data(cfg) if segment.name == 'main'), None)
+    if (main is None or not 0x100c <= main.rom_start < main.rom_end < 0x2000
+            or raw_main.get('subsegments') != [[main.rom_start,'c','main']]
+            or entry.get('subsegments') != [[entry['start'],'hasm']]):
+        return False
+    at = main.rom_start
+    stamp = _VERSION_DATE.match(rom, at, at+64)
+    if not stamp or main.rom_end > stamp.end():
+        return False
+    call, delay, trap = struct.unpack_from('>3I', rom, at-12)
+    if call>>26 != 3 or delay or trap&0xfc00003f != 0xd:
+        return False
+    target = ((main.vram-8)&0xf0000000) | ((call&0x03ffffff)<<2)
+    if main.vram <= target < main.vram+main.rom_end-at:
+        return False
+    raw_main['subsegments'] = [[at,'rodata','boot_version']]
+    config.write_text(yaml.safe_dump(cfg,sort_keys=False,default_flow_style=None),encoding='utf-8')
+    log('Kept the version stamp following the boot trap in read-only data.')
     return True

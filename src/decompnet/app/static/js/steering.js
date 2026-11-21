@@ -69,6 +69,8 @@ function dialog(title, html, kind = "") {
   if(typeof stopRomAssetAudio=== "function")stopRomAssetAudio();
   $("dialogBody").classList.remove("rom-region-body");
   $("dialogTitle").textContent = title;
+  $("dialogSubtitle").hidden = true;
+  $("dialogSubtitle").textContent = "";
   $("dialogBody").innerHTML = html;
   $("dialogBody")._html = null;  // (setHtml's memory of what another panel showed here)
   S.dialogKind = kind;
@@ -153,7 +155,9 @@ function renderRepositoryAutoCommit(state = {}) {
   $("repositoryAutoCommitDetails").hidden = !state.pending;
   $("repositoryAutoCommitDetails").textContent = `Pending commits (${state.pending || 0})`;
   const status = $("repositoryAutoCommitState");
-  status.textContent = state.error || (state.enabled || state.polished_enabled
+  status.textContent = state.error || (state.awaiting_checkout
+    ? `${state.pending || 0} pending · Automatic commits start once a Git checkpoint is linked.`
+    : state.enabled || state.polished_enabled
     ? `${state.pending || 0} pending · ${state.last_commit ? "Last commit: " + state.last_commit.slice(0, 8) : "Waiting for new matches or polished functions."}`
     : "Off. Matches and polished functions will not be committed automatically.");
   status.classList.toggle("err", !!state.error);
@@ -328,47 +332,203 @@ $("phRename").onclick = () => {
 };
 /* What agents learned (app/knowledge.py): fetched now and then, not on every poll. */
 const KNOWLEDGE_EVERY_MS = 30000;
+let knowledgeView;
+const knowledgePending = new Set();
 async function renderKnowledge(force = false) {
   if (!force && S.knowAt && Date.now() - S.knowAt < KNOWLEDGE_EVERY_MS && S.knowSlug === S.slug) return;
-  S.knowAt = Date.now(); S.knowSlug = S.slug;
-  let k;
-  try { k = await api(`/api/knowledge?slug=${encodeURIComponent(S.slug)}`); } catch { return; }
-  $("knowAuto").checked = k.auto;
-  const evidence = (it) => it.evidence?.length ? `<details><summary>Supporting examples · ${it.evidence.length}</summary>${it.evidence.map(e => `<p class="small muted">${esc(e.agent || 'Agent')}: ${esc(e.text)}</p>`).join('')}</details>` : '';
-  const row = (it) => {
-    const verification=it.verification ? `<p class="small muted">Independent review queued for ${esc(it.verification.agent)} · ${esc(it.verification.model)} · next session</p>` : '';
-    if (it.status === "agreed") return `<div class="note">${saidHead("agreed · waiting for you", it.models, it.t)}${saidText(it.text)}${evidence(it)}
-      <div class="row"><button class="primary small-btn" data-know="${it.id}" data-accept="1" type="button">Give it to agents</button>
-      <button class="ghost small-btn" data-know="${it.id}" type="button">Reject</button></div></div>`;
-    if (it.status === "accepted") return `<div class="note">${saidHead("agents get this", it.models, it.t, true)}${saidText(it.text)}${evidence(it)}
-      <div class="row"><button class="ghost small-btn" data-know="${it.id}" type="button">Take it back</button></div></div>`;
-    return `<div class="note">${saidHead("waiting for a second model", it.models, it.t, true)}${saidText(it.text)}${evidence(it)}${verification}<div class="row"><button class="primary small-btn" data-know="${it.id}" data-accept="1" type="button">Accept for all agents</button><button class="ghost small-btn" data-verify-knowledge="${it.id}" type="button">Verify with another model</button><button class="ghost small-btn" data-know="${it.id}" type="button">Reject</button></div></div>`;
-  };
-  const waiting = k.items.filter((it) => it.status === "agreed").length;
-  $("knowState").textContent = waiting ? `${waiting} waiting for you` : k.items.length ? "" : "nothing yet";
-  setHtml($("knowList"), k.items.map(row).join(""));
+  const request = {};
+  const slug = S.slug;
+  if (knowledgeView?.slug !== slug) {
+    knowledgeView = {slug, groups: new Set(), data: null};
+    setHtml($("knowList"), '<p class="small muted">Loading findings…</p>');
+  }
+  knowledgeView.request = request;
+  S.knowAt = Date.now(); S.knowSlug = slug;
+  try {
+    const data = await api(`/api/knowledge?slug=${encodeURIComponent(slug)}`);
+    if (S.slug !== slug || knowledgeView?.request !== request) return;
+    knowledgeView.data = data;
+    $("knowAuto").disabled = knowledgePending.has(slug);
+    if (!knowledgePending.has(slug)) $("knowAuto").checked = data.auto;
+    drawKnowledge();
+  } catch (error) {
+    if (S.slug === slug && knowledgeView?.request === request) {
+      S.knowAt = 0;
+      $("knowState").textContent = error.message;
+    }
+  }
 }
+function knowledgeExamples(it) {
+  const example = e => {
+    const refs = [...(e.revisions || []), ...(e.flags || [])];
+    const trials = (e.trials || []).map(t => `<p class="small">${t.restored ? 'Saved trial summary' : 'Recorded trial'} ${esc(t.id)} · ${t.exact ? 'Exact at trial time' : t.score == null ? 'Could not score' : `Score ${esc(t.score)}`}<br><code>${esc([t.compiler, t.flags].filter(Boolean).join(' '))}</code></p>`);
+    return `<p class="small"><b>${esc(e.agent || 'Agent')}</b> · ${esc(e.text)}</p>
+      ${(e.functions || []).map(fn => fnLink(fn)).join('')}${refs.length ? `<p class="mono small muted">${esc(refs.join(' · '))}</p>` : ''}${trials.join('')}`;
+  };
+  return it.evidence?.length ? `<details data-knowledge-example="${it.id}"><summary>Reported compile evidence · ${it.evidence.length}</summary>${it.evidence.map(example).join('')}</details>` : '';
+}
+function openKnowledgeMerge(target, items, slug, profile = false) {
+  const body = dialog("Merge findings", `<p>Choose equivalent findings to combine into #${target.id}. The merged finding keeps their votes and supporting examples.</p>
+    <label class="field"><span>Merged wording</span><textarea data-merge-text rows="5" maxlength="600">${esc(target.text)}</textarea></label>
+    <label class="field"><span>Find duplicates by ID or wording</span><input type="search" data-merge-search></label>
+    <div data-merge-options></div>
+    <button type="button" class="primary" data-merge-save disabled>Merge findings</button>
+    <div data-merge-work></div>`, "knowledge-merge");
+  const search = body.querySelector("[data-merge-search]");
+  const options = body.querySelector("[data-merge-options]");
+  const wording = body.querySelector("[data-merge-text]");
+  const save = body.querySelector("[data-merge-save]");
+  const work = body.querySelector("[data-merge-work]");
+  const selected = new Set();
+  const update = () => { save.disabled = !selected.size || !wording.value.trim(); };
+  search.oninput = () => {
+    const query = search.value.trim().toLowerCase();
+    const candidates = items.filter(it => it.id !== target.id &&
+      (selected.has(it.id) || (query ? `#${it.id} ${it.text}`.toLowerCase().includes(query) : profile || target.topic === it.topic)));
+    options.innerHTML = candidates.map(it => `<label class="check"><input type="checkbox" value="${it.id}"${selected.has(it.id) ? ' checked' : ''}>
+      <span><b>#${it.id}</b> · ${esc(it.text)}</span></label>`).join("") ||
+      '<p class="muted">No findings match. Search by ID or wording to look across topics.</p>';
+  };
+  options.onchange = ({target: input}) => {
+    if (input.checked) selected.add(Number(input.value));
+    else selected.delete(Number(input.value));
+    update();
+  };
+  wording.oninput = update;
+  search.oninput();
+  save.onclick = async () => {
+    if (save.disabled || S.slug !== slug) return;
+    const keys = [target.id, ...selected].map(id => `${slug}/${id}`);
+    if (keys.some(key => knowledgePending.has(key))) {
+      showJobError(work, "A selected finding is being updated. Try again after it finishes.");
+      return;
+    }
+    keys.forEach(key => knowledgePending.add(key));
+    const draw = profile ? drawCompilerProfileEvidence : drawKnowledge;
+    draw();
+    const finish = beginWork(work, "Merging findings", [save, wording, search, ...options.querySelectorAll("input")], "");
+    try {
+      const result = await api("/api/knowledge/merge", {
+        method: "POST", body: {slug, target: target.id, sources: [...selected], text: wording.value, profile}
+      });
+      if (S.slug === slug) {
+        if (S.dialogKind === "knowledge-merge" && work.isConnected) closeDialog();
+        toast(esc(result.message));
+        if (profile) await loadCompilerProfileEvidence(slug);
+        else await renderKnowledge(true);
+      }
+    } catch (error) {
+      showJobError(work, error.message);
+    } finally {
+      finish();
+      keys.forEach(key => knowledgePending.delete(key));
+      draw();
+    }
+  };
+}
+function drawKnowledge() {
+  const k = knowledgeView?.data;
+  if (!k || knowledgeView.slug !== S.slug) return;
+  const query = ($("knowSearch")?.value || '').trim().toLowerCase();
+  const status = $("knowFilter")?.value || '';
+  const row = (it) => {
+    const busy = knowledgePending.has(`${S.slug}/${it.id}`);
+    const disabled = busy ? ' disabled' : '';
+    const verification=it.verification ? `<p class="small muted">Independent review queued for ${esc(it.verification.agent)} · ${esc(it.verification.model)} · next session</p>` : '';
+    const accepted = it.status === 'accepted';
+    const agreed = it.status === 'agreed';
+    const badge = accepted ? (it.models.length >= 2 ? 'accepted · model consensus' : 'accepted') :
+      agreed ? 'agreed · waiting for you' : 'waiting for a second model';
+    const accept = accepted ? '' : `<button class="primary small-btn" data-know="${it.id}" data-accept="1" type="button"${disabled}>${agreed ? 'Give it to agents' : 'Accept for all agents'}</button>`;
+    const verify = it.status === 'proposed' ? `<button class="ghost small-btn" data-verify-knowledge="${it.id}" type="button"${disabled}>Verify with another model</button>` : '';
+    return `<div class="note">${saidHead(badge, it.models, it.t, true)}${saidText(it.text)}${knowledgeExamples(it)}${verification}
+      <div class="row wrap">${accept}${verify}<button class="ghost small-btn" data-knowledge-merge="${it.id}" type="button"${disabled}>Merge…</button><button class="ghost small-btn" data-knowledge-profile="${it.id}" type="button"${disabled}>Move to compiler evidence</button><button class="ghost small-btn" data-know="${it.id}" type="button"${disabled}>${accepted ? 'Take it back' : 'Reject'}</button>${busy ? '<span role="status">Saving…</span>' : ''}</div></div>`;
+  };
+  const counts = {proposed: 0, agreed: 0, accepted: 0};
+  const topics = new Map();
+  for (const it of k.items) {
+    counts[it.status]++;
+    const topic = it.topic || 'Other techniques';
+    const searchable = [`#${it.id}`, topic, it.text, ...it.models, ...(it.evidence || []).map(e => e.text)].join(' ').toLowerCase();
+    if ((status && status !== it.status) || !searchable.includes(query)) continue;
+    if (!topics.has(topic)) topics.set(topic, []);
+    topics.get(topic).push(it);
+  }
+  $("knowState").textContent = k.items.length ? `${counts.proposed} pending · ${counts.agreed} ready for review · ${counts.accepted} accepted` : 'No findings yet';
+  const list = $("knowList");
+  const examples = new Set(Array.from(list.querySelectorAll?.('details[data-knowledge-example][open]') || [], el => el.dataset.knowledgeExample));
+  const html = [...topics].sort(([a], [b]) => a.localeCompare(b)).map(([topic, items]) =>
+    `<details class="more" data-knowledge-topic="${esc(topic)}"${query || status || knowledgeView.groups.has(topic) || k.items.length < 12 ? ' open' : ''}>
+      <summary>${esc(topic)} · ${items.length}</summary>${items.map(row).join('')}</details>`).join('');
+  setHtml(list, html || '<p class="muted small">No findings match this view.</p>');
+  for (const el of list.querySelectorAll?.('details[data-knowledge-example]') || []) {
+    if (examples.has(el.dataset.knowledgeExample)) el.open = true;
+  }
+}
+$("knowList").addEventListener?.('toggle', event => {
+  const topic = event.target.dataset?.knowledgeTopic;
+  if (!topic || !knowledgeView || $("knowSearch").value || $("knowFilter").value) return;
+  if (event.target.open) knowledgeView.groups.add(topic);
+  else knowledgeView.groups.delete(topic);
+}, true);
+$("knowSearch")?.addEventListener('input', drawKnowledge);
+$("knowFilter")?.addEventListener('change', drawKnowledge);
 $("knowList").onclick = async (e) => {
-  const verify=e.target.closest('[data-verify-knowledge]');
-  if(verify?.dataset.verifyKnowledge){
-    const slug=S.slug, work=$('knowledgeVerifyWork'), finish=beginWork(work,'Queueing independent verification',[verify],'');
-    try {const result=await api('/api/knowledge/verify',{method:'POST',body:{slug,id:Number(verify.dataset.verifyKnowledge)}});if(S.slug===slug){toast(esc(result.message));await renderKnowledge(true);}}
-    catch(error){showJobError(work,error.message);}finally{finish();}
+  const link = e.target.closest('.fn[data-fn]');
+  if (link?.dataset.fn) {
+    openFn(link.dataset.fn);
     return;
   }
+  const merge = e.target.closest("[data-knowledge-merge]");
+  if (merge) {
+    const items = knowledgeView?.slug === S.slug ? knowledgeView.data?.items : null;
+    const target = items?.find(it => it.id === Number(merge.dataset.knowledgeMerge));
+    if (target) openKnowledgeMerge(target, items, S.slug);
+    return;
+  }
+  const profile = e.target.closest("[data-knowledge-profile]");
+  const verify=e.target.closest('[data-verify-knowledge]');
   const b = e.target.closest("[data-know]");
-  if (!b) return;
+  const verification = verify?.dataset.verifyKnowledge;
+  const id = Number(verification || profile?.dataset.knowledgeProfile || b?.dataset.know);
+  if (!id) return;
+  const slug = S.slug, key = `${slug}/${id}`;
+  if (knowledgePending.has(key)) return;
+  knowledgePending.add(key);
+  drawKnowledge();
   try {
-    await api("/api/knowledge", { method: "POST", body: { slug: S.slug, id: Number(b.dataset.know), accept: !!b.dataset.accept } });
-    renderKnowledge(true);
-  } catch (err) { toast(esc(err.message), "err"); }
+    const result = await api(verification ? '/api/knowledge/verify' : profile ? '/api/knowledge/profile' : '/api/knowledge', {
+      method: 'POST', body: verification ? {slug, id} : profile ? {slug, ids: [id]} : {slug, id, accept: !!b.dataset.accept}
+    });
+    if (S.slug === slug) {
+      toast(esc(result.message || 'Finding updated.'));
+      await renderKnowledge(true);
+    }
+  } catch (err) {
+    if (S.slug === slug) toast(esc(err.message), 'err');
+  } finally {
+    knowledgePending.delete(key);
+    drawKnowledge();
+  }
 };
 $("knowAuto").onchange = async (e) => {
+  const slug = S.slug, control = e.target, next = control.checked;
+  if (knowledgePending.has(slug)) return;
+  knowledgePending.add(slug);
+  control.disabled = true;
   try {
-    await api("/api/knowledge", { method: "POST", body: { slug: S.slug, auto: e.target.checked } });
-    toast(e.target.checked ? "What two models agree on goes to agents by itself now." : "You decide what agents get.");
-    renderKnowledge(true);
-  } catch (err) { toast(esc(err.message), "err"); }
+    await api("/api/knowledge", { method: "POST", body: { slug, auto: next } });
+    if (S.slug === slug) {
+      toast(next ? "Automatic acceptance enabled." : "Automatic acceptance disabled.");
+      await renderKnowledge(true);
+    }
+  } catch (err) {
+    if (S.slug === slug) toast(esc(err.message), "err");
+  } finally {
+    knowledgePending.delete(slug);
+    control.disabled = knowledgePending.has(S.slug);
+    if (knowledgeView?.slug === S.slug && knowledgeView.data) control.checked = knowledgeView.data.auto;
+  }
 };
 $("instrSave").onclick = async () => {
   try {
@@ -404,6 +564,73 @@ async function setClaimOrder(order) {
   }
 }
 $("claimOrder").onchange = () => setClaimOrder($("claimOrder").value);
+const routingExperimentRequests = new Map();
+
+function renderRoutingExperiment(ov) {
+  const start = $("routingExperimentStart"), stop = $("routingExperimentStop");
+  if (!start || !stop) return;
+  const data = ov?.routing_experiment;
+  const active = data?.enabled && data.used < data.budget;
+  const pending = routingExperimentRequests.get(S.slug);
+  const input = $("routingExperimentBudget");
+  const section = $("routingExperimentContext");
+  const status = $("routingExperimentStatus");
+  if (input.dataset.project !== S.slug || (data && active)) input.value = data?.budget ?? 60;
+  input.dataset.project = S.slug || "";
+  input.disabled = Boolean(pending || active || data?.pending);
+  start.disabled = input.disabled;
+  stop.disabled = Boolean(pending);
+  stop.hidden = !active;
+  section.textContent = data ? `${data.used}/${data.budget} sampled` : "";
+  if (pending) {
+    status.textContent = pending.message;
+    return;
+  }
+  if (!data) {
+    status.textContent = "";
+    return;
+  }
+  const format = (label, result) => {
+    const perHour = result.matches_per_helper_hour;
+    const perClaim = result.matches_per_claim;
+    return `${label} ${result.matches}/${result.claims} exact, ${perClaim === null ? "" : (perClaim * 100).toFixed(1) + "% per claim, "}${perHour === null ? "rate pending" : perHour.toFixed(2) + " per helper-hour"}`;
+  };
+  const sampling = active && ov.claim_order ? "Sampling waits for the default project claim order."
+    : active ? "Sampling eligible automatic claims." : "Sampling ended.";
+  status.textContent = data.cohorts
+    ? `${sampling} ${format("Normal routing", data.results.policy)} · ${format("Overlap", data.results.overlap)}`
+    : `${sampling} Results appear when both groups complete work on comparable cases.`;
+  if (data.pending) status.textContent += ` ${data.pending} sampled claims still active.`;
+}
+
+async function setRoutingExperiment(budget) {
+  const slug = S.slug;
+  if (!slug || routingExperimentRequests.has(slug)) return;
+  routingExperimentRequests.set(slug, { message: budget ? "Starting comparison…" : "Stopping comparison…" });
+  renderRoutingExperiment(S.ov);
+  let error;
+  try {
+    const updated = await api("/api/routing-experiment", { method: "POST", body: { slug, budget } });
+    if (S.slug === slug) S.ov = updated;
+  } catch (e) {
+    error = e.message;
+  } finally {
+    routingExperimentRequests.delete(slug);
+    if (S.slug === slug) {
+      renderRoutingExperiment(S.ov);
+      if (error) $("routingExperimentStatus").textContent = error;
+    }
+  }
+}
+
+if ($("routingExperimentStart")) {
+  $("routingExperimentStart").onclick = () => {
+    const input = $("routingExperimentBudget");
+    if (input.reportValidity() && input.value) setRoutingExperiment(Number(input.value));
+  };
+  $("routingExperimentStop").onclick = () => setRoutingExperiment(0);
+}
+
 /* ★: agents take a starred function before the others. */
 async function togglePrio(name, on) {
   try {
@@ -1124,6 +1351,66 @@ function renderProjectFacts(ov) {
   renderScope(ov);
 }
 
+function renderPolishChecklist(slug, fork) {
+  const panel = $("polishChecklist");
+  if (panel.dataset.slug === slug) return;
+  panel.dataset.slug = slug;
+  $("polishChecklistPc").hidden = !fork;
+  // Give pending requests their own elements when the user switches games.
+  const oldForm = $("polishChecklistForm");
+  panel.checklistForms ||= new Map();
+  const existing = panel.checklistForms.get(slug);
+  if (existing) {
+    oldForm.replaceWith(existing.form);
+    panel.ontoggle = existing.open;
+    existing.open();
+    return;
+  }
+  const form = oldForm.cloneNode(false);
+  form.innerHTML = (panel.checklistTemplate ||= oldForm.innerHTML);
+  oldForm.replaceWith(form);
+  const log = form.querySelector("[data-checklist-log]");
+  const checks = [...form.querySelectorAll("input")];
+  const format = form.querySelector("select");
+  const naming = checks.find(input => input.name === "require_name");
+  const controls = [...checks, format, form.querySelector("button")];
+  let loaded = false, pending = false;
+
+  async function updateOptions(save) {
+    if (pending || (save && !loaded)) return;
+    pending = true;
+    const selected = checks.filter(input => input.checked).map(input => input.name);
+    showJobError(log, "");
+    log.hidden = true;
+    const finish = beginWork(log, save ? "Saving checklist" : "Loading checklist", controls,
+      save ? "Checklist saved." : "");
+    try {
+      const options = await api(save ? "/api/polishing-checklist" : `/api/polishing-checklist?slug=${encodeURIComponent(slug)}`,
+        save ? {method: "POST", body: {slug, selected, name_format: format.value}} : undefined);
+      checks.forEach(input => { input.checked = options.selected.includes(input.name); });
+      format.value = options.name_format;
+      loaded = true;
+    } catch (error) {
+      const retry = save ? "" : " Close and reopen the checklist to try again.";
+      showJobError(log, (error.message || String(error)) + retry);
+    } finally {
+      finish();
+      controls.forEach(control => { control.disabled = !loaded; });
+      pending = false;
+      naming.onchange();
+    }
+  }
+
+  naming.onchange = () => { format.disabled = pending || !loaded || !naming.checked; };
+  panel.ontoggle = () => { if (panel.open && !loaded) updateOptions(false); };
+  form.onsubmit = event => {
+    event.preventDefault();
+    if (S.slug === slug) updateOptions(true);
+  };
+  panel.checklistForms.set(slug, {form, open: panel.ontoggle});
+  panel.ontoggle();
+}
+
 async function renderProjectSettings(keepRemoved = false) {
   const ov = S.ov;
   if (!ov) return;
@@ -1454,6 +1741,56 @@ const PART_STATE = {
   waiting: ["waiting", "agents try its neighbours when they take them"],
   "": ["not checked yet", ""],
 };
+async function loadCompilerProfileEvidence(slug) {
+  const box = $("compilerProfileEvidence");
+  if (!box) return;
+  const request = {};
+  box._request = request;
+  if (box._slug !== slug) {
+    box._slug = slug;
+    box._items = null;
+    setHtml(box, '<p class="small muted">Loading compiler profile evidence…</p>');
+  }
+  try {
+    const {items} = await api(`/api/knowledge/profile?slug=${encodeURIComponent(slug)}`);
+    if (S.slug !== slug || S.tab !== "settings" || box._request !== request) return;
+    box._items = items;
+    drawCompilerProfileEvidence();
+  } catch (error) {
+    if (S.slug === slug && box._request === request) {
+      box._items = null;
+      setHtml(box, `<p role="alert">${esc(error.message)}</p>`);
+    }
+  }
+}
+function drawCompilerProfileEvidence() {
+  const box = $("compilerProfileEvidence");
+  if (!box || box._slug !== S.slug || S.tab !== "settings" || !box._items) return;
+  const items = box._items;
+  const opened = new Set(Array.from(box.querySelectorAll('details[data-knowledge-example][open]'),
+    el => el.dataset.knowledgeExample));
+  setHtml(box, items.map(it => {
+    const busy = knowledgePending.has(`${S.slug}/${it.id}`);
+    const merge = items.length > 1 ? `<button type="button" class="ghost small-btn" data-profile-merge="${it.id}"${busy ? ' disabled' : ''}>Merge…</button>` : '';
+    return `<div class="note">${saidHead("reported", it.models, it.t, true)}${saidText(it.text)}${knowledgeExamples(it)}
+      ${merge}${busy ? '<span role="status">Merging…</span>' : ''}</div>`;
+  }).join("") || '<p class="small muted">No compiler profile evidence has been moved here.</p>');
+  for (const el of box.querySelectorAll('details[data-knowledge-example]')) {
+    if (opened.has(el.dataset.knowledgeExample)) el.open = true;
+  }
+}
+$("compilerProfileEvidence")?.addEventListener("click", event => {
+  const link = event.target.closest(".fn[data-fn]");
+  if (link) {
+    openFn(link.dataset.fn);
+    return;
+  }
+  const merge = event.target.closest("[data-profile-merge]");
+  const box = $("compilerProfileEvidence");
+  if (!merge || merge.disabled || box._slug !== S.slug) return;
+  const target = box._items?.find(it => it.id === Number(merge.dataset.profileMerge));
+  if (target) openKnowledgeMerge(target, box._items, S.slug, true);
+});
 const hexShort = (n) => "0x" + n.toString(16).toUpperCase();
 async function loadCompilerAnswer() {
   clearTimeout(S.answerTimer);
@@ -1462,6 +1799,7 @@ async function loadCompilerAnswer() {
   try { a = await api(`/api/compilermap?slug=${encodeURIComponent(slug)}`); } catch (e) { $("compilerAnswer").textContent = e.message; return; }
   if (slug !== S.slug || S.tab !== "settings") return;
   renderCompilerAnswer(a);
+  loadCompilerProfileEvidence(slug);
   if (!compilerRecheckJob && S.ov?.kind !== "fork") loadCompilerRecheck();
   if (a.checking) S.answerTimer = setTimeout(loadCompilerAnswer, COMPILER_ANSWER_EVERY_MS);
 }
@@ -1560,7 +1898,7 @@ async function compareProfileWithDefault(button) {
   const item = {running:true, message:"Comparing matched functions against the default…"};
   compilerProfileJobs.set(key, item); renderCompilerParts(compilerPartsAnswer);
   try {
-    const {job} = await api("/api/compiler/cleanup", {method:"POST", body:{slug,profile,action}});
+    const {job} = await api("/api/compiler/cleanup", {method:"POST", body:{slug,profile}});
     const out = await followJob(job, null, lines => {
       item.message = lines[lines.length - 1] || "Comparing against default…";
       if (S.slug === slug) renderCompilerParts(compilerPartsAnswer);
@@ -1735,9 +2073,12 @@ const compilerReasonsOpen = new Set();
 function renderCompilerParts(a) {
   if (compilerPartsSlug !== S.slug) { compilerPartsSlug = S.slug; compilerGroupsOpen.clear(); compilerReasonsOpen.clear(); }
   compilerPartsAnswer = a;
-  const parts = a.parts || [], mode = $("compilerGroup").value, sort = $("compilerSort").value;
+  const ranges = a.parts || [], parts = [...ranges, ...(a.function_parts || [])], mode = $("compilerGroup").value, sort = $("compilerSort").value;
   $("compilerViewControls").hidden = !parts.length;
   const row = (p, showProfile) => {
+    if (p.function_only) return `<li class="compiler-range"><div class="compiler-range-heading"><code>${hexShort(p.start)}</code>
+      ${compilerFunctionLinks(p.function_list)}</div>
+      ${showProfile ? `<div class="small"><b>${esc(p.compiler)}</b><code class="compiler-arguments">${esc(p.flags)}</code></div>` : ""}</li>`;
     const [word, why] = PART_STATE[p.check] || PART_STATE[""];
     return `<li class="compiler-range"><div class="compiler-range-heading"><code>${hexShort(p.start)}–${hexShort(p.end)}</code>
       <span class="part-state ${esc(p.check || "none")}">${esc(word)}</span>
@@ -1750,7 +2091,7 @@ function renderCompilerParts(a) {
   };
   // #259: a part a Remove took out stays greyed with a Revert that puts back the same range, compiler and flags
   const removed = (S.removedParts || []).map((p, at) => ({ ...p, at })).filter((p) => p.slug === S.slug
-    && !parts.some((q) => q.start === p.start && q.end === p.end && (q.file || "") === (p.file || "")));
+    && !ranges.some((q) => q.start === p.start && q.end === p.end && (q.file || "") === (p.file || "")));
   const removedHtml = removed.length ? `<ol class="parts">${removed.map((p) => `<li class="removed"><code>${hexShort(p.start)}–${hexShort(p.end)}</code><span class="grow">${esc(p.compiler)} <span class="flags mono">${esc(Array.isArray(p.flags) ? p.flags.join(" ") : p.flags)}</span></span>
       ${p.file ? `<span class="muted small mono">${esc(p.file)}</span>` : ""}<span class="muted small">removed</span>
       <button class="ghost small-btn" type="button" data-revert="${p.at}" aria-label="Build ${hexShort(p.start)} to ${hexShort(p.end)} with ${esc(p.compiler)} again" title="Build this part with ${esc(p.compiler)} again">Revert</button></li>`).join("")}</ol>` : "";
@@ -1758,7 +2099,7 @@ function renderCompilerParts(a) {
   compilerDisplayedGroups = groups;
   setHtml($("compilerParts"), removedHtml + (mode === "range" ? `<ol class="compiler-range-list">${groups.flatMap(g => g.parts).map(p => row(p, true)).join("")}</ol>`
     : groups.map((g, index) => `<details class="compiler-profile" data-compiler-group="${esc(g.id)}"${compilerGroupsOpen.has(g.id) ? " open" : ""}>
-      <summary><span><b>${esc(mode === "family" ? g.family.toUpperCase() : g.compiler)}</b>${g.default ? ` <span class="chip-s">${mode === "family" && g.profiles > 1 ? "Includes default" : "Default"}</span>` : ""}${mode === "settings" ? `<code class="compiler-arguments">${esc(g.flags || "No arguments")}</code>` : ""}<span class="compiler-profile-count">${plural(g.parts.length, "range")}${g.functions != null ? ` · ${plural(g.functions, "function")}` : ""}${mode === "family" ? ` · ${plural(g.profiles, "argument profile")}` : ""}</span></span></summary>
+      <summary><span><b>${esc(mode === "family" ? g.family.toUpperCase() : g.compiler)}</b>${g.default ? ` <span class="chip-s">${mode === "family" && g.profiles > 1 ? "Includes default" : "Default"}</span>` : ""}${mode === "settings" ? `<code class="compiler-arguments">${esc(g.flags || "No arguments")}</code>` : ""}<span class="compiler-profile-count">${[g.ranges ? plural(g.ranges, "range") : "", g.functions != null ? plural(g.functions, "function") : ""].filter(Boolean).join(" · ")}${mode === "family" ? ` · ${plural(g.profiles, "argument profile")}` : ""}</span></span></summary>
       ${mode === "settings" && !g.default && S.ov.kind !== "fork" ? `<div class="compiler-profile-action"><div class="compiler-profile-tools"><span class="small muted">Profile actions</span><details class="agent-menu compiler-profile-menu"><summary aria-label="Actions for ${esc(g.compiler)} profile" title="Compiler profile actions">⋮</summary><div class="agent-menu-items"><button type="button" data-profile-default="${index}"${compilerProfileJobs.get(`${S.slug}:${g.id}`)?.running ? " disabled" : ""}>Compare all matches with default</button><button type="button" data-profile-test-default="${index}">Test this profile as default</button><button type="button" data-profile-test-default="${index}" data-profile-action="replace">Replace default with this profile</button><button type="button" data-profile-test-default="${index}" data-profile-action="nonmatches">Test all non-matches</button></div></details></div><p class="small muted">Only exact byte matches move to the project default. Drafts and non-matches keep their settings.</p><p class="small" role="status">${esc(compilerProfileJobs.get(`${S.slug}:${g.id}`)?.message || "")}</p></div>` : ""}
       <ol class="compiler-range-list">${g.parts.map(p => row(p, mode === "family")).join("")}</ol></details>`).join("")));
   $("compilerParts").querySelectorAll("details[data-range-reason]").forEach(d => d.ontoggle = () => {
@@ -2096,10 +2437,11 @@ $("sourcePrepExportRun").onclick = async () => {
 
 let deepSweepFollowing = null, deepSweepProjectVersion = 0, deepSweepSnapshot = null, deepSweepRetryTimer = null;
 // Keep the actual inputs when the shared drawer closes or changes tasks, so a poll never loses edits.
-function openDeepOptions() {
+function openDeepOptions(startLabel = "") {
   const settings = $("deepSweepSettings"), slug = S.slug;
-  dialog("Deep permuter search options", `<p class="small muted" id="deepSweepOptionsHelp"></p><div id="deepSweepOptionsHost"></div><div class="row"><button type="button" class="primary" id="deepSweepOptionsDone">Done</button></div>`, "deep-options");
+  dialog("Deep permuter search options", `<p class="small muted" id="deepSweepOptionsHelp"></p><div id="deepSweepOptionsHost"></div><div class="row"><button type="button" class="primary" id="deepSweepOptionsDone">${startLabel ? esc(startLabel) : "Done"}</button></div>`, "deep-options");
   $("deepSweepOptionsHost").append(settings);
+  $("deepSweepOptionsDone").dataset.start = startLabel;
   $("deepSweepOptionsHelp").textContent = settings.disabled
     ? "These settings are in use. Stop the search to change them."
     : "Changes apply when you start the next search.";
@@ -2115,7 +2457,10 @@ function openDeepOptions() {
   settings.oninput = edited;
   settings.onchange = edited;
   $("deepSweepOptionsDone").onclick = () => {
-    if ([...settings.querySelectorAll("input")].every(input => input.reportValidity())) closeDialog();
+    if (S.slug !== slug || (startLabel && settings.disabled)) return;
+    if (![...settings.querySelectorAll("input")].every(input => input.reportValidity())) return;
+    closeDialog();
+    if (startLabel) return startDeepSweep();
   };
   (settings.disabled ? $("deepSweepOptionsDone") : $("deepSweepMinutes")).focus();
 }
@@ -2140,7 +2485,7 @@ function deepAttentionAction(issue) {
 function openDeepMetric(kind) {
   const slug = S.slug;
   if (!slug || $("deepSweepPanel").dataset.slug !== slug) return;
-  const titles = {matched:"Matched by deep permuter", improved:"Improved by deep permuter", active:"Searching now", attention:"Functions needing attention"};
+  const titles = {matched:"Matched by deep permuter", improved:"Improved by deep permuter", active:"Searching now", eligible:"Eligible functions", attention:"Functions needing attention"};
   if (!titles[kind]) return;
   dialog(titles[kind], "", "deep-metric:" + kind);
   deepMetricSlug = slug;
@@ -2151,21 +2496,32 @@ function renderDeepMetricDrawer() {
   if (!S.dialogKind?.startsWith("deep-metric:") || $("dialog").hidden) return;
   if (deepMetricSlug !== S.slug) { closeDialog(); return; }
   const kind = S.dialogKind.slice("deep-metric:".length), status = deepSweepSnapshot || {};
-  const active = kind === "active", attention = kind === "attention", body = $("dialogBody");
+  const active = kind === "active", attention = kind === "attention", eligible = kind === "eligible", body = $("dialogBody");
   if (kind === "improved") {
     if (body._deepMetricHtml && body._deepMetricSource === deepMetricResultStatus && body._deepMetricKind === kind) return;
     renderDeepImprovementTable(deepMetricResultStatus, body);
     body._deepMetricHtml = body.innerHTML; body._deepMetricSource = deepMetricResultStatus; body._deepMetricKind = kind;
     return;
   }
-  const source = active ? status.state === "running" ? status.progress?.workers : null : attention ? status.attention : deepMetricRows;
-  if (body._deepMetricHtml && body._deepMetricSource === source && body._deepMetricKind === kind) return;
+  const source = active ? status.state === "running" ? status.progress?.workers : null : attention ? status.attention : eligible ? status.progress?.preparation : deepMetricRows;
+  if (body._deepMetricHtml && body._deepMetricSource === source && body._deepMetricKind === kind && (!eligible || body._deepMetricState === status.state)) return;
+  body._deepMetricState = status.state;
   body._deepMetricSource = source; body._deepMetricKind = kind;
-  const rows = active || attention ? source || [] : deepMetricRows.filter(row => kind === "matched" ? row.new_score === 0 : row.new_score < row.starting_score);
-  const intro = attention ? "Searches that stopped for the current inputs. Open a function to inspect it; the reason and next step are shown below." : active ? "Live searches for this project. Select a function to inspect it."
+  const rows = eligible ? (source?.candidates || []).map(name => ({function:name}))
+    : active || attention ? source || [] : deepMetricRows.filter(row => kind === "matched" ? row.new_score === 0 : row.new_score < row.starting_score);
+  const checked = source?.checked || 0, total = source?.total || 0;
+  const checkLabel = source?.done ? "Candidates checked" : status.state === "running" ? "Checking candidates" : "Candidate check ended";
+  const checkPercent = total ? Math.floor(100 * checked / total) : source?.done ? 100 : 0;
+  const checkDetails = source
+    ? `<div class="compiler-queue-count"><span>${checkLabel} · ${checked.toLocaleString()} / ${total.toLocaleString()} · ${checkPercent}% · ${(source.eligible || 0).toLocaleString()} eligible${source.done ? "" : " so far"}</span><progress class="deep-sweep-bar" max="${Math.max(1, total)}" value="${total ? checked : Number(!!source.done)}" aria-label="Functions checked for search eligibility"></progress></div>`
+    : "";
+  const intro = eligible ? "Functions found eligible in the latest candidate check. Select a function to inspect it."
+    : attention ? "Searches that stopped for the current inputs. Open a function to inspect it; the reason and next step are shown below." : active ? "Live searches for this project. Select a function to inspect it."
     : "Saved deep-permuter results since the last metrics reset, across runs. Improved includes functions that reached a match.";
-  const html = `<p class="small muted">${intro}</p><p><b>${rows.length.toLocaleString()} function${rows.length === 1 ? "" : "s"}</b></p>` + (rows.length
-    ? `<ul class="deep-metric-list">${rows.map((row, i) => {
+  const html = `<p class="small muted">${intro}</p>` + (eligible ? checkDetails
+    : `<p><b>${rows.length.toLocaleString()} function${rows.length === 1 ? "" : "s"}</b></p>`) + (rows.length
+    ? `<ul class="${eligible ? "deep-issue-functions" : "deep-metric-list"}">${rows.map((row, i) => {
+      if (eligible) return `<li><button type="button" class="deep-issue-link mono" data-deep-metric-function="${i}">${esc(row.function)}<span aria-hidden="true">↗</span></button></li>`;
       const percent = n => n == null ? "—" : `${Number(n).toFixed(1)}%`;
       const before = active ? percent(row.starting_percent) : row.starting_percent_text || "—";
       const after = active ? percent(row.best_percent) : row.new_percent_text || "—";
@@ -2173,7 +2529,7 @@ function renderDeepMetricDrawer() {
         : `Score ${row.starting_score} → ${row.new_score}${row.new_score === 0 ? " · Byte-for-byte match" : ""}`;
       const updated = !active && row.updated_at ? `<p class="small muted">Last improvement: <time datetime="${esc(new Date(row.updated_at * 1000).toISOString())}">${esc(new Date(row.updated_at * 1000).toLocaleString())}</time></p>` : "";
       return `<li><header><button type="button" class="ghost small-btn mono" data-deep-metric-function="${i}">${esc(row.function)}</button>${attention ? "" : `<span class="deep-metric-match">${esc(before)} → <b>${esc(after)}</b></span>`}</header><p><b>${esc(info)}</b></p>${attention ? `<p class="small muted">${esc(deepAttentionAction(row))}</p><details><summary>Technical details</summary><p class="small mono">${esc(row.error || "No additional details.")}</p></details>` : updated}</li>`;
-    }).join("")}</ul>` : `<p class="deep-metric-empty">${attention ? "No functions currently need attention." : active ? "No functions are being searched right now." : kind === "matched" ? "No matches from the deep permuter yet. Verified matches will appear here." : "No improvements from the deep permuter yet. Verified improvements will appear here."}</p>`);
+    }).join("")}</ul>` : `<p class="deep-metric-empty">${eligible ? source ? "No eligible functions found in this check." : "Start a search to check candidates." : attention ? "No functions currently need attention." : active ? "No functions are being searched right now." : kind === "matched" ? "No matches from the deep permuter yet. Verified matches will appear here." : "No improvements from the deep permuter yet. Verified improvements will appear here."}</p>`);
   if (body._deepMetricHtml === html) return;
   const scrollTop = body.scrollTop;
   const focused = document.activeElement?.dataset?.deepMetricFunction;
@@ -2277,15 +2633,25 @@ function renderDeepOptionsSummary() {
 function setDeepRunVisibility(running) {
   $("deepSweepSettings").disabled = running;
   renderDeepOptionsSummary();
-  if (S.dialogKind === "deep-options") $("deepSweepOptionsHelp").textContent = running
-    ? "These settings are in use. Stop the search to change them."
-    : "Changes apply when you start the next search.";
+  if (S.dialogKind === "deep-options") {
+    $("deepSweepOptionsDone").disabled = running && !!$("deepSweepOptionsDone").dataset.start;
+    $("deepSweepOptionsHelp").textContent = running
+      ? "These settings are in use. Stop the search to change them."
+      : "Changes apply when you start the next search.";
+  }
   for (const id of ["deepActivitySection", "deepSweepLogSection"]) $(id).hidden = !running;
 }
 function renderDeepQueueState(status) {
   if (status.control_only === true) status = {...deepSweepSnapshot, ...status, statistics_pending:status.statistics_pending ?? deepSweepSnapshot?.statistics_pending ?? true};
   if (status.control_only !== true && status.statistics_pending == null) status = {...status, statistics_pending:false};
+  const seconds = Math.max(status.runtime_seconds || 0, deepSweepSnapshot?.runtime_seconds || 0);
+  status = {...status, runtime_seconds:seconds};
   deepSweepSnapshot = status;
+  const runtime = $("deepSweepRuntime"), wholeSeconds = Math.floor(seconds);
+  const hours = Math.floor(wholeSeconds / 3600);
+  const minutes = Math.floor(wholeSeconds / 60) % 60;
+  runtime.hidden = !seconds && status.state !== "running";
+  runtime.textContent = `Total runtime: ${hours ? hours + "h " : ""}${minutes || hours ? minutes + "m " : ""}${wholeSeconds % 60}s`;
   renderDeepMetricDrawer();
   const running = status.state === "running", left = status.queue_left || 0;
   setDeepRunVisibility(running);
@@ -2298,27 +2664,20 @@ function renderDeepQueueState(status) {
   const active = running ? (status.progress?.workers || []).length : 0;
   const preparation = status.progress?.preparation;
   const preparing = running && preparation && !preparation.done;
-  $("deepSweepPreparation").hidden = !preparing;
-  if (preparing) {
-    const checked = preparation.checked || 0, count = preparation.total || 0;
-    $("deepSweepPreparationText").textContent = `Checking candidates: ${checked.toLocaleString()} / ${count.toLocaleString()} · ${count ? Math.floor(100 * checked / count) : 0}% · ${preparation.eligible || 0} eligible so far`;
-    $("deepSweepPreparationBar").max = Math.max(1, count);
-    $("deepSweepPreparationBar").value = checked;
-  }
+  $("deepSweepEligible").textContent = preparation ? (preparation.eligible || 0).toLocaleString() : "—";
   const done = status.queue_done || 0, total = done + left + blocked;
   $("deepSweepQueueState").dataset.state = running ? "running" : stopped ? "stopped" : error ? "error" : "idle";
-  $("deepSweepQueueTitle").textContent = running ? active ? `Running — searching ${active} function${active === 1 ? "" : "s"}` : status.progress?.phase === "waiting for host claims or scored C" ? "Running — waiting for available functions" : preparing ? "Running — checking candidates" : "Running — preparing the next search"
+  $("deepSweepQueueTitle").textContent = running ? ""
     : stopped ? "Search stopped" : error ? "Search needs attention" : left && status.has_activity ? `Paused — ${left} function${left === 1 ? "" : "s"} available`
     : blocked ? "Paused — remaining functions need attention" : status.statistics_pending ? "Ready to search" : status.has_activity ? "Finished — no eligible functions left" : "Ready to search";
+  const waitingForWork = running && !active && status.progress?.phase === "waiting for host claims or scored C";
   $("deepSweepQueueReason").textContent = running
-    ? preparing ? active ? "Searching while preparing the queue. More candidates are checked as workers become free." : "Checking saved candidates and previous passes. Searches start as soon as work is ready."
-    : !active && status.progress?.phase === "waiting for host claims or scored C" ? "Waiting for available functions or saved C. The queue is checked automatically." : "Improvements are verified and saved as they happen."
+    ? waitingForWork ? "Waiting for available functions or saved C. The queue is checked automatically." : ""
     : stopped ? "Your improvements and completed searches are saved." : error ? error : left ? `${rotated ? `${rotated} paused early without further progress. ` : ""}Continue gives remaining functions a fresh search; completed turns stay saved.`
     : blocked ? "Open the reasons below, fix the affected functions, then run again."
-    : waiting ? `${waiting} functions need saved C with a measured score before they can be searched.`
+    : waiting ? "Start a search to try recovering missing saved C automatically."
     : status.statistics_pending ? "Saved totals are loading. You can start a search now." : status.has_activity ? "Each eligible function finished a bounded turn. Run again repeats completed turns to try more rewrites." : "Start with untested or changed functions that have saved C.";
-  $("deepSweepQueueReason").hidden = !error && !stopped && !blocked && !waiting && !preparing
-    && !(running && status.progress?.phase === "waiting for host claims or scored C");
+  $("deepSweepQueueReason").hidden = running ? !waitingForWork : !error && !stopped && !blocked && !waiting;
   $("deepSweepStart").hidden = running;
   $("deepSweepStart").textContent = left && status.has_activity ? "Continue search" : status.has_activity ? "Run again" : "Start search";
   $("deepSweepStart").disabled = false;
@@ -2328,24 +2687,37 @@ function renderDeepQueueState(status) {
   $("deepSweepActive").textContent = status.statistics_pending && !running ? "—" : active.toLocaleString();
   $("deepSweepDone").textContent = done.toLocaleString();
   $("deepSweepLeft").textContent = left.toLocaleString();
-  for (const [id, count] of [["Paused", rotated], ["Blocked", blocked], ["Waiting", waiting]]) {
+  for (const [id, count] of [["Paused", rotated], ["Blocked", blocked]]) {
     $("deepSweep" + id).textContent = count.toLocaleString();
     $("deepSweep" + id + "Group").hidden = !count;
   }
-  $("deepSweepRunChecked").textContent = status.progress?.functions_tested != null
-    ? `${running && status.loop ? `Pass ${status.progress.cycle || 1} · looping` : running ? "This run" : "Last run"}: ${status.progress.functions_tested.toLocaleString()} functions checked` : "";
-  $("deepSweepBar").max = Math.max(1, total);
-  $("deepSweepBar").value = done;
-  $("deepSweepBar").hidden = !total || !status.has_activity;
-  $("deepSweepProgressText").textContent = total && status.has_activity
+  const recovering = running && status.progress?.phase === "Rechecking saved matches";
+  const recoveryTotal = recovering ? status.progress.total || 0 : 0;
+  const checked = status.progress?.functions_tested;
+  const run = running && status.loop ? `Pass ${status.progress?.cycle || 1} (looping)` : running ? "This run" : "Last run";
+  $("deepSweepBar").max = Math.max(1, recovering ? recoveryTotal : total);
+  $("deepSweepBar").value = recovering ? status.progress.completed || 0 : done;
+  $("deepSweepBar").ariaLabel = recovering ? "Rechecking saved matches" : "Saved completed search turns";
+  $("deepSweepBar").hidden = recovering ? !recoveryTotal : !total || !status.has_activity || status.statistics_pending;
+  const savedProgress = status.statistics_pending ? "Loading saved totals…"
+    : total && status.has_activity
     ? `Saved progress: ${done.toLocaleString()} of ${total.toLocaleString()} search turns completed · ${left.toLocaleString()} remaining${blocked ? ` · ${blocked.toLocaleString()} need attention` : ""}`
-    : running ? "Preparing search…" : status.has_activity ? "No eligible functions remaining." : "No searches yet.";
-  $("deepSweepLoadingBar").hidden = preparing || !(status.statistics_pending || (running && !total));
-  $("deepSweepLoadingBar").ariaLabel = status.statistics_pending ? "Loading saved search totals" : "Searching functions";
+    : "";
+  const emptyProgress = running ? preparing ? "" : "Preparing search…"
+    : status.has_activity ? "No eligible functions remaining." : "No searches yet.";
+  $("deepSweepProgressText").textContent = [
+    savedProgress,
+    recovering ? recoveryTotal
+      ? `Rechecking saved matches: ${(status.progress.completed || 0).toLocaleString()} / ${recoveryTotal.toLocaleString()} · ${status.progress.matched || 0} recovered`
+      : "Looking for saved matches…" : "",
+    checked != null ? `${run}: ${checked.toLocaleString()} functions checked` : "",
+    waiting ? `${waiting.toLocaleString()} waiting for saved C` : "",
+  ].filter(Boolean).join(" · ") || emptyProgress;
+  $("deepSweepLoadingBar").hidden = recovering ? !!recoveryTotal : preparing || !(status.statistics_pending || (running && !total));
+  $("deepSweepLoadingBar").ariaLabel = recovering ? "Looking for saved matches"
+    : status.statistics_pending ? "Loading saved search totals" : "Searching functions";
   if (status.statistics_pending) {
-    $("deepSweepBar").hidden = true;
     for (const id of ["deepSweepMatched", "deepSweepImproved", "deepSweepLeft"]) $(id).textContent = "—";
-    $("deepSweepProgressText").textContent = "Loading saved totals…";
     $("deepSweepStart").textContent = "Start search";
   }
 }
@@ -2387,7 +2759,7 @@ async function renderDeepSweep() {
     $("deepSweepStart").hidden = false;
     $("deepSweepActive").textContent = "—";
     $("deepSweepRecipes").replaceChildren();
-    for (const id of ["deepSweepDone", "deepSweepLeft", "deepSweepWaiting"]) $(id).textContent = "0";
+    for (const id of ["deepSweepDone", "deepSweepLeft"]) $(id).textContent = "0";
     $("deepSweepBar").value = 0;
     $("deepSweepProgressText").textContent = "";
     $("deepSweepLeft").textContent = "—";
@@ -2478,8 +2850,11 @@ async function followDeepSweep(slug, job) {
         refreshing = true; lastResults = Date.now();
         api(`/api/permuter/pass?slug=${encodeURIComponent(slug)}`).then(status => {
           if (S.slug === slug && deepSweepFollowing === following) {
-            renderDeepSweepResults(status);
-            renderDeepQueueState(status);
+            const live = deepSweepSnapshot;
+            const combined = live && live.job === status.job
+              ? {...status, state:live.state, progress:live.progress, error:live.error} : status;
+            renderDeepSweepResults(combined);
+            renderDeepQueueState(combined);
           }
         }).catch(() => {}).finally(() => { refreshing = false; });
       }
@@ -2511,11 +2886,13 @@ $("deepSweepBlockedGroup").onclick = () => openDeepMetric("attention");
 $("deepSweepMetricMatched").onclick = () => openDeepMetric("matched");
 $("deepSweepMetricImproved").onclick = () => openDeepMetric("improved");
 $("deepSweepMetricActive").onclick = () => openDeepMetric("active");
-$("deepSweepOptions").onclick = openDeepOptions;
-$("deepSweepStart").onclick = async () => {
-  if ($("deepSweepStart").disabled) return;
-  const invalid = [...$("deepSweepSettings").querySelectorAll("input")].find(input => !input.checkValidity());
-  if (invalid) { openDeepOptions(); invalid.reportValidity(); return; }
+$("deepSweepMetricEligible").onclick = () => openDeepMetric("eligible");
+$("deepSweepOptions").onclick = () => openDeepOptions();
+$("deepSweepStart").onclick = () => {
+  if (!$("deepSweepStart").disabled) openDeepOptions($("deepSweepStart").textContent);
+};
+async function startDeepSweep() {
+  if ($("deepSweepStart").disabled || $("deepSweepSettings").disabled) return;
   $("deepSweepPanel").open = true;
   const slug = S.slug, log = $("deepSweepLog");
   deepSweepProjectVersion++; clearTimeout(deepSweepRetryTimer);
@@ -2543,11 +2920,19 @@ $("deepSweepStart").onclick = async () => {
   }
   finally { done(); }
   if (job && S.slug === slug) { $("deepSweepStop").hidden = false; followDeepSweep(slug, job); }
-};
+}
 $("deepSweepStop").onclick = async () => {
-  const button = $("deepSweepStop"); button.disabled = true; button.textContent = "Stopping…";
-  try { await api("/api/permuter/pass", {method:"POST", body:{slug:S.slug, action:"stop"}}); }
-  catch (error) {
+  const button = $("deepSweepStop");
+  if (button.disabled) return;
+  button.disabled = true; button.textContent = "Stopping…";
+  const slug = S.slug, job = deepSweepSnapshot?.job;
+  try {
+    const status = await api("/api/permuter/pass", {method:"POST", body:{slug, action:"stop"}});
+    if (S.slug === slug && deepSweepSnapshot?.job === job && deepSweepSnapshot?.state === "running") {
+      renderDeepQueueState(status);
+    }
+  } catch (error) {
+    if (S.slug !== slug || deepSweepSnapshot?.job !== job) return;
     button.disabled = false; button.textContent = "Stop";
     $("deepSweepQueueReason").textContent = "Could not stop: " + error.message;
     $("deepSweepQueueReason").hidden = false;

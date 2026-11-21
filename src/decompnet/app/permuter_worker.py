@@ -30,7 +30,12 @@ WATCHED = ("read_cache.py", "metadata_rows.py", "function_rows.py", "candidate_s
            "app/wrapper_families.py", "app/view_snapshots.py", "app/code_coverage.py", "app/progress.py", "app/saves.py", "app/permuter_worker.py", "permuter_claims.py", "app/permute.py", "app/local_claims.py", "app/permuter_initialization.py", "app/permuter_local.py",
            "app/snapshot_branch_repairs.py", "app/dispatch_specialization.py", "app/layout_frontiers.py", "app/targeted_debug_layout.py", "app/compiler_phase_repairs.py", "app/carrier_sequence_repairs.py", "app/record_layout_search.py", "app/compiler_phase_routing.py",
            "app/permuter_macro_effects.py", "app/inline_scheduling_repairs.py", "app/call_preparation_repairs.py", "app/repair_cleanup.py", "inline_helpers.py", "object_emission.py", "app/argument_mask_repairs.py", "app/store_result_repairs.py", "app/loop_weight_repairs.py", "app/local_flow.py",
-           "passthrough_argument_repairs.py", "permuter_gen.py", "permuter_capture.py", "permuter_formatting.py", "app/maintenance_tasks.py")
+           "app/target_memory_schedule_diff_repairs.py", "app/target_memory_schedule_repairs.py",
+           "app/target_inline_storage_diff_repairs.py", "app/target_inline_storage_repairs.py",
+           "app/target_guard_width_diff_repairs.py", "app/target_guard_width_repairs.py",
+           "app/target_edge_diff_repairs.py", "app/target_edge_repairs.py",
+           "app/target_schedule_diff_repairs.py", "app/target_schedule_repairs.py",
+           "app/target_conversion_diff_repairs.py", "app/target_conversion_order_repairs.py", "passthrough_argument_repairs.py", "permuter_gen.py", "permuter_capture.py", "permuter_formatting.py", "app/maintenance_tasks.py")
 POLL_SECONDS = 1
 STOP_SECONDS = 5
 
@@ -49,7 +54,8 @@ def _library() -> Path:
 def revision() -> tuple:
     root = Path(__file__).resolve().parents[1]
     library = _library()
-    result = []
+    from . import library_skew
+    result = [('library', library_skew.installed_versions())]  # any upgrade replaces the child, not only a watched file's
     for name in sorted(WATCHED):
         # the permuter's rewrites live in decomprepair now: their names here are aliases, so watch the library's file
         path = library / Path(name).name if (library / Path(name).name).exists() else root / name
@@ -155,7 +161,8 @@ class PermuterWorker:
             self._next_id += 1
             ident = self._next_id
             reply = self._replies[ident] = queue.Queue(maxsize=1)
-            self._send("repair_pass", slug=slug, ident=ident)
+            from ..repair_feedback import capture_suppressed
+            self._send("repair_pass", slug=slug, ident=ident, skip_capture=capture_suppressed())
         cancelled = False
         try:
             while not self._closed.is_set():
@@ -442,9 +449,11 @@ def child(db_path: str, workspace: str) -> None:
             repair_threads.pop(ident, None)
             task_promotes.pop(ident, None)
 
-    def repair(ident, slug, stop):
+    def repair(ident, slug, stop, skip_capture):
         try:
-            result = permuter.repair_pass(slug, stop)
+            from ..repair_feedback import without_capture
+            with without_capture(skip_capture):
+                result = permuter.repair_pass(slug, stop)
             emit({"kind": "reply", "ident": ident, "matched": result.matched})
         except Exception:
             log.exception("permuter worker repair pass failed")
@@ -479,7 +488,7 @@ def child(db_path: str, workspace: str) -> None:
             elif action == "repair_pass":
                 ident = message["ident"]
                 stop = repair_stops[ident] = threading.Event()
-                thread = threading.Thread(target=repair, args=(ident, message["slug"], stop), daemon=True)
+                thread = threading.Thread(target=repair, args=(ident, message["slug"], stop, message.get("skip_capture") is True), daemon=True)
                 repair_threads[ident] = thread
                 thread.start()
             elif action == "cancel":

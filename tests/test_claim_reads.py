@@ -37,7 +37,8 @@ def test_claim_history_reads_come_from_covering_indexes_without_sorting(tmp_path
     assert any("COVERING INDEX idx_events_agent_kind_time" in step for step in cutoff), cutoff
     args = {"retry_grants": "[]", "batch_sdk": "[]", "batch_unit": None, "batch_limit": None, "model_tried": "[]",
             "stalled": "[]", "sdk": "[]", "pid": pid, "agent": 1, "kin": "[1]", "cooled": 0, "overall": .5,
-            "escalate": 3, "weak": False, "strong": False, "mine": 0, "custom": False, "below": None, "tries": None,
+            "route_preferred": "[]", "route_deferred": "[]", "name": "worker", "mine": 0,
+            "custom": False, "below": None, "tries": None,
             "machine_pending": "[]"}
     claim = [row[3] for row in net.store.conn.execute("EXPLAIN QUERY PLAN " + network.claim_query("easiest"), args)]
     on_events = [step for step in claim if "events" in step and "idx_events_project_time" not in step]
@@ -51,8 +52,8 @@ def test_a_function_taken_after_the_pick_is_not_claimed_twice(tmp_path, monkeypa
     pick = network.Network._claim_pick
     raced = []
 
-    def racing(read, query, args, route):
-        fn = pick(read, query, args, route)
+    def racing(read, query, args):
+        fn = pick(read, query, args)
         if not raced:  # another worker claims the same function between the snapshot and the transaction
             raced.append(None)
             raced[0] = net.claim_row(second, "game", None, "easiest")["name"]
@@ -90,3 +91,18 @@ def test_a_function_id_finds_its_project_database(tmp_path, project_databases):
         assert net.function_store(fid) is net.project_store(slug)
         assert net.function_store(fid) is net.project_store(slug)  # again, from what the first lookup learned
     assert net.function_store(max(ids.values()) + 1000) is None
+
+
+def test_compact_claim_carries_previous_repair_notes(tmp_path):
+    from decompnet.app import tools
+
+    net, _ = _game(tmp_path, functions=1)
+    previous, _ = net.local_agent('previous')
+    worker, _ = net.local_agent('worker')
+    function = net.claim_row(previous, 'game', 'f0')
+    net.add_note(previous, 'game', 'Declaration order produced the same register moves.', 'f0')
+    with net.store.tx() as db:
+        db.execute('DELETE FROM claims WHERE function_id=?', (function['id'],))
+    result = tools.call(net, worker, 'game', 'claim_function', {'function': 'f0'})
+    assert 'Handoff notes:' in result
+    assert 'Declaration order produced the same register moves.' in result

@@ -20,7 +20,22 @@ functions are usually matched already in other public decomps.
 In ROM projects on this computer, decompdecomp indexes C that has already matched in your other games.
 Autopilot finds identical relocated code built with the same compiler and flags, adapts referenced names,
 and compiles it against this game's bytes. The project's **Matches from other games** panel shows every
-transfer attempt and its source. A match counts only after the byte judge accepts it.
+transfer attempt and its source. A match counts only after the byte judge accepts it. A manual search on a MIPS ROM
+also checks whether verified code from an imported project sits inside a larger function already mapped by
+the ROM importer. When it finds a unique span, checks the cuts, and builds the donor C to the exact bytes,
+it splits the function and submits the source to the ordinary judge. A manual search also uses the donor object’s relocation
+positions to find whole functions when the ROM importer inferred different relocation records. The destination
+keeps its original bytes and linker settings for verification. For imported IDO C files, the search also tries the donor's
+declared per-file compiler profile, preprocessor definitions and local headers. An exact verdict saves the
+successful compiler and private header for that function. When a supported donor C file can reproduce the match as a
+whole translation unit, the project saves that source snapshot for rechecks. A rebuildable export recompiles
+the unit and links and verifies the selected entry every time it builds. This also uses generated C left by
+the donor build when available. Donor-specific object rewriting is outside this source replay.
+
+For an imported decomp using the same base ROM, open **Code coverage review → Review code from imported
+decomp**. Preview compares donor object functions with complete original byte spans in mapped ROM and supported
+overlay text. You can add verified non-overlapping candidates as open functions. The report lists overlaps for
+boundary review. Enable overlay additions explicitly. The export keeps those banks' original cartridge bytes.
 
 The function page and `find_similar(function)` also show near matches from other games. These are leads
 for writing C, not matches: similar instructions may come from unrelated functions. A name from another
