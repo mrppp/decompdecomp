@@ -196,3 +196,28 @@ def test_worker_applies_background_priority_once_and_keeps_metadata_out_of_repai
     assert priorities == ([True] if background else [])
     assert len(received) == 2 and all('_background' not in options for options in received)
     assert all('error' not in json.loads(line) for line in output.getvalue().splitlines())
+
+
+def test_threads_that_come_and_go_reuse_a_bounded_set_of_workers(monkeypatch):
+    """Workers are borrowed per request, not kept per thread: the executor replaces its threads, and each new
+    thread used to start a process while the old one's stayed open until the pass ended (457 after five hours)."""
+    started=[]
+    class Worker:
+        def __init__(self):
+            self.closed=threading.Event();started.append(self)
+        def run(self,payload,check):
+            check();return {'choices':[],'labels':{}}
+        def close(self):self.closed.set()
+    monkeypatch.setattr(deep_proposals,'Worker',Worker)
+    pool=deep_proposals.Pool(2)
+    try:
+        for index in range(40):  # a fresh thread for every request, as when the executor's threads turn over
+            t=threading.Thread(target=pool.work,args=(str(index).encode(),lambda:None))
+            t.start();t.join()
+        assert len(started)==1, "one idle worker serves every later thread"
+        with ThreadPoolExecutor(8) as threads:  # more threads at once than the pool's count
+            list(threads.map(lambda i:pool.work(str(i).encode(),lambda:None),range(64)))
+        open_now=[w for w in started if not w.closed.is_set()]
+        assert len(open_now)<=2, "no more idle workers than the pool's count stay open"
+    finally:pool.close()
+    assert all(w.closed.is_set() for w in started)
