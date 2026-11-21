@@ -94,25 +94,29 @@ def _strip_comments(code: str) -> str:
 
 
 def _rewrite(path: Path, text: str) -> None:
-    """`path.write_text(text, encoding="utf-8")`, the same bytes, writing only from the first 4 KB block that differs.
-    A compile writes the agent's version of a unit's source and an undo writes the original back: a dtk unit can be
-    a megabyte, and only the part from the changed function on is new. An unchanged file is only touched, so a build
-    still sees it as new."""
+    """`path.write_text(text, encoding="utf-8")`, the same bytes, written whole and swapped in at once (a temporary
+    file beside it, then os.replace). A compile writes the agent's version of a unit's source and an undo writes the
+    original back. Written in place from the first 4 KB block that differed (seek, write, truncate), two writers of
+    one file at once (an attempt and a trial's restore) left a run of NUL bytes where one truncated the file and the
+    other then wrote past its new end: on a DOS game, ten files in an hour, each then not building and every
+    function in it reopened. Now a reader sees the whole old file or the whole new one. An unchanged file is only
+    touched, so a build still sees it as new."""
     data = text.replace("\n", os.linesep).encode("utf-8")  # as text mode writes it
     try:
-        with open(path, "r+b") as f:
-            old = f.read()
-            if old == data:
-                os.utime(path)
-                return
-            at = 0
-            while old[at:at + 4096] == data[at:at + 4096]:
-                at += 4096
-            f.seek(at)
-            f.write(data[at:])
-            f.truncate()
+        if path.read_bytes() == data:
+            os.utime(path)
+            return
+        mode = path.stat().st_mode & 0o7777
     except FileNotFoundError:
-        path.write_bytes(data)
+        mode = None
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _config_stamp(root: Path, globs: tuple[str, ...]) -> tuple | None:
