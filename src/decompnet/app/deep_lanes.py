@@ -241,6 +241,14 @@ class Lanes:
                     self.started -= 1
                     self.lanes.discard(lane)
                 lane.close()
+                self._recover()
+
+    def _recover(self):
+        """A lane closed mid-turn (stuck after a Stop, then killed) left its trial in a project's file: put it back
+        (trial_journal). The lane has exited by now, so its notes are a dead process's."""
+        forks = getattr(self.net, 'forks', None)
+        if forks is not None and hasattr(forks, 'recover_trials'):
+            forks.recover_trials()
 
     def trim(self, idle_seconds=IDLE_SECONDS):
         """Close the lanes that have waited for a turn longer than `idle_seconds`, with their proposal workers.
@@ -281,6 +289,8 @@ class Lanes:
                 break
         for lane in lanes:
             lane.close()
+        if lanes:
+            self._recover()
 
 
 class _Cancelled(Exception):

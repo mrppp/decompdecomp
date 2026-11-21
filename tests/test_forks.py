@@ -7,9 +7,11 @@ builds it and has an agent work through the guarded tools.
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -437,8 +439,9 @@ def test_similarity_ranks_copies_first():
     assert [n for n, _ in ranked][:2] == ["copy", "tweaked"] and ranked[0][1] == 1.0
 
 
-def test_a_source_is_rewritten_from_its_first_change_only(tmp_path, monkeypatch):
-    # a compile writes the agent's version of a dtk unit (up to a megabyte) and an undo writes the original back
+def test_a_source_is_rewritten_whole_with_the_right_line_endings(tmp_path, monkeypatch):
+    # a compile writes the agent's version of a unit and an undo writes the original back: whole, swapped in
+    # (forkengine._rewrite; written in place from the first change, two writers left NUL bytes)
     import os
 
     from decompnet.app import forkengine
@@ -474,7 +477,6 @@ def test_a_source_is_rewritten_from_its_first_change_only(tmp_path, monkeypatch)
         written.clear()
         forkengine._rewrite(p, after)
         assert p.read_bytes() == after.replace("\n", linesep).encode()
-        assert 0 < sum(written) < 8192 < len(head)  # only the block with the change, and what follows it
         os.utime(p, (1, 1))
         written.clear()
         forkengine._rewrite(p, after)  # the same text: nothing written, but a build still sees it as new
@@ -1850,3 +1852,41 @@ def test_a_function_moved_to_another_top_level_file_keeps_its_row_and_history(tm
     row = store.one("SELECT id, unit, status, meta FROM functions WHERE id=?", ids["FUN_2"])
     assert (row["unit"], row["status"]) == ("text_b", "open") and '"gone"' not in (row["meta"] or "")
     assert store.one("SELECT COUNT(*) AS n FROM attempts WHERE function_id=?", ids["FUN_2"])["n"] == 1
+
+
+@needs_tools
+def test_a_trial_is_noted_while_it_is_in_the_file_and_dropped_after(fork, monkeypatch):
+    """forkengine notes each trial it writes (trial_journal), so a process stopped mid-trial can be put right."""
+    from decompnet.app import trial_journal
+
+    net, slug, agent = fork
+    noted = []
+    real = trial_journal.note
+    monkeypatch.setattr(trial_journal, "note", lambda folder, path, before, after: (
+        noted.append(path), real(folder, path, before, after)))
+    name = next(r["name"] for r in net.function_map(slug) if r["status"] == "open")
+    net.claim(agent, slug, name)
+    res = net.attempt(agent, name, f"int {name}(void) {{ return 12345; }}", slug)
+    assert not res["matched"]
+    assert noted and noted[0].name == "game.c"
+    assert not list((net.workspace / ".decomp" / "trials").glob("*.json")), "the note is dropped when the call ends"
+
+
+@needs_tools
+def test_a_file_left_broken_is_put_back_from_its_last_commit(fork):
+    """A file that hasn't built for half an hour, untouched, gets its last commit back when that builds."""
+    net, slug, _ = fork
+    root = Path(net.project_row(slug)["root"])
+    path = root / "src" / "game.c"
+    committed = _git(root, "show", "HEAD:src/game.c")
+    path.write_text(committed + "\nint half_a_function(\n")
+    assert net.forks.repair_stale_files(slug) == [], "a file just changed is an agent's, still working on it"
+    old = time.time() - 2 * 3600
+    os.utime(path, (old, old))
+    assert net.forks.repair_stale_files(slug) == ["src/game.c"]
+    assert path.read_text() == committed
+    kept = net.workspace / ".decomp" / "repaired" / slug
+    assert "half_a_function" in next(kept.glob("game.c.*")).read_text()
+    assert "src/game.c" in (kept / "list.txt").read_text()
+    os.utime(path, (old, old))
+    assert net.forks.repair_stale_files(slug) == [], "a file that builds is left alone"

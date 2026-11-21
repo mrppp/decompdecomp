@@ -270,6 +270,19 @@ def _query_outputs(text: str) -> set[str]:
     return found
 
 
+def write_manifest(root: Path, manifest: dict) -> None:
+    """`.decomp.wtf.json`, written whole and swapped in (a temporary file beside it, then os.replace). Written in
+    place, a reader at the wrong moment (the project page's live overview, reading a file's compiler) found it empty
+    and that refresh failed."""
+    path = Path(root) / ".decomp.wtf.json"
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 class ForkProject:
     def __init__(self, root: Path, *, create_state: bool = True):
         self.root = Path(root)
@@ -297,7 +310,7 @@ class ForkProject:
                 manifest.pop(k, None)
             else:
                 manifest[k] = v
-        (self.root / ".decomp.wtf.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        write_manifest(self.root, manifest)
         return manifest
 
     @property
