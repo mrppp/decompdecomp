@@ -117,6 +117,8 @@ class Api(Agent):
         if saved:
             saved[0] = messages[0]  # Current rules and tools apply after restart.
             messages = saved + [{'role':'user','content':'Resume after interruption. Check current project state and reclaim eligible work. ' + handoff(s)}]
+            if (s.options.get('automatic_assignment') or s.options.get('focus_id')) and s.startup_context:
+                messages[-1]['content'] = s.startup_context + handoff(s)
             s.push('info','Restored saved API conversation and function handoff.')
         if s.record:
             s.record('prompt', messages)
@@ -225,7 +227,8 @@ class Api(Agent):
                         s.record('tool_request', {'name': name, 'arguments': args, 'call_id': c['id']})
                     result = tools.call(net, agent, s.slug, name, args)
                     if s.record:
-                        s.record('tool_response', {'name': name, 'content': result, 'call_id': c['id']})
+                        manager.record_agent(agent, s.slug, 'tool_response',
+                                             {'name': name, 'content': result, 'call_id': c['id']})
                     messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
                     if s.options.get('task') == 'boundary' and name == 'suggest_boundary' and not result.startswith('error:'):
                         return True
@@ -551,6 +554,9 @@ def api_tool_schemas(fork: bool = False, names: list[str] | None = None) -> list
     from ..app import tools  # (here: app/tools.py imports this package)
 
     s = lambda **props: {"type": "object", "properties": props, "required": [k for k, v in props.items() if v.pop("req", False)]}
+    from ..repair_feedback import AGENT_CATEGORIES
+    repair_labels = ' | '.join(AGENT_CATEGORIES)
+    category_suggestion = 'Optional short new category when the label is other'
     st = lambda desc, req=False: {"type": "string", "description": desc, "req": req}
     it = lambda desc: {"type": "integer", "description": desc}
     bo = lambda desc: {"type": "boolean", "description": desc}
@@ -568,15 +574,17 @@ def api_tool_schemas(fork: bool = False, names: list[str] | None = None) -> list
               end=st("Exclusive hex end for adjust"), confidence=st("strong, tentative, unclear"))),
         "get_claims": ("Recover only your live claims and claim tokens; no build or mutation.", s()),
         "project_info": ("Game, compiler and progress; detail=true includes all facts and suggestions.", s(detail=bo("full details"))),
-        "get_candidate": ("Read candidate C and its revision, without assembly or notes.", s(function=st("function", True), base={"type":"string","enum":["current","saved_best","last_compiling","reported_corrected"],"description":"Named recovery base, never a revision hash; selection does not judge source."})),
+        "get_candidate": ("Read candidate C and its revision, without assembly or notes.", s(function=st("function", True), base={"type":"string","enum":["current","saved_best","last_compiling","reported_corrected","regional_alternative"],"description":"Named recovery base, never a revision hash; selection does not judge source."})),
         "compile_patch": ("Compile one exact-text replacement against a candidate revision using the normal judge.",
                           s(function=st("function", True), revision=st("revision from get_candidate or compile feedback", True),
                             old=st("text occurring exactly once", True), new=st("replacement", True),
-                            repair_note=st("Optional decisive repair"), repair_category=st("Repair category"),
+                            repair_note=st("Optional decisive repair"), repair_category=st(repair_labels),
+                            suggested_category=st(category_suggestion),
                             repair_automation=st("Potential deterministic repair"), occurrence=it("1-based occurrence; 0 requires unique anchor"))),
         "compiler_experiments": ("Bounded diagnostic source/profile trials on one candidate revision. 1–6 compiler profiles (compiler=current uses this function’s current compiler); optional independent old/new/occurrence patches. No compiler choice applied.",
                                  s(function=st("function",True),revision=st("candidate revision",True),trials={"type":"array","minItems":1,"maxItems":6,"req":True,"items":{"type":"object","additionalProperties":False,"properties":{"compiler":{"type":"string","description":"current or an exact compiler ID; use try_local_repairs for repair families"},"flags":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"occurrence":{"type":"integer"}},"required":["compiler"]}})),
-        "get_search_brief": ("Read current allocation lines, failed experiments and reviewed roots; no compile.",s(function=st("function",True))),
+        "get_search_brief": ("Read allocation lines, failed experiments and reviewed roots; no compile.",
+                             s(function=st("function",True), base={"type":"string","enum":["current","saved_best"]})),
         "review_search_seed": ("Review a diagnostic seed for deep search. Changed/unknown signatures stay diagnostic-only.",s(function=st("function",True),trial_id=st("trial ID",True),review_note=st("Why this seed; caller/interface checks"),enabled=bo("Enable seed; false disables"))),
         "get_compiler_trial": ("Retrieve the saved C/compiler/flags diagnostic pair; no compile/application.",s(function=st("function",True),trial_id=st("trial id",True),include_header=bo("Include historical shared header snapshot; default false to save context"))),
         "try_local_repairs": ("Try applicable local repair families on one snapshot, max six normal compiles/60 seconds. Keeps best continuation; replaces parallel family probes.",
@@ -603,26 +611,42 @@ def api_tool_schemas(fork: bool = False, names: list[str] | None = None) -> list
                              "Score 0 = matched. Several functions: names comma-separated, all definitions in source.",
                              s(function=st("function name, or several: a, b, c", True), source=st("C source", True),
                              repair_note=st("Optional one-sentence decisive change, single function only; saved only if it matches"),
-                             repair_category=st("types | casts | constants | addresses | signatures | layout | temporaries | expression_order | control_flow | compiler_settings | other"),
+                             repair_category=st(repair_labels), suggested_category=st(category_suggestion),
                              repair_automation=st("How a deterministic repair could make this change"))),
         "report_candidate_issue": ("Report a saved-C concern; no score or match changes.",
                                    s(function=st("function",True),revision=st("affected revision",True),
                                      issue=st("uninitialized|loop_mutation|wrong_store|wrong_value|other",True),
                                      reason=st("10–600 characters",True),alternative_revision=st("compiled alternative"))),
-        "report_repair": ("Annotate your captured verified match for human review, without enabling a rule.",
-                          s(function=st("Function you matched", True), change=st("Decisive change; do not guess", True),
-                            category=st("Repair category (same as compile_and_diff)"),
+        "search_repair_examples": ("Search up to 12 verified repair summaries in this project. One live claim provides ranking context.",
+                                   s(category=st(repair_labels + " | unclassified", True),
+                                     function=st("Optional ranking context for multiple claims"))),
+        "get_repair_examples": ("Read before/after diff excerpts and compiler settings for selected IDs.",
+                                s(ids={"type":"array","items":{"type":"integer","minimum":1},"minItems":1,"maxItems":6,"req":True})),
+        "upvote_repair_example": ("Mark an example that helped. One vote per agent and example.",
+                                  s(id={"type":"integer","minimum":1,"description":"Repair example ID","req":True})),
+        "report_repair": ("Classify your captured verified repair before moving on.",
+                          s(function=st("Function you matched", True), case_id=it("Repair example ID from the match result"),
+                            change=st("Optional decisive change"), category=st(repair_labels),
+                            suggested_category=st(category_suggestion),
                             automation=st("How a deterministic rule could make it"))),
         "last_diff": ("A page of rows from your last compile diff; start is zero-based and limit is at most 200. "
                       "Costs no compile.", s(function=st("function", True), context=it("equal rows around each difference"), start=it("zero-based row"), limit=it("up to 200 rows"))),
-        "release_function": ("Give up a function with notes for the next agent, once compile_and_diff says to move "
+        "release_function": ("Give up a function once compile_and_diff says to move "
                              "on (before that it answers once with what to try; call again to release anyway). A "
                              "release with no compile since you claimed it is pushed back: compile first, pass move_on "
                              "with your reasons, or end your session.",
-                             s(claim_token=st("Always pass the current claim token from the claim, continuation state or get_candidate on the first release and retries; stale tokens cannot release a newer claim"), function=st("function", True), notes=st("what you tried, what is left", True),
+                             s(claim_token=st("Always pass the current claim token from the claim, continuation state or get_candidate on the first release and retries; stale tokens cannot release a newer claim"), function=st("function", True), notes=st("Optional findings: remaining assembly difference, tried approach and judged result (including failures), and one untested Next step: if available. Required for move_on and not_c."),
                                not_c=bo("True only with evidence of handwritten assembly or non-function code. Unsupported compiler extensions, asm-register restrictions, return-address builtins or build flags are blockers, not no-C proof; release normally with notes."),
                                move_on=bo("Explicitly release now with precise notes explaining why; bypasses the one-time pushback"),
-                               next_experiment={"type":"object","description":"Optional untested exact patch. Anchor/revision are validated; retrieve with get_function(section=experiment).", "properties":{key:{"type":"string"} for key in ('revision','old','new','title')}, "required":["revision","old","new"],"additionalProperties":False},
+                               next_experiment={"type": "object", "description": "Stalled-claim handoff: tried, observed change, and one untested next step on the saved candidate. Include both old and new for an exact patch.",
+                                                "properties": {key: {"type": "string", "description": meaning} for key, meaning in {
+                                                    "revision": "Candidate revision the next worker will inherit.",
+                                                    "tried": "The approach you tested.",
+                                                    "changed": "What changed in the measured output, or what stayed the same.",
+                                                    "title": "One untested next step.",
+                                                    "old": "Optional unique patch anchor.",
+                                                    "new": "Optional replacement for that anchor.",
+                                                }.items()}, "required": ["revision"], "additionalProperties": False},
                                needs=st("Optional direct callee in original assembly; obeys pauses and allows one pivot per unchanged input. Explain inline/header concerns in notes."))),
         "get_context": ("The header used by function; omit only for one held claim or a single-header project.", s(function=st("Function whose per-file header is needed"))),
         "edit_context": ("Replace `old` (exactly once) with `new` in the shared header, or append when old is empty.",
@@ -668,6 +692,10 @@ def api_tool_schemas(fork: bool = False, names: list[str] | None = None) -> list
                                           "required": ["old", "new"]}})),
         "compile_data": ("Judge C defining one data symbol: kept only if it holds the game's bytes there, all of it.",
                          s(name=st("data symbol", True), source=st("C defining it", True))),
+        "compare_candidate_behaviour": ("Compare an already compiled N64 candidate with the original on recorded calls. Diagnostic only.",
+            s(function=st("function", True), revision=st("current candidate revision", True),
+              calls=it("number of recorded calls, 1–3"), vis=it("maximum emulator retraces"),
+              input=st("optional scripted controller input"))),
         "compare_behaviour": ("Does a function behave like the original in a port? Records its first real calls in "
                               "the reversing emulator (N64), runs each through its recompiled and decompiled C, and "
                               "compares results and memory. Slow the first time: 'still running' means call again "
@@ -724,10 +752,11 @@ def api_tool_schemas(fork: bool = False, names: list[str] | None = None) -> list
                             "Compiler identity/profile changes use compiler_map, try_compiler/search_flags or suggest.",
                             s(evidence=st("Concrete function examples and scores; keep text as the reusable rule. Evidence is not put in every agent prompt."), text=st("reusable matching technique, not a function-specific note"), supports=it("a proposal's number to back"))),
         "suggest": ("Suggest a setup change for the user (another compiler or flags), with evidence.",
-                    s(text=st("what and why", True), compiler=st("toolchain id"), flags=st("flags"),
+                    s(text=st("what and why"), compiler=st("toolchain id"), flags=st("flags"),
                       function=st("a function whose best attempt should match with it: checked now"),
                       ranges=st("address ranges it built, when not the whole game: 0x10BFD0-0x10CD40, ..."),
-                      source=st("the C to check it with (default: the best attempt)"))),
+                      source=st("the C to check it with (default: the best attempt)"),
+                      trial_id=st("exact local ROM trial receipt; supply function and omit source, compiler, flags and ranges"))),
         "try_compiler": ("Compile a function's C with another compiler and flags, recording nothing: test before suggesting.",
                          s(function=st("function", True), compiler=st("toolchain id", True), flags=st("flags"),
                            source=st("the C (default: the best attempt)"))),
@@ -759,6 +788,9 @@ def api_tool_schemas(fork: bool = False, names: list[str] | None = None) -> list
                        s(path=st("file", True), at=st("function name or .text offset", True),
                          new_name=st("new file path (optional)"), data=st("e.g. .rodata:0x88 .data:0x28 (optional)"))),
     }
+    defs["release_and_continue"] = (
+        "Release your current function with optional findings and receive the next assignment when eligible. "
+        + defs["release_function"][0], defs["release_function"][1])
     if fork:
         defs["compile_and_diff"] = ("Write one complete function definition into its source file, build it and diff "
                                     "with objdiff. 100% / score 0 = matched.",

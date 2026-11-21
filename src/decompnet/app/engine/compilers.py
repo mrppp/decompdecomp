@@ -46,7 +46,7 @@ FLAGS_SHOWN = 6
 class CompilerMixin:
     # Settings: auto-adjust compiler. A suggested compiler is applied without asking once it's proven (a function's
     # C matches with it) or three agents agree on it (see suggest)
-    auto_compiler = False
+    auto_compiler = True
 
     AGREE = 3
 
@@ -690,7 +690,7 @@ class CompilerMixin:
         return ["", "### Compiler"] + lines if lines else []
 
     def suggest(self, agent: Agent, slug: str, text: str, compiler: str = "", flags: str = "",
-                function: str | None = None, ranges: str = "", source: str = "") -> str:
+                function: str | None = None, ranges: str = "", source: str = "", *, review_only: bool = False) -> str:
         """A change to the project's setup an agent can't make itself (the compiler, its flags, anything), for the user
         to apply or dismiss. With a compiler and a function whose C is ready, it's checked first: that C, built with the
         suggested compiler, matches the game or doesn't (GTA San Andreas: agents said EE-GCC 2.96, then 2.95.3). The
@@ -744,6 +744,8 @@ class CompilerMixin:
         s = found[0]
         note = f" ({check})" if check else ""
         if bundle:
+            if review_only:
+                return f"Suggested function-only compiler bundle for {function}. Review and apply it to recheck the match.{note}"
             if not self.auto_adjusts(self._project(slug)):
                 return f"Suggested function-only compiler bundle for {function}; automatic compiler changes are off. Apply it to recheck and save the source/header/profile together.{note}"
             try:
@@ -815,27 +817,38 @@ class CompilerMixin:
                 if c["status"] == "waiting":
                     c["said"] = self.rangechecks.waiting_reason(c, rows)
         audits = {tuple(map(tuple, c["spans"])): c for c in checks if c.get("audit")}
+        def profile_fields(toolchain, flags):
+            return {"compiler": consoles.compiler_name(toolchain), "flags": " ".join(flags),
+                    "flag_list": list(flags), "toolchain": toolchain, "default": (toolchain, tuple(flags)) == main,
+                    "family": toolchains.compiler_family(toolchain) or toolchain}
+
         parts = []
-        function_rows = self.rangechecks._rows(proj)
         for r in ranges:
             c = audits.get(((r["start"], r["end"]),)) or {}
-            parts.append({"start": r["start"], "end": r["end"], "compiler": consoles.compiler_name(r["toolchain"]),
-                          "flags": " ".join(r["flags"]), "flag_list": list(r["flags"]), "toolchain": r["toolchain"],
-                          "default": (r["toolchain"], tuple(r["flags"])) == main,
-                          "family": toolchains.compiler_family(r["toolchain"]) or r["toolchain"],
-                          "functions": sum(r["start"] <= f["vram"] < r["end"] for f in function_rows),
-                          "function_list": [{k: f[k] for k in ("name", "vram", "status")} for f in function_rows if r["start"] <= f["vram"] < r["end"]],
-                          "check": c.get("status", ""), "said": c.get("said", "")})
+            parts.append({"start": r["start"], "end": r["end"], **profile_fields(r["toolchain"], r["flags"]),
+                          "functions": 0, "function_list": [], "check": c.get("status", ""), "said": c.get("said", "")})
+        function_parts, default_functions = [], []
+        for fn in self.rangechecks._rows(proj):
+            address = fn["vram"]
+            own = compiler_for(cfg, address, fn)
+            profile = (own["toolchain"], tuple(own["flags"]))
+            entry = {k: fn[k] for k in ("name", "vram", "status")}
+            if profile == main:
+                default_functions.append(entry)
+            part = next((p for p in parts if p["start"] <= address < p["end"]), None)
+            if part is not None and profile == (part["toolchain"], tuple(part["flag_list"])):
+                part["function_list"].append(entry)
+                part["functions"] += 1
+            elif profile != main:
+                function_parts.append({"start": address, "end": address, **profile_fields(*profile),
+                                       "function_only": True, "functions": 1, "function_list": [entry]})
         elsewhere = sorted((r for r in (cmap.runs if cmap else []) if r.differs()), key=lambda r: -r.functions)
-        def uses_default(fn):
-            own = compiler_for(cfg, fn["vram"], fn)
-            return (own["toolchain"], tuple(own["flags"])) == main
         has_map = cmap is not None
         # the compiler's name and its flags apart: "built with KMC GCC 2.7.2" reads at a glance, the flags are details
         # (`mips` is what older pages called this fact: a map now also covers a project's source files, PC and DS)
         return {"compiler": consoles.compiler_name(main[0]), "flags": " ".join(main[1]), "parts": parts,
-                "default_function_list": [dict(f) for f in function_rows if uses_default(f)],
-                "default_functions": sum(uses_default(f) for f in function_rows),
+                "function_parts": function_parts, "default_function_list": default_functions,
+                "default_functions": len(default_functions),
                 "compiler_map": has_map, "mips": has_map,
                 "elsewhere": [{"start": r.start, "end": r.end, "compiler": self._short(r.label), "functions": r.functions,
                                "confirmed": r.confirmed} for r in elsewhere[:self.ANSWER_STRETCHES]],
@@ -853,7 +866,8 @@ class CompilerMixin:
         all of them: the import's test could only try what was installed, and a guess from the program alone can
         miss (a game linked by CodeWarrior was GCC's code). Returns what was installed, left out, and the test's
         counts."""
-        proj = self._project(slug)
+        # Saved code may need the very compiler that Setup is about to install.
+        proj = self.project_row(slug, sync=False)
         console = self.console(proj)
         installed, left_out = [], []
         for tid in console.installable_compilers():
@@ -951,8 +965,9 @@ class CompilerMixin:
         Each variant changes the project's flags in one place, so what matches says which flag it was."""
         family = toolchains.compiler_family(toolchain) or next((f for prefix, f in FLAG_FAMILIES if toolchain.startswith(prefix)), "gcc")
         levels, extras = FLAG_LEVELS[family], FLAG_EXTRAS[family] + tuple(more)
+        from ..profile_hypotheses import kmc_variants
         current = next((f for f in base if f in levels), None)
-        out = [base]
+        out = [base, *kmc_variants(toolchain, base)]
         for level in levels:
             if level != current:
                 out.append([level if f == current else f for f in base] if current else [*base, level])

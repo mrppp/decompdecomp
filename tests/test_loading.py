@@ -238,7 +238,7 @@ def test_activity_changes_only_the_incremental_map_cursor(tmp_path):
     updated = net.map_signature("game")
     assert updated != sig and updated.rsplit(".",1)[0] == sig.rsplit(".",1)[0]
     sig = updated
-    for change in ("best_score=7", "status='matched', matched_at=5", "readable=1", "status='asm'"):
+    for change in ("best_score=7", "status='matched', name='updateWorld', matched_at=5", "readable=1", "status='asm'"):
         with net.store.tx() as db:
             db.execute(f"UPDATE functions SET {change} WHERE id=?", (fid,))
         assert net.map_signature("game") != sig, change
@@ -300,7 +300,10 @@ def test_live_feed_returns_recorded_score_change_without_source_payloads(tmp_pat
     with net.store.tx() as db:
         db.execute('INSERT INTO attempts(function_id,agent_id,score,score_before,score_improved,compiled,source,created_at) VALUES(?,?,?,?,?,?,?,?)',
                    (fid,agent.id,95,100,1,1,'private source',time.time()))
-    attempt = net.live('game')['attempts'][0]
+        db.execute("INSERT INTO attempts(function_id,agent_id,score,compiled,created_at,via) VALUES(?,?,0,1,?,?)",
+                   (fid,agent.id,time.time(),'saved_recheck'))
+    attempt, recheck = net.live('game')['attempts']
+    assert recheck['via'] == 'saved_recheck' and recheck['score'] == 0
     assert attempt['score_before'] == 100 and attempt['score'] == 95 and attempt['score_improved'] == 1
     assert 'source' not in attempt
 

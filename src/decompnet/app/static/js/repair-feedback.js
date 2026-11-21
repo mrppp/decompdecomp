@@ -9,16 +9,17 @@ $("repairExamples").onclick = async () => {
     <div class="repair-scroll"><div class="repair-filters">
     <div class="repair-filter-selects"><label>Category<select data-category aria-label="Repair category"><option value="">All categories</option></select></label>
     <label>Review status<select data-status aria-label="Review state"><option value="new" selected>Needs review</option><option value="">All statuses</option></select></label>
+    <label>Sort by<select data-sort><option value="recent">Newest</option><option value="upvotes">Most upvoted</option></select></label>
     <button data-refresh type="button">Refresh</button></div>
     <div class="repair-filter-checks"><label><input type="checkbox" data-comparable checked> Source changes only <span class="muted small">Same compiler settings</span></label>
     <label><input type="checkbox" data-all> Include other projects</label></div></div>
     <details class="panel settings-disclosure repair-concerns" data-quality-panel hidden><summary class="panel-head"><h3>Candidate concerns <span class="disclosure-context" data-quality-count></span></h3></summary><div class="pad">
     <p class="small muted">Agent-reported concerns, not proven errors. Review the evidence before changing a candidate.</p>
     <section data-quality class="repair-list" aria-label="Candidate quality review"></section></div></details>
-    <details class="panel settings-disclosure repair-source-section" data-source-panel open><summary class="panel-head"><h3>Source repairs <span data-count class="disclosure-context" role="status"></span></h3></summary><div class="pad">
+    <details class="panel settings-disclosure repair-source-section" data-source-panel open><summary class="panel-head"><h3><span data-list-heading>Source repairs</span> <span data-count class="disclosure-context" role="status"></span></h3></summary><div class="pad">
     <div data-list class="repair-list"></div>
-    <details class="repair-section" data-first-reports hidden><summary>First matches · no failed baseline</summary><p class="small muted">Useful starting code, but no captured failed version to isolate a repair.</p><div data-first-list class="repair-list"></div></details>
-    <details class="repair-section" data-context-reports hidden><summary>Compiler or header changes</summary><p class="small muted">Inputs changed together. Local replay can test compiler-only and header-only combinations before attributing an improvement.</p><div data-context-list class="repair-list"></div></details><button data-more hidden type="button">Load older examples</button>
+    <details class="repair-section" data-first-reports hidden><summary>No saved failed baseline</summary><p class="small muted">These matches have no saved candidate that compiled and scored below an exact match.</p><div data-first-list class="repair-list"></div></details>
+    <details class="repair-section" data-context-reports hidden><summary>Compiler or header changes</summary><p class="small muted">Inputs changed together. Local replay can test compiler-only and header-only combinations before attributing an improvement.</p><div data-context-list class="repair-list"></div></details><button data-more hidden type="button">Load more examples</button>
     <details class="repair-section" data-build-reports hidden><summary>Build reports</summary><p class="small muted">Grouped by source unit and one-minute window. These are build status captures, not isolated source repairs.</p><div data-build-list class="repair-list"></div></details>
     </div></details><details class="repair-section" data-tools><summary>Testing &amp; analysis <span class="muted small">Local compiler tools · no AI tokens</span></summary>
     <p class="small muted">These tests measure saved evidence. They do not apply source, change game progress or mark repairs as implemented.</p>
@@ -47,9 +48,12 @@ $("repairExamples").onclick = async () => {
   document.body.append(dialog);
   const get = (selector) => dialog.querySelector(selector);
   const list = get('[data-list]'), category = get('[data-category]'), status = get('[data-status]'), all = get('[data-all]');
-  const comparable = get('[data-comparable]');
-  comparable.checked = true; status.value = 'new';
-  let before = 0, shown = 0, investigation;
+  const comparable = get('[data-comparable]'), sort = get('[data-sort]');
+  comparable.checked = true; status.value = 'new'; sort.value = 'recent';
+  let before = 0, beforeVotes = 0, shown = 0, investigation;
+  const baselineCategory = 'no_failed_baseline';
+  const categoryNames = {[baselineCategory]: 'No saved failed baseline', memory_access_order: 'Memory access order'};
+  const formatCategory = value => categoryNames[value] || value.replaceAll('_', ' ');
   const reviewLabel = value => ({new:'Needs review', reviewed:'Reviewed', implemented:'Added to app', dismissed:'Dismissed'}[value] || value.replaceAll('_', ' '));
   const investigationConfig = () => investigation ||= api('/api/repair-examples/investigate');
   const scope = () => `slug=${encodeURIComponent(slug)}&all=${all.checked ? 1 : 0}`;
@@ -64,9 +68,9 @@ $("repairExamples").onclick = async () => {
     catch(error) { auto.checked=!auto.checked; toast(error.message); }
     finally { auto.disabled=false; }
   };
-  const controls = [category, status, all, comparable, get('[data-refresh]'), get('[data-more]')];
+  const controls = [category, status, sort, all, comparable, get('[data-refresh]'), get('[data-more]')];
   function options(select, values) {
-    for (const value of values) { if (Array.from(select.options).some((option) => option.value === value)) continue; const option = document.createElement('option'); option.value = value; option.textContent = select === status ? reviewLabel(value) : value.replaceAll('_', ' '); select.append(option); }
+    for (const value of values) { if (Array.from(select.options).some((option) => option.value === value)) continue; const option = document.createElement('option'); option.value = value; option.textContent = select === status ? reviewLabel(value) : formatCategory(value); select.append(option); }
   }
   function card(row, states, categories) {
     const details = document.createElement('details'), summary = document.createElement('summary');
@@ -74,7 +78,11 @@ $("repairExamples").onclick = async () => {
     const title = document.createElement('span'); title.className = 'repair-card-title'; title.textContent = row.function;
     const meta = document.createElement('span'); meta.className = 'repair-card-meta'; meta.textContent = `#${row.id} · ${row.project}${row.agent ? ' · ' + row.agent : ''}`;
     const badges = document.createElement('span'); badges.className = 'repair-badges';
-    for (const value of [row.category.replaceAll('_', ' '), reviewLabel(row.status), ...(row.evidence_kind && row.evidence_kind !== 'source repair' ? [row.evidence_kind] : []), ...(row.automation_known ? ['already automated'] : []), ...(row.repetitions > 1 ? [`${row.repetitions} ${row.evidence_kind === 'build report' ? 'build' : 'equivalent'} captures`] : [])]) {
+    const upvotes = row.upvotes || 0;
+    const voteLabel = `${upvotes} ${upvotes === 1 ? 'upvote' : 'upvotes'}`;
+    const distinctEvidence = row.evidence_kind && row.evidence_kind !== 'source repair' &&
+      !(row.category === baselineCategory && row.evidence_kind === 'no failed baseline');
+    for (const value of [voteLabel, formatCategory(row.category), reviewLabel(row.status), ...(distinctEvidence ? [row.evidence_kind] : []), ...(row.automation_known ? ['already automated'] : []), ...(row.repetitions > 1 ? [`${row.repetitions} ${row.evidence_kind === 'build report' ? 'build' : 'equivalent'} captures`] : [])]) {
       const badge = document.createElement('span'); badge.className = 'repair-badge'; badge.textContent = value; badges.append(badge);
     }
     summary.append(title, meta, badges);
@@ -86,7 +94,11 @@ $("repairExamples").onclick = async () => {
       try {
         const data = await api(`/api/repair-examples?${scope()}&id=${row.id}`);
         const explanation = document.createElement('p');
-        explanation.textContent = `${data.explanation || 'No agent explanation supplied.'}${data.automation ? ' Suggested automation: ' + data.automation : ''}`;
+        explanation.textContent = [
+          data.explanation,
+          data.suggested_category && `Suggested category: ${data.suggested_category}.`,
+          data.automation && `Suggested automation: ${data.automation}`,
+        ].filter(Boolean).join(' ');
         const pre = document.createElement('pre'); pre.className = 'repair-diff'; pre.setAttribute('tabindex', '0'); pre.setAttribute('aria-label', 'Source changes');
         const change = document.createElement('p'); change.className = 'muted small';
         change.textContent = data.evidence.source_change_label || '';
@@ -132,12 +144,12 @@ $("repairExamples").onclick = async () => {
         for (const value of states) { const option = document.createElement('option'); option.value = value; option.textContent = reviewLabel(value); review.append(option); }
         review.value = data.status;
         const kind = document.createElement('select'); kind.setAttribute('aria-label', `Category for example ${row.id}`);
-        for (const value of categories) { const option = document.createElement('option'); option.value = value; option.textContent = value.replaceAll('_', ' '); kind.append(option); }
+        for (const value of categories) { const option = document.createElement('option'); option.value = value; option.textContent = formatCategory(value); kind.append(option); }
         kind.value = data.category;
         const suggestion = data.evidence.review_suggestion;
         if (suggestion && suggestion.category !== 'unclassified') {
           const suggested = document.createElement('p'); suggested.className = 'muted small';
-          suggested.textContent = `Suggested category: ${suggestion.category.replaceAll('_', ' ')}. ${suggestion.note}`;
+          suggested.textContent = `Suggested category: ${formatCategory(suggestion.category)}. ${suggestion.note}`;
           body.append(suggested);
           if (data.category === 'unclassified') kind.value = suggestion.category;
         }
@@ -206,7 +218,8 @@ $("repairExamples").onclick = async () => {
           finally { providersLoading = false; done(); }
         });
         test.className = 'repair-example-test';
-        body.append(explanation, evidence, advanced, test, investigate); details.loaded = true;
+        if (explanation.textContent) body.append(explanation);
+        body.append(evidence, advanced, test, investigate); details.loaded = true;
       } catch (error) { toast(esc(error.message), 'err'); }
       finally { finish(); }
     });
@@ -215,7 +228,11 @@ $("repairExamples").onclick = async () => {
   async function load(reset = true) {
     const done = beginWork(list, 'Loading repair examples', controls);
     try {
-      const data = await api(`/api/repair-examples?${filters()}&before=${reset ? 0 : before}`);
+      const byVotes = sort.value === 'upvotes';
+      const baselineSelected = category.value === baselineCategory;
+      const flat = byVotes || baselineSelected;
+      const cursor = reset ? '&before=0' : `&before=${before}${byVotes ? `&before_votes=${beforeVotes}` : ''}`;
+      const data = await api(`/api/repair-examples?${filters()}&sort=${sort.value}${cursor}`);
       if (!dialog.isConnected) return;
       if (reset) {
         shown = 0; list.replaceChildren(); for (const group of ['first','context']) { get(`[data-${group}-list]`).replaceChildren(); get(`[data-${group}-reports]`).hidden = true; } get('[data-build-list]').replaceChildren(); get('[data-build-reports]').hidden = true;
@@ -264,6 +281,7 @@ $("repairExamples").onclick = async () => {
           panel.append(heading, body); area.append(panel);
         }
       }
+      get('[data-list-heading]').textContent = baselineSelected ? formatCategory(baselineCategory) : byVotes && !comparable.checked ? 'All captures' : 'Source repairs';
       options(category, data.categories); options(status, data.states);
       if (data.metrics) {
         const m = data.metrics, describe = x => `${x.attempted.toLocaleString()} trials · ${x.improved.toLocaleString()} improvements · ${x.matched.toLocaleString()} matches`;
@@ -271,12 +289,14 @@ $("repairExamples").onclick = async () => {
         get('[data-metrics]').textContent += (m.efficiency || []).slice(0,12).map(r => ` ${r.family}: ${r.matched}/${r.attempted} exact wins (${(100*r.matches_per_compile).toFixed(1)}%/compile), ${r.matches_per_trial_minute == null ? 'unknown time rate' : r.matches_per_trial_minute.toFixed(2)+' wins/trial-minute'}; ${r.evidence}, profile ${r.profile.slice(0,8)}, ${r.focus}.`).join('')+' Trial time is summed elapsed measurement time, not measured CPU time or wall time for a whole run.';
         get('[data-metrics]').textContent += (m.input_effects || []).map(r => ` ${r.family.replaceAll("_", " ")}: ${r.attempted} proposals, ${r.no_edit} with no edit, ${r.same_output} identical function outputs, ${r.worse} worse, ${r.improved} improved.`).join("") + " Input-specific priorities drop only after 8 fresh trials with no improvement and at least 80% no-edit/identical/worse results. Exploration remains enabled; edits reset the input scope.";
       }
-      get('[data-breakdown]').textContent = data.groups.map((group) => `${group.count} captures · ${group.category.replaceAll('_', ' ')} (${group.status})`).join(' · ') || 'No examples for these filters.';
+      get('[data-breakdown]').textContent = data.groups.map((group) => `${group.count} captures · ${formatCategory(group.category)} (${group.status})`).join(' · ') || 'No examples for these filters.';
       if (reset && !data.examples.length) { const empty = document.createElement('p'); empty.className = 'repair-empty'; empty.textContent = 'No examples match these filters. Choose another review status or turn off “Source changes only” to include settings changes and captures without a failed baseline.'; list.append(empty); }
       for (const row of data.examples) {
         const group = row.review_group || (row.evidence_kind === 'build report' ? 'build' : 'source');
-        if (group !== 'source') get(`[data-${group}-reports]`).hidden = false;
-        (group === 'source' ? list : get(`[data-${group}-list]`)).append(card(row, data.states, data.categories)); before = row.id;
+        if (!flat && group !== 'source') get(`[data-${group}-reports]`).hidden = false;
+        (flat || group === 'source' ? list : get(`[data-${group}-list]`)).append(card(row, data.states, data.categories));
+        before = row.id;
+        beforeVotes = row.upvotes || 0;
         shown++;
       }
       get('[data-count]').textContent = `— Showing ${shown.toLocaleString()}/${data.total.toLocaleString()}`;
@@ -295,7 +315,11 @@ $("repairExamples").onclick = async () => {
     } catch (error) { toast(esc(error.message), 'err'); }
     finally { done(); }
   }
-  category.onchange = status.onchange = all.onchange = comparable.onchange = () => load();
+  category.onchange = () => {
+    if (category.value === baselineCategory) comparable.checked = false;
+    return load();
+  };
+  status.onchange = sort.onchange = all.onchange = comparable.onchange = () => load();
   get('[data-refresh]').onclick = () => { investigation = null; return load(); }; get('[data-more]').onclick = () => load(false);
   get('[data-prompt]').onclick = async () => {
     try { await copyText(investigationConfig().then((data) => data.prompt)); toast('Analysis prompt copied. Attach the exported examples in your coding agent.'); }

@@ -498,7 +498,10 @@ class Session:
                 "boundary_function":self.options.get("boundary_function"), "boundary_until":self.options.get("boundary_until"),
                 "focus_function":self.options.get("focus_function"), "focus_until":self.options.get("focus_until"),
                 "focus_id":self.options.get("focus_id"), "focus_minutes":self.options.get("focus_minutes"),
+                "focus_max_tries":self.options.get("focus_max_tries"),
+                "focus_tries_used":self.options.get("focus_tries_used", 0),
                 "per_session": self.options.get("per_session", PER_SESSION),
+                "automatic_assignment": self.options.get("automatic_assignment", False),
                 "task": self.options.get("task") or "",  # "readable": it polishes matched code
                 "slug": self.slug, "agent": self.agent_name, "model": self.model, "state": self.state, "why": self.why,
                 "provider_waiting": self.provider_waiting, "provider_retry_requested": self.provider_retry_requested,
@@ -708,7 +711,7 @@ class Manager:
         _end_groups(crashed | self._strays())
         # helpers, and the runners from before records (named like helpers): with a note on each function, and a
         # 'stopped' event that ends their run (what they released in it no longer keeps them off it)
-        self.net.release_local_claims("the app restarted")
+        self.net.release_local_claims()
 
     def _save(self, s: Session, *, db=None) -> None:
         if self._down and db is None:return  # shutdown owns the single batched recovery write
@@ -807,7 +810,7 @@ class Manager:
         report_start("Validating worker selection…")
         options = dict(options or {})
         options["selection"] = self.net.validate_selection(options.get("selection"))
-        from . import focused_agents
+        from . import automatic_assignment, focused_agents
         options = focused_agents.configure(self.net,slug,options,count)
         from . import boundary_investigations
         options = boundary_investigations.configure(self.net,slug,options,count)
@@ -817,6 +820,10 @@ class Manager:
         options = data_agents.configure(self.net,slug,options,count)
         from . import port_agents
         options = port_agents.configure(self.net,slug,options,count)
+        if type(options.get('automatic_assignment', False)) is not bool:
+            raise ValueError('Automatic assignment must be true or false.')
+        if not automatic_assignment.configured(options):
+            options.pop('automatic_assignment', None)
         agent = agents.get(kind)  # (an unknown kind is a ValueError that says which there are)
         if agent.id != kind:
             kind = agent.id
@@ -891,7 +898,7 @@ class Manager:
                 raise ValueError('This agent is not waiting for a provider limit.')
             s.provider_retry_requested=True
             self._set(s,'waiting','Provider retry requested; checking within 30 seconds',time.time()+30,
-                      'This worker will retry once. A successful session releases the shared account wait.')
+                      'This worker will retry once. A successful session clears the cooldown it observed.')
         return {'requested':True}
 
     def retry_paused(self, sid, limit=5, log=lambda *_: None):
@@ -899,7 +906,8 @@ class Manager:
         with self._lock:
             session=self.sessions.get(sid)
             if session is None:raise ValueError('This agent no longer exists. Refresh the agents list.')
-            if session.options.get('task') in NOT_MATCHING:raise ValueError('Retry paused functions applies to matching agents.')
+            if session.options.get('task') in NOT_MATCHING or session.options.get('focus_id'):
+                raise ValueError('Retry paused functions applies to agents that work through a queue.')
             slug, name = session.slug, session.agent_name
         agent=self.net.attribution_agent(name)
         return retry_paused.retry(self.net,slug,agent,limit,log=log)
@@ -912,6 +920,11 @@ class Manager:
             if per_session is not None and (type(per_session) is not int or not 1 <= per_session <= 20):
                 raise ValueError("Functions per session must be a whole number from 1 to 20.")
             policy = self.net.validate_selection(policy)
+            if s.options.get('focus_id'):
+                if per_session is not None:
+                    raise ValueError('Focused agents work on their assigned function. Set the try limit when starting a focused agent.')
+                disabled = policy.get('disabled_tools', (s.options.get('selection') or {}).get('disabled_tools', []))
+                policy = {**(s.options.get('selection') or {}), 'disabled_tools': disabled}
             if 'disabled_tools' not in policy and 'disabled_tools' in (s.options.get('selection') or {}):
                 policy = {**policy, 'disabled_tools':s.options['selection']['disabled_tools']}
             policy = self.net.set_selection(s.slug, s.agent_name, policy)
@@ -942,8 +955,14 @@ class Manager:
         if session.options.get('task') == 'boundary':
             from .boundary_investigations import INSTRUCTIONS
             return INSTRUCTIONS
+        from . import automatic_assignment, focused_agents
         from .prompt_settings import for_session
-        return for_session(self.net, session)['instructions']
+        instructions = for_session(self.net, session)['instructions']
+        if session.options.get('focus_id'):
+            return focused_agents.prompt(session) + '\n\n' + instructions
+        if automatic_assignment.configured(session.options):
+            return automatic_assignment.INSTRUCTIONS + '\n\n' + instructions
+        return instructions
 
     def instructions_for(self, agent, slug):
         for session in list(self.sessions.values()):
@@ -977,9 +996,8 @@ class Manager:
         s.output_limit_retries = 0
         s.started_at = time.time()
         if s.options.get('focus_id'):
-            s.options.setdefault('focus_until',s.started_at+s.options['focus_minutes']*60)
-            with self.net.store.tx() as db:
-                db.execute('UPDATE helpers SET options=? WHERE id=?',(json.dumps({k:v for k,v in s.options.items() if k!='api_key'}),s.id))
+            from .focused_agents import begin
+            begin(s)
         self._save(s)
         s.thread = threading.Thread(target=self._run, args=(s,), daemon=True, name=f"agent-{s.agent_name}")
         s.thread.start()
@@ -1018,22 +1036,26 @@ class Manager:
             options = self.options_now(s.kind, dict(s.options))
             if options is None:
                 raise ValueError("its account or API endpoint was removed: start a new helper and choose another one")
-            options.pop('focus_until',None)  # A manual restart explicitly begins a fresh time allowance.
+            # Start again gives the same function a fresh budget. Provider and
+            # app restarts keep the current run's allowance.
+            for key in ('focus_until', 'focus_since', 'focus_tries_used'):
+                options.pop(key, None)
             s.options, s.restarts = options, 0
             if not s.options.get("focus_id") and s.options.get("task") not in NOT_MATCHING:
                 self._prepare(s.slug)
             self._launch(s)
 
     def restart_project(self, slug: str) -> dict:
-        """Restart stopped helpers on this project and report any that need attention."""
+        """Restart stopped or paused helpers and report any that need attention."""
         with self._lock:
-            stopped = [s for s in self.sessions.values() if s.slug == slug and s.state == "stopped"
-                       and not s.configuration_error]
+            restartable = [s for s in self.sessions.values() if s.slug == slug and s.state not in LIVE
+                           and not s.configuration_error]
         restarted = []
         errors = []
-        for session in stopped:
+        for session in restartable:
             with self._lock:
-                if self.sessions.get(session.id) is not session or session.state != "stopped":
+                if (self.sessions.get(session.id) is not session or session.state in LIVE
+                        or session.configuration_error):
                     continue
                 try:
                     self.restart(session.id)
@@ -1199,10 +1221,15 @@ class Manager:
         recent = [dict(r) for r in self.net.project_store(slug).all(query.format("AND task NOT IN (" + ",".join(f"'{task}'" for task in sorted(NOT_MATCHING)) + ")"), slug,
                                                       time.time() - SPIN_WINDOW)]
         advice = spin_advice(recent)
+        from ..claim_routing import model_results
+        from ..network import model_of
+        names = {row["id"]: row["name"] for row in self.net.store.all("SELECT id,name FROM agents")}
+        cohorts = model_results(self.net.project_store(slug), slug, time.time(), names)
         out = []
         for r in rows:
             said = advice.get((r["kind"], r["model"]), "")
             out.append(dict(r) | {"usd": r["usd"] or 0.0, "tokens": r["tokens"] or 0, "matches": r["matches"] or 0,
+                                  "claim_results": cohorts.get(model_of(helper_name(r["kind"], r["model"], set())), []),
                                   "advice": said, "advice_model": (r["model"] or r["kind"]) if said else ""})
         # a model without a price (the API helper counts only tokens) isn't free: priced models by dollars a match,
         # then the rest by tokens a match, then those that matched nothing
@@ -1519,12 +1546,13 @@ class Manager:
 
     @agent_startup.current_projects
     def _run_work(self, s: Session) -> None:
-        from . import focused_agents
+        from . import automatic_assignment, focused_agents
         agent_startup.stage(s, "Reading project and worker settings")
         agent, token = self.net.local_agent(s.agent_name)
         self.net.set_selection(s.slug, agent.name, s.options.get("selection"))
         self.assignments[agent.id] = s.slug
         focused_agents.bind(self.net,s,agent)
+        automatic_assignment.bind(self.net, agent, s)
         from . import asset_agents, boundary_investigations
         boundary_investigations.bind(self.net,s,agent)
         asset_agents.bind(self.net,s,agent)
@@ -1628,7 +1656,7 @@ class Manager:
             if (shared_until := session_followups.cooldown(self, s)) is not None:
                 s.cooldown_observed = shared_until
                 self._wait(s, agents.get(s.kind).limit_wait_why(), shared_until + session_followups.stagger(s),
-                           "Helpers on the same account or model resume automatically after reset.", wall_clock=True)
+                           "Work resumes automatically after reset.", wall_clock=True)
                 continue
             s.runs += 1
             with self._lock:
@@ -1682,6 +1710,9 @@ class Manager:
                 s.error = f"{type(e).__name__}: {e}"
                 s.push("error", s.error)
                 ok = False
+            if s.state == "paused" and s.stop.is_set():
+                self._session_end(s, row, agent, began, "paused")
+                break
             from .tool_connections import failure as connection_failure_report
             if ok and not s.stop.is_set() and (transport := connection_failure_report(s,self.net)):
                 connection_failures += 1
@@ -1709,7 +1740,7 @@ class Manager:
                 investigation = 'Boundary recommendation submitted'
             if task=="assets" and asset_agents.progress(self.net,s.slug,agent.id)>asset_before:
                 investigation="Asset findings or unsuccessful approaches saved for review"
-            followup = task not in {"boundary","assets"} and ok and not s.rotated and not investigation and session_followups.premature(self, s, agent, compiled)
+            followup = not s.options.get("focus_id") and task not in {"boundary","assets"} and ok and not s.rotated and not investigation and session_followups.premature(self, s, agent, compiled)
             if compiled >= 2:
                 s.continuation_attempts = 0
             if followup:
@@ -1837,7 +1868,7 @@ class Manager:
             except Exception:  # the host lets the claim expire
                 pass
         # its claims go now, with a note, rather than when their lease runs out; and its next run starts afresh
-        self.net.release_stopped([agent_id], (s.why or "it stopped")[:200], project=s.slug)
+        self.net.release_stopped([agent_id], project=s.slug)
 
     def _session_begin(self, s: Session) -> int:
         from .prompt_settings import effective
@@ -1868,7 +1899,32 @@ class Manager:
         for session in list(self.sessions.values()):
             if session.agent_name == agent.name and session.slug == slug and session.record:
                 session.record(kind, value)
+                if kind == "tool_response":
+                    self._pause_for_missing_compiler(session, value)
                 break
+
+    def _pause_for_missing_compiler(self, session, response):
+        # These tools use the assigned compiler. A diagnostic tool may deliberately
+        # probe an uninstalled alternative while the ordinary judge is usable.
+        if response.get("name") not in {
+            "compile_and_diff", "compile_patch", "compile_variants",
+            "compile_family", "try_local_repairs", "make_readable", "polish_function",
+        }:
+            return
+        error = response.get("error") or (response.get("content") or "").removeprefix("error: ")
+        if not re.fullmatch(
+            r"toolchain '[\w.+-]+' is not installed: install it in decompdecomp, under Compilers & tools",
+            error.strip(),
+        ):
+            return
+        with self._lock:
+            if session.state != "working" or session.stop.is_set():
+                return
+            session.stop.set()
+            session.error = error
+            self._pause(session, error, "Install the compiler, then press Start on this helper.")
+            if session.proc is not None:
+                _terminate(session.proc)
 
     def transcript(self, slug, helper, session=0, after=0, before=0, whole=False):
         result = self.transcripts.read(slug, helper, session, after, before, whole=whole)
@@ -1928,7 +1984,13 @@ class Manager:
             return
         if agent is None:
             agent = self.net.authenticate(token)
-        if (agent.id, s.slug) in getattr(self.net, '_pending_tool_handshakes', set()):
+        from . import automatic_assignment
+        automatic = automatic_assignment.configured(s.options)
+        focused = bool(s.options.get('focus_id'))
+        if not focused and (agent.id, s.slug) in getattr(self.net, '_pending_tool_handshakes', set()):
+            if automatic:
+                s.startup_context = 'First call project_info(detail=false) to confirm the tool connection and get your assigned function.'
+                return
             s.startup_context = 'Connection check required: first call project_info(detail=false). Then claim_function to receive your function. No new claim has been handed over by this startup.'
             return
         facts = tools._project_info(self.net, s.slug, detail=False).split('Next:')[0][:STARTUP_FACTS_CHARS]
@@ -1939,15 +2001,20 @@ class Manager:
             # A fresh provider session has no copy of a previous session's brief/C.
             getattr(self.net, '_claim_packets', {}).pop((agent.id, s.slug), None)
             packet = tools._claim(self.net, agent, s.slug, '', '', count=1)
+            if focused and packet.startswith(('Nothing to claim', 'Nothing left to claim', 'Work availability:')):
+                raise StartupMetadataPending('Waiting for the assigned function before starting the model.')
             if len(packet) > STARTUP_BRIEF_CHARS:
                 packet = packet[:STARTUP_BRIEF_CHARS].rsplit('\n', 1)[0] + '\n[Startup brief abbreviated. Read get_function(section=brief) or get_candidate for omitted evidence before editing.]'
-            parts += ['The app already called claim_function(count=1) for you. Start with the brief below. '
-                      'Do not claim again before working on or releasing this function. '
-                      'If no function was available, do not invent one; end the session.', packet]
+            if automatic or focused:
+                parts += ['Start with the assigned function below.', packet]
+            else:
+                parts += ['The app already called claim_function(count=1) for you. Start with the brief below. '
+                          'Do not claim again before working on or releasing this function. '
+                          'If no function was available, do not invent one; end the session.', packet]
         s.startup_context = '\n\n'.join(parts)
 
     def prompt(self, s: Session) -> str:
-        from . import focused_agents
+        from . import automatic_assignment, focused_agents
         from .session_handoffs import previous
         if s.options.get("task")=="assets":
             from .asset_agents import prompt
@@ -1970,7 +2037,9 @@ class Manager:
         ov = agent_startup.project_facts(self.net, s.slug)
         text += "\nGuides to load when needed:\n\n" + tools.up_front(
             ov.get("platform") or "", ov.get("kind") or "", (ov.get("compiler") or {}).get("toolchain", ""))
-        if (order := self.net.claim_order(s.slug)):
+        if automatic_assignment.configured(s.options):
+            text = automatic_assignment.INSTRUCTIONS + "\n\n" + text.replace("release_function", automatic_assignment.RELEASE)
+        elif not s.options.get('focus_id') and (order := self.net.claim_order(s.slug)):
             text += (f"\nThe project's owner chose the order helpers take functions in: {network.CLAIM_ORDERS[order]}. "
                      "claim_function without a function follows it; one you name still comes.\n")
         if (wish := self.net.instructions(s.slug)):
@@ -1980,10 +2049,6 @@ class Manager:
         if (known := self.net.knowledge.for_prompt(s.slug, knowledge_agent)):
             text += f"\n{known}\n"
         text += previous(self.net, s.id, s.slug)
-        if s.options.get('focus_id'):
-            text += (f"\nUSER FOCUS: Work only on {s.options['focus_function']} until the app's deadline. "
-                     'Do not move to other functions, even after repeated failures. Read callees as needed, save improved candidates and notes. '
-                     'Keep this conversation running; compact older context rather than ending the session. The app stops this worker on a match or timeout.\n')
         if s.continuation_note:
             text += '\n\nSession continuation guidance:\n' + s.continuation_note
             s.continuation_note = ""
@@ -2070,7 +2135,7 @@ class Manager:
         if s.options.get('resume_conversation') and k.focus_resume:
             prompt += '\nResume this conversation after interruption. Continue from saved context, checking current state first.\n'
         if s.tool_handshake_required:
-            prompt += '\nFirst call project_info(detail=false) to confirm tools in this CLI session, before claiming or editing. If unavailable, end immediately and report the connection failure. The app will retry once.'
+            prompt += '\nFirst call project_info(detail=false) to confirm tools in this CLI session, before editing. If unavailable, end immediately and report the connection failure. The app will retry once.'
         try:
             prompt_file = k.prompt_file(workdir, prompt)
         except ValueError as e:
@@ -2339,11 +2404,12 @@ class Manager:
         # Raw stderr (including title requests) still carries the provider's "usage limit" wording.
         # Strip it so a free-tier refusal cannot publish the account-wide cooldown.
         limit_text = FREE_MODEL_ALLOWANCE.sub("", everything)
-        if LIMIT.search(limit_text):
+        quota_error = k.quota_error(state, code, list(errors), limit_text if LIMIT.search(limit_text) else "")
+        if quota_error:
             s.limited = True  # whatever the exit code: Claude Code says so in an ordinary result
-            s.limit_until = limit_reset(limit_text)
-            # Publish the account cooldown before closing this session, so siblings
-            # do not launch another paid request while its exit is being recorded.
+            s.limit_until = limit_reset(quota_error)
+            # Persist the cooldown before closing the session. Connectors with shared waits
+            # need it visible before another helper starts a paid request.
             from . import session_followups
             session_followups.remember_limit(self, s, (s.limit_until or time.time()+LIMIT_WAIT_FIRST)+LIMIT_RESET_MARGIN)
             s.error = "Provider usage limit reached; waiting for reset."

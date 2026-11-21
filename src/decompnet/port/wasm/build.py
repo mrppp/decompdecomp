@@ -286,7 +286,8 @@ HEX_EXPONENT_SIGN = re.compile(r"\b(0[xX][0-9a-fA-F]*[eE])([+-])(?=[0-9A-Za-z_(]
 # An endless loop that does nothing (an idle thread's `for (;;) {}`): on the console only an interrupt switches away
 # from it, and the host switches threads only at a call, so a packed shooter's idle thread (priority 0) held the CPU
 # and its scheduler, ready at priority 14, never ran. It parks instead, as the interpreter parks `j .` (mips.c).
-EMPTY_FOREVER = re.compile(r"\b(?:for\s*\(\s*;\s*;\s*\)|while\s*\(\s*1\s*\))\s*(?:\{\s*\}|;)")
+EMPTY_FOREVER = re.compile(r"\b(?:for\s*\(\s*;\s*;\s*\)|while\s*\(\s*1\s*\))\s*(?:\{\s*\}|;)"
+                           r"|^(?P<label>[ \t]*(?P<name>[A-Za-z_]\w*)[ \t]*:\s*)goto\s+(?P=name)\s*;", re.M)
 IDLE = "void port_idle_forever(void);\n"
 
 
@@ -295,7 +296,7 @@ def ido_c(text: str) -> str:
     by a sign spaced apart, and an endless empty loop as the thread parking for good (EMPTY_FOREVER)."""
     text = HEX_EXPONENT_SIGN.sub(r"\1 \2 ", UNTYPED_DECLARATION.sub(r"\1()\2", text))
     if EMPTY_FOREVER.search(text):
-        text = IDLE + EMPTY_FOREVER.sub("for (;;) port_idle_forever();", text)
+        text = IDLE + EMPTY_FOREVER.sub(lambda loop: (loop["label"] or "") + "for (;;) port_idle_forever();", text)
     return text
 
 
@@ -343,7 +344,7 @@ def _defines_left_out(path: Path, leave_out) -> bool:
 EMPTY_UNIT = "port_no_game_c.c"
 
 
-def gather(repo: Path, out: Path, leave_out=(), function_headers=None) -> dict[str, Path]:
+def gather(repo: Path, out: Path, leave_out=(), function_headers=None, *, ensure_host_import=False) -> dict[str, Path]:
     """The C the build compiles, in out/src (one file per function, the shared header included) and out/include.
     `leave_out`: more matched files to leave out than exclude.txt names (play.library). `function_headers`: the
     project's own {function: part} (play.function_headers), over the save's, which an older save lacks. Returns
@@ -376,7 +377,7 @@ def gather(repo: Path, out: Path, leave_out=(), function_headers=None) -> dict[s
         _write(out / "src" / name, big_endian_bitfields(ido_c(text)))
     # By name in any case: on a case-insensitive disk (macOS, Windows) a file an old save wrote as SelectStateReset.c
     # is the one just written as selectStateReset.c, and deleting it as stale deleted that function's C
-    if not chosen:  # a game with no C yet: N64Recomp's C runs every function, and the module still needs an object
+    if not chosen or ensure_host_import:  # standalone leaves may have no host imports of their own
         empty = out / "src" / EMPTY_UNIT
         # its one function (never called) uses the stack and imports one of the host's functions, so the module
         # keeps the stack pointer the host sets and is instantiated with the host's environment (host.c)
@@ -384,7 +385,7 @@ def gather(repo: Path, out: Path, leave_out=(), function_headers=None) -> dict[s
                       "void osCreateThread(int, int, int, int, int, int);\n"
                       "void port_no_game_c(void (*use)(char *)) {\n"
                       "    char buffer[16];\n    use(buffer);\n    if (!use) osCreateThread(0, 0, 0, 0, 0, 0);\n}\n")
-        chosen = {EMPTY_UNIT: empty}
+        chosen[EMPTY_UNIT] = empty
     kept = {name.casefold() for name in chosen}
     for stale in (out / "src").glob("*.c"):
         if stale.name.casefold() not in kept:
@@ -787,7 +788,7 @@ def place_all(out: Path, lls: list[Path], functions: set, zig, env: dict, log, s
 
 
 def build(repo: Path, *, console: str = "n64", log=print, steps=STEPS, leave_out=(), universal: bool = False,
-          library_c=None, library_names=None, recomp=None, function_headers=None) -> Path:
+          library_c=None, library_names=None, recomp=None, function_headers=None, ensure_host_import=False) -> Path:
     """Build the game in the save repository `repo` for the PC; returns the program (port/wasm/build/game). Only
     what changed since the last build is made again (the keys, above). `steps` are the progress bar's, when a
     caller adds its own after these (play.py); `leave_out`, library files the host provides (gather). A second
@@ -796,18 +797,19 @@ def build(repo: Path, *, console: str = "n64", log=print, steps=STEPS, leave_out
     objects kept apart from Play's so neither build undoes the other's. `library_c`: {file name: (C, flags)} of
     library functions built from ultralib's C (port/ultralib.units). `library_names`: library code's own names for
     functions with no C (renames). `recomp`: {"folder", "header"} of the console's recompiler's output, whose C the
-    host runs for functions with no C yet (port/wasm/recomp.py)."""
+    host runs for functions with no C yet (port/wasm/recomp.py). A standalone candidate comparison sets
+    `ensure_host_import` because its C can define a single leaf with no imports of its own."""
     repo = Path(repo).expanduser().resolve()
     from ...app.recompile import build_turn
     recomp_turn = build_turn(recomp["folder"], log) if recomp else nullcontext()
     with build_turn(repo / "port" / "wasm" / "build", log, resource="native port build"), recomp_turn:
         return _build(repo, console=console, log=log, steps=steps, leave_out=leave_out, universal=universal,
                       library_c=library_c or {}, library_names=library_names or {}, recomp=recomp,
-                      function_headers=function_headers)
+                      function_headers=function_headers, ensure_host_import=ensure_host_import)
 
 
 def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool = False, library_c=None,
-           library_names=None, recomp=None, function_headers=None) -> Path:
+           library_names=None, recomp=None, function_headers=None, ensure_host_import=False) -> Path:
     kit = consoles.get(console).port_kit
     if kit is None or kit.wasm is None:
         raise NetworkError(f"{consoles.get(console).name} has no WebAssembly build yet (its port kit has no host)")
@@ -826,7 +828,7 @@ def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool =
     files = _Files()
 
     log("gathering the game's C from its save")
-    sources = gather(repo, out, leave_out, function_headers)
+    sources = gather(repo, out, leave_out, function_headers, ensure_host_import=ensure_host_import)
     library = _library(out, library_c or {}, sources, log)
     manifest = json.loads((repo / "progress" / "decompdecomp.json").read_text(encoding="utf-8"))
     fixed, functions = addresses(manifest)
@@ -873,7 +875,9 @@ def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool =
     progress.start(STEPS[2])
     log("one signature per function")
     lls = sorted((out / "ll").glob("*.ll"))
-    done = _run([py, HERE / "sigs.py", out / "sigs.txt", host / "libultra.sigs", *lls], log)
+    renamed = renames(lls, fixed, library_names)
+    _write(out / "renames.txt", "".join(f"{a} {b}\n" for a, b in sorted(renamed.items())))
+    done = _run([py, HERE / "sigs.py", out / "sigs.txt", host / "libultra.sigs", out / "renames.txt", *lls], log)
     if done.returncode:
         raise NetworkError(f"reading the functions' signatures failed: {done.stderr.strip()[-400:]}")
     own = game_host(host, repo)
@@ -889,13 +893,13 @@ def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool =
                                          library_names)
     extra += interp.mips_signatures(lls, fixed, [*sorted(host.glob("*.c")), *own], library_names, left_out, replaced,
                                     interp.by_value(lls, declared=True))
-    extra = sorted({n for n in extra if n not in known})
+    extra = {renamed.get(n, n) for n in extra}
+    extra = sorted(extra.difference(known))
     if extra:
         ret, params = recomp_c.MIPS_SIGNATURE
         _write(out / "sigs.txt", (out / "sigs.txt").read_text(encoding="utf-8")
                + "".join(f"{n}\t{ret}\t{params}\n" for n in extra))
 
-    _write(out / "renames.txt", "".join(f"{a} {b}\n" for a, b in sorted(renames(lls, fixed, library_names).items())))
     progress.start(STEPS[3])
     log("placing every symbol at its console address, data big-endian")
     if failed := place_all(out, lls, set(functions), zig, env, log, progress.files):

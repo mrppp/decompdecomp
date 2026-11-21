@@ -1,7 +1,77 @@
 """Rank applicable hypotheses by observed mismatches without excluding other families."""
 
+import hashlib
+import re
+
 STRUCTURAL = ('scratch_role_reuse','scalar_storage_reuse','row_number_staging','explicit_loop_backedge','integer_array_pointer_phase','inferred_record_layout','scalar_normalization_scope')
-GUARDED = ('matched_zero_argument_call', 'zero_argument_parameter_alias', 'matched_integer_prototype', 'mips_debug_break','live_return_address','live_return_address_initializers')
+GUARDED = ('matched_zero_argument_call', 'zero_argument_parameter_alias', 'matched_integer_prototype', 'mips_debug_break','live_return_address','live_return_address_initializers', 'kmc_address_operand_order', 'kmc_float_comparison_order',
+           'callee_array_extent', 'callee_buffer_extent', 'loop_sentinel_placement')
+
+
+def four_word_transfer(instructions):
+    # Require a contiguous sequence on each base and the same values in the stores.
+    decoded = [re.fullmatch(r'\w+\s+(\$\w+),\s*(-?(?:0x[0-9a-fA-F]+|[0-9]+))\((\$\w+)\)', op.strip())
+               for op in instructions]
+    if not all(decoded):
+        return False
+    for block in (decoded[:4], decoded[4:]):
+        offsets = [int(entry[2], 16 if '0x' in entry[2] else 10) for entry in block]
+        if len({entry[3] for entry in block}) != 1 or offsets != list(range(offsets[0], offsets[0]+16, 4)):
+            return False
+    values = [entry[1] for entry in decoded[:4]]
+    return len(set(values)) == 4 and values == [entry[1] for entry in decoded[4:]]
+
+
+def instruction_rows(rows):
+    return [row for row in rows if isinstance(row, (list, tuple)) and len(row) == 3
+            and all(isinstance(cell, str) for cell in row)]
+
+
+def matching_topics(rows):
+    """Recognize narrow MIPS patterns that select an existing repair or a brief tip."""
+    def opcode(cell):
+        parts = cell.split(None, 1)
+        return parts[0] if parts else ''
+
+    rows = instruction_rows(rows)
+    target_rows = [(left, marker) for marker, left, _ in rows if left]
+    target = [(opcode(left), marker) for left, marker in target_rows]
+    changed = [(opcode(left), opcode(right)) for marker, left, right in rows if marker != ' ']
+    topics = []
+    for load, store in (('lw', 'sw'), ('lwc1', 'swc1')):
+        for i in range(len(target)-5):
+            ops, markers = zip(*target[i:i+6])
+            if (ops == (load,)*3 + (store,)*3 and any(marker != ' ' for marker in markers)
+                    and (i == 0 or target[i-1][0] != load)
+                    and (i+6 == len(target) or target[i+6][0] != store)):
+                topics.append('Grouped copies')
+                break
+        if topics:
+            break
+    if not topics:
+        for i in range(len(target)-7):
+            ops, markers = zip(*target[i:i+8])
+            if (ops in (('lw',)*4 + ('sw',)*4, ('lwc1',)*4 + ('swc1',)*4)
+                    and any(marker != ' ' for marker in markers)
+                    and four_word_transfer([text for text, _ in target_rows[i:i+8]])):
+                topics.append('Grouped copies')
+                break
+    widths = {'lb', 'lbu', 'lh', 'lhu', 'lw', 'lwc1', 'ldc1'}
+    if any(a in widths and b in widths and a != b for a, b in changed):
+        topics.append('Load width and indexing')
+    if any(a in {'jal', 'jalr'} or b in {'jal', 'jalr', 'cvt.d.s', 'cvt.s.d'} for a, b in changed):
+        topics.append('Call signatures')
+    if any(op in {'trunc.w.s', 'trunc.w.d'} and marker != ' ' for op, marker in target):
+        topics.append('Unsigned conversions')
+    return topics
+
+
+TOPIC_REPAIRS = {
+    'Grouped copies': ('global_record_copy', 'word_block_copy', 'float_record_copy'),
+    'Load width and indexing': ('field_width', 'symbol_access_width', 'pointer_byte_step', 'pointer_walk_index'),
+    'Call signatures': ('float_argument_bits', 'float_prototype', 'matched_integer_prototype', 'passthrough_argument'),
+    'Unsigned conversions': ('float_unsigned_conversion',),
+}
 
 
 def guarded_first(candidates, labels=None):
@@ -34,7 +104,7 @@ def order(families, rows):
             'split_scalar_lifetime', 'array_index_width', 'local_width', 'declaration_order')
     from . import frame_plateau
     if diagnosis['frame_only_gap'] or frame_plateau.gap(rows,'mips'):
-        preferred = ('halfword_store_normalization','spill_normalization','split_narrow_lifetime','call_return_normalization')
+        preferred = ('callee_buffer_extent','callee_array_extent','halfword_store_normalization','spill_normalization','split_narrow_lifetime','call_return_normalization')
     elif diagnosis['return_copy_rotation']:
         preferred = ('prepared_return_scope','prepared_call_scope','assigned_call_scope','call_one_shot_scope')
     elif diagnosis['register_cycles']:
@@ -103,6 +173,8 @@ def order(families, rows):
     from .snapshot_branch_repairs import missing_masks
     if missing_masks(rows):
         preferred=GUARDED+('narrow_snapshot_branches','local_width','inline_scalar_shape')+preferred
+    focused = tuple(family for topic in matching_topics(rows) for family in TOPIC_REPAIRS[topic])
+    preferred = focused + preferred
     ranked=sorted(families, key=lambda f: preferred.index(f) if f in preferred else len(preferred))
     from .trial_evidence import order as evidence_order
     return evidence_order(ranked,rows,evidence=diagnosis)
@@ -121,33 +193,57 @@ def evidence(net, function_id, agent_id):
     return []
 
 
-def remember(net, scope, family, baseline, measured):
-    # Displayed instruction identity is only advisory evidence of ineffectiveness, never proof
-    # of identical linked bytes. Errors/missing evidence do not count. Source text stays exact.
-    if not baseline or not measured or baseline.get('rows') is None or measured.get('rows') is None:
+def remember(net, fn, scope, baseline, observations):
+    """Keep distinct scored trials for this exact parent and build, across workers."""
+    if not baseline or not baseline.get('rows') or baseline.get('score') is None or not scope:
         return
-    if baseline.get('score') is None or measured.get('score') is None:
-        return
-    history=getattr(net,'_repair_effects',{})
-    net._repair_effects=history
-    key=(scope,family)
-    unchanged=(baseline['score']==measured['score'] and baseline['rows']==measured['rows'])
-    history[key]=history.get(key,0)+1 if unchanged else 0
-    while len(history)>256:
-        del history[next(iter(history))]
+    evidence = []
+    for family, source, measured in observations:
+        if (source == baseline.get('source') or not measured or measured.get('cached')
+                or not measured.get('rows') or measured.get('score') is None):
+            continue
+        if baseline.get('input_scope') and measured.get('input_scope') and baseline['input_scope'] != measured['input_scope']:
+            continue
+        same = baseline['score'] == measured['score'] and baseline['rows'] == measured['rows']
+        before = baseline.get('output_fingerprint')
+        after = measured.get('output_fingerprint')
+        if before and after:
+            same = same and before == after
+        outcome = 'same:' if same else 'changed:'
+        evidence.append((fn['id'], scope, family, outcome + hashlib.sha256(source.encode()).hexdigest(),
+                         fn['id'], scope, family, outcome + '%', 2 if same else 1))
+    if evidence:
+        from . import trial_bookkeeping
+        sql = """INSERT OR IGNORE INTO agent_family_targets (function_id,scope,family,target_hash)
+                 SELECT ?,?,?,? WHERE (SELECT COUNT(*) FROM agent_family_targets
+                   WHERE function_id=? AND scope=? AND family=? AND target_hash LIKE ?) < ?"""
+        trial_bookkeeping.submit(net.project_store(fn['project_id']), [(sql, row) for row in evidence])
 
 
-def demote(net, scope, families):
-    history=getattr(net,'_repair_effects',{})
-    return sorted(families,key=lambda family:history.get((scope,family),0)>=2)
+def no_effect(net, fn, scope):
+    """Two different measured edits with no changed output are enough to lower priority."""
+    if not scope:
+        return set()
+    from . import trial_bookkeeping
+
+    store = net.project_store(fn['project_id'])
+    trial_bookkeeping.flush(store)
+    return {row['family'] for row in store.all(
+        """SELECT family FROM agent_family_targets WHERE function_id=? AND scope=? GROUP BY family
+           HAVING SUM(target_hash LIKE 'same:%') >= 2 AND SUM(target_hash LIKE 'changed:%') = 0""",
+        fn['id'], scope)}
+
+
+def demote(net, fn, scope, families):
+    ineffective = no_effect(net, fn, scope)
+    return sorted(families, key=lambda family: family in ineffective)
 
 
 def effect_scope(net, fn, source):
     """Family demotion belongs to this exact parent, not all future source shapes."""
-    import hashlib
-
     from .agent_tokens import target_scope
-    return hashlib.sha256((target_scope(net,fn,'')+source).encode()).hexdigest()
+    key = hashlib.sha256((target_scope(net, fn, '') + source).encode()).hexdigest()
+    return 'repair-effect:' + key
 
 
 def private_abi_order(families, arch, asm, rows):

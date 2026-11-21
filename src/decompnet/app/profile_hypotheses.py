@@ -1,7 +1,96 @@
 """Rank profile hypotheses from target evidence, never from a familiar function name alone."""
 import json
+import re
+from collections import Counter
 
 from ..arch.mips_runtime import helper
+
+
+def kmc_variants(toolchain, flags, *, single_pass=False):
+    """Bounded KMC trials that change scheduling or induction-variable reduction."""
+    if toolchain != 'gcc-2.7.2-kmc':
+        return []
+    scheduling = {'-fschedule-insns', '-fschedule-insns2',
+                  '-fno-schedule-insns', '-fno-schedule-insns2'}
+    base = [flag for flag in flags if flag not in scheduling]
+    variants = []
+    if '-O1' in base:
+        variants.append([*base, '-fschedule-insns', '-fschedule-insns2'])
+        if single_pass:
+            variants.append([*base, '-fschedule-insns2'])
+    if base != flags:
+        variants.append(base)
+    if '-fno-strength-reduce' in flags:
+        variants.append([flag for flag in flags if flag != '-fno-strength-reduce'])
+    return [variant for variant in variants if variant != flags]
+
+
+def kmc_cse_address_probe(own, rows):
+    """Try disabling CSE across skipped blocks when the target reloads one address repeatedly."""
+    flags = list(own['flags'])
+    option = '-fno-cse-skip-blocks'
+    if (own['toolchain'] != 'gcc-2.7.2-kmc' or '-O2' not in flags
+            or option in flags or '-fcse-skip-blocks' in flags):
+        return None
+    high = re.compile(r'^lui\s+\$\w+,\s*%hi\(([^()]+)\)$')
+    low = re.compile(r'^addiu\s+\$\w+,\s*\$\w+,\s*%lo\(([^()]+)\)$')
+    counts = []
+    for side in (1, 2):
+        halves = [Counter(match[1] for row in rows if (match := pattern.fullmatch(row[side].strip())))
+                  for pattern in (high, low)]
+        counts.append(halves[0] & halves[1])
+    target, candidate = counts
+    if any(candidate[symbol] > 0 and count - candidate[symbol] >= 2 for symbol, count in target.items()):
+        return [*flags, option]
+    return None
+
+
+def kmc_priorities(own, assembly, rows):
+    from .allocation_evidence import diagnose
+
+    flags = list(own['flags'])
+    diagnosis = diagnose(rows)
+    changed = [right for marker, _, right in rows if marker != ' ']
+    prologue = any(marker not in {' ', 'r'} and '$sp' in (left + right)
+                   for marker, left, right in rows[:12])
+    variants = []
+    if cse := kmc_cse_address_probe(own, rows):
+        variants.append(cse)
+    if diagnosis['delay_slot'] and any(right.strip() == 'nop' for right in changed):
+        variants.append([flag for flag in flags if not re.fullmatch(r'-g[0-3]?', flag)])
+    scheduling = kmc_variants(own['toolchain'], flags, single_pass=prologue)
+    if prologue and not diagnosis['delay_slot']:
+        scheduling.sort(key=lambda variant: '-fschedule-insns2' not in variant or '-fschedule-insns' in variant)
+    for variant in scheduling:
+        restores_induction = '-fno-strength-reduce' in flags and '-fno-strength-reduce' not in variant
+        if restores_induction:
+            if re.search(r'\bmultu?\b', ' '.join(changed)) and re.search(r'\baddiu?\b', assembly):
+                variants.insert(0, variant)
+        elif prologue or diagnosis['scheduling'] or diagnosis['delay_slot']:
+            variants.append(variant)
+    return list(dict.fromkeys(tuple(variant) for variant in variants if variant != flags))
+
+
+def float_sqrt_source(own, assembly, source, name, header=''):
+    """The single-precision target can diagnose a draft's wrong sqrt spelling."""
+    if (own.get('toolchain') != 'gcc-2.7.2-kmc' or not re.search(r'\bsqrt\.s\b', assembly)
+            or re.search(r'\bjalr?\b.*\bsqrtf?\b', assembly)):
+        return None
+    from decomprepair.near_match_repairs import square_rootf
+    return square_rootf(source, name, header)
+
+
+def kmc_sqrt_probe(own, assembly, rows):
+    """Test the missing GCC square-root fallback only when the target uses hardware sqrt."""
+    if (own['toolchain'] != 'gcc-2.7.2-kmc' or '-ffast-math' in own['flags']
+            or not re.search(r'\bsqrt\.[sd]\b', assembly)
+            or re.search(r'\bjalr?\b.*\bsqrtf?\b', assembly)):
+        return None
+    extra = [right for marker, _, right in rows if marker != ' ']
+    if (any(re.match(r'c\.eq\.[sd]\b', op.strip()) for op in extra)
+            and any(re.match(r'jal\b.*\bsqrtf?\b', op.strip()) for op in extra)):
+        return [*own['flags'], '-ffast-math']
+    return None
 
 
 def prioritized(proj, fn, own):

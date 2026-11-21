@@ -64,7 +64,7 @@ def test_recovery_is_saved_before_claim_release_and_other_workers_keep_claims(ma
     options=json.loads(saved['options'])
     assert options['resume_functions']==['func_0'] and 'api_key' not in options
     assert [r['agent_id'] for r in net.store.all('SELECT agent_id FROM claims')]==[other.id]
-    assert net.store.one("SELECT COUNT(*) n FROM notes WHERE agent_id=? AND text LIKE 'Released because%'",actor.id)['n']==1
+    assert not net.store.one("SELECT 1 FROM notes WHERE agent_id=?",actor.id)
     assert net.store.one("SELECT COUNT(*) n FROM events WHERE kind='freed' AND agent_id=?",actor.id)['n']==1
     assert calls[0]=='rooms'
     assert next(i for i,c in enumerate(calls) if c.startswith('Saving recovery')) < next(i for i,c in enumerate(calls) if c.startswith('Releasing'))
@@ -124,7 +124,7 @@ def test_room_admission_stops_before_authentication_or_database_work(manager,mon
     assert response.status_code==400 and 'shutting down' in response.json()['error']
 
 
-def test_batched_shutdown_uses_the_project_owner_for_claims_and_notes(tmp_path):
+def test_batched_shutdown_uses_the_project_owner_for_claims(tmp_path):
     # Reuse the independent-file fixture without enabling a runtime storage switch.
     from tests.test_project_storage import scoped
     fixture=scoped.__wrapped__(tmp_path)
@@ -142,7 +142,7 @@ def test_batched_shutdown_uses_the_project_owner_for_claims_and_notes(tmp_path):
         for pid in (1,2):
             assert not stores[pid].one('SELECT 1 FROM claims')
             assert stores[pid].one("SELECT COUNT(*) n FROM events WHERE kind='freed'")['n']==1
-            assert stores[pid].one('SELECT COUNT(*) n FROM notes')['n']==1
+            assert not stores[pid].one('SELECT 1 FROM notes')
     finally:
         with pytest.raises(StopIteration):next(fixture)
 
@@ -209,13 +209,13 @@ def test_quit_exits_after_blocked_recovery_without_racing_a_final_folder_sync(tm
     monkeypatch.setattr(net.progress,'flush',lambda **kwargs:pytest.fail('incomplete cleanup must not race a final sync'))
     monkeypatch.setattr(window,'close_app',lambda:None)
     monkeypatch.setattr(server.wine,'stop',lambda:None)
+    deadlines = []
+    monkeypatch.setattr(server, 'exit_after', deadlines.append)
     monkeypatch.setattr(server.os,'_exit',lambda code:exited.append(code))
-    # quit_app also starts the real deadline timer (exit_after): it outlived this test's _exit stub and, minutes
-    # later, hard-exited whichever test worker it was in, which hung the parallel run.
-    monkeypatch.setattr(server,'exit_after',lambda seconds:None)
     try:
         quit_app()
         assert exited==[0] and manager._down and net.shutting_down
+        assert deadlines == [server.QUIT_DEADLINE_SECONDS]
         assert sorted(releases)==[('room-one',('POST','/collab/leave')),('room-two',('POST','/collab/leave'))]
         assert 'Deferring final progress-folder sync' in output.getvalue()
         assert 'blocked project' in output.getvalue()

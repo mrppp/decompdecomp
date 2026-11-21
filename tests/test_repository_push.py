@@ -232,3 +232,245 @@ def test_push_queue_preserves_order_and_recovers_after_failure(tmp_path):
         with pytest.raises(ValueError, match='earlier push failed'):futures[0].result(timeout=5)
         for future in futures[1:]:future.result(timeout=5)
     assert order == [0,1,2] and not repository_operations._STATES
+
+
+def incoming(remote, tmp_path):
+    other = tmp_path/'other'
+    subprocess.run(['git', 'clone', '-q', str(remote), str(other)], check=True)
+    git(other, 'config', 'user.name', 'Other')
+    git(other, 'config', 'user.email', 'other@example.invalid')
+    return other
+
+
+def test_pull_reviews_fresh_count_and_applies_only_reviewed_commits(progress, tmp_path):
+    from decompnet.app import repository_pull
+
+    net, root, remote = progress
+    git(root, 'add', '-A')
+    git(root, 'commit', '-qm', 'save fixture progress')
+    git(root, 'push', 'origin', 'HEAD')
+    before = git(root, 'rev-parse', 'HEAD')
+    other = incoming(remote, tmp_path)
+    commit(other, 'first.txt')
+    commit(other, 'second.txt')
+    git(other, 'push', 'origin', 'HEAD')
+    log = []
+    assert repository_push.status(net, 'game', str(root))['behind'] == 0
+    review = repository_pull.run(net, 'game', str(root), log.append)['pull_review']
+    assert review['count'] == 2
+    assert git(root, 'rev-parse', 'HEAD') == before
+    latest = commit(other, 'third.txt')
+    git(other, 'push', 'origin', 'HEAD')
+    with pytest.raises(NetworkError, match='changed since your review'):
+        repository_pull.run(net, 'game', str(root), log.append, review=review['token'])
+    assert git(root, 'rev-parse', 'HEAD') == before
+    review = repository_pull.run(net, 'game', str(root), log.append)['pull_review']
+    assert review['count'] == 3
+    (root/'untracked-notes.txt').write_text('local notes')
+    state = repository_pull.run(net, 'game', str(root), log.append, review=review['token'])['status']
+    assert state['head'] == latest and state['behind'] == 0
+    assert (root/'untracked-notes.txt').read_text() == 'local notes'
+    assert 'Pulled 3 commits from ' in log[-1]
+    assert repository_pull.run(net, 'game', str(root), log.append)['pull_review'] is None
+
+
+def test_pull_preserves_dirty_work_and_reports_divergence(progress, tmp_path):
+    from decompnet.app import repository_pull
+
+    net, root, remote = progress
+    git(root, 'add', '-A')
+    git(root, 'commit', '-qm', 'save fixture progress')
+    git(root, 'push', 'origin', 'HEAD')
+    other = incoming(remote, tmp_path)
+    commit(other, 'upstream.txt')
+    git(other, 'push', 'origin', 'HEAD')
+    review = repository_pull.run(net, 'game', str(root), print)['pull_review']
+    (root/'staged.txt').write_text('staged edits')
+    git(root, 'add', 'staged.txt')
+    with pytest.raises(NetworkError, match='stash tracked changes'):
+        repository_pull.run(net, 'game', str(root), print, review=review['token'])
+    git(root, 'commit', '-qm', 'local edits')
+    local = git(root, 'rev-parse', 'HEAD')
+    result = repository_pull.run(net, 'game', str(root), print)
+    review = result['pull_review']
+    assert review['count'] == 1 and review['merge']
+    assert '1 local-only commit' in result['message']
+    assert not (root/'upstream.txt').exists()
+    assert git(root, 'rev-parse', 'HEAD') == local
+
+    result = repository_pull.run(net, 'game', str(root), print, review=review['token'])
+    assert result['status']['behind'] == 0
+    assert git(root, 'rev-parse', 'HEAD^1') == local
+    assert git(root, 'rev-parse', 'HEAD^2') == git(other, 'rev-parse', 'HEAD')
+    assert git(remote, 'rev-parse', 'HEAD') == git(other, 'rev-parse', 'HEAD')
+    assert (root/'upstream.txt').exists()
+    assert (root/'staged.txt').read_text() == 'staged edits'
+
+
+def test_pull_merge_conflict_leaves_checkout_untouched(progress, tmp_path):
+    from decompnet.app import repository_pull
+
+    net, root, remote = progress
+    git(root, 'add', '-A')
+    git(root, 'commit', '-qm', 'save fixture progress')
+    git(root, 'push', 'origin', 'HEAD')
+    other = incoming(remote, tmp_path)
+    (other/'new.txt').write_text('remote version')
+    git(other, 'add', 'new.txt')
+    git(other, 'commit', '-qm', 'remote version')
+    git(other, 'push', 'origin', 'HEAD')
+    (root/'new.txt').write_text('local version')
+    git(root, 'add', 'new.txt')
+    git(root, 'commit', '-qm', 'local version')
+    local = git(root, 'rev-parse', 'HEAD')
+    before = git(root, 'status', '--porcelain')
+
+    review = repository_pull.run(net, 'game', str(root), print)['pull_review']
+    with pytest.raises(NetworkError, match='changes need manual review'):
+        repository_pull.run(net, 'game', str(root), print, review=review['token'])
+
+    assert git(root, 'rev-parse', 'HEAD') == local
+    assert git(root, 'status', '--porcelain') == before
+    assert (root/'new.txt').read_text() == 'local version'
+
+
+@pytest.mark.parametrize('different_headers', [False, True])
+def test_pull_keeps_matches_and_lower_scores_in_diverged_progress(progress, tmp_path, different_headers):
+    import json
+
+    from decompnet.app import repository_pull, repository_pull_progress, save_readme, saves
+
+    net, root, remote = progress
+    # Use a clean checkpoint with four open functions. The two branches independently
+    # promote one function, improve another, and add separate attempts.
+    manifest_path = root/saves.MANIFEST
+    manifest = json.loads(manifest_path.read_text())
+    manifest['functions'] = {}
+    manifest['layout'] = [{'name': name, 'vram': addr, 'size': 4, 'status': 'open'}
+                          for addr, name in enumerate(('f', 'g', 'h', 'i'), 4096)]
+    (root/'src/f.c').unlink()
+    progress_text, card = repository_pull_progress._report(manifest)
+    (root/'README.md').write_text('My project notes\n\n' + save_readme.block('progress', progress_text) + '\n')
+    (root/save_readme.CARD).write_text(card)
+    manifest_path.write_text(json.dumps(manifest, indent=1) + '\n')
+    git(root, 'add', '-A')
+    git(root, 'commit', '-qm', 'shared progress checkpoint')
+    git(root, 'push', 'origin', 'HEAD')
+    other = incoming(remote, tmp_path)
+
+    def progress_commit(checkout, title, records):
+        manifest_file = checkout/saves.MANIFEST
+        data = json.loads(manifest_file.read_text())
+        for name, verdict in records.items():
+            matched = verdict is None
+            entry = {'matched_by': title} if matched else {'best_score': verdict, 'best_by': title}
+            data['functions'][name] = {'vram': next(row['vram'] for row in data['layout'] if row['name'] == name), **entry}
+            source = checkout/('src' if matched else 'best')/f'{name}.c'
+            source.parent.mkdir(exist_ok=True)
+            source.write_text(f'void {name}(void) {{}} /* {title} */\n')
+        manifest_file.write_text(json.dumps(data, indent=1) + '\n')
+        progress_text, card = repository_pull_progress._report(data)
+        readme = checkout/'README.md'
+        readme.write_text(save_readme._replace(readme.read_text(), 'progress', progress_text))
+        (checkout/save_readme.CARD).write_text(card)
+        notes = checkout/saves.NOTES_FILE
+        notes.write_text(json.dumps([{'function': 'f', 'text': title}], indent=1) + '\n')
+        if title == 'remote progress':
+            evidence = {'matches': {'f': {'source_sha256': 'remote-source'}},
+                        'sources': {'remote-source': 'source snapshot'}}
+            (checkout/saves.VERIFICATION_FILE).write_text(json.dumps(evidence) + '\n')
+            if different_headers:
+                (checkout/'include/common.h').write_text('typedef long s32;\n')
+        git(checkout, 'add', '-A')
+        git(checkout, 'commit', '-qm', title)
+        return git(checkout, 'rev-parse', 'HEAD')
+
+    local = progress_commit(root, 'local progress', {'f': 1, 'g': 12, 'h': 2})
+    upstream = progress_commit(other, 'remote progress', {'f': None, 'g': 3, 'i': 9})
+    git(other, 'push', 'origin', 'HEAD')
+    review = repository_pull.run(net, 'game', str(root), print)['pull_review']
+    if different_headers:
+        with pytest.raises(NetworkError, match='changes need manual review'):
+            repository_pull.run(net, 'game', str(root), print, review=review['token'])
+        assert git(root, 'rev-parse', 'HEAD') == local
+        assert git(root, 'status', '--porcelain') == ''
+        assert 'local progress' in (root/'best/f.c').read_text()
+        return
+    result = repository_pull.run(net, 'game', str(root), print, review=review['token'])
+
+    assert 'best saved progress for 2 functions' in result['message']
+    assert git(root, 'rev-parse', 'HEAD^1') == local
+    assert git(root, 'rev-parse', 'HEAD^2') == upstream
+    assert git(root, 'status', '--porcelain') == ''
+    data = json.loads(manifest_path.read_text())['functions']
+    assert data['f']['matched_by'] == 'remote progress'
+    assert not (root/'best/f.c').exists()
+    assert 'remote progress' in (root/'src/f.c').read_text()
+    assert data['g']['best_score'] == 3
+    assert 'remote progress' in (root/'best/g.c').read_text()
+    assert set(data) == {'f', 'g', 'h', 'i'}
+    readme = (root/'README.md').read_text()
+    assert readme.startswith('My project notes\n')
+    assert '1 matching function(s), 3 best attempt(s)' in readme
+    assert '1 / 4 functions matched' in (root/save_readme.CARD).read_text()
+    assert [item['text'] for item in json.loads((root/saves.NOTES_FILE).read_text())] == ['local progress', 'remote progress']
+    proof = json.loads((root/saves.VERIFICATION_FILE).read_text())
+    assert proof['matches']['f']['source_sha256'] == 'remote-source'
+    assert proof['sources']['remote-source'] == 'source snapshot'
+
+
+def test_pull_checkpoints_autosaved_match_and_keeps_it_over_upstream_draft(progress, tmp_path):
+    import json
+
+    from decompnet.app import repository_pull, saves
+
+    net, root, remote = progress
+    base = commit(root, 'retired.txt', 'Old tracked file')
+    git(root, 'push', 'origin', 'HEAD')
+    other = incoming(remote, tmp_path)
+    (root/'retired.txt').unlink()
+    (other/'retired.txt').unlink()
+    data = json.loads((other/saves.MANIFEST).read_text())
+    data['functions']['f']['best_score'] = 1
+    (other/saves.MANIFEST).write_text(json.dumps(data) + '\n')
+    (other/'best/f.c').write_text('void f(void) { /* improved draft */ }\n')
+    git(other, 'add', '-A')
+    git(other, 'commit', '-qm', 'Improve upstream draft')
+    git(other, 'push', 'origin', 'HEAD')
+    upstream = git(other, 'rev-parse', 'HEAD')
+
+    (root/'private-notes.txt').write_text('Keep local\n')
+    review = repository_pull.run(net, 'game', str(root), print)['pull_review']
+    assert review['merge']
+    assert git(root, 'rev-parse', 'HEAD') == base
+    result = repository_pull.run(net, 'game', str(root), print, review=review['token'])
+
+    assert 'best saved progress for 1 function.' in result['message']
+    assert git(root, 'rev-parse', 'HEAD^1^') == base
+    assert git(root, 'rev-parse', 'HEAD^2') == upstream
+    assert git(remote, 'rev-parse', 'HEAD') == upstream
+    assert 'matched_by' in json.loads((root/saves.MANIFEST).read_text())['functions']['f']
+    assert (root/'src/f.c').read_text() == 'void f(void) { return; }\n'
+    assert not (root/'best/f.c').exists()
+    assert not (root/'retired.txt').exists()
+    assert git(root, 'status', '--porcelain') == '?? private-notes.txt'
+
+
+def test_pull_keeps_unrelated_tracked_edits_out_of_the_checkpoint(progress, tmp_path):
+    from decompnet.app import repository_pull
+
+    net, root, remote = progress
+    base = commit(root, 'local-notes.txt', 'Original notes')
+    git(root, 'push', 'origin', 'HEAD')
+    (root/'local-notes.txt').write_text('Edited notes')
+    other = incoming(remote, tmp_path)
+    commit(other, 'upstream.txt')
+    git(other, 'push', 'origin', 'HEAD')
+
+    review = repository_pull.run(net, 'game', str(root), print)['pull_review']
+    with pytest.raises(NetworkError, match='local-notes.txt'):
+        repository_pull.run(net, 'game', str(root), print, review=review['token'])
+
+    assert git(root, 'rev-parse', 'HEAD') == base
+    assert (root/'local-notes.txt').read_text() == 'Edited notes'
+    assert (root/'src/f.c').is_file()

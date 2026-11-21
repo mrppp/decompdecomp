@@ -13,11 +13,13 @@ from pathlib import Path
 
 from ... import compile_sessions, compile_timing, consoles, scoring
 from ...candidate_work import trial
-from ...network import MACHINE_AGENTS, Agent, Network, NetworkError, stall_line
+from ...network import MACHINE_AGENTS, Agent, Network, NetworkError, large_plateau, stall_line
 from ...release_receipts import operation as release_operation
 from ...request_timing import build as timed_build
+from ...request_timing import timed_lock
 from ...rom import match
 from ...rom.symbols import SymbolTable
+from .. import attempt_workers
 from ..function_names import canonical_source
 from .common import _AUTO_TOKEN, BATCH_INSNS
 
@@ -98,16 +100,20 @@ class JudgeMixin:
         with compile_timing.phase('link'):
             target = self._rom_target(fn)
             # the console links it (GBA: ARM/Thumb, PS3: PPC64; the rest: rom.match), against the caller's overlay (#230)
+            symbols = self.symbols(proj["id"])
             console = getattr(self, "console", None)
-            if console is None:
-                # An engine with no console connector at all (a bare Core, which tests judge with) links with the
-                # generic matcher, exactly as Console.link_function's default does.
-                from ...rom import match
 
-                res = match.link(obj, fn["name"], target, self.symbols(proj["id"]), self.reader(proj, fn))
-            else:
-                res = console(proj).link_function(obj, fn["name"], target, self.symbols(proj["id"]),
-                                                  self.reader(proj, fn))
+            def link():
+                if console is None:
+                    # An engine with no console connector at all (a bare Core, which tests judge with) links with the
+                    # generic matcher, exactly as Console.link_function's default does.
+                    from ...rom import match
+
+                    return match.link(obj, fn["name"], target, symbols, self.reader(proj, fn))
+                return console(proj).link_function(obj, fn["name"], target, symbols, self.reader(proj, fn))
+
+            res = (attempt_workers.run("rom-link", (dict(proj), dict(fn), obj, target, symbols), link)
+                   if attempt_workers.active() and "rom_offset" in fn.keys() else link())
         if diagnose is None:
             return res.candidate, res.exact if res.candidate is not None else None, res.problems
         if _search_evaluation.get():
@@ -150,6 +156,9 @@ class JudgeMixin:
             if context:checks['export']=context
         checks['instructions'] = {'exact': res.instructions_exact}
         checks['data'] = [p for p in res.problems if p.startswith('your data for ')]
+        if res.instructions_exact and getattr(res, 'data_mismatches', ()):
+            from .. import switch_tables
+            checks['jump_tables'] = switch_tables.differences(self, proj, fn, res)
         address_rows = []
         if res.linked_code is not None and res.candidate is not None and not res.problems and proj['arch'] == 'mips':
             from decomprepair.mips_addresses import aligned
@@ -265,6 +274,9 @@ class JudgeMixin:
             if held[0]["n_insns"] > BATCH_INSNS:
                 return f"Requested {count} functions; returned 1 because it exceeds the {BATCH_INSNS}-instruction batch limit. Work on the held function before claiming again.\n\n" + text
         first = held[0]
+        from ...routing_experiment import exclusive
+        if exclusive(self, proj, first['id'], agent.id):
+            return 'Routing comparison is measuring one function for this claim.\n\n' + self.claim(agent, project, first['name'], strategy)
         rows = list(held)
         if first["n_insns"] <= BATCH_INSNS and len(rows) < count:
             rows += self._batch_more(agent, proj, first, count - len(rows), strategy)
@@ -306,6 +318,8 @@ class JudgeMixin:
         out, matched = [], 0
         for name in names:
             try:
+                if self._function(name, project)['status'] == 'matched':
+                    raise NetworkError(f"{name} is already matched. Claim another function.")
                 one = self.forks.one_definition(fork, source, name, [n for n in names if n != name]) if fork else source
                 res = self.attempt(agent, name, one, project)
                 res["text"] += self.attempt_limit_note(agent, name, project)
@@ -315,32 +329,33 @@ class JudgeMixin:
             out.append(f"### {name}\n{res['text']}")
         return f"{matched} of {len(names)} matched.\n\n" + "\n\n".join(out)
 
-    def _yield_autopilot(self, function: str | None, project: str | None, *, check_cancel=None) -> None:
-        """The autopilot holds a function only while its draft compiles: an agent that wants it waits for that."""
+    def _yield_autopilot(self, function: str | None, project: str | None, *, check_cancel=None) -> bool:
+        """Wait for an autopilot draft and return whether a wait was needed."""
         # Saved verification already waited outside its verdict lock. Repeating
         # that wait here can strand the autopilot waiting to publish under it.
-        if getattr(self._compile_ahead_local, 'strict', False):return
+        if getattr(self._compile_ahead_local, 'strict', False):return False
         if not function:
-            return
+            return False
         try:
             fn = self._function(function, project)
             fid = fn["id"]
         except NetworkError:
-            return
-        for _ in range(100):
+            return False
+        for poll in range(100):
             if check_cancel is not None:check_cancel()
             held = self.project_store(fn['project_id']).one('SELECT agent_id FROM claims WHERE function_id=?', fid)
             identity = self.store.one('SELECT name FROM agents WHERE id=?', held['agent_id']) if held else None
             if not identity or identity['name'] != 'autopilot':
-                return
+                return poll > 0
             time.sleep(0.2)
+        return True
 
     def attempt(self, agent: Agent, function: str, source: str, project: str | None = None, *, publish: bool = True) -> dict:
         # The editor leaves saved-folder publication to autosave. Its judge still checks the inputs explicitly.
         with self.progress.foreground(), (nullcontext() if publish else self.progress.view()):
             fn = self._function(function, project)
             slug = self.project_store(fn['project_id']).one("SELECT slug FROM projects WHERE id=?", fn["project_id"])["slug"]
-            with self.progress.judging(slug, publish=publish):
+            with self.progress.judging(slug, publish=publish), attempt_workers.attempt(self):
                 from ...attempt_status import update
                 update('compiling', fn['name'])
                 try:
@@ -358,7 +373,7 @@ class JudgeMixin:
         proj = store.one('SELECT * FROM projects WHERE id=?', fn['project_id']) if matching and not self.progress.applying else None
         automatic = proj is not None and self.cfg(proj).get('auto_commit_matches', False)
         verdict = None
-        with self.progress._project_lock(slug):
+        with timed_lock(self.progress._project_lock(slug), 'judge_publish_lock_wait'):
             # attempt()'s judging block already read progress just before this record; a second full read here made
             # every compile check the folder twice before and once after.
             if not self.progress.applying and not getattr(self.progress.local, "judging", None):
@@ -375,7 +390,7 @@ class JudgeMixin:
 
     def _remember_search_output(self, agent, function, source, project, result):
         """Give manual/agent trials the same compact output history as local search."""
-        if result.get('score') is None:
+        if result.get('score') is None or result.get('repeat'):
             return
         fn = self._function(function, project)
         proj = self.project_row(project) if project else self.project_store(fn['project_id']).one(
@@ -386,7 +401,8 @@ class JudgeMixin:
         remember(self, agent, proj, fn, source, result['score'], output=output)
 
     def _attempt(self, agent: Agent, function: str, source: str, project: str | None = None) -> dict:
-        self._yield_autopilot(function, project)
+        if self._yield_autopilot(function, project) and self._function(function, project)['status'] == 'matched':
+            raise NetworkError(f"{function} is already matched. Call claim_function for the next function.")
         if (fork := self.fork_slug(project)):
             res = self.forks.attempt(agent, fork, function, source)
             self._remember_search_output(agent, function, source, project, res)
@@ -425,21 +441,28 @@ class JudgeMixin:
         self._record(fn, agent, score, source, self._context(fn["project_id"], fn["unit"])["version"], via="room", before_record=before_record)
 
     @release_operation("release")
-    def release(self, agent: Agent, function: str, notes: str, project: str | None = None, not_c: bool = False, claim_token: str = "") -> str:
+    def release(self, agent: Agent, function: str, notes: str, project: str | None = None, not_c: bool = False, claim_token: str = "", *, handoff=None, room_evidence=None) -> str:
         if (fork := self.fork_slug(project)):
-            return self.forks.release(agent, fork, function, notes, not_c, claim_token=claim_token)
+            return self.forks.release(agent, fork, function, notes, not_c, claim_token=claim_token, handoff=handoff,
+                                      room_evidence=room_evidence)
         link = self._link(project)
         if link is not None:
-            link.call("/collab/release", agent, function=self._function(function, project)["name"], notes=notes,
-                      not_c=not_c)
-        said = super().release(agent, function, notes, project, not_c, claim_token=claim_token)
+            from ...agent_notes import room_handoff
+
+            fn = self._function(function, project)
+            evidence = room_handoff(self.project_store(fn['project_id']), fn, agent, notes)
+            link.call("/collab/release", agent, function=fn["name"], notes=notes, not_c=not_c,
+                      note_evidence=evidence)
+        said = super().release(agent, function, notes, project, not_c, claim_token=claim_token, handoff=handoff,
+                               room_evidence=room_evidence)
         fn = self._function(function, project)
         self.rangechecks.gave_up(self.project_store(fn['project_id']).one("SELECT * FROM projects WHERE id=?", fn["project_id"]), fn)
         return said
 
     @release_operation("function", protect_new=True)
     def release_function(self, agent: Agent, function: str, notes: str, project: str | None = None,
-                         needs: str = "", not_c: bool = False, move_on: bool = False, claim_token: str = "") -> str:
+                         needs: str = "", not_c: bool = False, move_on: bool = False, claim_token: str = "", *,
+                         next_experiment=None, automatic_pivot: bool | None = None) -> str:
         """release_function as agents call it (the app's own releases and a room host's go straight to release).
         On a demo fork and a large x86 game, agents released functions seconds after claiming them, untried,
         for reasons a compile would have shown were none (12,565 releases, median 5 s after the claim): so a release
@@ -449,6 +472,10 @@ class JudgeMixin:
         A release without a compile doesn't count against the session's claims, and says so. `not_c`: the agent's
         verdict that no C makes it (Network.release), which isn't pushed back: it's a finding, not giving up, and
         it counts only once agents of two models agree."""
+        from ...search_notes import boilerplate
+
+        if boilerplate(notes):
+            notes = ''
         if move_on and not notes.strip():
             raise NetworkError("Explain what you tried and why you need to move on.")
         fn = self._function(function, project)
@@ -469,16 +496,39 @@ class JudgeMixin:
             # A small model released a function it never compiled, with move_on and notes saying "no better score
             # in 6 compiles", and those notes are what the next agent starts from. Say what the app knows.
             notes = '[Released without compiling it once; notes not checked by a compile.] ' + notes
-        said = self.release(agent, function, notes, project, not_c, claim_token=claim_token)
+        handoff = None
+        stale_handoff = False
+        if next_experiment is not None and not not_c and progress is not None:
+            from ..agent_review import StaleHandoff, prepare_experiment
+
+            slug = self.project_store(fn['project_id']).one('SELECT slug FROM projects WHERE id=?', fn['project_id'])['slug']
+            try:
+                handoff = prepare_experiment(self, agent, slug, fn, next_experiment, progress)
+            except StaleHandoff:
+                stale_handoff = True
+                findings = [next_experiment.get(field, '').strip() for field in ('tried', 'changed')]
+                notes = '\n'.join(dict.fromkeys(filter(None, [notes.strip(), *findings])))
+        said = self.release(agent, function, notes, project, not_c, claim_token=claim_token, handoff=handoff)
+        if handoff is not None:
+            said += '\nNext experiment saved with the handoff. The next claim will show it while applicable.'
+        elif stale_handoff:
+            said += '\n'
+            if notes.strip():
+                said += 'Findings saved as notes. '
+            said += 'The proposed experiment referred to a different candidate revision.'
         if not not_c and need is None and progress is not None and progress['compiles']:
             from .. import release_repairs
             slug = self.project_store(fn['project_id']).one('SELECT slug FROM projects WHERE id=?',fn['project_id'])['slug']
-            said += release_repairs.handoff(self,slug,self._function(fn['name'],slug))
+            plateau = large_plateau(fn) and progress['no_better'] >= progress['after']
+            said += release_repairs.handoff(self, slug, self._function(fn['name'], slug), plateau=plateau)
         if need is not None:
             self.wait_for(agent, fn, need)
             said += (f"\n{fn['name']} now waits for {need['name']}: it's claimed after everything else until "
                      f"{need['name']} matches, and {need['name']} goes first meanwhile.")
-            said += self._pivot(agent, project, need, fn)
+            if automatic_pivot is not False:
+                said += self._pivot(agent, project, need, fn)
+        if automatic_pivot is not None:
+            return said  # The assignment response says what comes after this release.
         if progress is not None and not progress["compiles"]:
             said += ("\nYou didn't compile it, so this release doesn't count against your session's claims: claim "
                      "another one.")
@@ -583,10 +633,10 @@ class JudgeMixin:
                 f"{stall_line(streak, after)}.")
         x86 = self.console(self.project_store(fn['project_id']).one("SELECT * FROM projects WHERE id=?", fn["project_id"])).arch == "x86"
         from .. import agent_tokens
-        source, revision = agent_tokens.candidate(self,agent,project,fn['name'])
+        source = agent_tokens.candidate(self, agent, project, fn['name'])[0] if n else None
         lines = [head,
                  f"No-improvement budget remaining: {max(0,after-streak)}/{after}; improvements reset it.",
-                 agent_tokens.next_action(self,agent,fn,source,revision),
+                 agent_tokens.next_action(self, agent, fn, source=source),
                  "Compile the next step your notes name first, and act on what the diff shows"
                  + (": a target that reads `this` or a pointer from the stack ([esp+4]) and ends in `ret N` is a "
                     "function taking it as a stack parameter (__stdcall; __cdecl with a plain `ret`), not a member "

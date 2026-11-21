@@ -62,6 +62,31 @@ def exported_source(prelude: str, include: str, source: str) -> str:
     return f'{prelude}#include "{include}"\n\n{CONTEXT_INCLUDE.sub(f"#include \"{include}\"", source.strip())}\n'
 
 
+_SPLAT_LABEL = re.compile(
+    r'^[ \t]*(nonmatching|glabel|dlabel|jlabel|alabel|ehlabel|enddlabel)[ \t]+'
+    r'([A-Za-z_.$][\w.$]*)(?=[, \t\r\n]|$)[^\n]*(?:\n|$)', re.M)
+
+
+def remove_shadowed_bss(root: Path, functions) -> None:
+    """Splat may reuse loaded code addresses as BSS labels. Keep the space and the actual text definition."""
+    bss = {}
+    labels = set()
+    for path in (root / 'asm' / 'data').rglob('*.bss.s'):
+        text = path.read_text(encoding='utf-8')
+        bss[path] = text
+        labels.update(name for directive, name in _SPLAT_LABEL.findall(text) if directive not in ('nonmatching', 'enddlabel'))
+    if not labels:
+        return
+    text_names = {fn['name'] for fn in functions} & labels
+    for path in (root / 'asm' / 'nonmatchings').rglob('*.s'):
+        text_names.update(name for directive, name in _SPLAT_LABEL.findall(path.read_text(encoding='utf-8'))
+                          if name in labels and directive not in ('nonmatching', 'enddlabel'))
+    for path, text in bss.items():
+        updated = _SPLAT_LABEL.sub(lambda hit: '' if hit[2] in text_names else hit[0], text)
+        if updated != text:
+            path.write_text(updated, encoding='utf-8')
+
+
 def _first_address(path: Path) -> tuple[int | None, int | None]:
     """(ROM offset, VRAM) of the first instruction or data word in a splat assembly file."""
     text = path.read_text(errors="replace", encoding="utf-8")
@@ -74,12 +99,14 @@ def _first_address(path: Path) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _symbol_lines(net, proj) -> list[str]:
+def _symbol_lines(net, proj, rows=None, excluded=()) -> list[str]:
     """symbol_addrs.txt entries for every function and every named symbol, so splat writes the project's names. A
     function's size too: spimdisasm ends a function with a switch at its first return, and the import put the cases
     back (split.merge_switch_cases: a PSP game's GCC and EE-GCC 3.2 load jump tables that way), so splat must too."""
     syms = net.symbols(proj["id"])
-    funcs = {r["vram"]: r for r in net.project_store(proj['id']).all("SELECT name, vram, size FROM functions WHERE project_id=?", proj["id"])}
+    if rows is None:
+        rows = net.project_store(proj['id']).all("SELECT name, vram, size FROM functions WHERE project_id=?", proj["id"])
+    funcs = {r["vram"]: r for r in rows}
     lines = []
     for vram, r in sorted(funcs.items()):
         lines.append(f"{r['name']} = 0x{vram:08X}; // type:func size:0x{r['size']:X}")
@@ -87,7 +114,7 @@ def _symbol_lines(net, proj) -> list[str]:
     # two names). The table's own name for the address labels it; the other names still link, from build.json.
     named = set(funcs)
     for s in sorted(syms.by_name.values(), key=lambda s: (s.address, s.name != syms.name_at(s.address)[0], s.name)):
-        if s.address in named or AUTO_NAME.match(s.name):
+        if s.name in excluded or s.address in named or AUTO_NAME.match(s.name):
             continue
         named.add(s.address)
         lines.append(f"{s.name} = 0x{s.address:08X};")
@@ -128,6 +155,10 @@ def _export_segments(config: dict, functions) -> dict:
     """
     from .reviewed import extend_config
     config = extend_config(config, functions)
+    # Splat uses the function sizes we supply to keep switch tails in text. Its BSS scan
+    # also uses those sizes to insert padding, which can assert when a sized symbol
+    # overlaps the end of a BSS subsection. Let the configured BSS boundaries size it.
+    config.setdefault('options', {})['create_bss_pads'] = False
     for segment in _segments(config):
         if segment.get('type') != 'code' or 'vram' not in segment:
             continue
@@ -294,17 +325,24 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     from ..consoles import EXPORT
 
     proj = net._project(slug)
-    if net.project_store(proj['id']).one("SELECT vram FROM functions WHERE project_id=? GROUP BY vram HAVING COUNT(*)>1 LIMIT 1", proj["id"]):
+    cfg = net.cfg(proj)
+    store = net.project_store(proj['id'])
+    population = store.all('SELECT name,vram,size,rom_offset FROM functions WHERE project_id=?', proj['id'])
+    banks = cfg.get('donor_overlays') or {}
+    native_end = min(banks.values(), default=None)
+    excluded = ({r['name'] for r in population if r['rom_offset'] is not None and r['rom_offset'] >= native_end}
+                if native_end is not None else set())
+    population = [row for row in population if row['name'] not in excluded]
+    if len({row['vram'] for row in population}) != len(population):
         raise ExportError("Rebuildable export does not yet support overlapping overlay banks. "
                           "Your matches remain saved; continue working in the app until bank-aware export is available.")
-    cfg = net.cfg(proj)
     if EXPORT not in console.features:
         raise ExportError(f"exporting a rebuildable project isn't supported for {console.name or 'this console'} yet")
     work = Path(proj["root"])
     configs = sorted(work.glob("*.yaml"))
     if not configs:
         raise ExportError("this project has no splat configuration to export from")
-    image_name = cfg["rom"]["file"]
+    image_name = cfg["rom"].get("donor_analysis_base", cfg["rom"]["file"])
     image = (work / image_name).read_bytes()
 
     if out.exists():
@@ -321,13 +359,13 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     progress_step(log, 1, "Extracting assembly and data")
     log("writing the assembly with the project's names (splat)")
     split_config = yaml.safe_load(configs[0].read_text(encoding='utf-8'))
-    known = net.project_store(proj['id']).all('SELECT vram,size FROM functions WHERE project_id=?', proj['id'])
+    known = population
     (out / 'splat.yaml').write_text(yaml.safe_dump(_export_segments(split_config, known), sort_keys=False), encoding='utf-8')
     shutil.copyfile(work / image_name, out / image_name)
     for extra in ("reloc_addrs.txt",):
         if (work / extra).exists():
             shutil.copyfile(work / extra, out / extra)
-    (out / "symbol_addrs.txt").write_text("\n".join(_symbol_lines(net, proj)) + "\n", encoding="utf-8")
+    (out / "symbol_addrs.txt").write_text("\n".join(_symbol_lines(net, proj, population, excluded)) + "\n", encoding="utf-8")
     res = run([console_python(), "-m", "splat", "split", "splat.yaml"], out, log)
     if res.returncode != 0:
         raise ExportError("splat failed:\n" + (res.stdout + res.stderr)[-1500:])
@@ -337,7 +375,8 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
         ld.rename(out / f"splat-{ld.name}")
 
     # 2. which function is where, and which are matched
-    rows = {r["vram"]: r for r in net.project_store(proj['id']).all("SELECT * FROM functions WHERE project_id=?", proj["id"])}
+    rows = {r["vram"]: r for r in net.project_store(proj['id']).all("SELECT * FROM functions WHERE project_id=?", proj["id"])
+            if r["name"] not in excluded}
     sources = sources or {}
     rows = {address: dict(row) | ({"matched_source": sources[row['id']]['source'], "status": "matched"}
                                 if row['id'] in sources else {}) for address, row in rows.items()}
@@ -397,9 +436,11 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
                 f["kind"] = "asm"
                 continue
             from ..app.compiler_context import verified
+            from ..app.donor_unit import is_unit
+            donor_unit = is_unit(hdr, proj)
             single = _single_definition(compiled.obj, row["name"])
-            predecessor = None if single else verified(net, proj, row, compiled.obj)
-            if not single and not predecessor:
+            predecessor = None if single or donor_unit else verified(net, proj, row, compiled.obj)
+            if not single and not predecessor and not donor_unit:
                 as_fallback.append((f["name"], "its C also defines other functions; split their bodies into separate source files"))
                 f["kind"] = "asm"
                 continue
@@ -409,7 +450,7 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
                 f["kind"] = "asm"
                 continue
             bases, problem = _section_bases(linked.placements)
-            if problem or predecessor:
+            if problem or predecessor or donor_unit:
                 # Recompile and judge this entry every build; the builder can retain
                 # scattered original pools without pretending they share one base.
                 from .export_entry import object_for
@@ -427,6 +468,39 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
             f["src"] = src.relative_to(out).as_posix()
             f["obj"] = f"build/src/{f['seg']}/{f['name']}.o"
             private += [(f["obj"], section, base) for section, base in bases.items()]
+
+    overlays = []
+    all_rows = store.all('SELECT * FROM functions WHERE project_id=? ORDER BY rom_offset', proj['id']) if excluded else ()
+    overlay_rows = (dict(row) | ({'matched_source': sources[row['id']]['source'], 'status': 'matched'}
+                                 if row['id'] in sources else {})
+                    for row in all_rows if row['name'] in excluded)
+    overlay_rows = [row for row in overlay_rows if row['status'] == 'matched' and row['matched_source']]
+    with export_workers.ordered(compile_match, overlay_rows, check) as results:
+        for row, unit, hdr, compiled, error in results:
+            check()
+            target = net._rom_target(row)
+            placement = console.export_overlay(target)
+            if placement is None:
+                as_fallback.append((row['name'], 'Overlay placement needs a supported relocation table. Reimport the ROM.'))
+                continue
+            if error is not None or not compiled.ok:
+                as_fallback.append((row['name'], f'overlay C could not be compiled: {error or 'compilation failed'}'))
+                continue
+            linked = console.link_function(compiled.obj, row['name'], target, net.symbols(proj['id']), net.reader(proj, row))
+            if not linked.exact:
+                as_fallback.append((row['name'], 'overlay C no longer matches its bytes and relocation bindings'))
+                continue
+            src = out / 'src' / f"uso_{placement['section']:X}" / f"{row['name']}.{'cpp' if compiled.language == 'c++' else 'c'}"
+            src.parent.mkdir(parents=True, exist_ok=True)
+            compiler = compiler_for(cfg, row['vram'], row)
+            prelude = toolchains.source_prelude(toolchains.get(compiler['toolchain']), row['matched_source'] + "\n" + hdr)
+            include = f'common_{unit}.h' if unit else 'common.h'
+            src.write_text(exported_source(prelude, include, row['matched_source']), encoding='utf-8')
+            overlays.append({'name': row['name'], 'c': src.relative_to(out).as_posix(),
+                             'compiler': compiler, 'placement': placement})
+    if excluded:
+        log(f'Rebuilding {len(overlays)} overlay functions from C. '
+            f'The other {len(excluded) - len(overlays)} retain their original cartridge text.')
 
     progress_step(log, 3, 'Writing data and layout')
 
@@ -487,7 +561,7 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     data_c = _data_in_c(net, proj, out, layout, objects, image, cfg, log)
     defined.update(d["name"] for d in data_c)
     syms = net.symbols(proj["id"])
-    absolute = {s.name: s.address for s in syms.by_name.values() if s.name not in defined}
+    absolute = {s.name: s.address for s in syms.by_name.values() if s.name not in defined and s.name not in excluded}
     # Startup assembly can retain an import-time alias after a discovered function receives an address-based
     # name. Keep those known addresses too; otherwise its named jump target is undefined in the standalone link.
     for name, address in split.named_symbols(work).items():
@@ -542,7 +616,7 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
         "big_endian": console.big_endian, "asm_preamble": console.asm_preamble,
         "as_flags": [*console.as_flags, "-G0", "-no-pad-sections", "-I", "include"],
         "ld_flags": ["-EB" if console.big_endian else "-EL", "--no-check-sections"],
-        "assembly": objects, "segments": layout, "functions": fn_json,
+        "assembly": objects, "segments": layout, "functions": fn_json, "overlay_functions": overlays, "overlay_total": len(excluded),
         "data": [{k: d[k] for k in ("name", "src", "obj", "vram", "size")} for d in data_c],
         # every named datum's address, for the judge steps (export_entry, `build.py check`): names the assembly
         # defines aren't in "symbols" (the link has them), and a function's C that reads one couldn't be judged
@@ -550,10 +624,10 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
                    if s.kind != "func" and not AUTO_NAME.match(s.name)},
         "symbols": {k: v for k, v in sorted(absolute.items(), key=lambda kv: kv[1])},
     }
-    # An expanded analysis image is not the cartridge. Rebuild RNC literals from linked code before reporting
-    # an original-ROM match; both the expanded image and the final cartridge must pass their comparisons.
+    # Verify linked program bytes against the compressed cartridge members before reporting an original-ROM match.
     original_name = cfg["rom"].get("program")
     if console.id == "n64" and original_name and original_name != image_name:
+        from ..consoles.n64 import boot_gzip
         from ..consoles.n64.code import unpack_code
 
         original = (work / original_name).read_bytes()
@@ -564,11 +638,16 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
                 raise ExportError("compressed analysis export needs a verified reconstruction for every block")
             blocks.append({"rom": offset, "analysis": cursor, "size": len(payload)})
             cursor += len(payload)
+        gzip_boot_ranges = []
         if not blocks:
-            raise ExportError("expanded analysis image has no verified compressed-block reconstruction")
+            gzip_boot_ranges = [entry for entry in split.code_ranges(configs[0]) if entry[1] <= len(original)]
+            if not boot_gzip.verify_analysis(original, image, gzip_boot_ranges):
+                raise ExportError("expanded analysis image has no verified compressed-block reconstruction")
         cartridge = f"baserom.cartridge{ext}"
         (out / cartridge).write_bytes(original)
         build["cartridge"] = {"image": cartridge, "sha1": hashlib.sha1(original).hexdigest(), "blocks": blocks}
+        if gzip_boot_ranges:
+            build["cartridge"]["gzip_boot_ranges"] = gzip_boot_ranges
     (out / "build.json").write_text(json.dumps(build, indent=1), encoding="utf-8")
     shutil.copyfile(Path(__file__).with_name("export_build.py"), out / "build.py")
     shutil.copyfile(Path(__file__).with_name("export_entry.py"), out / "export_entry.py")
@@ -581,8 +660,14 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
         units_json.append(unit)
     (out / "objdiff.json").write_text(json.dumps({"build_base": False, "build_target": False, "units": units_json}, indent=2),
                                       encoding="utf-8")
-    matched = sum(1 for f in functions if f["kind"] == "c")
-    _write_docs(out, proj["name"], console.name, base, matched, len(functions), as_fallback)
+    matched = sum(1 for f in functions if f["kind"] == "c") + len(overlays)
+    total_functions = len(functions) + len(excluded)
+    _write_docs(out, proj["name"], console.name, base, matched, total_functions, as_fallback)
+    if overlays:
+        with (out / 'README.md').open('a', encoding='utf-8') as readme:
+            readme.write("\nMatched USO text is compiled and checked against the original relocation bindings. "
+                         "The build writes the verified bytes into the original raw or Yay0 text section. "
+                         "Unmatched text and the original relocation and data sections remain cartridge inputs.\n")
     if cartridge := build.get("cartridge"):
         readme = out / "README.md"
         text = readme.read_text(encoding="utf-8")
@@ -605,7 +690,7 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     identical = proc.returncode == 0 and "identical" in proc.stdout
     if not identical:
         log((proc.stdout + proc.stderr)[-3000:])
-    return {"path": str(out), "identical": identical, "matched": matched, "functions": len(functions),
+    return {"path": str(out), "identical": identical, "matched": matched, "functions": total_functions,
             "data": len(data_c),
             "fallback": as_fallback, "log": (proc.stdout + proc.stderr)[-3000:]}
 

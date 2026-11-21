@@ -10,9 +10,14 @@ function element(){return {open:false,disabled:false,hidden:false,textContent:''
   setAttribute(){},replaceChildren(...c){this.children=c;}};}
 function setup(){
   const nodes=new Map(),calls=[],bodies=[];
+  const values={App:'app',Window:'window',Web:'web',WebSimd:'simd',Ios:'ios',Miyoo:'miyoo',SteamDeck:'steamdeck'};
   const c=vm.createContext({console,Map,Promise,Error,Number,encodeURIComponent,S:{slug:'a'},
-    $:id=>{if(!nodes.has(id))nodes.set(id,element());return nodes.get(id);},document:{createElement:element,addEventListener(k,f){c.docListeners[k]=f;}},docListeners:{},
-    api(url,opts){calls.push(url);bodies.push(opts&&opts.body);return c.reply(url,opts);},reply:async()=>({})});
+    $:id=>{if(!nodes.has(id))nodes.set(id,{...element(),value:values[id.slice(10)]});return nodes.get(id);},document:{createElement:element,createDocumentFragment:element,addEventListener(k,f){c.docListeners[k]=f;}},docListeners:{},
+    api(url,opts){
+      if(url.startsWith('/api/recompile?'))return c.recompileStatus(url);
+      if(url.startsWith('/api/port-export-options?'))return c.exportOptions(url);
+      calls.push(url);bodies.push(opts&&opts.body);return c.reply(url,opts);
+    },recompileStatus:async()=>({recomp_available:false}),exportOptions:async()=>({available:true,mac:true,targets:[]}),reply:async()=>({})});
   vm.runInContext(base.slice(base.indexOf('function beginWork('),base.indexOf('function updateWorkProgress(')),c);
   vm.runInContext(base.slice(base.indexOf('function showJobError('),base.indexOf('/*',base.indexOf('function showJobError('))),c);
   vm.runInContext(source,c);
@@ -33,11 +38,11 @@ const report={console:'Nintendo 64',kit:{name:'libultraship and Torch',summary:'
    await t.run('loadPortReadiness()');
    t.c.projectReport=await t.c.reply();
    const steps=t.run('portSteps(projectReport)');
-   for(const index of [2,4,5,8,9]){
+   for(const index of [0,3,5,6,9,10]){
      assert.equal(steps[index].pct,null);
      assert.equal(steps[index].buttons.length,0,'unsupported project actions are not offered');
    }
-   assert.match(steps[0].detail,/3 matched without readable C/);
+   assert.match(steps[1].detail,/3 matched without readable C/);
    const rows=t.c.$('portFacts').children.map(r=>r.children[0].textContent+r.children[1].textContent);
    assert.ok(rows.some(r=>r.includes('Read project data in its own source files')));
    assert.ok(rows.some(r=>r.includes('4 unit files read, 2 paths inferred')));
@@ -47,8 +52,8 @@ const report={console:'Nintendo 64',kit:{name:'libultraship and Torch',summary:'
    t.run('renderPortReadiness(projectReport)');
    assert.notEqual(t.c.$('portOverall').textContent,'100%','unavailable build steps cannot show a finished port');
    t.c.reply=async()=>report;await t.run('loadPortReadiness()');
-   assert.ok(t.run('portSteps(projectReport).length')===10);
-   assert.ok(t.c.$('portSteps').children[9].children[1].children.some(c=>c.children&&c.children.includes(t.c.$('portPlay'))),
+   assert.ok(t.run('portSteps(projectReport).length')===11);
+   assert.ok(t.c.$('portSteps').children[10].children[1].children.some(c=>c.children&&c.children.includes(t.c.$('portPlay'))),
      'returning to a ROM report restores its supported controls');
   }
   {const t=setup();await t.run('loadPortReadiness()');assert.equal(t.calls.length,0,'another tab asks for nothing');}
@@ -57,10 +62,10 @@ const report={console:'Nintendo 64',kit:{name:'libultraship and Torch',summary:'
    assert.deepEqual(t.calls,['/api/port-readiness?slug=a']);
    assert.equal(t.c.$('portBlockers').children.length,2);
    const steps=t.c.$('portSteps').children;
-   assert.equal(steps.length,10,'ten steps');
-   assert.match(steps[0].className,/part/);assert.equal(steps[0].children[1].children[0].children[1].textContent,'57%');
-   assert.ok(steps[9].children[1].children.some(c=>c.children&&c.children.includes(t.c.$('portPlay'))),'Play sits in its step');
-   assert.equal(steps[6].children[1].children[0].children[1].textContent,'to do','calls: not built yet');
+   assert.equal(steps.length,11,'eleven steps');
+   assert.match(steps[1].className,/part/);assert.equal(steps[1].children[1].children[0].children[1].textContent,'57%');
+   assert.ok(steps[10].children[1].children.some(c=>c.children&&c.children.includes(t.c.$('portPlay'))),'Play sits in its step');
+   assert.equal(steps[7].children[1].children[0].children[1].textContent,'to do','calls: not built yet');
    assert.match(t.c.$('portOverall').textContent,/^\d+%$/);
    assert.match(t.c.$('portKit').textContent,/libultraship and Torch/);
    assert.ok(t.c.$('portFacts').children.some(r=>r.children[1].textContent.includes('F3DEX.Rej 2.05')));
@@ -128,7 +133,7 @@ const report={console:'Nintendo 64',kit:{name:'libultraship and Torch',summary:'
    const rows=t.c.$('portFacts').children.map(r=>r.children[0].textContent+r.children[1].textContent);
    assert.ok(rows.some(r=>r.startsWith('Matched but suspicious: 3 calls in 2 functions disagree')),rows.join('\n'));
    assert.ok(rows.some(r=>r.includes('declares void')&&r.includes('start_yaw \u2192 wrapper')));
-   const step=t.c.$('portSteps').children[6];
+   const step=t.c.$('portSteps').children[7];
    assert.equal(step.children[1].children[0].children[0].textContent,'Calls agree with what they call');
    assert.equal(step.children[1].children[0].children[1].textContent,'71%','5 of 7 functions without a disagreeing call');}
   {const t=setup();t.c.S.tab='porting';const follow=deferred(),cancels=[];t.c.followJob=()=>follow.promise;t.c.updateWorkProgress=()=>{};
@@ -139,7 +144,7 @@ const report={console:'Nintendo 64',kit:{name:'libultraship and Torch',summary:'
    const rows=t.c.$('portFacts').children.map(r=>r.children[0].textContent+r.children[1].textContent);
    assert.ok(rows.some(r=>r.startsWith('Behaves like the original: 1,200 the same, 3 differ, 800 not reached, 2 couldn')),rows.join('\n'));
    assert.ok(rows.some(r=>r.includes('func_8001C444: $v0: recompiled 00000800, decompiled 00000000; ...')));
-   const step=t.c.$('portSteps').children[7].children[1];
+   const step=t.c.$('portSteps').children[8].children[1];
    assert.equal(step.children[0].children[0].textContent,'Behaves like the original');
    assert.equal(step.children[0].children[1].textContent,'100%','1,200 of 1,203 compared');
    assert.ok(step.children.some(c=>c.children&&c.children.includes(t.c.$('portBehaviour'))),'Check behaviour sits in its step');
@@ -156,22 +161,91 @@ const report={console:'Nintendo 64',kit:{name:'libultraship and Torch',summary:'
    await t.run('loadPortReadiness()');await Promise.resolve();await Promise.resolve();
    assert.deepEqual(followed,['b9'],'a check running elsewhere is followed, not started again');
    assert.ok(!t.calls.includes('/api/behaviour-check'));}
-  {const t=setup();t.c.S.tab='porting';const followed=[];t.c.followJob=async(job)=>{followed.push(job);};
-   t.c.reply=async url=>url==='/api/recompile'?{job:'rc1'}:({...report,recomp_available:true,recomp:{functions:2125,found:12,
-     stubs:14,runtime:4,errors:0,files:42,at:1,folder:'/p/build/recomp',stub_examples:['func_8008AE70 (cop0)'],
+  {const t=setup();t.c.S.tab='porting';
+   t.c.reply=async()=>({...report,recomp_available:true,recomp:{functions:2125,found:12,
+     succeeded:2100,total:2137,stubs:14,runtime:4,errors:1,error_examples:['generated.c: invalid operand'],files:42,at:1,folder:'/p/build/recomp',stub_examples:['func_8008AE70 (cop0)'],
      found_examples:['func_80000400 (the ROM\'s entry point)']}});
    await t.run('loadPortReadiness()');
    const rows=t.c.$('portFacts').children.map(r=>r.children[0].textContent+r.children[1].textContent);
-   assert.ok(rows.some(r=>r.startsWith('Recompiled (N64Recomp): 2,125 of the split\'s functions and 12 it doesn\'t list, as C in 42 files: 14 set aside as stubs, 4 for the runtime to provide, the C compiles')),rows.join('\n'));
+   assert.ok(rows.some(r=>r.startsWith('Recompiled (N64Recomp): 2,125 of the split\'s functions and 12 it doesn\'t list, as C in 42 files: 14 set aside as stubs, 4 for the runtime to provide, 1 compile error')),rows.join('\n'));
    assert.ok(rows.some(r=>r.includes('set aside')&&r.includes('func_8008AE70 (cop0), ...')));
-   const play=t.c.$('portSteps').children[9].children[1];
-   assert.ok(play.children.some(c=>c.children&&c.children.includes(t.c.$('portRecompile'))),'Recompile sits in the Play step');
-   t.calls.length=0;await t.run('recompileGame()');
-   assert.deepEqual(t.calls,['/api/recompile','/api/port-readiness?slug=a']);assert.deepEqual(followed,['rc1']);
-   assert.equal(t.c.$('portRecompile').disabled,false,'the button comes back');}
-  {const t=setup();t.c.S.tab='porting';t.c.reply=async()=>report;await t.run('loadPortReadiness()');
-   const play=t.c.$('portSteps').children[9].children[1];
-   assert.ok(!play.children.some(c=>c.children&&c.children.includes(t.c.$('portRecompile'))),'no recompiler: no button');}
+   assert.ok(rows.some(r=>r.includes('generated.c: invalid operand')));
+   const play=t.c.$('portSteps').children[10].children[1];
+   const buttons=play.children.flatMap(c=>c.children||[]);
+   assert.ok(buttons.includes(t.c.$('portPlay')),'Play stays in the Play step');
+   assert.ok(!buttons.includes(t.c.$('portRecompile')),'the diagnostic has its own step');
+   const [first, second]=t.c.$('portSteps').children;
+   assert.equal(first.children[0].textContent,'1');
+   assert.equal(first.children[1].children[0].children[0].textContent,'Recompile It');
+   assert.equal(first.children[1].children[0].children[1].textContent,'98%');
+   assert.equal(first.children[1].children[1].children[0].style.width,'98%');
+   assert.equal(first.children[1].children[2].textContent,'2,100 of 2,137 functions recompiled successfully');
+   assert.match(first.children[1].children[3].textContent,/functions the split missed/);
+   assert.match(first.children[1].children[4].textContent,/12 functions found outside the split/);
+   assert.ok(first.children[1].children.some(row=>row.children.includes(t.c.$('portRecompile'))));
+   assert.equal(second.children[0].textContent,'2');
+   assert.equal(second.children[1].children[0].children[0].textContent,"The game's code in C");
+   const html=fs.readFileSync(path.join(__dirname,'../src/decompnet/app/static/index.html'),'utf8');
+   assert.match(html,/type="checkbox" id="portExportApp"[^>]*><span>Standalone app \(opens in your browser\)/);
+   assert.match(html,/type="checkbox" id="portExportWindow"[^>]*><span>Standalone app \(opens in its own Mac window via SDL3\)/);
+   assert.match(html,/id="portRecompile"[^>]*>Run N64Recomp/);}
+  {const t=setup();t.c.S.tab='porting';
+   const discoveries=Array.from({length:13},(_,i)=>({name:`func_${i}`,vram:0x80001000+i*16,rom:0x1000+i*16,
+     size:12,unit:'main',why:'called from entry',blocked:i===1?'Overlaps the current split.':''}));
+   const result={...report,recomp_available:true,recomp:{at:42,functions:7,found:13,files:1,stubs:0,runtime:0,errors:0,
+     stub_examples:[],found_examples:[],discoveries}};
+   const pending=deferred();
+   t.c.reply=async(url)=>url==='/api/recompile'?{job:'add1'}:result;
+   t.c.followJob=()=>pending.promise;
+   t.c.recompileStatus=async url=>url.includes('preview=')?{assembly:'80001000  jr $ra'}:{recomp_available:true};
+   await t.run('loadPortReadiness()');
+   assert.equal(t.c.$('portDiscoveries').hidden,false);
+   assert.match(t.c.$('portSteps').children[0].children[1].children[2].textContent,/again to measure/);
+   const list=t.c.$('portDiscoveryList');
+   assert.equal(list.children[0].children.length,13,'all discoveries are available for review');
+   const [first, second]=list.children[0].children;
+   const check=first.children[0].children[0], preview=first.children[3];
+   preview.open=true;preview.ontoggle();
+   for(let i=0;i<8;i++)await Promise.resolve();
+   assert.match(preview.children[1].textContent,/jr \$ra/);
+   assert.equal(second.children[0].children[0].disabled,true);
+   assert.match(second.children[2].textContent,/Overlaps/);
+   check.checked=true;check.onchange();
+   assert.equal(t.c.$('portDiscoveryAdd').disabled,false);
+   const adding=t.c.$('portDiscoveryAdd').onclick();
+   assert.equal(t.c.$('portDiscoveryAdd').disabled,true,'duplicate confirmation is disabled immediately');
+   assert.deepEqual(JSON.parse(JSON.stringify(t.bodies.at(-1))),{slug:'a',revision:42,addresses:[0x80001000]});
+   discoveries[0]={...discoveries[0],blocked:'Already in the split as func_0.',added:'func_0'};
+   pending.resolve({added:[{name:'func_0'}]});await adding;
+   assert.equal(t.c.$('portDiscoveryAdd').disabled,true,'added rows cannot be selected again');
+   assert.match(list.children[0].children[0].children[2].textContent,/Already in the split/);}
+  {const t=setup(),ready=deferred(),follow=deferred(),stopped=[];
+   t.c.S.tab='porting';t.c.followJob=()=>follow.promise;
+   t.c.updateWorkProgress=(log,progress)=>{log.seen=progress;};
+   t.c.recompileStatus=async()=>({recomp_available:true,job:{id:'rc1',progress:{phase:'Translating'}}});
+   t.c.reply=async(url,opts)=>{
+     if(url==='/api/job/cancel'){stopped.push(opts.body.id);return {};}
+     return ready.promise;
+   };
+   const loading=t.run('loadPortReadiness()');for(let i=0;i<8;i++)await Promise.resolve();
+   assert.equal(t.c.$('portRecompile').disabled,true,'reattaches before the full readiness scan');
+   assert.equal(t.c.$('portRecompileLog').seen.phase,'Translating');
+   assert.equal(t.c.$('portSteps').children.length,1,'the diagnostic is visible while readiness loads');
+   await t.run('stopRecompile()');assert.deepEqual(stopped,['rc1']);
+   assert.ok(!t.calls.includes('/api/recompile'),'reattaching never starts another job');
+   follow.reject(Error('Recompilation stopped.'));
+   ready.resolve({...report,recomp_available:true});await loading;
+   assert.match(t.c.$('portRecompileLog')._errorBox.textContent,/Recompilation stopped/);}
+  {const t=setup(),start=deferred(),follow=deferred();
+   t.c.S.tab='porting';t.c.followJob=()=>follow.promise;
+   t.c.reply=async(url)=>url==='/api/recompile'?start.promise:({...report,recomp_available:true});
+   const running=t.run('runRecompile()');
+   assert.equal(t.c.$('portRecompile').disabled,true,'the first click disables start immediately');
+   await t.run('runRecompile()');
+   assert.deepEqual(t.calls,['/api/recompile']);
+   start.resolve({job:'rc2'});follow.resolve({functions:7});await running;
+   assert.equal(t.c.$('portRecompile').disabled,false);
+   assert.ok(t.calls.includes('/api/port-readiness?slug=a'),'the results are refreshed after compilation');}
   {const t=setup();t.c.S.tab='porting';const followed=[];t.c.followJob=async(job)=>{followed.push(job);};
    t.c.reply=async url=>url==='/api/rename-calls'?{job:'r1'}:report;
    await t.run('fixRenamedCalls()');
@@ -200,7 +274,7 @@ const report={console:'Nintendo 64',kit:{name:'libultraship and Torch',summary:'
    assert.equal(t.c.$('portStop').hidden,false);assert.equal(t.c.$('portStop').textContent,'Stop the build');
    await t.run('playGame()');assert.deepEqual(t.calls.filter(u=>u==='/api/play'),['/api/play'],'a second click starts nothing');
    await t.run('loadPortReadiness()');
-   const body=t.c.$('portSteps').children[9].children[1].children;
+   const body=t.c.$('portSteps').children[10].children[1].children;
    assert.ok(body.includes(log._workStatus)&&body.includes(log._workBar)&&body.includes(log),'status, bar and log move together');
    assert.ok(body.indexOf(log._workBar)<body.indexOf(log));
    await t.run('stopGame()');assert.deepEqual(cancels,['p3'],'Stop cancels the build');
@@ -218,88 +292,84 @@ const report={console:'Nintendo 64',kit:{name:'libultraship and Torch',summary:'
    t.c.reply=async()=>({...report,play:{job:null,url:'http://127.0.0.1:6/'}});
    await t.run('loadPortReadiness()');assert.equal(t.c.$('portStop').hidden,false,'a running game can be stopped');
    assert.equal(t.c.$('portStop').textContent,'Stop the game');}
-  {// Export: either kind is a job with the build's bar; the menu closes; Show the folder opens what was made
-   const t=setup(),follow=deferred(),bodies=[];t.c.S.tab='porting';t.c.followJob=()=>follow.promise;t.c.updateWorkProgress=()=>{};
-   t.c.reply=async(url,opts)=>{if(url==='/api/play-export'){bodies.push(opts.body);return opts.body.show?{ok:true}:{job:'e1'};}return report;};
-   t.c.$('portExportMenu').open=true;
-   const exporting=t.run('exportGame("web")');for(let i=0;i<5;i++)await Promise.resolve();
-   assert.equal(t.c.$('portExportMenu').open,false,'choosing closes the menu');
-   assert.equal(t.c.$('portExportWeb').disabled,true,'no second export while one runs');
-   assert.equal(t.c.$('portExportWindow').disabled,true,'nor one with its own window');
-   assert.equal(t.c.$('portExportIos').disabled,true,'nor iOS');
-   assert.equal(t.c.$('portExportStop').hidden,false);
-   await t.run('exportGame("app")');assert.equal(bodies.length,1,'a second choice starts nothing');
-   follow.resolve({kind:'web',path:'/save/port/wasm/export/web/index.html',folder:'/save/port/wasm/export/web'});await exporting;
-   assert.equal(t.c.$('portExportShow').hidden,false);assert.equal(t.c.$('portExportStop').hidden,true);
-   assert.equal(t.c.$('portExportWeb').disabled,false);
-   assert.ok(t.c.$('portExportLog').children.some(x=>String(x).includes('index.html')),'the log says where it went');
-   await t.run('showExport()');assert.equal(JSON.stringify(bodies[1]),JSON.stringify({slug:'a',kind:'web',show:true}));
-   t.c.$('portExportMenu').open=true;t.c.docListeners.click({target:{}});assert.equal(t.c.$('portExportMenu').open,false,'a click elsewhere closes it');}
-  {// The iOS choice uses the existing durable export job, with feedback before the first response.
+  {// Save by project on change, including before an export, and reload from the server in a new window.
+   const t=setup(),saved={a:[],b:['miyoo']},save=deferred();t.c.S.tab='porting';
+   t.c.exportOptions=async(url)=>({available:true,mac:true,targets:saved[url.at(-1)]});
+   t.c.reply=async(url,opts)=>{
+     if(url==='/api/port-export-options'){await save.promise;saved[opts.body.slug]=opts.body.targets;return {targets:opts.body.targets};}
+     return report;
+   };
+   await t.run('loadPortReadiness()');
+   assert.equal(t.c.$('portExportStart').disabled,true,'empty selection cannot start');
+   t.c.$('portExportIos').checked=true;
+   const saving=t.c.$('portExportIos').onchange();
+   assert.match(t.c.$('portExportStatus').textContent,/Saving/);
+   assert.equal(t.c.$('portExportStart').disabled,true,'waits for the save');
+   t.c.$('portExportSteamDeck').checked=true;
+   await t.c.$('portExportSteamDeck').onchange();
+   save.resolve();await saving;
+   assert.equal(t.c.$('portExportStart').disabled,false);
+   assert.equal(JSON.stringify(saved.a),'["ios","steamdeck"]');
+   t.c.S.slug='b';await t.run('loadPortReadiness()');
+   assert.equal(t.c.$('portExportIos').checked,false);
+   assert.equal(t.c.$('portExportMiyoo').checked,true);
+   const fresh=setup();fresh.c.S.tab='porting';fresh.c.exportOptions=t.c.exportOptions;fresh.c.reply=async()=>report;
+   await fresh.run('loadPortReadiness()');
+   assert.equal(fresh.c.$('portExportIos').checked,true);
+   assert.equal(fresh.c.$('portExportSteamDeck').checked,true);
+   fresh.c.reply=async()=>{throw Error('Database unavailable');};
+   fresh.c.$('portExportIos').checked=false;await fresh.c.$('portExportIos').onchange();
+   assert.equal(fresh.c.$('portExportIos').checked,true,'failed saves restore the saved selection');
+   assert.match(fresh.c.$('portExportStatus').textContent,/Database unavailable/);}
+  {// One job receives the complete batch. Each result keeps its instructions and folder action.
    const t=setup(),request=deferred(),follow=deferred();t.c.S.tab='porting';t.c.updateWorkProgress=()=>{};
-   t.c.reply=()=>request.promise;t.c.followJob=()=>follow.promise;
-   const exporting=t.c.$('portExportIos').onclick();
-   assert.equal(t.c.$('portExportIos').disabled,true,'iOS disables immediately');
-   assert.equal(t.c.$('portExportWeb').disabled,true,'other exports wait too');
-   assert.equal(JSON.stringify(t.bodies[0]),JSON.stringify({slug:'a',kind:'ios'}));
-   await t.run('exportGame("ios")');assert.equal(t.calls.length,1,'duplicate start suppressed');
-   request.resolve({job:'ios1'});for(let i=0;i<5;i++)await Promise.resolve();
-   follow.resolve({kind:'ios',path:'/save/export/ios/Game.xcodeproj',instructions:['Open in Xcode.','Choose your signing team.']});
+   t.c.exportOptions=async()=>({available:true,mac:false,targets:['window','ios','steamdeck']});
+   t.c.reply=async(url,opts)=>url==='/api/play-export'?(opts.body.show?{ok:true}:request.promise):report;
+   t.c.followJob=()=>follow.promise;
+   await t.run('loadPortReadiness()');
+   assert.equal(t.c.$('portExportWindowChoice').hidden,true,'Mac window only appears on a Mac host');
+   const exporting=t.c.$('portExportStart').onclick();
+   assert.equal(t.c.$('portExportStart').disabled,true);
+   assert.equal(t.c.$('portExportSteamDeck').disabled,true);
+   assert.equal(t.c.$('portExportStop').hidden,false);
+   assert.equal(JSON.stringify(t.bodies.at(-1)),'{"slug":"a","targets":["ios","steamdeck"]}');
+   await t.c.$('portExportStart').onclick();
+   assert.equal(t.calls.filter(url=>url==='/api/play-export').length,1,'duplicate start suppressed');
+   request.resolve({job:'e1'});
+   follow.resolve({exports:[{kind:'ios',path:'/save/ios/Game.xcodeproj',instructions:['Open in Xcode.']},
+     {kind:'steamdeck',path:'/save/steamdeck/README.txt',instructions:['Copy to Steam Deck.']}]});
    await exporting;
-   assert.equal(t.c.$('portExportIos').disabled,false);
-   assert.match(JSON.stringify(t.c.$('portExportNext').children),/Xcode.*signing team/);
-   t.c.reply=async()=>{throw Error('Browser port not available');};await t.run('exportGame("ios")');
-   assert.match(t.c.$('portExportLog')._errorBox.textContent,/Browser port not available/);
-   assert.equal(t.c.$('portExportIos').disabled,false,'failed requests restore the choice');}
-  {// The Miyoo Mini export is one more kind of the same job, and the log says what to do with the folder
-   const t=setup(),bodies=[];t.c.S.tab='porting';t.c.updateWorkProgress=()=>{};
-   t.c.followJob=async()=>({kind:'miyoo',path:'/save/port/wasm/export/miyoo/README.txt',folder:'/save/port/wasm/export/miyoo',
-     instructions:['Copy the App and Tools folders to the root of your SD card.','Your ROM is already in App/Rally64/ as rom.z64.']});
-   t.c.reply=async(url,opts)=>{if(url==='/api/play-export'){bodies.push(opts.body);return {job:'e3'};}return report;};
-   await t.run('exportGame("miyoo")');
-   assert.equal(JSON.stringify(bodies[0]),JSON.stringify({slug:'a',kind:'miyoo'}));
-   assert.equal(t.c.$('portExportMiyoo').disabled,false,'its button comes back');
-   const next=t.c.$('portExportNext'),text=JSON.stringify(next.children,(k,v)=>k==='parentNode'?undefined:v);
-   assert.equal(next.hidden,false,'what to do next shows under the log');
-   assert.ok(/SD card/.test(text)&&/rom\.z64/.test(text),'its steps say what to copy and where the ROM is');
-   assert.ok(!t.c.$('portExportLog').children.some(x=>/rom\.z64/.test(String(x))),'not buried in the log');
-   t.c.followJob=()=>new Promise(()=>{});t.run('exportGame("web")');for(let i=0;i<5;i++)await Promise.resolve();
-   assert.equal(next.hidden,true,'a new export clears the last one\'s steps until it ends');}
-  {// The Steam Deck export is one more kind of the same job: its button waits while it runs, and its steps show
-   const t=setup(),bodies=[];t.c.S.tab='porting';t.c.updateWorkProgress=()=>{};
-   let follow;t.c.followJob=()=>new Promise(r=>{follow=r;});
-   t.c.reply=async(url,opts)=>{if(url==='/api/play-export'){bodies.push(opts.body);return {job:'e4'};}return report;};
-   const exporting=t.run('exportGame("steamdeck")');for(let i=0;i<5;i++)await Promise.resolve();
-   assert.equal(t.c.$('portExportSteamDeck').disabled,true,'its button waits while it exports');
-   assert.equal(JSON.stringify(bodies[0]),JSON.stringify({slug:'a',kind:'steamdeck'}));
-   follow({kind:'steamdeck',path:'/save/port/wasm/export/steamdeck/README.txt',folder:'/save/port/wasm/export/steamdeck',
-     instructions:['Copy the Rally64 folder to your Steam Deck.','Add Rally64/launch.sh to Steam as a non-Steam game.']});
-   await exporting;
-   assert.equal(t.c.$('portExportSteamDeck').disabled,false,'its button comes back');
-   const next=t.c.$('portExportNext'),text=JSON.stringify(next.children,(k,v)=>k==='parentNode'?undefined:v);
-   assert.ok(/Steam Deck/.test(text)&&/non-Steam game/.test(text),'its steps say where it goes');}
-  {// "faster where it can" is the browser export with its SIMD modules as well: the same job, simd in its request
-   const t=setup(),bodies=[];t.c.S.tab='porting';t.c.updateWorkProgress=()=>{};
-   t.c.followJob=async()=>({kind:'web',path:'/save/port/wasm/export/web/index.html',folder:'/save/port/wasm/export/web'});
-   t.c.reply=async(url,opts)=>{if(url==='/api/play-export'){bodies.push(opts.body);return {job:'e4'};}return report;};
-   await t.run('exportGame("web", null, { simd: true })');
-   assert.equal(JSON.stringify(bodies[0]),JSON.stringify({slug:'a',kind:'web',simd:true}));
-   assert.equal(t.c.$('portExportWebSimd').disabled,false,'its menu item comes back');}
-  {// an export running when the panel is drawn again is followed, and its Stop cancels it
-   const t=setup(),follow=deferred(),cancels=[];t.c.S.tab='porting';t.c.followJob=()=>follow.promise;t.c.updateWorkProgress=()=>{};
-   t.c.reply=async(url,opts)=>{if(url==='/api/job/cancel'){cancels.push(opts.body.id);return {};}return {...report,play:{job:null,url:null,export_job:{id:'e2',progress:{phase:'Linking',step:5,steps:11}}}};};
-   await t.run('loadPortReadiness()');for(let i=0;i<5;i++)await Promise.resolve();
+   assert.equal(t.c.$('portExportStop').hidden,true);
+   assert.equal(t.c.$('portExportStart').disabled,false);
+   const results=t.c.$('portExportNext');
+   assert.match(JSON.stringify(results.children),/Open in Xcode.*Copy to Steam Deck/);
+   await results.children[1].children[0].children[1].onclick();
+   assert.equal(JSON.stringify(t.bodies.at(-1)),'{"slug":"a","kind":"steamdeck","show":true}');
+   t.c.followJob=async()=>({exports:[{kind:'steamdeck',path:'/save/steamdeck/README.txt'}],failures:['iOS build failed']});
+   await t.c.$('portExportStart').onclick();
+   assert.equal(results.children.length,1,'successful exports remain available after a partial failure');
+   assert.match(t.c.$('portExportLog')._errorBox.textContent,/iOS build failed/);}
+  {// A running batch is discovered independently of slower readiness reads, with Stop and no duplicate start.
+   const t=setup(),follow=deferred(),readiness=deferred(),cancels=[];
+   t.c.S.tab='porting';t.c.followJob=()=>follow.promise;t.c.updateWorkProgress=(log,value)=>{log.seen=value;};
+   t.c.exportOptions=async()=>({available:true,mac:true,targets:['web','simd'],
+     job:{id:'e2',progress:{phase:'Linking',done:50,total:200}}});
+   t.c.reply=async(url,opts)=>{if(url==='/api/job/cancel'){cancels.push(opts.body.id);return {};}return readiness.promise;};
+   const loading=t.run('loadPortReadiness()');for(let i=0;i<5;i++)await Promise.resolve();
    assert.ok(!t.calls.includes('/api/play-export'),'not started again');
+   assert.equal(t.c.$('portExportLog').seen.phase,'Linking');
+   assert.equal(t.c.$('portExportWebSimd').checked,true);
    await t.run('stopExport()');assert.deepEqual(cancels,['e2']);
-   follow.reject(new Error('Cancelled.'));await Promise.resolve();await Promise.resolve();await Promise.resolve();
-   assert.match(t.c.$('portExportLog')._errorBox.textContent,/Cancelled/);}
+   follow.reject(new Error('Export stopped.'));await Promise.resolve();await Promise.resolve();
+   assert.match(t.c.$('portExportLog')._errorBox.textContent,/Export stopped/);
+   readiness.resolve(report);await loading;}
   {const t=setup();t.c.S.tab='porting';t.c.followJob=async()=>({url:'http://127.0.0.1:5/',window:true});
    const runtimes=[{id:'wasm',name:'WebAssembly',summary:'Plays now.',built:true,missing:[],playable:true},
      {id:'libultraship',name:'libultraship',summary:'Native.',built:false,missing:['Compiles for a PC','Assets extracted'],playable:false},
      {id:'n64modernruntime',name:'N64ModernRuntime',summary:'Native.',built:false,missing:[],playable:false}];
    t.c.reply=async url=>url==='/api/play'?{job:'p3'}:{...report,runtimes};
    await t.run('loadPortReadiness()');
-   const play=t.c.$('portSteps').children[9].children[1];
+   const play=t.c.$('portSteps').children[10].children[1];
    const choice=play.children.find(c=>c.className==='port-runtimes');
    assert.ok(choice,'the Play step offers its runtimes');
    const options=choice.children.slice(1).map(l=>({radio:l.children[0],status:l.children[1].children[2].textContent}));

@@ -19,6 +19,7 @@ from ...candidate_work import trial
 from ...network import Agent, NetworkError
 from ...project import compiler_for, unknown_compiler_message
 from ...repair_feedback import trial as repair_trial
+from ...repair_feedback import without_capture
 from ..draft_context import candidate_context
 from ..purpose_work import Executor
 
@@ -32,6 +33,7 @@ QUEUE_POLL_SECONDS = 0.5  # how often a queued one looks for a slot (and whether
 
 
 class AutopilotMixin:
+    @without_capture()
     def start_autopilot(self, slug: str, workers: int | None = None, *, foreground=False) -> dict:
         """Try every open function's machine draft (m2c, compilable form) through the judge, smallest first, in the
         background unless explicitly requested with foreground=True. Matches are saved before agents spend tokens; drafts that compile
@@ -133,7 +135,8 @@ class AutopilotMixin:
         state["phase"] = "twins"
         try:  # identical code first: free, and it takes those functions off the drafts' list
             if slug not in self.links and not state["stop"].is_set():  # (a room member's matches come from the host)
-                job = self.twins.full_pass(slug,foreground_event=state['_foreground'])
+                from ..twins import Job
+                job = self.twins.full_pass(slug, Job(autopilot=True), foreground_event=state['_foreground'])
                 state["twins"] = job.matched
                 state["matched"] += job.matched
         except Exception as e:
@@ -164,7 +167,7 @@ class AutopilotMixin:
                 from ...compile_sessions import session
                 def check_stop():
                     if state['stop'].is_set():raise NetworkError('Autopilot stopped.')
-                with database_reads(), maintenance.foreground(state['_foreground']), session(), compiler.cancellable(check_stop), \
+                with without_capture(), database_reads(), maintenance.foreground(state['_foreground']), session(), compiler.cancellable(check_stop), \
                         compiler._SLOTS.capacity(width) if manual else nullcontext(), \
                         compiler.throughput_slots(manual):
                     outcome = try_one(agent, proj, fid)
@@ -284,6 +287,9 @@ class AutopilotMixin:
                 'machine_ids': self._machine_agent_ids(), 'nonexclusive_ids': self._nonexclusive_agent_ids()}
             with store.tx() as db:
                 self._expire_claims(db, **identities)
+                fn = db.execute("SELECT * FROM functions WHERE id=?", (fn["id"],)).fetchone()
+                if fn is None or fn["status"] != "open":
+                    raise NetworkError("This function is no longer open. Claim another function.")
                 if db.execute("SELECT 1 FROM claims WHERE function_id=?", (fn["id"],)).fetchone():
                     raise NetworkError(f"{fn['name']} is claimed")
                 db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + 300))
@@ -322,18 +328,19 @@ class AutopilotMixin:
                 with self.project_store(proj['id']).tx() as db:
                     db.execute("DELETE FROM claims WHERE function_id=? AND agent_id=?", (fn["id"], agent.id))
 
-    def _autopilot_one(self, agent, proj, fid: int) -> str:
+    def _autopilot_one(self, agent, proj, fid: int, *, retry_draft=False) -> str:
         """match | near | far | fail | skip, for one function's draft. A draft autopilot already judged with the same
         header is skipped: autopilot tries a function again when its draft changed (the background drafter asks it
         to after the header or the compiler changed, app/drafts.py), not to judge the same C twice."""
         with self.progress.judging(proj["slug"], synchronize=False) if hasattr(self, "progress") else nullcontext():
-            return AutopilotMixin._autopilot_one_work(self, agent, proj, fid)
+            return AutopilotMixin._autopilot_one_work(self, agent, proj, fid, **({"retry_draft": True} if retry_draft else {}))
 
     def _autopilot_repair_one(self, agent, proj, fid):
         with self.progress.judging(proj['slug'],synchronize=False) if hasattr(self,'progress') else nullcontext():
             return self._autopilot_one_work(agent,proj,fid,repair_only=True)
 
-    def _autopilot_one_work(self, agent, proj, fid: int, *, repair_only=False) -> str:
+    @without_capture()
+    def _autopilot_one_work(self, agent, proj, fid: int, *, repair_only=False, retry_draft=False) -> str:
         now = time.time()
         store = self.project_store(proj['id'])
         from .. import autopilot_claims
@@ -357,7 +364,7 @@ class AutopilotMixin:
             input_key = draft_reports.key(plan, ctx['header'], data_asm, fn)
             previous = draft_reports.read(self, fid, project_id=proj['id'])
             external_inputs = own.get('cmd') or own.get('ro_paths') or any(flag.startswith(('-I','-include','-imacros')) for flag in own.get('flags',[]))
-            if not external_inputs and previous.get('key') == input_key and previous.get('complete'):
+            if not retry_draft and not external_inputs and previous.get('key') == input_key and previous.get('complete'):
                 return 'skip'
             target_asm = self._asm_text(fn, proj)
             # Eligibility is known before any generation. Reuse this exact captured
@@ -375,12 +382,14 @@ class AutopilotMixin:
             if (seed and seed.startswith(prefix) and seed_row and seed_row['seed_key'] == plan
                     and previous.get('data_key',data_key) == data_key):
                 draft = seed[len(prefix):]
-            elif previous.get('seed_key') == plan and previous.get('failures'):
+            elif not retry_draft and previous.get('seed_key') == plan and previous.get('failures'):
                 report['failures'] = previous['failures']
                 draft = None
             else:
                 try:
-                    draft = seeds.generate_from_asm(target_asm, fn['name'], toolchain, context, data_asm, valid=True, strict=True, timeout=20)
+                    draft = seeds.generate_from_asm(target_asm, fn['name'], toolchain, context, data_asm,
+                                                    valid=True, strict=True, timeout=20,
+                                                    resolve=lambda symbol: self.symbols(proj['id']).resolve(symbol))
                 except seeds.DraftError as error:
                     draft_reports.failure(report, 'generation', 'raw_m2c', error)
                     draft = None
@@ -424,7 +433,8 @@ class AutopilotMixin:
                     return
                 try:
                     local = seeds.generate_from_asm(self._asm_text(fn, proj), fn['name'], toolchain,
-                                                   alternative, data_asm, valid=True, strict=True)
+                                                   alternative, data_asm, valid=True, strict=True,
+                                                   resolve=lambda symbol: self.symbols(proj['id']).resolve(symbol))
                 except seeds.DraftError:
                     return
                 if not local:

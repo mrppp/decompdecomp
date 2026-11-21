@@ -74,16 +74,20 @@ class BriefMixin:
     def _twin_lines(self, proj, fn) -> list[str]:
         """For a brief: the matched function with the same code, and its C with this one's names."""
         try:
-            twin_id = self.twins.twin_of(proj, fn["id"])
-        except Exception:
+            donor = self.twins.deep_donor(proj, fn)
+            if not donor:
+                return []
+            twin_id, partial = donor
+            a = self.project_store(proj['id']).one("SELECT * FROM functions WHERE id=?", twin_id)
+            if a is None:
+                return []
+            source = self.twins.source_for(proj, a, fn, partial=partial)
+        except (NetworkError, OSError, ValueError):
             return []
-        if twin_id is None:
-            return []
-        a = self.project_store(proj['id']).one("SELECT * FROM functions WHERE id=?", twin_id)
-        source = self.twins.source_for(proj, a, fn)
-        out = ["", f"### Identical code: {a['name']} is the same machine code and already matches"]
+        relation = 'has a closer saved draft' if partial else 'already matches'
+        out = ["", f"### Identical target: {a['name']} {relation}"]
         if source and len(source) < 6000:
-            out += ["Its C with this function's names (try it first):", "```c", source.strip(), "```"]
+            out += ["Retargeted C (judge it first):", "```c", source.strip(), "```"]
         return out
 
     def _asm_text(self, fn, proj) -> str:
@@ -134,6 +138,124 @@ class BriefMixin:
         bindings = [(name,self.symbols(proj['id']).resolve(name)) for name in sorted(roots)]
         from ..draft_reports import generation
         inputs = [DRAFT_REVISION, self.cfg(proj).get("draft_generation", 0), hashlib.sha256((fn["asm"] or "").encode()).hexdigest(), fn["name"], target, own["toolchain"], own.get("flags", []), sorted(roots), bindings, context]
+        if own["toolchain"] == 'gcc-2.7.2-kmc' and 'swl' in (fn['asm'] or ''):
+            from decomprepair.unaligned_stack_drafts import stack_copy
+
+            # Regenerate older drafts only for functions that can use this recovery.
+            if stack_copy(fn['asm']):
+                inputs.append('unaligned stack copy')
+        if own["toolchain"] == 'gcc-2.7.2-kmc':
+            from decomprepair import (
+                aligned_allocator_request,
+                aligned_stack_read,
+                byte_cursor_postincrements,
+                direct_mapped_address,
+                field_snapshot_copies,
+                float_matrix_identity,
+                global_pointer_local_repairs,
+                guard_inversion_repairs,
+                indexed_field_cursor,
+                indirect_call_drafts,
+                kmc_cast_repairs,
+                large_stack_drafts,
+                likely_branch_cursor,
+                loop_storage_shapes,
+                measured_address_repairs,
+                measured_callback_loop,
+                measured_mmio_polling,
+                measured_stack_drafts,
+                ordered_halfword_updates,
+                packed_matrix_conversion,
+                passthrough_argument_repairs,
+                relocated_byte_table,
+                relocated_global_update,
+                shared_default_drafts,
+                shared_return_repairs,
+                short_leaf_drafts,
+                split_dispatch_zero_case,
+                stack_fill_drafts,
+                stack_header_buffer,
+                stack_read_retry,
+                stack_word_index_drafts,
+                uncached_read_repairs,
+            )
+
+            if short_leaf_drafts.applies(fn['asm'] or ''):
+                inputs.append('short leaf functions')
+            if measured_stack_drafts.applies(fn['asm'] or ''):
+                inputs.append('measured stack copies')
+            if measured_callback_loop.applies(fn['asm'] or ''):
+                inputs.append('indexed callback loops')
+            if indirect_call_drafts.applies(fn['asm'] or ''):
+                inputs.append('typed indirect calls')
+            if likely_branch_cursor.applies(fn['asm'] or ''):
+                inputs.append('shared branch-likely cursor advance')
+            if relocated_byte_table.applies(fn['asm'] or ''):
+                inputs.append('relocated byte table')
+            if relocated_global_update.applies(fn['asm'] or ''):
+                inputs.append('relocated global update')
+            if relocated_global_update.countdown_applies(fn['asm'] or ''):
+                inputs.append('relocated countdown')
+            if stack_fill_drafts.applies(fn['asm'] or ''):
+                inputs.append('descending stack buffer fill')
+            if stack_fill_drafts.ascending_applies(fn['asm'] or ''):
+                inputs.append('ascending stack buffer fill')
+            if stack_fill_drafts.word_clear_applies(fn['asm'] or ''):
+                inputs.append('stack word clear')
+            if stack_word_index_drafts.applies(fn['asm'] or ''):
+                inputs.append('indexed stack word copy')
+            if stack_header_buffer.applies(fn['asm'] or ''):
+                inputs.append('serialized stack header buffer')
+            if relocated_global_update.reload_applies(fn['asm'] or ''):
+                inputs.append('direct global reload before calls')
+            if stack_read_retry.applies(fn['asm'] or ''):
+                inputs.append('stack read retry')
+            if stack_read_retry.inline_applies(fn['asm'] or ''):
+                inputs.append('inline stack read comparison')
+            if float_matrix_identity.applies(fn['asm'] or ''):
+                inputs.append('floating-point identity matrix')
+            if packed_matrix_conversion.applies(fn['asm'] or ''):
+                inputs.append('packed matrix conversion')
+            if byte_cursor_postincrements.applies(fn['asm'] or ''):
+                inputs.append('byte cursor increments')
+            if aligned_allocator_request.applies(fn['asm'] or ''):
+                inputs.append('aligned allocator request')
+            if indexed_field_cursor.applies(fn['asm'] or ''):
+                inputs.append('indexed field cursor')
+            if split_dispatch_zero_case.applies(fn['asm'] or ''):
+                inputs.append('split dispatch zero case')
+            if field_snapshot_copies.applies(fn['asm'] or ''):
+                inputs.append('staged field copies')
+            if ordered_halfword_updates.applies(fn['asm'] or ''):
+                inputs.append('ordered halfword updates')
+            if aligned_stack_read.applies(fn['asm'] or ''):
+                inputs.append('aligned stack read')
+            if guard_inversion_repairs.byte_toggle_applies(fn['asm'] or ''):
+                inputs.append('byte flag update branch')
+            if kmc_cast_repairs.float_table_applies(fn['asm'] or ''):
+                inputs.append('typed floating-point table return')
+            if direct_mapped_address.applies(fn['asm'] or ''):
+                inputs.append('direct address range returns')
+            if global_pointer_local_repairs.list_transfer_applies(fn['asm'] or ''):
+                inputs.append('linked list node transfer')
+            if global_pointer_local_repairs.linked_insert_applies(fn['asm'] or ''):
+                inputs.append('linked list insertion')
+            if shared_return_repairs.global_guard_applies(fn['asm'] or ''):
+                inputs.append('guarded global return')
+            if measured_address_repairs.byte_offsets_apply(fn['asm'] or ''):
+                inputs.append('byte offsets from globals')
+            if passthrough_argument_repairs.entry_wrapper_applies(fn['asm'] or ''):
+                inputs.append('entry argument wrapper')
+            if loop_storage_shapes.copy_setup_applies(fn['asm'] or ''):
+                inputs.append('measured copy loop setup')
+            if measured_mmio_polling.applies(fn['asm'] or ''):
+                inputs.append('measured MMIO polling')
+            if large_stack_drafts.applies(fn['asm'] or ''):
+                inputs.append('larger stack objects')
+            if shared_default_drafts.applies(fn['asm'] or ''):
+                inputs.append('shared switch default')
+            if uncached_read_repairs.applies(fn['asm'] or ''):
+                inputs.append('uncached word read')
         if refresh := generation(self,fn['id'],project_id=proj['id']):
             inputs.append(('regeneration',refresh))
         key = hashlib.sha1(json.dumps(inputs).encode()).hexdigest()[:16]
@@ -164,14 +286,16 @@ class BriefMixin:
             report = {'seed_key':key, 'compiled':False, 'failures':[]}
             try:
                 draft = seeds.generate_from_asm(target_asm, fn['name'], toolchain, context, data_asm,
-                                                valid=True, strict=True, timeout=20)
+                                                valid=True, strict=True, timeout=20,
+                                                resolve=lambda symbol: self.symbols(proj['id']).resolve(symbol))
             except seeds.DraftError as error:
                 draft_reports.failure(report, 'generation', 'raw_m2c', error)
                 draft = None
                 if context.strip():
                     try:
                         draft = seeds.generate_from_asm(target_asm, fn['name'], toolchain, '', data_asm,
-                                                        valid=True, strict=True, timeout=20)
+                                                        valid=True, strict=True, timeout=20,
+                                                        resolve=lambda symbol: self.symbols(proj['id']).resolve(symbol))
                     except seeds.DraftError as fallback_error:
                         draft_reports.failure(report, 'generation', 'without_context', fallback_error)
             if report['failures']:
@@ -222,6 +346,18 @@ class BriefMixin:
             return self.forks.can_draft(proj)
         return (self.is_rom(proj) and seeds.available()
                 and bool(seeds.m2c_target(self.cfg(proj)["compiler"]["toolchain"])))
+
+    def reference_wrapper(self, project, function, source, url, sha256):
+        """Compare a reference wrapper's argument setup with an original ROM function."""
+        from ..reference_wrapper import analyze
+
+        proj = self._project(project)
+        fn = self._function(function, proj['slug'])
+        if not self.is_rom(proj) or proj['arch'] != 'mips' or not fn['vram']:
+            raise NetworkError('Reference wrapper analysis currently needs a MIPS ROM function.')
+        rom, _ = self._rom(proj)
+        return analyze(source, url, sha256, hashlib.sha256(rom).hexdigest(),
+                       fn['name'], fn['vram'], fn['asm'] or '')
 
     def redraft(self, project: str | None, function: str, context: str) -> str:
         """m2c's draft of a function made again with declarations an agent worked out (a struct, a prototype) on top
@@ -285,6 +421,8 @@ class BriefMixin:
                     +assembly.get('alias_note',''))
         warning=self.console(proj).boundary_reason(fn['target'] or b'') if fn['status']!='matched' else None
         review='\n\nBoundary review before tuning:\n'+warning if warning else ''
+        if warning:
+            review += '\nUse get_boundary_evidence before compiling. Review any overlapping entry and original data references.'
         if header_report:review += '\n\n'+header_report
         from ..wrapper_contracts import brief as wrapper_hint
         advice=wrapper_hint(self,proj,fn,fn['matched_source'] or fn['best_source'] or fn['seed'] or '')
@@ -302,12 +440,22 @@ class BriefMixin:
         from ..sdk_evidence import brief as sdk_brief
         text += '\n'.join(sdk_brief(self, proj, fn))
         from ..return_contract_evidence import brief as return_hint
-        advice=return_hint(self,proj,fn,fn['best_source'] or fn['seed'] or '')
+        from ..return_contract_evidence import matched_review, review_text
+        advice = (review_text(matched_review(self, proj, fn)) if fn['status'] == 'matched'
+                  else return_hint(self, proj, fn, fn['best_source'] or fn['seed'] or ''))
         if advice:text+='\n\n'+advice
         if fn['status'] == 'open' and fn['best_source']:
             from .. import compiler_preflight, repair_ranking, source_diagnostics
-            suggestions = source_diagnostics.hints(fn['best_source'], fn['name'], fn['asm'], proj['arch'],
-                                                   repair_ranking.evidence(self, fn['id'], agent.id))
+            from ..callee_frame_evidence import messages as callee_writes
+            rows = repair_ranking.evidence(self, fn['id'], agent.id if agent else None)
+            suggestions = callee_writes(self, proj, fn, rows) + source_diagnostics.hints(
+                fn['best_source'], fn['name'], fn['asm'], proj['arch'], rows)
+            from ..profile_hypotheses import float_sqrt_source
+            if float_sqrt_source(compiler_for(self.cfg(proj), fn['vram'], fn), fn['asm'] or '',
+                                 fn['best_source'], fn['name'], self._context(proj['id'], fn['unit'])['header']):
+                suggestions.insert(0, 'Target uses sqrt.s. Try the float sqrtf prototype and call through '
+                                      'compiler_experiments with the current flags and with -ffast-math. '
+                                      'An exact fast-math result needs per-function review.')
             if advice:suggestions=[s for s in suggestions if not s.startswith('Return-contract hypothesis:')]
             if suggestions:
                 text += '\n\nSource checks (advisory):\n' + '\n'.join(suggestions)

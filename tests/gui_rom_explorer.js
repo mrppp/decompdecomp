@@ -44,7 +44,7 @@ function setup(){
     const html=t.run('romAssetHTML(scriptRegion)');
     assert.match(html,/value="1" selected>START · Opening · 3 cues/);
     assert.match(html,/value="A" selected>Führer/);
-    assert.match(html,/Browse dialogue/);
+    assert.match(html,/Update preview/);
     assert.equal(t.run("romRows({query:'german dialogue',report:{regions:[scriptRegion]}}).length"),1);
   }
 
@@ -135,6 +135,32 @@ function setup(){
     assert.equal(t.run("romRows(romView()).map(r=>r.id).join(',')"),'large,small,missing');
     t.run("romView().function='reader'");assert.equal(t.run('romRows(romView())[0].id'),'large');
   }
+  // A recognized, non-playable audio directory still has an inspectable preview.
+  {
+    const t=setup(),pending=deferred();
+    const asset={media:'audio',audio_kind:'indexed sample directory',label:'MusyX sample directory 9',
+      offset:128,samples:[{preview_available:false}]};
+    const row={id:'80-90',start:128,end:144,size:16,kind:'audio',confidence:'validated',detected_asset:asset,
+      mappings:[],evidence:[],sampled_bytes:16,entropy:0,references:[],pointers:[],strings:[],preview:'',annotation:{}};
+    t.context.row=row;t.run("romView().report={image_hash:'hash',regions:[row]}");
+    const body=t.context.$('body');
+    for(const [key,value] of Object.entries({source:'rom',format:'auto',offset:'128'})){
+      body.querySelector(`[data-asset-${key}]`).value=value;
+    }
+    t.context.reply=(url,options)=>options?.method==='POST'?pending.promise:Promise.resolve(row);
+    await t.run("openRomRegion('80-90')");
+    assert.equal(t.context.$('dialogTitle').textContent,asset.label);
+    assert.equal(t.context.$('dialogSubtitle').textContent,'128–144 · 16 bytes');
+    assert.equal(t.context.$('dialogSubtitle').hidden,false);
+    assert.ok(body.innerHTML.indexOf('data-asset-result')<body.innerHTML.indexOf('<h3>Evidence'));
+    assert.doesNotMatch(body.innerHTML,/Zoom map to/);
+    assert.equal(t.calls.length,2);
+    assert.equal(t.calls[1].options.body.region,row.id);
+    assert.match(body.querySelector('[data-asset-work]')._workStatus.textContent,/Preparing asset preview/);
+    pending.resolve({media:'metadata',title:asset.label,fields:{entries:9}});
+    await tick();
+    assert.equal(body.querySelector('[data-asset-result]').children[1].textContent,'entries: 9');
+  }
   // Note saves disable conflicting edits before the request and retain failures.
   {
     const t=setup(),saving=deferred();
@@ -142,6 +168,7 @@ function setup(){
     t.context.row=row;t.run("romView().report={image_hash:'hash',regions:[row]}");
     t.context.reply=(url,options)=>options?.method==='POST' ? saving.promise : Promise.resolve(row);
     await t.run("openRomRegion('0-10')");
+    assert.equal(t.calls.length,1,'Unknown data should not trigger a guessed decode');
     const body=t.context.$('body'),button=body.querySelector('[data-rom-save]');body.querySelector('[data-rom-label]').value='Textures';
     const promise=button.onclick();await tick();assert.equal(button.disabled,true);assert.equal(body.querySelector('[data-rom-notes]').disabled,true);
     await button.onclick();assert.equal(t.calls.filter(c=>c.options?.method==='POST').length,1);
@@ -189,21 +216,46 @@ function setup(){
     t.run('romView().report.stale=true;drawRomTypeMap()');canvas.onkeydown({key:'Enter',preventDefault(){}});assert.equal(opened.length,2);
     t.run('romView().report=null;drawRomTypeMap()');assert.equal(t.context.$('romTypeMapPanel').hidden,true);
   }
-  // The byte strip and the grid draw the same rows in the same colours, and
-  // grouping changes both.
+  // Both maps and the legend share colours. Grouping can hide a type and free
+  // its colour for a type that would otherwise collide.
   {
     const t=setup(),strip=[],grid=[];
     const map=fs.readFileSync(path.join(__dirname,'../src/decompnet/app/static/js/map.js'),'utf8');
     vm.runInContext(map.slice(map.indexOf('function squareMapLayout('),map.indexOf('function layoutMap(')),t.context);
     t.context.getComputedStyle=()=>({getPropertyValue:name=>name});
-    const paint=(log,cell)=>{const ctx={scale(){},beginPath(){},fill(){},strokeRect(){},roundRect(){log.push(ctx.fillStyle);},fillRect(){log.push(ctx.fillStyle);}};return ()=>ctx;};
+    const paint=log=>{const ctx={scale(){},beginPath(){},fill(){},strokeRect(){},roundRect(){log.push(ctx.fillStyle);},fillRect(){log.push(ctx.fillStyle);}};return ()=>ctx;};
     t.context.$('romMap').getContext=paint(strip);t.context.$('romMap').clientWidth=200;
     t.context.$('romTypeMap').getContext=paint(grid);t.context.$('romTypeMap').clientWidth=200;
-    t.run("romView().report={available:true,size:40,regions:[{id:'a',start:0,end:10,size:10,kind:'code'},{id:'b',start:10,end:20,size:10,kind:'image'},{id:'c',start:20,end:30,size:10,kind:'image'},{id:'d',start:30,end:40,size:10,kind:'repeated bytes'}],asset_groups:[{id:'g',start:10,end:30,size:20,region_ids:['b','c']}]};drawRomMap();drawRomTypeMap()");
-    assert.deepEqual(strip,['--cc-1','--cc-2','--muted']);assert.deepEqual(grid,strip);
-    assert.match(t.context.$('romTypeLegend').innerHTML,/Image \(1\)/);assert.equal(t.context.$('romMapKey').hidden,false);
+    t.context.report={available:true,size:60,regions:[
+      {id:'code',start:0,end:10,size:10,kind:'code'},
+      {id:'audio',start:10,end:20,size:10,kind:'audio'},
+      {id:'music',start:20,end:30,size:10,kind:'music sequence'},
+      {id:'image1',start:30,end:40,size:10,kind:'image'},
+      {id:'image2',start:40,end:50,size:10,kind:'image'},
+      {id:'font',start:50,end:60,size:10,kind:'font'},
+    ],asset_groups:[
+      {start:10,end:30,size:20,region_ids:['audio','music']},
+      {start:30,end:50,size:20,region_ids:['image1','image2']},
+    ]};
+    const legend=t.context.$('romTypeLegend');
+    t.run('romView().report=report;drawRomMap();drawRomTypeMap()');
+    assert.deepEqual(strip,['--cc-1','--faint','--cc-2','--cc-7']);
+    assert.deepEqual(grid,strip);
+    assert.match(legend.innerHTML,/Data \(1\)/);
+    assert.match(legend.innerHTML,/Image \(1\)/);
+    assert.match(legend.innerHTML,/Other data \(1\)/);
+    assert.doesNotMatch(legend.innerHTML,/Audio|Music sequence|\(0\)/);
+
     strip.length=0;grid.length=0;t.context.$('romGroupAssets').checked=false;t.context.$('romGroupAssets').onchange();
-    assert.equal(strip.length,4);assert.deepEqual(grid,strip);assert.match(t.context.$('romTypeLegend').innerHTML,/Image \(2\)/);
+    assert.deepEqual(strip,['--cc-1','--cc-3','--cc-4','--cc-2','--cc-2','--cc-7']);
+    assert.deepEqual(grid,strip);
+    assert.match(legend.innerHTML,/data-rom-color="--cc-4"><\/i>Music sequence \(1\)/);
+    assert.match(legend.innerHTML,/Image \(2\)/);
+    assert.doesNotMatch(legend.innerHTML,/>Data |\(0\)/);
+
+    const colors=t.run('Array.from(romMapTypes(ROM_TYPES.map(([kind])=>({kind}))).values(),type=>type.color)');
+    assert.equal(new Set(colors).size,colors.length);
+    assert.ok(colors.every(Boolean));
   }
   // Discovery shares the preview lock and retains errors through delayed requests.
   {
@@ -237,18 +289,24 @@ function setup(){
     t.context.body=body;t.context.painted=painted;
     t.run('renderRomModel=(host,model,active)=>{if(active())painted.push(model.vertices.length);}');
     const mesh={node:0,part:0,section:0,vertices:3,triangles:1};
-    t.context.region={id:'mesh',start:128,annotation:{preview_settings:{mesh:1}},detected_asset:{media:'model',nodes:1,meshes:[mesh,mesh],vertices:6,triangles:2}};
-    const html=t.run('romAssetHTML(region)');assert.match(html,/Detected model geometry/);assert.match(html,/value="1" selected/);assert.ok(!html.includes('texture bank ·'));
+    t.context.region={id:'mesh',start:128,annotation:{preview_settings:{mesh:1}},detected_asset:{media:'model',offset:128,assembled:true,nodes:1,meshes:[mesh,mesh],vertices:6,triangles:2}};
+    const html=t.run('romAssetHTML(region)');assert.match(html,/Detected model geometry/);assert.match(html,/value="1" selected/);assert.match(html,/value="assembled" selected/);assert.ok(!html.includes('texture bank ·'));
     vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/decompnet/app/static/js/rom-textures.js'),'utf8'),t.context);
     assert.equal(t.run('romTextureControlsHTML(region)'),'');t.run('setupRomTextureControls(body,region,()=>true)');
     assert.equal(t.run('romTextureBanks({regions:[region]}).length'),0);
     for(const [key,value] of Object.entries({source:'rom',format:'auto',offset:'128'}))body.querySelector(`[data-asset-${key}]`).value=value;
-    const button=body.querySelector('[data-asset-preview]'),selector=body.querySelector('[data-native-model-mesh]');selector.value='1';
-    body.querySelectorAll=key=>key==='input,select,button' ? [button,selector] : [];
-    t.context.reply=()=>pending.promise;t.run('setupRomAsset(body,region,"first","hash",()=>S.slug==="first")');
-    const waiting=button.onclick();await tick();assert.ok(button.disabled && selector.disabled);await selector.onchange();await button.onclick();assert.equal(t.calls.length,1);
-    assert.equal(t.calls[0].options.body.options.mesh,'1');pending.resolve({media:'model',vertices:[[0,0,0],[1,0,0],[0,1,0]],edges:[],points:[],triangles:1});await waiting;
+    const button=body.querySelector('[data-asset-preview]'),selector=body.querySelector('[data-native-model-mesh]'),assembly=body.querySelector('[data-native-assembly]');
+    selector.value='1';assembly.value='assembled';
+    selector.hasAttribute=key=>key==='data-native-model-mesh';
+    body.querySelectorAll=key=>key==='input,select,button' ? [button,selector] : key.startsWith('[data-native-model-mesh]') ? [selector] : [];
+    t.context.reply=()=>pending.promise;
+    t.run('setupRomAsset(body,region,"first","hash",()=>S.slug==="first",true)');
+    await tick();assert.ok(button.disabled && selector.disabled);await selector.onchange();await button.onclick();assert.equal(t.calls.length,1);
+    assert.equal(t.calls[0].options.body.options.mesh,'1');
+    assert.equal(t.calls[0].options.body.options.assembly,'assembled');
+    pending.resolve({media:'model',vertices:[[0,0,0],[1,0,0],[0,1,0]],edges:[],points:[],triangles:1,surfaces:[{}]});await tick();
     assert.deepEqual(painted,[3]);assert.equal(button.disabled,false);
+    assert.ok(body.querySelector('[data-asset-result]').children.some(node=>node.textContent==='Export glTF'));
     t.context.reply=async()=>{throw Error('Mesh is invalid. Refresh ROM Explorer.');};await button.onclick();assert.match(body.querySelector('[data-asset-work]').textContent,/Mesh is invalid/);
     const late=deferred();t.context.reply=()=>late.promise;const closing=button.onclick();body._romCancelPreview();late.resolve({media:'model',vertices:[]});await closing;assert.deepEqual(painted,[3]);
   }
@@ -256,7 +314,7 @@ function setup(){
   {
     const t=setup(),body=element(),pending=deferred();t.context.body=body;
     t.context.region={id:'anim',start:128,size:100,detected_asset:{media:'metadata',resource_type:'animation',resource_path:'directory/objects/object[9]/animations/animation[2]',compression:{codec:'RNC method 1',packed_bytes:100,expanded_bytes:400}}};
-    const html=t.run('romAssetHTML(region)');assert.match(html,/Inspect resource/);assert.match(html,/animation\[2\]/);assert.ok(!html.includes('texture bank ·'));
+    const html=t.run('romAssetHTML(region)');assert.match(html,/Update preview/);assert.match(html,/animation\[2\]/);assert.ok(!html.includes('texture bank ·'));
     vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/decompnet/app/static/js/rom-textures.js'),'utf8'),t.context);
     assert.equal(t.run('romTextureControlsHTML(region)'),'');assert.equal(t.run('romTextureBanks({regions:[region]}).length'),0);
     for(const [key,value] of Object.entries({source:'rom',format:'auto',offset:'128'}))body.querySelector(`[data-asset-${key}]`).value=value;

@@ -14,6 +14,8 @@ from ..project import compiler_for
 from ..repair_feedback import trial
 from . import agent_targets
 
+LINK_NEXT = ('Next: resolve the linker diagnostics before testing changes to the instruction sequence. '
+             'Check the named symbol or data definition in the current function context.')
 
 def candidate(net, agent, slug, function):
     fn = net._function(function, slug)
@@ -56,9 +58,9 @@ def candidate_line_note(net, agent, slug, fn, source):
     return note or '\nC-line mapping unavailable for this candidate/build; no line locations inferred.'
 
 
-def get_candidate(net, agent, slug, function, base='current'):
-    if base not in ('current', 'saved_best', 'last_compiling', 'reported_corrected'):
-        raise NetworkError('Choose base=current, saved_best, last_compiling or reported_corrected.')
+def get_candidate(net, agent, slug, function, base='current', option=0):
+    if base not in ('current', 'saved_best', 'last_compiling', 'reported_corrected', 'regional_alternative', 'measured_option'):
+        raise NetworkError('Choose base=current, saved_best, last_compiling, reported_corrected, regional_alternative or measured_option.')
     note = ''
     if base != 'current':
         fn = net._function(function,slug)
@@ -67,7 +69,20 @@ def get_candidate(net, agent, slug, function, base='current'):
         if not claim or fn['status'] != 'open':
             raise NetworkError('Hold an open function before selecting a recovery candidate.')
         latest = store.one('SELECT id,created_at FROM attempts WHERE function_id=? AND agent_id=? ORDER BY id DESC LIMIT 1',fn['id'],agent.id)
-        if base == 'saved_best':
+        measurement = None
+        stamp = (latest['id'] if latest and latest['created_at'] >= claim['claimed_at'] else None,
+                 claim['claimed_at'],target_scope(net,fn,''))
+        if base == 'measured_option':
+            batch = getattr(net, '_measured_agent_options', {}).get((agent.id, fn['id']))
+            if not batch or batch['stamp'] != stamp or type(option) is not int or option not in batch['choices']:
+                raise NetworkError('That measured option expired or is unavailable. Compare fresh options for the current revision.')
+            selected, measurement = batch['choices'][option]
+        elif base == 'regional_alternative':
+            alternative = getattr(net, '_agent_alternatives', {}).get((agent.id, fn['id']))
+            if not alternative or alternative['stamp'] != stamp:
+                raise NetworkError('There is no current regional alternative. Continue from the active candidate.')
+            selected, measurement = alternative['source'], alternative['measurement']
+        elif base == 'saved_best':
             selected = fn['best_source']
         elif base == 'reported_corrected':
             from ..candidate_quality import corrected_alternative
@@ -78,8 +93,10 @@ def get_candidate(net, agent, slug, function, base='current'):
             selected = row['source'] if row else None
         if not selected:
             raise NetworkError('No source is available for that recovery base; current candidate retained.')
-        stamp = (latest['id'] if latest and latest['created_at'] >= claim['claimed_at'] else None,
-                 claim['claimed_at'],target_scope(net,fn,''))
+        if measurement:
+            net.__dict__.setdefault('_agent_outcomes', {})[agent.id, fn['id']] = measurement
+            if measurement.get('rows'):
+                net.keep_diff(agent.id, fn['id'], measurement['rows'], measurement.get('legend', scoring.LEGEND))
         if not hasattr(net,'_agent_selected'):net._agent_selected = {}
         net._agent_selected[agent.id,fn['id']] = {'stamp':stamp,'source':selected,'cause':'You selected '+base+' for continuation; no compile occurred'}
         while len(net._agent_selected)>64:
@@ -90,6 +107,30 @@ def get_candidate(net, agent, slug, function, base='current'):
     fn = net._function(function, slug)
     remaining = local_experiments.summary(net, agent, slug, fn, source, revision, discover=False)
     measured = agent_evidence.baseline(net, agent, slug, fn, source) if base == 'current' else None
+    if (measured and measured.get('exact') and source == fn['best_source'] and fn['status'] == 'open'
+            and hasattr(net, 'try_quietly') and slug not in getattr(net, 'links', {})):
+        store = net.project_store(fn['project_id'])
+        if store.one('SELECT 1 FROM claims WHERE function_id=? AND agent_id=? AND expires_at>?',
+                     fn['id'], agent.id, time.time()):
+            # The claim stays cheap. Its first substantive read already rejudges
+            # the saved candidate, so publish only a freshly confirmed exact result.
+            from ..candidate_scope import key
+            from ..forks.project import ForkError
+            proj = net.project_row(slug)
+            if measured.get('input_scope') == key(net, proj, fn):
+                try:
+                    if net.fork_slug(slug):
+                        with net.attempt_turn(agent, fn):
+                            net.forks._attempt(agent, slug, fn['name'], source, keep=False, quiet=0, exact_only=True)
+                    else:
+                        auto, _ = net.local_agent('autopilot')
+                        net.try_quietly(auto, proj, fn, source, synchronize=False, exact_only=True)
+                except (NetworkError, ForkError):
+                    pass  # A concurrent winner or changed inputs can supersede this recheck.
+                fn = net._function(function, slug)
+                if fn['status'] == 'matched':
+                    note += 'Saved C matched when rejudged. This function is matched and its claim is released.\n'
+                    source, revision = candidate(net, agent, slug, function)
     line_note = measured.get('line_note', '') if measured and measured.get('source') == source else ''
     mapping = (line_note or '\nC-line mapping unavailable for this candidate/build; no line locations inferred.') if base == 'current' else '\nC-line mapping will refresh after this candidate is compiled; no historical line locations inferred.'
     baseline = agent_evidence.baseline_note(fn, measured, net) or 'Baseline: historical/unverified for these inputs; no current score inferred.'
@@ -139,7 +180,7 @@ def stale(net, agent, fn, submitted, source, actual, anchor=""):
                         'Apply your next patch to the current revision; get_candidate only if these changes are insufficient.\n'+origin+change)
 
 
-def next_action(net, agent, fn, source, revision):
+def next_action(net, agent, fn, *, rows=None, source=None):
     store = net.project_store(fn['project_id'])
     held = store.one('SELECT 1 FROM claims WHERE function_id=? AND agent_id=?',fn['id'],agent.id)
     if not held:
@@ -147,18 +188,26 @@ def next_action(net, agent, fn, source, revision):
     state = net.stall_status(fn['id'],agent.id,project_id=fn['project_id'])
     if state['compiles'] and state['no_better'] >= state['after']:
         return 'Next: move-on budget exhausted. Release with concise findings, then claim another function; no further tuning is recommended.'
-    for family in ('signedness','declaration_order'):
-        targets = agent_targets.valid_targets(source,family)
-        if any(available_target(net,fn,source,revision,family,t['old']) for t in targets):
-            return f'Next valid local experiment: compile_family(function="{fn["name"]}", revision="{revision}", family="{family}", target="next").'
-    for family,proposal in pattern_repairs.variants(source,fn['name']):
-        used = store.one('SELECT 1 FROM agent_variant_runs WHERE function_id=? AND revision=? AND family=?',fn['id'],revision,family)
-        if not used and not target_tried(net,fn,revision,'local:'+family,proposal) and not compiled_before(net,fn,proposal):
-            return f'Next applicable repair: compile_family(function="{fn["name"]}", revision="{revision}", family="{family}").'
-    return 'Next: inspect the first differing region with last_diff; fix structure, calls or types rather than repeating ineffective edits.'
+    if rows is None:
+        if not state['compiles']:
+            return 'Next: compile the current candidate to obtain a measured mismatch.'
+        measured = getattr(net, '_agent_outcomes', {}).get((agent.id, fn['id']))
+        if measured and measured['source'] == source:
+            from .agent_evidence import build_key
+            if measured.get('input_scope') == build_key(net, fn)[0]:
+                if measured.get('build_failed'):
+                    return 'Next: resolve the reported compiler or build error before tuning instructions.'
+                if '\nwhen linking your code' in measured.get('warnings', ''):
+                    return LINK_NEXT
+                rows = measured.get('rows')
+        if rows is None:
+            return 'Next: judge this revision to obtain a current instruction diff before choosing an edit.'
+    from .efficiency_feedback import next_experiment
+    project = store.one('SELECT arch FROM projects WHERE id=?', fn['project_id'])
+    return next_experiment(rows, arch=project['arch'])
 
 
-def patch(net, agent, slug, function, revision, old, new, repair_note='', repair_category='other', repair_automation='', occurrence=0):
+def patch(net, agent, slug, function, revision, old, new, repair_note='', repair_category='', repair_automation='', occurrence=0, suggested_category=''):
     fn = net._function(function, slug)
     with net.attempt_turn(agent, fn):
         source, actual = candidate(net, agent, slug, function)
@@ -169,7 +218,12 @@ def patch(net, agent, slug, function, revision, old, new, repair_note='', repair
         except NetworkError as error:
             raise NetworkError(f'{error}\nCurrent candidate revision {actual}; no compile run. Use an exact anchor from the current C; no fuzzy edit was applied.') from error
         from .tools import _compile
-        return _compile(net, agent, slug, function, edited, repair_note, repair_category, repair_automation)
+        reply = _compile(net, agent, slug, function, edited, repair_note, repair_category, repair_automation, suggested_category)
+        measured = getattr(net, '_agent_outcomes', {}).get((agent.id, fn['id']))
+        if measured and measured['source'] == edited and measured.get('score') is not None:
+            measured['patch_receipt'] = {'from_revision': revision, 'old': old[:320], 'new': new[:320],
+                                         'occurrence': occurrence, 'abbreviated': max(len(old), len(new)) > 320}
+        return reply
 
 
 def remember(net, agent, fn, before):
@@ -311,9 +365,8 @@ def brief(net, text, slug=None, agent=None):
                     from . import agent_review
                     proj=net.project_row(slug)
                     review=agent_review.brief(net,proj,fn)
-                    pending=agent_review.load(net,agent_review.EXPERIMENT+str(fn['id']),project_id=fn['project_id'])
-                    next_step='\nStructured next experiment available: get_function(section="experiment"). It is untested and must pass current revision/anchor checks.' if pending else ''
-                    text = experiments+'\n'+review+next_step+'\n'+text
+                    next_step = agent_review.handoff_brief(net, slug, fn, source)
+                    text = experiments+'\n'+review+'\n'+next_step+'\n'+text
         except NetworkError:
             pass
     return text
@@ -506,6 +559,7 @@ def feedback(net, agent, slug, function, text, previous):
         remember_log(net,agent,fn,warn)
         warn = concise_warnings(warn)
         warn = ('\n'+warn) if warn else ''
+    link_blocked = '\nwhen linking your code' in text
     if previous == rows:
         key = (agent.id, fn['id'])
         streaks = getattr(net, '_agent_unchanged', None)
@@ -513,15 +567,23 @@ def feedback(net, agent, slug, function, text, previous):
             streaks = net._agent_unchanged = {}
         streaks[key] = streaks.get(key, 0) + 1
         detail = 'Instruction diff unchanged from your previous compile (not merely an equal score).'
-        if streaks[key] >= 2:
-            detail += (' Multiple edits produced identical instructions. Change approach: inspect the differing '
-                       'region, try a local permutation search, or test independent alternatives with compile_variants; '
-                       'avoid repeating edits the compiler optimizes away.')
-            current_source, revision = candidate(net,agent,slug,function)
-            history = net.project_store(fn['project_id']).all('SELECT h.summary FROM attempt_hints h JOIN attempts a ON a.id=h.attempt_id '
-                                    'WHERE h.function_id=? AND a.agent_id=? ORDER BY h.attempt_id DESC LIMIT 3',fn['id'],agent.id)
-            detail += '\nRecent change history: ' + '; '.join(r['summary'][:180] for r in history if r['summary'])
-            detail += '\n'+next_action(net,agent,fn,current_source,revision)
+        if streaks[key] >= 2 and not link_blocked:
+            detail += ' Multiple edits produced identical instructions.'
+            detail += '\n' + next_action(net, agent, fn, rows=diagnostic)
+            if streaks[key] == 2 and 'Next experiment:' in detail:
+                from . import repair_search, search_evidence
+
+                proj = net.project_row(slug)
+                outcome = getattr(net, '_agent_outcomes', {}).get(key) or {}
+                if outcome.get('source') and (repeat := search_evidence.repeated_hint(net, proj, fn, outcome['source'])):
+                    detail += '\n' + repeat
+                if example := repair_search.retry_example(net, proj, fn, diagnostic):
+                    detail += '\n' + example
+            history = net.project_store(fn['project_id']).all(
+                'SELECT h.summary FROM attempt_hints h JOIN attempts a ON a.id=h.attempt_id '
+                'WHERE h.function_id=? AND a.agent_id=? ORDER BY h.attempt_id DESC LIMIT 3', fn['id'], agent.id)
+            if history:
+                detail += '\nRecent change history: ' + '; '.join(row['summary'][:180] for row in history)
     else:
         getattr(net, '_agent_unchanged', {}).pop((agent.id, fn['id']), None)
         # Show newly changed differing rows first, with ordinary first-region fallback.
@@ -531,14 +593,22 @@ def feedback(net, agent, slug, function, text, previous):
     from ..source_lines import feedback_note
     mapping = ('\nInstruction differences unchanged; repeated C-line table omitted. Source line numbers may have shifted; get_candidate supplies current C.'
                if previous == rows else feedback_note(text, rendering_rows=[a for a,b in zip(rows,diagnostic) if a[0]!=' ' and b[0]==' ']))
+    if link_blocked:
+        warn = '\n' + LINK_NEXT + warn
     return head + detail + mapping + warn + '\nFull/paged instructions: last_diff(function, start=0, limit=40).'
 
 
 
 def function_view(net, agent, slug, function, section='summary', start=0, limit=6000):
+    if section == 'work':
+        from .guided_matching import packet
+        return packet(net, agent, slug, function)
     if section=='summary':
         fn=net._function(function,slug)
+        from .stub_candidates import hint as stub_hint
+        stub_note=stub_hint(net,fn,fn['best_source'] or '')
         return (f"{fn['name']}: {fn['status']}; {fn['n_insns']} instructions; saved historical score {fn['best_score'] if fn['best_score'] is not None else 'unavailable'}.\n"
+                +(stub_note+'\n' if stub_note else '')+
                 'Use section=brief for a working packet, candidate for complete editable C, history/quality/notes for evidence, or get_assembly for instruction pages. Supporting sections accept character offsets start/limit.')
     text=_function_view(net,agent,slug,function,section)
     if section in {'candidate','source','draft','matched','brief'}:
@@ -565,6 +635,9 @@ def _function_view(net, agent, slug, function, section='all'):
                 text+='\nCurrent continuation:\n'+get_candidate(net,agent,slug,function)
             elif 'candidate revision '+revision not in text.lower():
                 text+=f'\nCandidate revision {revision}; use compile_patch on the supplied candidate.\n'
+            from .agent_review import handoff_brief
+            if handoff := handoff_brief(net, slug, fn, source):
+                text = handoff + '\n\n' + text
         return text
     if section == 'draft':
         fn=net._function(function,slug)
@@ -611,8 +684,12 @@ def outcome(net, agent, fn, source, text):
     kept = net._last_diffs.get((agent.id, fn['id'])) if score is not None else None
     offsets = [text.index(mark) for mark in ('\ncompiler output:', '\nwhen linking your code') if mark in text]
     warnings = text[min(offsets):] if offsets else ''
-    value = {'source': source, 'score': score, 'rows': list(kept[0]) if kept else None, 'legend': kept[1] if kept else scoring.LEGEND, 'warnings': warnings}
+    value = {'source': source, 'score': score, 'rows': list(kept[0]) if kept else None,
+             'legend': kept[1] if kept else scoring.LEGEND, 'warnings': warnings,
+             'build_failed': 'COMPILE ERROR' in text or 'BUILD ERROR' in text}
     from .agent_evidence import build_key
+    from .efficiency_feedback import patch_anchors
+    value['anchors'] = patch_anchors(text, source) if kept else []
     current=net.project_store(fn['project_id']).one('SELECT * FROM functions WHERE id=?',fn['id'])
     if current is not None:
         value['input_scope']=build_key(net,current)[0]
@@ -809,7 +886,7 @@ def local_family(net, agent, slug, function, revision, family, old='', declarati
         return (f'Selected declaration {declaration}.\n' if declaration else '') + result
 
 
-def variants(net, agent, slug, function, revision, patches, family="explicit patches", *, seconds=60, deadline=None, provenance_kind='agent batch', variant_families=None):
+def variants(net, agent, slug, function, revision, patches, family="explicit patches", *, seconds=60, deadline=None, provenance_kind='agent batch', variant_families=None, combine=False, present_options=False):
     """Independent alternatives against one snapshot, with one deadline across preparation and trials."""
     if deadline is None:
         deadline = time.monotonic() + seconds
@@ -818,6 +895,8 @@ def variants(net, agent, slug, function, revision, patches, family="explicit pat
     from .tools import _compile
     if not isinstance(patches, list) or not 1 <= len(patches) <= 6:
         raise NetworkError('Send 1 to 6 independent patches with old and new text.')
+    if combine and (family != 'explicit patches' or not 2 <= len(patches) <= 5):
+        raise NetworkError('Send 2 to 5 independent patches to reserve one trial for a combination.')
     fn = net._function(function, slug)
     with net.attempt_turn(agent, fn):
         source, actual = candidate(net, agent, slug, function)
@@ -882,6 +961,7 @@ def variants(net, agent, slug, function, revision, patches, family="explicit pat
                 f"{i}: "+'\n'.join(list(difflib.unified_diff(source.splitlines(),text.splitlines(),n=0,lineterm=''))[2:14])[:600]
                 for i,text in enumerate(candidates,1)))
         durable_scope=target_scope(net,fn,'')
+        combined_source = None
         for i, src in enumerate(candidates, 1):
             if time.monotonic() >= deadline:
                 if last is None:
@@ -902,7 +982,7 @@ def variants(net, agent, slug, function, revision, patches, family="explicit pat
             measured = measured if measured and measured['source'] == src else None
             observations.append({'score':measured['score'],'rows':measured['rows'],
                                  'cached':'REPEAT:' in result, 'elapsed_ms':round((time.monotonic()-started)*1000),
-                                 **{key:measured[key] for key in ('output_fingerprint','output_granularity','candidate_target','candidate_relocs','matched','exact') if key in measured}} if measured else None)
+                                 **{key:measured[key] for key in ('input_scope','output_fingerprint','output_granularity','candidate_target','candidate_relocs','matched','exact') if key in measured}} if measured else None)
             score = measured['score'] if measured else None
             compile_error = score is None and '❌ COMPILE ERROR' in result
             if family != 'explicit patches' and ((score is not None and score > 0) or compile_error):
@@ -947,6 +1027,22 @@ def variants(net, agent, slug, function, revision, patches, family="explicit pat
                 results.append(('Unchanged-output limit reached' if 'Unchanged-output limit reached' in result else 'Max tries reached')+'; no further variants submitted.')
             if net._function(function, slug)['status'] != 'open' or 'Max tries reached' in result or 'Unchanged-output limit reached' in result:
                 break
+            if combine and combined_source is None and i == len(candidates) and (baseline or {}).get('input_scope'):
+                from .model_replay_evidence import complementary_edits
+
+                siblings = [(source, baseline, candidate, evidence) for _, candidate, evidence, index in choices
+                            if index and evidence.get('input_scope') == baseline['input_scope']]
+                for composed, parent, left, right in complementary_edits(siblings):
+                    if composed in candidates or composed == source:
+                        continue
+                    combined_source = composed
+                    candidates.append(composed)
+                    results.append(f'Variant {i+1} combines nonoverlapping edits that recovered different target '
+                                   f'instructions. Starting score {parent["score"]}, individual scores '
+                                   f'{left["score"]} and {right["score"]}.')
+                    break
+        if combine and combined_source is None:
+            results.append('No measured complementary pair qualified for an extra compile.')
         for indices, summary in groups.values():
             results.append('Variants '+','.join(map(str,indices))+': '+summary)
         if baseline:
@@ -970,6 +1066,37 @@ def variants(net, agent, slug, function, revision, patches, family="explicit pat
             claim = net.project_store(fn['project_id']).one('SELECT claimed_at FROM claims WHERE function_id=? AND agent_id=?',fn['id'],agent.id)
             stamp = (latest['id'] if latest and claim and latest['created_at']>=claim['claimed_at'] else None,
                      claim['claimed_at'] if claim else None,target_scope(net,fn,''))
+            if present_options:
+                options = net.__dict__.setdefault('_measured_agent_options', {})
+                build_scope = agent_evidence.build_key(net, net._function(function, slug))[0]
+                eligible = {index: (src, evidence) for _, src, evidence, index in choices
+                            if index and evidence.get('rows') is not None and evidence.get('input_scope') == build_scope}
+                options[agent.id, fn['id']] = {'stamp': stamp, 'choices': eligible}
+                while len(options) > 64:
+                    options.pop(next(iter(options)))
+                if eligible:
+                    results.append('Choose a measured option with get_candidate(base="measured_option", option=NUMBER), '
+                                   'or keep the current continuation. Choosing one uses no compile.')
+                    from .region_repairs import resolution_text
+                    for index, (_, evidence) in eligible.items():
+                        effect = resolution_text((baseline or {}).get('rows'), evidence['rows'])
+                        if effect:
+                            results.append(f'Option {index}. {effect}')
+            from .region_repairs import gain, snapshot
+            arch = net.project_row(slug)['arch']
+            winner = snapshot(measurement.get('rows') or (), arch)
+            regional = [(gain(winner, snapshot(evidence.get('rows') or (), arch)), -score, index, src, evidence)
+                        for score, src, evidence, index in choices if src != selected and index]
+            alternatives = net.__dict__.setdefault('_agent_alternatives', {})
+            alternatives.pop((agent.id, fn['id']), None)
+            best_region = max(regional, key=lambda item: item[:3], default=None)
+            if best_region and best_region[0]:
+                recovered, _, index, alternate, evidence = best_region
+                alternatives[agent.id, fn['id']] = {'stamp': stamp, 'source': alternate, 'measurement': evidence}
+                if len(alternatives) > 64:
+                    del alternatives[next(iter(alternatives))]
+                results.append(f'Variant {index} improves a target region over the chosen continuation. '
+                               'Try a complementary edit from get_candidate(base="regional_alternative") if useful.')
             if not hasattr(net,'_agent_selected'):
                 net._agent_selected = {}
             net._agent_selected[agent.id,fn['id']] = {'stamp':stamp,'source':selected,'cause':('Your '+family+' batch retained its starting candidate' if selected_index==0 else f'Your {family} batch selected variant {selected_index}')}

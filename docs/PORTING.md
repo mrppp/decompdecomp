@@ -281,12 +281,10 @@ The host is the console's (`PortKit.wasm`; N64: `consoles/n64/port_wasm/host.c`)
   first controller's buttons and stick from a given frame on) and the serial bus the game may drive itself (the
   first controller, no Controller Pak, and a 4 Kbit save EEPROM kept in a file: `PORT_SAVE=path`, else `game.eep`
   in the folder the game runs from, written as the game saves);
-- the sound (`audio.c`): libultra's audio tasks (the "ABI 1" command list: ADPCM, resampling, envelopes, mixing; or
-  n_audio's, the `n_al*` synthesizer's, told apart by ABI 1's segment and buffer commands, which n_audio never
-  sends) run in software, and each buffer the game gives the audio interface is played in the live view (its Sound button)
-  and, with `PORT_AUDIO=file.wav`, saved. The interface's registers answer in real time at the game's rate, so the
-  game paces its sound as on the console. Not yet: the resampler's exact taps (linear for now), and n_audio's
-  A_POLEF (no game has sent it here, so its buffers aren't known);
+- the sound (`audio.c`, `audio_musyx.c`): the port runs libultra ABI 1 and n_audio command lists, and
+  MusyX v1 subframe descriptors, in software. The audio interface plays each submitted buffer in the live
+  view, can save it with `PORT_AUDIO=file.wav`, and signals the game when a DMA buffer completes. The
+  libultra resampler still uses linear interpolation, and n_audio's A_POLEF remains unimplemented.
 - the app's **Play in browser** (Porting): builds the game from the project's last save, starts it with
   `PORT_LIVE` on a free port and opens it in a window of its own (the app window's program; the browser where no
   window can open); closing the window, Stop the game or quitting the app ends it.
@@ -295,7 +293,9 @@ The host is the console's (`PortKit.wasm`; N64: `consoles/n64/port_wasm/host.c`)
   for placing, its IR and its own rows of the signature and address tables; for the host, the wasm2c part), so a
   Save that changed one function recompiles that function and the one wasm2c part holding it.
   Its saves stay in the build folder (`game.eep`);
-- the app's **Export…** (Porting, beside Play; `port/wasm/export.py`): the game as something to keep and share,
+- **Export** in Porting (`port/wasm/export.py`): select one or more targets, then click **Export selected**.
+  Selections are saved per project. One job builds the selected targets in order and shows each successful
+  export's folder and instructions. The game is exported
   into the save repository's `port/wasm/export/` (git ignores it: it's built from the game). App, browser and iOS
   exports ask for the player's own ROM. The local Miyoo and Steam Deck exports can include your ROM.
   Each export also adds a GitHub Actions workflow to the project's repository (`port/wasm/workflows.py`) that makes
@@ -310,14 +310,14 @@ The host is the console's (`PortKit.wasm`; N64: `consoles/n64/port_wasm/host.c`)
   from it. Both files are committed (those paths alone) and never pushed. What a runner can't make it leaves out:
   the handhelds' packs have no ROM (the player puts theirs in it), and the apps have no C recompiled from the ROM:
   a function with no C yet runs from the player's ROM, interpreted ("Functions with no C yet", below).
-  - *Standalone app for this computer*: the native program with a launcher. On macOS a universal app (`Game.app`,
+  - *Standalone app (opens in your browser)*: the native program with a launcher. On macOS a universal app (`Game.app`,
     macOS 11 and up, for Apple Silicon and Intel Macs alike, whichever kind exported it) that asks for the ROM once, keeps its saves in its own Application Support folder and opens the game
     in the browser; quitting it stops the game. Its program is a small compiled universal launcher that runs
     `Resources/play.sh`, and the bundle has an ad-hoc signature, so a zipped or AirDropped copy stays whole; without an
     Apple Developer ID another Mac still asks once (Control-click > Open, or Privacy & Security > Open Anyway), which
     `How to open on a Mac.txt` beside the app tells the player. On Linux and Windows the program with `play.sh` / `play.bat`
     (they take the ROM's path and remember it).
-  - *Standalone app with its own window (Mac)*: the game in an SDL3 window instead of the browser. The app is the
+  - *Standalone app (opens in its own Mac window via SDL3)*: the game in an SDL3 window instead of the browser. The app is the
     game itself (`Contents/MacOS/game`), with no script and no AppleScript: opened with no ROM named, it reads
     `Contents/Resources/port.env` (`PORT_WINDOW`, `PORT_TITLE`, `PORT_APP`), keeps its saves, the ROM's path and its
     log in `~/Library/Application Support/<PORT_APP>`, and asks for the ROM in SDL3's own file dialog, again until the

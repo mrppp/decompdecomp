@@ -30,6 +30,7 @@ import stat
 import threading
 import time
 import zlib
+from collections import Counter
 from contextlib import ExitStack, contextmanager
 from contextvars import copy_context
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ from ..network import NetworkError
 from ..request_timing import phase
 from ..rom.symbols import ASM_LOCAL, IDENT
 from ..store import in_transaction
+from .function_names import rename_identifiers
 
 log = logging.getLogger("decompdecomp")
 
@@ -395,6 +397,8 @@ def _manifest(files: dict[str, str], cfg: dict, known_names=()) -> dict:
                 raise ValueError("a note is malformed")
         if any(not isinstance(item, str) for item in manifest.get("knowledge", [])):
             raise ValueError("knowledge must be a list of text")
+        if not isinstance(manifest.get('knowledge_evidence', {}), dict):
+            raise ValueError('knowledge_evidence must be an object')
         for item in manifest.get("set_aside", []):
             if (not isinstance(item, dict) or not (IDENT.fullmatch(item.get("name", "")) or LOCAL_PIECE.fullmatch(item.get("name", "")))
                     or not isinstance(item.get("vram"), int)
@@ -483,6 +487,66 @@ def _merge_manifest(old, new, current, key: str = ""):
     return new
 
 
+def _reconcile_renames(store, pid, saved, rendered, disk, before, pending, removed):
+    """Carry saved files through a database rename, preserving edits under the old filename."""
+    local = json.loads(rendered[saves.MANIFEST])
+    if saved["layout"] == local["layout"]:
+        return False
+    local_names = {entry["name"] for entry in local["layout"]}
+    missing = {entry["name"]: entry for entry in saved["layout"] if entry["name"] not in local_names}
+    if not missing:
+        return False
+    rows = metadata_rows(store, ("name", "vram", "size", "original", "previous"),
+        """SELECT name,vram,size,json_extract(meta,'$.naming.original_name') AS original,
+           json_extract(meta,'$.naming.previous_name') AS previous FROM functions
+           WHERE project_id=? AND json_extract(meta,'$.naming.name')=name""", pid)
+    renames = {}
+    for row in rows:
+        for old in {row["original"], row["previous"]} & missing.keys():
+            if (missing[old]["vram"], missing[old]["size"]) == (row["vram"], row["size"]):
+                renames.setdefault(old, []).append(row["name"])
+    renames = {old: new[0] for old, new in renames.items() if len(new) == 1}
+    # Several former names of one function on disk can represent independent edits.
+    counts = Counter(renames.values())
+    renames = {old: new for old, new in renames.items() if counts[new] == 1}
+    if not renames:
+        return False
+
+    merged = json.loads(pending.get(saves.MANIFEST, disk[saves.MANIFEST]))
+    layout = {entry["name"]: entry for entry in merged["layout"]}
+    for old, new in renames.items():
+        entry = layout.pop(old, missing[old])
+        layout.setdefault(new, dict(entry, name=new))
+        for key in ("functions", "function_headers"):
+            entries = merged.get(key) or {}
+            if old in entries:
+                entries.setdefault(new, entries.pop(old))
+        for directory in ("src", "best"):
+            source = f"{directory}/{saves._source_file(old)}"
+            target = f"{directory}/{saves._source_file(new)}"
+            if source == target or source not in disk:
+                continue
+            text = disk[source]
+            if before is None or _hash(text) != before.files.get(source) or target not in rendered:
+                renamed = rename_identifiers(text, renames)
+                if target in disk and saves._source_text(disk[target]) != saves._source_text(renamed):
+                    raise NetworkError(f"Both {source} and {target} contain saved C. Reconcile their edits before syncing.")
+                if target not in rendered or saves._source_text(renamed) != saves._source_text(rendered[target]):
+                    pending[target] = renamed
+                elif target not in disk:
+                    pending[target] = rendered[target]
+            elif target not in disk:
+                pending[target] = rendered[target]
+            pending.pop(source, None)
+            removed[source] = None
+    merged["layout"] = list(layout.values())
+    current_symbols = {(sym["name"], sym["address"]) for sym in local.get("symbols", [])}
+    merged["symbols"] = [sym for sym in merged.get("symbols", [])
+                         if (renames.get(sym["name"]), sym["address"]) not in current_symbols]
+    pending[saves.MANIFEST] = saves.manifest_text(merged)
+    return True
+
+
 def _initial_merge(manifest: dict, projected: dict[str, str], disk: dict[str, str]) -> tuple[dict, dict[str, str]]:
     """A first sync has no deletion history, so keep database work while adding saved contributions."""
     local = json.loads(projected[saves.MANIFEST])
@@ -502,6 +566,8 @@ def _initial_merge(manifest: dict, projected: dict[str, str], disk: dict[str, st
                 current.append(item)
                 known.add(ident)
         manifest[key] = current
+    if records := _merge_manifest({}, local.get('knowledge_evidence', {}), manifest.get('knowledge_evidence', {})):
+        manifest['knowledge_evidence'] = records
 
     headers = manifest.get("headers") or {}
     pending = {}
@@ -554,6 +620,29 @@ def included_headers(files) -> set[str]:
         if isinstance(text, str) and path.endswith(('.c', '.h')) and path.startswith(('src/', 'best/', 'include/')):
             names.update(name.rsplit('/', 1)[-1] for name in _INCLUDE.findall(text))
     return names
+
+
+def _verification_causes(paths, pending, full, previous, current):
+    causes = []
+    if pending:
+        causes.append('pending-match')
+    for prefix, label in (('include/', 'header'), ('src/', 'matched-source'), ('best/', 'candidate-source')):
+        if any(path.startswith(prefix) for path in paths):
+            causes.append(label)
+    if saves.MANIFEST in paths:
+        fields = {
+            'compiler': ('compiler', 'compiler_ranges', 'function_compilers'),
+            'symbols': ('symbols',),
+            'layout': ('layout',),
+            'header-selection': ('headers',),
+            'assembly-selection': ('set_aside',),
+        }
+        changed_fields = [label for label, keys in fields.items()
+                          if any(previous.get(key) != current.get(key) for key in keys)]
+        causes.extend(changed_fields or ['manifest'])
+    if full:
+        causes.append('shared-or-initial-inputs')
+    return causes or ['deferred-recheck']
 
 
 def affected_functions(old, new, changed, rows, included=None):
@@ -643,6 +732,7 @@ class _Recheck:
     functions: set[str] = field(default_factory=set)
     foreground: bool = False
     ready: bool = False
+    acknowledged: tuple | None = None
 
 
 @dataclass(eq=False)
@@ -1369,6 +1459,7 @@ class Progress:
         ok, result = outcome[0]
         if not ok:
             raise result
+        self.local.finished_recheck = active
         return result, active
 
     @contextmanager
@@ -1402,7 +1493,7 @@ class Progress:
     # function's file is not an input to this judgment.
     JUDGE_FOLDERS = ("include",)
 
-    def check_for_judging(self, slug: str) -> bool:
+    def check_for_judging(self, slug: str, *, function: str = "") -> bool:
         """The check before a judge: only what it reads, when the last full check is on record.
 
         A forced check stats every saved file (2,100 on an N64 game: 0.3 to 1.8 s a compile under load). The folder's
@@ -1419,11 +1510,24 @@ class Progress:
         if cached is not None and slug not in self.rechecking and slug not in self.blocked:
             try:
                 folder = saves.default_folder(self.net, slug)
-                wanted = {*saves.TOP_FILES, *self.JUDGE_FOLDERS}
-                kept = tuple(item for item in cached if item[0] in wanted
-                             or item[0].split("/", 1)[0] in self.JUDGE_FOLDERS)
-                if kept and self._judge_signature(folder) == kept:
+                shapes = self.__dict__.setdefault('_scoped_judge_signatures', {})
+                kept = shapes.get(slug)
+                if not kept or kept[0] is not cached:
+                    by_path = {item[0]: item for item in cached}
+                    wanted = {*saves.TOP_FILES, *self.JUDGE_FOLDERS}
+                    build = tuple(item for item in cached if item[0] in wanted
+                                  or item[0].split('/', 1)[0] in self.JUDGE_FOLDERS)
+                    kept = (cached, by_path, build)
+                    if len(shapes) >= 32:
+                        shapes.clear()
+                    shapes[slug] = kept
+                if kept[2] and self._judge_signature(folder) == kept[2] and (
+                        not function or self._candidate_files_unchanged(folder, function, kept[1])):
                     self._judge_check("narrow")
+                    # Nested project lookups must not follow this verified snapshot with a full sync.
+                    synced = getattr(self.local, 'synced', None)
+                    if synced is not None and getattr(self.local, 'deferring', False):
+                        synced.add(slug)
                     return False
             except (OSError, NetworkError):
                 pass
@@ -1431,6 +1535,22 @@ class Progress:
         from ..attempt_status import update
         update("waiting")
         return self.sync(slug, force=True)
+
+    @staticmethod
+    def _candidate_files_unchanged(folder, function, acknowledged):
+        filename = saves._source_file(function)
+        if '/' in filename or '\\' in filename:
+            return False
+        for directory in ('src', 'best'):
+            name = f'{directory}/{filename}'
+            try:
+                info = os.stat(folder / name, follow_symlinks=False)
+                current = (name, info.st_mtime_ns, info.st_size, info.st_mode, info.st_ctime_ns, info.st_ino)
+            except FileNotFoundError:
+                current = None
+            if acknowledged.get(name) != current:
+                return False
+        return True
 
     def _judge_check(self, way: str) -> None:
         """Count which check a judge made, and log the counts now and then: whether the narrow check holds."""
@@ -1832,7 +1952,9 @@ class Progress:
                 return False  # the check holding the lock reads the folder for this call too (_sync_lock)
             if asked is not None and self._checked_since.get(slug, -1) > asked and slug not in self.rechecking:
                 return False  # a full check that took the lock after this was asked has just finished
+            joined = None
             while slug in self.rechecking:
+                joined = self.rechecking[slug]
                 if getattr(self.local, 'foreground', False) and self.rechecking[slug].ready:
                     self._check_rechecking_files(slug)
                     return False
@@ -1841,6 +1963,8 @@ class Progress:
                 # Public Condition.wait also releases an outer batch's recursive lock.
                 with span('progress_recheck_wait'):
                     threading.Condition(self._project_lock(slug)).wait(timeout=0.1)
+            if joined is not None and logger is None and self._joined_recheck(slug, store, joined):
+                return False
             if self._batching(slug):
                 return False
             observed_preparation = None
@@ -1868,6 +1992,7 @@ class Progress:
                 self.local.began = (slug, next(self._asks))
             self._activity(slug, phase="Reading saved files", done=0, total=None, function=None, full_recheck=False)
             self.local.busy = True
+            self.local.finished_recheck = None
             try:
                 proj = self.net._project(slug)
                 rom = self.net.is_rom(proj) and bool(self.net.cfg(proj).get("rom", {}).get("sha1"))
@@ -2000,6 +2125,9 @@ class Progress:
                     stable = signature == self._signature(folder)
                     if acknowledged and stable:
                         self.signatures[slug] = signature
+                        finished = self.local.finished_recheck
+                        if finished is not None:
+                            finished.acknowledged = (signature, _config_key(proj, self.net.cfg(proj)))
                         self.stamps[slug] = self._stamp(folder)
                         if mark is not None:
                             self.signature_marks[slug] = mark
@@ -2034,9 +2162,29 @@ class Progress:
                 raise
             finally:
                 self.local.busy = False
+                self.local.finished_recheck = None
                 with self.activity_lock:
                     if slug not in self.paused and slug not in self.rechecking:
                         self.activity.pop(slug, None)
+
+    def _joined_recheck(self, slug, store, joined):
+        """Reuse the completed saved revision only while its inputs still match."""
+        if joined.acknowledged is None:
+            return False
+        signature, config_key = joined.acknowledged
+        proj = self.net.project_row(slug, sync=False)
+        cfg = self.net.cfg(proj)
+        pid = proj['id']
+        state = self._state(pid)
+        dirty = self._dirty(pid)
+        if (state is None or dirty.token != state.dirty_token or dirty.functions or dirty.headers or dirty.metadata
+                or self._pending_match_checks(store, pid)
+                or _config_key(proj, cfg) != config_key
+                or saves.default_folder(self.net, slug) != joined.folder
+                or self._folder_signature(slug, joined.folder) != signature):
+            return False
+        saves.log.debug('Joined saved verification project=%s revision=%s', slug, self.revisions.get(slug, 0))
+        return True
 
     def _failed(self, slug: str) -> None:
         """Remember what a failed sync read (after its own writes), so the next one waits for a change."""
@@ -2376,9 +2524,12 @@ class Progress:
             # loading the pull; the contributor wins if both changed the same file.
             all_code = False
             affected = None
+            input_changes = changed
+            compared_manifest = {}
             deferred, recheck_due = set(), False
             judging_change = True  # Unknown import shapes conservatively invalidate in-flight results.
             pending = {}
+            reconciled_renames = False
             if projected is not None:
                 rendered = comparison if comparison is not None else saves._render(net, slug)[0]
                 previous = projected
@@ -2410,6 +2561,8 @@ class Progress:
                                         json.loads(disk[saves.MANIFEST])))
                 removed = {name: None for name in previous.files
                            if name not in changed and name not in rendered}
+                reconciled_renames = _reconcile_renames(
+                    store, pid, json.loads(disk[saves.MANIFEST]), rendered, disk, before, pending, removed)
                 candidate = {name: text for name, text in (disk | pending).items() if name not in removed}
                 # (the merge keeps a header entry the last sync's manifest had, after its function matched and the
                 # database's render dropped it: no file anywhere, and every sync after refused the folder)
@@ -2432,7 +2585,8 @@ class Progress:
                 input_changes = {name for name in set(candidate) | set(rendered)
                                  if input_text(candidate, name) != input_text(rendered, name)}
                 included = included_headers(rendered | candidate)
-                affected = affected_functions(json.loads(rendered[saves.MANIFEST]), merged_manifest,
+                compared_manifest = json.loads(rendered[saves.MANIFEST])
+                affected = affected_functions(compared_manifest, merged_manifest,
                                               input_changes, function_rows, included)
                 if before is None:
                     applied_changed = {name for name in set(candidate) | set(comparison)
@@ -2455,7 +2609,7 @@ class Progress:
                     applied_changed = {path for path in applied_changed
                                        if path in input_changes or path in external_code or not path.startswith(('src/', 'best/'))
                                        or source_name(path, matched_names | known_names) not in matched_names}
-                    shared = affected_functions(json.loads(rendered[saves.MANIFEST]), merged_manifest,
+                    shared = affected_functions(compared_manifest, merged_manifest,
                                                 {path for path in input_changes if not path.startswith(('src/', 'best/'))},
                                                 function_rows, included)
                     deferred, recheck_due, pending_rechecks = self._deferred_rechecks(store, pid, affected, candidate, shared)
@@ -2489,6 +2643,10 @@ class Progress:
                 if needs_judging:
                     reason = ("Shared linking inputs or function layout changed. Saved functions must be rebuilt to confirm their original bytes."
                               if all_code else f"Build inputs changed for {len(affected or [])} functions. Only their saved sources are being rechecked; other matches are retained.")
+                    causes = _verification_causes(input_changes, bool(pending_matches), all_code,
+                                                  compared_manifest, merged_manifest)
+                    saves.log.info('Saved verification planned project=%s causes=%s functions=%s',
+                                   slug, ','.join(causes), 'all' if all_code else len(affected or ()))
                     self._activity(slug, reason=reason, full_recheck=all_code or bool(function_rows) and
                                    all(row["name"] in (affected or set()) for row in function_rows))
                 if toolchain and needs_judging:
@@ -2542,6 +2700,7 @@ class Progress:
                                       (pid,)).fetchall()
                     checks = dict(queued_matches)
                     impacted_names = affected or set()
+                    rejudge_best = set()
                     for row in rows:
                         if row["name"] in deferred and row["id"] not in checks:
                             continue  # its saved C is the database's own verdict: checked again when due
@@ -2565,13 +2724,13 @@ class Progress:
                             else:
                                 checks.setdefault(row["id"], "")
                             continue
-                        keep = impacted and not changed_best
+                        # A saved draft is a proposal. Keep the last scored C and let the judge
+                        # publish a better replacement, even if the saved file went missing.
+                        if changed_best:
+                            rejudge_best.add(row["name"])
                         db.execute("UPDATE functions SET status=?, "
-                                   "matched_source=NULL,matched_agent_id=NULL,matched_at=NULL,readable=0,"
-                                   "best_source=CASE WHEN ? THEN best_source ELSE NULL END,"
-                                   "best_score=CASE WHEN ? THEN best_score ELSE NULL END,"
-                                   "best_agent_id=CASE WHEN ? THEN best_agent_id ELSE NULL END WHERE id=?",
-                                   (status, keep, keep, keep, row["id"]))
+                                   "matched_source=NULL,matched_agent_id=NULL,matched_at=NULL,readable=0 WHERE id=?",
+                                   (status, row["id"]))
                         db.execute("DELETE FROM claims WHERE function_id=?", (row["id"],))
                     if checks:
                         db.execute("INSERT INTO settings(key,value) VALUES(?,?) "
@@ -2581,7 +2740,12 @@ class Progress:
                     # with the fresh database render, retaining concurrent new notes too.
                     if restore_notes:
                         db.execute("DELETE FROM notes WHERE project_id=?", (pid,))
-                    db.execute("DELETE FROM knowledge WHERE project_id=? AND status='accepted'", (pid,))
+                    removed_knowledge = json.dumps(applied_manifest.get('knowledge', []))
+                    db.execute("DELETE FROM knowledge_support WHERE knowledge_id IN (SELECT id FROM knowledge "
+                               "WHERE project_id=? AND status='accepted' AND text NOT IN "
+                               "(SELECT value FROM json_each(?)))", (pid, removed_knowledge))
+                    db.execute("DELETE FROM knowledge WHERE project_id=? AND status='accepted' "
+                               "AND text NOT IN (SELECT value FROM json_each(?))", (pid, removed_knowledge))
                     units = set(applied_manifest.get("headers") or {})
                     for row in db.execute("SELECT DISTINCT unit FROM context_versions WHERE project_id=?",
                                           (pid,)).fetchall():
@@ -2593,7 +2757,8 @@ class Progress:
                                                          files=applied_files, restore_notes=restore_notes, agents=agents)
                     report.check_cancel()
                     if not saves._publish(folder, pending, removed, expected=disk,
-                                          chosen=bool(cfg.get("progress_folder")), guarded=disk.keys() | applied_changed):
+                                          chosen=bool(cfg.get("progress_folder")), guarded=disk.keys() | applied_changed,
+                                          write_before_remove=reconciled_renames):
                         raise _FolderChanged
             except _FolderChanged:
                 return self._refused(slug, folder, set(pending) | set(removed) | disk.keys() | applied_changed,
@@ -2633,7 +2798,8 @@ class Progress:
                 needs_judging = needs_judging or bool(verifying)
             self.results[slug], recheck = self._judge_saved(slug, folder, manifest, by_name,
                                                     saved, report,
-                                                    files=disk, judge_code=needs_judging, verifying=verifying)
+                                                    files=disk, judge_code=needs_judging, verifying=verifying,
+                                                    rejudge_best=rejudge_best)
             if any(status == "asm" for status, _ in verifying.values()):
                 saves._restore_set_aside(store, pid, manifest.get("set_aside") or [])
             # The saved judge has finished (including its worker's publications).
@@ -2673,8 +2839,10 @@ class Progress:
             # is recorded, so publish the database's newer C over it.
             judged_files = ({f"{kind}/{saves._source_file(name)}" for name in saved for kind in ("src", "best")}
                             if needs_judging else set())
+            changed_drafts = {f"best/{saves._source_file(name)}" for name in rejudge_best}
             moved = {name: text for name, text in rendered.items()
-                     if name in judged_files and name in disk and saves._source_text(disk[name]) != saves._source_text(text)}
+                     if (name in judged_files and name in disk or name in changed_drafts)
+                     and (name not in disk or saves._source_text(disk[name]) != saves._source_text(text))}
             foreground_files.update(moved)
             # (and a header the save names but the folder lacks: see the merge above)
             missing_headers = {name: text for name, text in rendered.items()

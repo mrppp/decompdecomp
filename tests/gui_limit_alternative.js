@@ -7,7 +7,7 @@ c.toast=(m,kind)=>c.toasts.push([m,kind]);c.poll=()=>{c.polls++;};
 c.$=()=>({});  // the slice wires the Restart all button at its top level (#restartAll): not under test here
 vm.createContext(c);
 const a=source.indexOf('function limitAlternativeButton(');
-vm.runInContext(source.slice(a,source.indexOf('function renderSessions(',a)),c);
+vm.runInContext(source.slice(a,source.indexOf('const agentRestarts',a)),c);
 const s={id:'7',slug:'demo',kind:'opencode',label:'Worker',limit_alternative:{model:'opencode-go/example',label:'OpenCode Go'}};
 assert(c.limitAlternativeButton(s).includes('Switch to the same model on OpenCode Go'));
 assert(c.limitAlternativeButton(s).includes('data-switch-model="7"'));

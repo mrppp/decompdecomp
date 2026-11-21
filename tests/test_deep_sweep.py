@@ -43,8 +43,14 @@ def test_persists_bounded_completion_and_resumes_after_restart(sweep, monkeypatc
     if imported:
         monkeypatch.setattr(net, 'fork_slug', lambda _: 'game')
         net.forks = SimpleNamespace(get=lambda _: (None,SimpleNamespace(root=path,unit=lambda _:SimpleNamespace(source=None,target=None)),{}))
-    result = obj.run('game', 1, 10, Log())
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET n_insns=3 WHERE name='f0'")
+    log = Log()
+    result = obj.run('game', 1, 10, log)
     assert result['functions_tested'] == 2 and calls == ['f0','f1']
+    for group in ('workers', 'recent_workers'):
+        counts = {worker['function']: worker['n_insns'] for update in log.updates for worker in update.get(group, [])}
+        assert counts == {'f0': 3, 'f1': None}
     assert obj.history('game', net._function('f0','game'))['completed']
     # The pass's own improvements must not make it immediately eligible again.
     assert obj.run('game', 1, 10, Log())['functions_tested'] == 0
@@ -680,7 +686,12 @@ def test_search_starts_before_full_preparation_and_reports_checked_total(sweep, 
     assert result['functions_tested'] == 34
     assert seen[0]['checked'] < seen[0]['total'] == 34
     assert all('preparation' in update for update in log.updates)
-    assert log.updates[-1]['preparation']['done']
+    preparations = [update['preparation'] for update in log.updates]
+    assert all(p['eligible'] == len(p['candidates']) <= p['checked'] for p in preparations)
+    full = next(p for p in preparations if p['done'] and p['eligible'] == 34)
+    assert len(set(full['candidates'])) == 34
+    assert {f'extra{i}' for i in range(32)} <= set(full['candidates'])
+    assert preparations[-1]['done']
 
 
 def test_loop_repeats_same_settings_and_stops_on_cancel(sweep, monkeypatch):
@@ -843,7 +854,10 @@ def test_invalid_function_threads_do_not_start_or_save(sweep, value):
 
 def test_controls_and_start_stop_do_not_wait_for_saved_statistics(sweep, monkeypatch):
     import threading
+    import time
     obj, net, calls, path = sweep
+    clock = [100]
+    monkeypatch.setattr(deep_sweep, 'time', SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
     entered, release = threading.Event(), threading.Event()
     def slow(*args):
         entered.set()
@@ -860,9 +874,42 @@ def test_controls_and_start_stop_do_not_wait_for_saved_statistics(sweep, monkeyp
         assert current['job'] == result['job'] and current['state'] == 'running'
         assert obj.start('game')['job'] == result['job']
         assert len(obj.jobs.jobs) == 1
-        assert not obj.stop('game')['enabled']
+        clock[0] = 112
+        assert obj.control('game')['runtime_seconds'] == 12
+        stopped = obj.stop('game')
+        assert not stopped['enabled']
+        assert stopped['runtime_seconds'] == 12
+        clock[0] = 200
+        assert obj.control('game')['runtime_seconds'] == 12
+        assert Sweeps(net, Jobs()).control('game')['runtime_seconds'] == 12
     finally:
         release.set()
+
+
+@pytest.mark.parametrize('fails', [False, True])
+def test_runtime_continues_from_saved_total_and_freezes_on_exit(sweep, monkeypatch, fails):
+    import time
+
+    obj, net, _, _ = sweep
+    obj.save('game', obj.config('game') | {'runtime_seconds': 40})
+    clock = [200]
+    monkeypatch.setattr(deep_sweep, 'time', SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+
+    def run(*args):
+        clock[0] = 207
+        assert obj.control('game')['runtime_seconds'] == 47
+        if fails:
+            raise NetworkError('Search failed.')
+
+    monkeypatch.setattr(obj, 'run', run)
+    if fails:
+        with pytest.raises(NetworkError, match='Search failed'):
+            obj.timed_run('game', 5, 10000, Log(), 1, False)
+    else:
+        obj.timed_run('game', 5, 10000, Log(), 1, False)
+    clock[0] = 300
+    assert obj.status('game')['runtime_seconds'] == 47
+    assert Sweeps(net, Jobs()).control('game')['runtime_seconds'] == 47
 
 
 def test_maximum_throughput_controls_persist_for_returning_project(sweep, monkeypatch):
@@ -924,3 +971,230 @@ def test_one_function_bug_does_not_stop_the_pass(sweep, monkeypatch, caplog, thr
     assert 'TypeError' in row['error']
     assert 'continuing with other functions' in caplog.text
     assert obj.history('game', net._function('f1', 'game'))['completed']
+
+
+def test_deep_search_tries_matched_twin_and_rejudges_improved_partial(tmp_path, monkeypatch):
+    net = RomNetwork(tmp_path / 'db.sqlite', tmp_path)
+    body = bytes.fromhex('2402000103e0000800000000')  # homemade return-one target
+    with net.store.tx() as db:
+        pid = db.execute('INSERT INTO projects(slug,name,arch,root,config,big_endian) VALUES(?,?,?,?,?,1)',
+                         ('game', 'Example', 'mips', str(tmp_path), json.dumps({
+                             'kind': 'rom', 'platform': 'n64', 'big_endian': True,
+                             'compiler': {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O2']}}))).lastrowid
+        for index, name in enumerate(('donor', 'target', 'other')):
+            db.execute('INSERT INTO functions(project_id,name,status,size,vram,target,relocs,best_source,best_score,matched_source) '
+                       'VALUES(?,?,?,?,?,?,?,?,?,?)',
+                       (pid, name, 'matched' if not index else 'open', len(body), 0x80001000+index*32, body, '[]',
+                        f'int {name}(void) {{return 2;}}', 50, 'int donor(void) {return 1;}' if not index else None))
+    monkeypatch.setattr(net, '_context', lambda *_: {'header': '', 'version': 1})
+    judged = []
+
+    def judge(agent, proj, fn, source, **kwargs):
+        judged.append((fn['name'], source))
+        exact = 'return 1;' in source
+        score = 0 if exact else 10
+        with net.store.tx() as db:
+            db.execute('UPDATE functions SET status=?,best_source=?,best_score=?,matched_source=? WHERE id=?',
+                       ('matched' if exact else 'open', source, score, source if exact else None, fn['id']))
+        return {'matched': exact, 'score': score}
+
+    monkeypatch.setattr(net, 'try_quietly', judge)
+    result = deep_permuter.run(net, 'game', 'target', 1, 10, Log())
+    assert result['matched'] and result['tested'] == 1
+    assert judged[0][0] == 'target' and 'int target(void)' in judged[0][1]
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET status='asm' WHERE name='donor'")
+        db.execute("UPDATE functions SET status='open',matched_source=NULL,best_score=50,best_source='int target(void) {return 2;}' WHERE name='target'")
+
+    def search(*args, **kwargs):
+        with net.store.tx() as db:
+            db.execute("UPDATE functions SET best_score=10,best_source='int target(void) {return 3;}' WHERE name='target'")
+        return {'matched': False, 'tested': 1}
+
+    monkeypatch.setattr(deep_permuter, '_run', search)
+    result = deep_permuter.run(net, 'game', 'target', 1, 10, Log())
+    assert result['tested'] == 2
+    assert judged[-1][0] == 'other' and 'int other(void) {return 3;}' in judged[-1][1]
+    assert net._function('other', 'game')['best_score'] == 10
+
+
+def test_rejudges_saved_candidates_before_search(sweep, monkeypatch):
+    obj, net, calls, _ = sweep
+    fn = net._function('f0', 'game')
+    agent = net.attribution_agent('autopilot')
+    bad = 'int f0(void) { return 2; }'
+    good = 'int f0(void) { return 3; }'
+    with net.store.tx() as db:
+        db.execute('UPDATE functions SET best_source=NULL,best_score=1 WHERE id=?', (fn['id'],))
+        db.execute("INSERT INTO context_versions(project_id,version,header,unit) VALUES(?,1,'','')", (fn['project_id'],))
+        db.executemany('INSERT INTO attempts(function_id,agent_id,source,compiled,score) VALUES(?,?,?,1,?)',
+                       [(fn['id'], agent.id, bad, 1), (fn['id'], agent.id, bad, 2), (fn['id'], agent.id, good, 3)])
+    def change_config(**changes):
+        with net.store.tx() as db:
+            project = db.execute('SELECT config FROM projects WHERE id=?', (fn['project_id'],)).fetchone()
+            config = json.loads(project['config'])
+            config.update(changes)
+            db.execute('UPDATE projects SET config=? WHERE id=?', (json.dumps(config), fn['project_id']))
+
+    def shuffle(batch):
+        change_config(compiler={'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O1']})
+        batch.reverse()  # Scored f1 would otherwise fill the queue first.
+
+    monkeypatch.setattr(deep_sweep.random, 'shuffle', shuffle)
+    tried = []
+
+    def compile_source(proj, header, source, fn):
+        assert net.cfg(proj)['compiler']['flags'] == ['-O1']
+        tried.append(source)
+        change_config(spend={'tokens': len(tried)}, auto_push={'next_check': len(tried)},
+                      score_commits={'last_check': len(tried)})
+        return SimpleNamespace(ok=source == good, log='undeclared name', obj=b'object')
+
+    monkeypatch.setattr(net, '_compile', compile_source)
+    monkeypatch.setattr(net, '_evaluate', lambda *args: (object(), False, []))
+    monkeypatch.setattr(net, '_score_candidate', lambda *args: SimpleNamespace(score=36, bytes_match=False))
+    monkeypatch.setattr(net, 'can_draft', lambda proj: True)
+    monkeypatch.setattr(net, '_autopilot_one', lambda *args, **kw: pytest.fail('History yielded a baseline'))
+    original = deep_permuter.run
+
+    def search(net, slug, name, *args):
+        if name == 'f0':
+            current = net._function(name, slug)
+            assert current['best_score'] == 36
+            assert current['best_source'] == good
+        return original(net, slug, name, *args)
+
+    monkeypatch.setattr(deep_permuter, 'run', search)
+    obj.run('game', 1, 10, Log())
+    assert tried == [bad, good]
+    assert calls == ['f0', 'f1']
+    assert not net.store.one('SELECT 1 FROM claims WHERE function_id=?', fn['id'])
+
+
+def test_failed_recovery_uses_drafts_and_waits_for_new_inputs(sweep, monkeypatch):
+    obj, net, _, _ = sweep
+    from decompnet.app.deep_source_recovery import prepare
+
+    proj = net.project_row('game')
+    fn = net._function('f0', 'game')
+    with net.store.tx() as db:
+        db.execute('UPDATE functions SET best_source=NULL,best_score=NULL WHERE id=?', (fn['id'],))
+    monkeypatch.setattr(net, 'can_draft', lambda proj: True)
+    calls = []
+
+    def draft(agent, proj, fid, *, retry_draft):
+        assert retry_draft
+        calls.append(fid)
+        if len(calls) == 1:
+            return 'fail'
+        with net.store.tx() as db:
+            db.execute('UPDATE functions SET best_source=?,best_score=80 WHERE id=?', ('int f0(void) { return 4; }', fid))
+        return 'far'
+
+    monkeypatch.setattr(net, '_autopilot_one', draft)
+    assert prepare(net, proj, fn, Log())['best_source'] is None
+    assert prepare(net, proj, fn, Log())['best_source'] is None
+    assert calls == [fn['id']]
+    assert obj.status('game')['attention'][0]['function'] == 'f0'
+    with net.store.tx() as db:
+        db.execute("INSERT INTO settings(key,value) VALUES(?, '1')", (f'machine-draft-generation:{fn["id"]}',))
+    assert prepare(net, proj, fn, Log())['best_score'] == 80
+    assert len(calls) == 2
+
+
+def test_claimed_function_defers_source_recovery(sweep, monkeypatch):
+    _, net, _, _ = sweep
+    from decompnet.app.deep_source_recovery import prepare
+
+    proj = net.project_row('game')
+    fn = net._function('f0', 'game')
+    agent = net.attribution_agent('helper')
+    with net.store.tx() as db:
+        db.execute('UPDATE functions SET best_source=NULL,best_score=NULL WHERE id=?', (fn['id'],))
+        db.execute("INSERT INTO claims VALUES(?,?,0,unixepoch()+600)", (fn['id'], agent.id))
+    monkeypatch.setattr(net, 'can_draft', lambda proj: pytest.fail('The helper owns this function'))
+    assert prepare(net, proj, fn, Log())['best_source'] is None
+    assert net.store.one('SELECT agent_id FROM claims WHERE function_id=?', fn['id'])['agent_id'] == agent.id
+
+
+def test_sweep_recovers_exact_candidates_before_search(sweep, monkeypatch):
+    from decompnet.app import match_reconciliation
+
+    obj, net, calls, _ = sweep
+    monkeypatch.setattr(net, 'is_rom', lambda proj: True)
+
+    def recover(engine, slug, seconds, attempts, log, *, automatic):
+        assert engine is net and slug == 'game' and automatic
+        assert seconds is None and attempts is None
+        assert calls == []
+        with net.store.tx() as db:
+            db.execute("UPDATE functions SET status='matched',best_score=0 WHERE name='f0'")
+        return {'matched': 1, 'attempts': 1}
+
+    monkeypatch.setattr(match_reconciliation, 'run', recover)
+    assert obj.run('game', 1, 10, Log())['matched'] == 1
+    assert calls == ['f1']
+
+
+def _record_pass(obj, net, name, state, result, completed_at):
+    cfg, proj = obj.config('game'), net.project_row('game')
+    fn = net._function(name, 'game')
+    obj.record(fn, deep_sweep.signature(net, proj, fn, cfg['minutes'], cfg['max_variants']), state,
+               cfg['minutes'], cfg['max_variants'], result)
+    with net.store.tx() as db:
+        db.execute('UPDATE deep_permutation_passes SET completed_at=? WHERE function_id=?', (completed_at, fn['id']))
+    return fn['id']
+
+
+def test_passes_made_without_the_randomizer_are_repeated_once_it_is_installed(sweep, monkeypatch):
+    """Without decomp-permuter a deep pass only ran the simple rewrites yet counted as finished; installing it
+    sends those passes (recorded as such, or older than the install) back to pending, and keeps the others."""
+    from decompnet.app import permute
+    obj, net, _, _ = sweep
+    flagged = _record_pass(obj, net, 'f0', 'completed', {'randomizer': False}, 500.0)
+    older = _record_pass(obj, net, 'f1', 'completed', {}, 500.0)
+    newer = _record_pass(obj, net, 'f2', 'completed', {}, 2000.0)
+    full = _record_pass(obj, net, 'f3', 'completed', {'randomizer': True}, 500.0)
+    monkeypatch.setattr(permute, 'installed_at', lambda: None)
+    assert obj.reopen_without_randomizer('game') == 0
+    monkeypatch.setattr(permute, 'installed_at', lambda: 1000.0)
+    assert obj.reopen_without_randomizer('game') == 2
+    states = {r['function_id']: r['state'] for r in net.store.all('SELECT function_id,state FROM deep_permutation_passes')}
+    assert states == {flagged: 'pending', older: 'pending', newer: 'completed', full: 'completed'}
+    assert obj.reopen_without_randomizer('game') == 0
+
+
+def test_deep_search_result_says_when_the_randomizer_was_missing(monkeypatch):
+    from decompnet.app import permute
+    monkeypatch.setattr(permute, 'ensure_available', lambda report=None: False)
+    monkeypatch.setattr(deep_permuter, '_full_run', lambda *a, **k: {'matched': False, 'tested': 3})
+    lines = []
+    result = deep_permuter.run(None, 'game', 'f0', 1, 10, lines.append)
+    assert result['randomizer'] is False and 'not installed' in result['notice']
+    assert any('not installed' in line for line in lines)
+    monkeypatch.setattr(permute, 'ensure_available', lambda report=None: True)
+    result = deep_permuter.run(None, 'game', 'f0', 1, 10, lines.append)
+    assert result['randomizer'] is True and 'notice' not in result
+
+
+def test_missing_randomizer_is_installed_once_and_a_failure_is_reported(monkeypatch):
+    from decompnet.app import permute
+    monkeypatch.setenv('DECOMP_AUTO_TOOLS', 'on')
+    state = {'installed': False, 'calls': 0}
+    monkeypatch.setattr(permute, 'available', lambda: state['installed'])
+    monkeypatch.setitem(permute._auto, 'failed', 0.0)
+
+    def ensure(tid, log=None):
+        state['calls'] += 1
+        if state['calls'] == 1:
+            raise OSError('offline')
+        state['installed'] = True
+    monkeypatch.setattr(permute.toolchains, 'ensure', ensure)
+    monkeypatch.setattr(permute.toolchains, 'get', lambda tid: SimpleNamespace(supported=True))
+    said = []
+    assert permute.ensure_available(said.append) is False
+    assert any('could not be installed' in line for line in said)
+    assert permute.ensure_available(said.append) is False and state['calls'] == 1  # backed off, not retried per function
+    monkeypatch.setitem(permute._auto, 'failed', 0.0)
+    assert permute.ensure_available(said.append) is True and state['calls'] == 2
+    assert permute.ensure_available(said.append) is True and state['calls'] == 2

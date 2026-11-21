@@ -4,6 +4,7 @@ import threading
 import time
 
 from ..network import NetworkError
+from . import automatic_assignment, focused_agents
 
 REQUIRED = {'project_info', 'claim_function', 'get_function', 'compile_and_diff', 'release_function'}
 KEY = 'agent-disabled-tools'
@@ -21,10 +22,10 @@ MATCHING = REQUIRED | {'get_search_brief','get_claims','get_candidate','compile_
 PRESETS = {'full': ('All tools', None), 'matching': ('Matching essentials', MATCHING),
            'investigation': ('Compiler and data investigation', MATCHING | {'read_data','resolve_addresses','get_class','guess_struct',
                'compiler_map','try_compiler','search_flags','compiler_experiments','get_compiler_trial','review_search_seed','suggest','report_boundary','report_data_region',
-               'get_boundary_evidence','suggest_boundary','get_data_unit','compile_data','watch_in_emulator','compare_behaviour'}),
+               'get_boundary_evidence','suggest_boundary','get_data_unit','compile_data','watch_in_emulator','compare_behaviour','compare_candidate_behaviour'}),
            'polishing': ('Polishing and names', REQUIRED | {'claim_readable','make_readable','polish_function','tidy_file','read_data','tidy_done','rename_symbol',
                'get_claims','guide','get_context','edit_context','read_file','edit_file','file_status','search_code','add_note','find_similar',
-               'port_readiness'})}
+               'port_readiness','check_for_pc'})}
 # Tools whose work queue belongs to another kind of helper the app starts: asset discovery, boundary review, data,
 # PC port fixes and polishing. A matching helper's tool definitions carried all of them on every turn, about a
 # quarter of a ROM project's 32,000 characters of definitions, for tools that refuse it (the asset ones and
@@ -53,6 +54,10 @@ def connection_required(net, agent):
         return asset_agents.TOOLS - {'get_assembly','guide'}
     if agent is not None and boundary_investigations.scope(net,agent):
         return boundary_investigations.TOOLS
+    if focused_agents.scope(net, agent):
+        return {'project_info', 'compile_and_diff', 'get_claims'}
+    if automatic_assignment.enabled(net, agent):
+        return {'project_info', 'compile_and_diff', automatic_assignment.RELEASE}
     return {'project_info','claim_function','compile_and_diff','release_function'}
 
 
@@ -61,7 +66,7 @@ def preset_disabled(preset):
     if not isinstance(preset, str) or preset not in PRESETS:
         raise NetworkError('Choose a known tool preset.')
     keep = PRESETS[preset][1]
-    return validate([name for name in HANDLERS if keep is not None and name not in keep])
+    return validate([name for name in HANDLERS if keep is not None and name not in keep and name != automatic_assignment.RELEASE])
 
 
 def set_preset(net, preset):
@@ -104,7 +109,7 @@ def validate(names):
     from .tools import HANDLERS
     if not isinstance(names, list) or any(not isinstance(n, str) or n not in HANDLERS for n in names):
         raise NetworkError('Choose known tool names to disable.')
-    if REQUIRED.intersection(names):
+    if REQUIRED.intersection(names) or automatic_assignment.RELEASE in names:
         raise NetworkError('Core project, claim, compile and release tools must remain enabled.')
     return sorted(set(names))
 
@@ -133,6 +138,14 @@ def visible(net, slug, names, agent=None):
         blocked.update(net.selection(slug, agent.name).get('disabled_tools', []))
     if matching_helper(net, agent):
         blocked |= OTHER_TASKS
+    if focused_agents.scope(net, agent):
+        names = [name for name in names if name not in focused_agents.BLOCKED_TOOLS | OTHER_TASKS]
+        blocked.discard('get_claims')
+    elif automatic_assignment.enabled(net, agent, slug):
+        names = [name for name in names if name not in {'claim_function', 'release_function'}]
+        blocked.difference_update({automatic_assignment.RELEASE, "get_claims"})
+    else:
+        names = [name for name in names if name != automatic_assignment.RELEASE]
     return [name for name in names if name in REQUIRED or name not in blocked]
 
 
@@ -150,6 +163,11 @@ def set_global(net, name, enabled):
 def record(net, agent, slug, name, *, count=True):
     from .tools import HANDLERS
     if name not in visible(net, slug, list(HANDLERS), agent):
+        if focused_agents.scope(net, agent) and name in focused_agents.BLOCKED_TOOLS | OTHER_TASKS:
+            raise NetworkError('The app manages this focused assignment. Use get_claims for its details and add_note for findings.')
+        if name in {'claim_function', 'release_function'} and automatic_assignment.enabled(net, agent, slug):
+            raise NetworkError('The app assigns your functions. Use get_claims to recover your assignment or '
+                               'release_and_continue to release it with notes.')
         if name in OTHER_TASKS and matching_helper(net, agent):
             raise NetworkError(f'{name} is for another kind of helper (assets, boundaries, data, PC port or polishing). '
                                'Work on your claimed function, or claim_function for the next one.')

@@ -783,7 +783,7 @@ def test_port_readiness_panel_reads_only_when_open_and_ignores_stale_replies():
                    capture_output=True,text=True,timeout=GUI_TIMEOUT_SECONDS)
 
 
-def test_texture_browser_paging_usage_cancellation_and_explicit_animation():
+def test_asset_browser_infinite_scroll_usage_cancellation_and_explicit_animation():
     if NODE is None:
         pytest.skip('needs node to run the GUI scripts')
     subprocess.run([NODE,str(Path(__file__).with_name('gui_rom_textures.js'))],check=True,
@@ -805,9 +805,15 @@ def test_audio_browser_cancellation_errors_and_explicit_playback():
 
 
 @pytest.mark.skipif(not NODE,reason='node is not installed')
-def test_rom_model_browser_lifecycle():
+def test_rom_model_browser_merges_split_regions():
     subprocess.run([NODE,str(Path(__file__).with_name('gui_rom_model_browser.js'))],check=True,
                    capture_output=True,text=True)
+
+
+@pytest.mark.skipif(not NODE, reason="node is not installed")
+def test_polishing_checklist_keeps_pending_saves_and_errors_scoped_to_the_game():
+    subprocess.run([NODE, str(Path(__file__).with_name("gui_polish_checklist.js"))], check=True,
+                   capture_output=True, text=True, timeout=GUI_TIMEOUT_SECONDS)
 
 
 def test_other_releases_panel_links_and_brings_names_with_its_progress_bar():
@@ -866,3 +872,10 @@ def test_restart_all_agents_feedback_survives_polling_and_navigation():
         pytest.skip('needs node')
     subprocess.run([NODE, str(Path(__file__).with_name('gui_restart_agents.js'))], check=True,
                    cwd=Path(__file__).resolve().parents[1], timeout=GUI_TIMEOUT_SECONDS)
+
+
+def test_community_directory_filters_and_shows_rom_matches():
+    if NODE is None:
+        pytest.skip("needs node to run the GUI's scripts")
+    subprocess.run([NODE, str(Path(__file__).with_name("gui_fork_directory.js"))], check=True,
+                   capture_output=True, text=True, encoding="utf-8", timeout=GUI_TIMEOUT_SECONDS)

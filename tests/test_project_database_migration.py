@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from decompnet.app import repair_outcomes
 from decompnet.app.agents import SCHEMA as SESSION_SCHEMA
 from decompnet.app.transcripts import Transcripts, service
 from decompnet.network import Network
@@ -26,6 +27,7 @@ def close(net):
 
 def legacy(path):
     net = Network(path)
+    repair_outcomes.prepare(net.repair_feedback)
     with net.store.tx() as db:
         for sql in SESSION_SCHEMA:db.execute(sql)
         db.execute("INSERT INTO agents(id,name,token_hash) VALUES(1,'worker','token')")
@@ -36,6 +38,8 @@ def legacy(path):
             db.execute("INSERT INTO context_versions(project_id,version,header,unit) VALUES(?,1,?,'')",(pid,'int '+slug+';'))
             db.execute('INSERT INTO attempts(id,function_id,agent_id,source,score,compiled,created_at) VALUES(?,?,1,?,10,1,1)',
                        (pid,10*pid,('attempt '+slug+'\n')*1000))
+            db.execute('INSERT INTO repair_coverage_verdicts VALUES(?,?,?,?,?)',
+                       (pid,pid,'source hash','family '+slug,1))
             db.execute('INSERT INTO notes(project_id,function_id,text) VALUES(?,?,?)',(pid,10*pid,slug+' note'))
             db.execute("INSERT INTO helper_sessions(id,helper_id,project,kind,model,agent,started_at) VALUES(?,?,?,'codex','test','worker',1)",(pid,pid,slug))
             db.execute('INSERT INTO settings VALUES(?,?)',('agent-review:'+str(10*pid),json.dumps({'owner':slug})))
@@ -53,6 +57,7 @@ def test_upgrade_moves_operations_and_transcripts_preserving_exact_payloads(tmp_
     try:
         assert state(net.store)['phase']=='ready'
         assert net.store.one('SELECT COUNT(*) n FROM functions')['n']==0
+        assert net.store.one('SELECT COUNT(*) n FROM repair_coverage_verdicts')['n']==0
         assert net.store.one('SELECT COUNT(*) n FROM helper_messages')['n']==0
         assert net.store.one('SELECT COUNT(*) n FROM text_payloads')['n']==0
         assert net.store.one("SELECT value FROM settings WHERE key='agent-prompt-overrides'")
@@ -64,6 +69,7 @@ def test_upgrade_moves_operations_and_transcripts_preserving_exact_payloads(tmp_
             assert store.one('SELECT best_source FROM functions')['best_source']==('source '+slug+'\n')*1000
             assert store.one('SELECT header FROM context_versions')['header']=='int '+slug+';'
             assert store.one('SELECT source FROM attempts')['source']==('attempt '+slug+'\n')*1000
+            assert [row['family'] for row in store.all('SELECT family FROM repair_coverage_verdicts')]==['family '+slug]
             assert store.one('SELECT value FROM settings WHERE key=?','agent-review:'+str(10*pid))
             assert not store.one('SELECT value FROM settings WHERE key=?','agent-review:'+str(10*(3-pid)))
             transcript = service(net).for_project(slug)
@@ -542,3 +548,63 @@ def test_corrupt_project_startup_names_slug_and_preserves_evidence(tmp_path):
     with pytest.raises(CorruptDatabaseError, match="Project 'first'") as failure:Network(path)
     assert str(selected) in str(failure.value)
     assert selected.read_bytes() == contents
+
+
+def test_repair_mismatch_evidence_and_votes_follow_the_project(tmp_path):
+    from decompnet.app import repair_search
+    from decompnet.network import Agent
+
+    path = tmp_path / 'catalog.db'
+    legacy(path)
+    agent = Agent(1, 'worker', None)
+    net = Network(path)
+    try:
+        fn = net._function('function', 'first')
+        # This recorded miss improves the legacy baseline and supplies the frozen instruction pair.
+        net._record(fn, agent, 5, 'int function(unsigned x) { return x > 1; }', 1,
+                    mismatch_rows=[('|', 'slt a0, a1', 'sltu a0, a1')])
+        net._record(fn, agent, 0, 'int function(int x) { return x > 1; }', 1, matched=True)
+        case = net.store.one('SELECT id FROM main.repair_examples')['id']
+        net.repair_feedback.report(agent, 'first', 'function', category='types')
+        repair_search.upvote(net, agent, 'first', case)
+    finally:
+        close(net)
+
+    net = Network(path, project_databases=True)
+    try:
+        result = repair_search.search(net, agent, 'first', 'types')
+        assert f'#{case}' in result and '1 vote]' in result
+        assert 'already upvoted' in repair_search.upvote(net, agent, 'first', case)
+        evidence = net.repair_feedback.detail('first', case)['evidence']
+        assert evidence['before']['mismatch_signature'] == [['|', 'slt', 'sltu']]
+        assert net.project_store('first').one('SELECT COUNT(*) n FROM repair_attempt_mismatches')['n'] == 1
+        assert net.project_store('second').one('SELECT COUNT(*) n FROM repair_attempt_mismatches')['n'] == 0
+        assert 'unavailable' in repair_search.details(net, agent, 'second', [case])
+    finally:
+        close(net)
+
+
+def test_repair_baseline_category_upgrades_existing_shards_on_open(tmp_path):
+    from decompnet.repair_feedback import BASELINE_MIGRATION, NO_FAILED_BASELINE
+
+    path = tmp_path / 'catalog.db'
+    legacy(path)
+    net = Network(path, project_databases=True)
+    try:
+        for (pid, slug) in ((1, 'first'), (2, 'second')):
+            store = net.repair_feedback.for_project(slug).store
+            with store.tx() as db:
+                db.execute('DELETE FROM settings WHERE key=?', (BASELINE_MIGRATION,))
+                db.execute('INSERT INTO repair_examples(project_id,function_id,created_at,evidence,category,status) '
+                           "VALUES(?,?,0,?,'other','reviewed')", (pid, 10 * pid, '{"before":null,"after":{}}'))
+    finally:
+        close(net)
+
+    net = Network(path)
+    try:
+        page = net.repair_feedback.listing(category=NO_FAILED_BASELINE, _metrics=False)
+        assert {row['slug'] for row in page['examples']} == {'first', 'second'}
+        assert {row['status'] for row in page['examples']} == {'reviewed'}
+        assert net.repair_feedback.listing(category='other', _metrics=False)['total'] == 0
+    finally:
+        close(net)

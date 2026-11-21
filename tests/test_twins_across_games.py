@@ -182,3 +182,158 @@ def test_donors_built_with_the_wanting_functions_own_compiler_come_first():
     prefer_own_compilers(sources, {"fp": [1], "other": [2]}, own.get)
     assert [s["name"] for s in sources] == ["b", "a", "c"] or [s["name"] for s in sources] == ["b", "c", "a"]
     assert sources[0]["name"] == "b"
+
+
+def test_manual_search_finds_imported_code_inside_a_merged_rom_function(built, tmp_path, monkeypatch):  # noqa: F811
+    from decompnet.app.twins import Job, object_prints
+
+    net = RomNetwork(tmp_path / "decomp.db", tmp_path)
+    slug = net.import_rom(ROM, confirmed=True, log=lambda *_: None)
+    agent, _ = net.local_agent("autopilot")
+    copy_project(net, slug, "imported-library")
+    proj, donor = net._project(slug), net._project("imported-library")
+    net.split_function(agent, donor['slug'], "func_800007C4", "0x800007D0")
+    a = net._function("func_800007D0", donor['slug'])
+    with net.project_store(donor['id']).tx() as db:
+        db.execute("UPDATE functions SET status='matched' WHERE id=?", (a['id'],))
+    ctx = net._context(donor['id'], a['unit'])
+    compiled = net._compile(donor, ctx['header'], CLAMP, a)
+    assert compiled.ok
+    fingerprint = object_prints(compiled.obj)[a['name']]
+    assert fingerprint.key == net.twins.prints(donor)[a['id']].key
+    monkeypatch.setattr(net.forks, "get", lambda _: (donor, object(), {"platform": "n64"}))
+    monkeypatch.setattr(net.forks, "is_asm", lambda *_: False)
+    monkeypatch.setattr(net.twins, "_fork_prints", lambda _, **kwargs: {a['id']: fingerprint})
+    job = Job()
+    job.cross_exhaustive = True
+    original = net._function("func_800007C4", slug)
+    monkeypatch.setattr(net.forks, "_current_source", lambda *_: "int func_800007D0(void) { return 123; }")
+    assert net.twins._fork_to_rom(agent, proj, donor, {}, net.twins.prints(proj), job) == 0
+    assert net._function(original['name'], slug)['target'] == original['target']
+
+    monkeypatch.setattr(net.forks, "_current_source", lambda *_: CLAMP)
+    assert net.twins._fork_to_rom(agent, proj, donor, {}, net.twins.prints(proj), job) == 1
+    recovered = net._function(a['name'], slug)
+    assert recovered['status'] == 'matched'
+    assert recovered['target'] == a['target']
+    assert recovered['vram'] == a['vram']
+    head = net._function(original['name'], slug)
+    assert original['target'].startswith(head['target'])
+    assert original['target'].endswith(recovered['target'])
+    assert not any(original['target'][head['size']:-recovered['size']])  # alignment padding
+
+
+def test_manual_search_tries_donor_when_relocation_layouts_differ(built, tmp_path, monkeypatch):  # noqa: F811
+    from decompnet.app.twins import Job, Print, _key
+    from decompnet.elfobj import Reloc, mask_relocs
+
+    net = RomNetwork(tmp_path / 'decomp.db', tmp_path)
+    slug = net.import_rom(ROM, confirmed=True, log=lambda *_: None)
+    agent, _ = net.local_agent('autopilot')
+    net.split_function(agent, slug, 'func_800007C4', '0x800007D0')
+    copy_project(net, slug, 'imported-library')
+    proj, donor = net._project(slug), net._project('imported-library')
+    b = net._function('func_800007D0', slug)
+    a = net._function(b['name'], donor['slug'])
+    with net.project_store(donor['id']).tx() as db:
+        db.execute("UPDATE functions SET status='matched' WHERE id=?", (a['id'],))
+    # Model an expected object with an additional linker-marked operand. The destination retains its own bytes
+    # and relocations, and the actual judge must still accept its independently compiled source.
+    layout = [(0, 5)]
+    code = mask_relocs(b['target'], [Reloc(0, 5, '', 0)], 'mips', True)
+    fingerprint = Print(_key(code, layout), ['donor_symbol'], len(code), layout=layout)
+    mine = net.twins.prints(proj)
+    assert mine[b['id']].key != fingerprint.key
+    monkeypatch.setattr(net.forks, 'get', lambda _: (donor, object(), {'platform': 'n64'}))
+    monkeypatch.setattr(net.forks, 'is_asm', lambda *_: False)
+    monkeypatch.setattr(net.twins, '_fork_prints', lambda _, **kwargs: {a['id']: fingerprint})
+    job = Job()
+    job.cross_exhaustive = True
+    monkeypatch.setattr(net.forks, '_current_source', lambda *_: 'int func_800007D0(void) { return 123; }')
+    assert net.twins._fork_to_rom(agent, proj, donor, {}, mine, job) == 0
+    assert net._function(b['name'], slug)['status'] == 'open'
+    monkeypatch.setattr(net.forks, '_current_source', lambda *_: CLAMP)
+    assert net.twins._fork_to_rom(agent, proj, donor, {}, mine, job) == 1
+    matched = net._function(b['name'], slug)
+    assert matched['status'] == 'matched'
+    assert matched['target'] == b['target'] and matched['relocs'] == b['relocs']
+
+
+def test_donor_build_retains_profile_and_header_only_after_exact_verdict(built, tmp_path, monkeypatch):  # noqa: F811
+    from decompnet.app import donor_build, donor_sources
+    from decompnet.app.twins import Job
+    from decompnet.project import compiler_for
+
+    net = RomNetwork(tmp_path / 'decomp.db', tmp_path)
+    slug = net.import_rom(ROM, confirmed=True, log=lambda *_: None)
+    agent, _ = net.local_agent('autopilot')
+    net.split_function(agent, slug, 'func_800007C4', '0x800007D0')
+    proj = net._project(slug)
+    fn = net._function('func_800007D0', slug)
+    own = compiler_for(net.cfg(proj), fn['vram'], fn)
+    settings = {'toolchain': own['toolchain'], 'flags': [*own['flags'], '-g', '-DKEEP_DONOR_VALUE=1']}
+    header = '#if !KEEP_DONOR_VALUE\n#error missing file define\n#endif\ntypedef int s32;\n#define KEEP_VALUE(x) (x)\n'
+    donor = {'name': fn['name']}
+    job = Job()
+    wrong = 's32 func_800007D0(s32 x) { return KEEP_VALUE(x + 2); }'
+    monkeypatch.setattr(donor_sources, 'imported', lambda *_: [(wrong, header, '')])
+    assert donor_build.verify(net, proj, fn, proj, donor, {}, settings, agent, job, {})[0] == 'miss'
+    assert net._function(fn['name'], slug)['unit'] == fn['unit']
+    assert compiler_for(net.cfg(net._project(slug)), fn['vram'], fn) == own
+
+    source = CLAMP.replace('return v;', 'return KEEP_VALUE(v);')
+    monkeypatch.setattr(donor_sources, 'imported', lambda *_: [(source, header, '')])
+    assert donor_build.verify(net, proj, fn, proj, donor, {}, settings, agent, job, {})[0] == 'match'
+    matched = net._function(fn['name'], slug)
+    assert net._context(matched['project_id'], matched['unit'])['header'] == header
+    assert compiler_for(net.cfg(net._project(slug)), matched['vram'], matched)['flags'] == settings['flags']
+    assert matched['status'] == 'matched'
+
+
+def test_saved_whole_donor_unit_reverifies_and_exports_only_its_entry(built, tmp_path):  # noqa: F811
+    from decompnet.app import donor_build, saves
+    from decompnet.app.twins import Job
+    from decompnet.project import compiler_for
+
+    net = RomNetwork(tmp_path / 'decomp.db', tmp_path)
+    slug = net.import_rom(ROM, confirmed=True, log=lambda *_: None)
+    agent, _ = net.local_agent('autopilot')
+    net.split_function(agent, slug, 'func_800007C4', '0x800007D0')
+    proj = net._project(slug)
+    fn = net._function('func_800007D0', slug)
+    own = compiler_for(net.cfg(proj), fn['vram'], fn)
+
+    root = tmp_path / 'donor'
+    (root / 'build').mkdir(parents=True)
+    (root / 'words.h').write_text('typedef int s32;\n')
+    whole = '#include "words.h"\nint other_body(int x) { return x + 31; }\n' + CLAMP
+    (root / 'unit.c').write_text(whole)
+    (root / 'build/unit.c').write_text(whole)
+    (root / 'objdiff.json').write_text(json.dumps({'units': [
+        {'name': 'unit', 'base_path': 'build/unit.c.o', 'metadata': {'source_path': 'unit.c'}}
+    ]}))
+    donor = {'name': fn['name'], 'unit': 'unit', 'meta': None}
+    settings = {'toolchain': own['toolchain'], 'flags': own['flags']}
+    status, reason = donor_build.verify(net, proj, fn, {'root': str(root)}, donor, {}, settings, agent, Job(), {})
+    assert status == 'match', reason
+    assert reason == 'Verified from a saved donor translation unit.'
+    saved = net._function(fn['name'], slug)
+    assert 'other_body' in net._context(proj['id'], saved['unit'])['header']
+    assert 'other_body' not in saved['matched_source']
+
+    folder = tmp_path / 'saved'
+    saves.save(net, slug, folder)
+    shutil.rmtree(root)  # finished matches carry the C and include text independently of the donor checkout
+    net.recheck(slug, log=lambda *_: None)
+    assert net._function(fn['name'], slug)['status'] == 'matched'
+    with net.progress.judging(slug, synchronize=False):
+        assert net._verify_saved_match(
+            proj['id'], fn['name'], saved['matched_source'], agent, False, lambda: None,
+            previous_source=saved['matched_source'], removed_status=None,
+        )
+    out = net.export_rom(slug, log=lambda *_: None)
+    assert out['identical'], out['log']
+    assert not out['fallback']
+    manifest = json.loads((Path(out['path']) / 'build.json').read_text())
+    entry = next(row for row in manifest['functions'] if row['vram'] == fn['vram'])
+    assert entry['entry_only']

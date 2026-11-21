@@ -476,3 +476,214 @@ def test_kmc_places_the_narrow_object_where_the_game_has_it(tmp_path):
     (_, narrow), = repairs.frame_variants(WIDE, 'f', CALL_ASM, 'mips')
     # the whole frame as one object grew the frame to 0x50; spanning its views it is the game's 0x38
     assert first(WIDE) == 'addiu $sp, $sp, -0x50' and first(narrow) == 'addiu $sp, $sp, -0x38'
+
+
+def test_valid_kmc_draft_recovers_the_witnessed_copy(monkeypatch):
+    raw = 'void f(void) { M2C_UNALIGNED32(input); }'
+    monkeypatch.setattr(seeds, 'run_m2c', lambda *args: raw)
+    monkeypatch.setattr(seeds, 'intrinsic_leaf', lambda *args: None)
+    monkeypatch.setattr(seeds, 'm2c_target', lambda *args: 'mips-gcc-c')
+    from decomprepair import unaligned_stack_drafts
+
+    calls = []
+
+    def repair(*args):
+        calls.append(args)
+        return 'void f(void) { }'
+
+    monkeypatch.setattr(unaligned_stack_drafts, 'rewrite', repair)
+    resolve = {'global': 0x80000000}.get
+    opts = dict(resolve=resolve)
+    assert seeds.generate_from_asm('asm', 'f', 'gcc-2.7.2-kmc', 'header', valid=True, **opts) == 'void f(void) { }'
+    assert seeds.generate_from_asm('asm', 'f', 'gcc-2.7.2-kmc', 'header', **opts) == raw
+    assert seeds.generate_from_asm('asm', 'f', 'ido-5.3', 'header', valid=True, **opts) == raw
+    assert calls == [(raw, 'f', 'asm', 'header', resolve)]
+
+
+def test_copied_word_index_repair_runs_during_valid_kmc_draft_generation(monkeypatch):
+    from decomprepair import measured_stack_drafts
+
+    raw = 's32 f(s32 arg) { return *((arg * 4) + sp); }'
+    monkeypatch.setattr(seeds, 'run_m2c', lambda *args: raw)
+    monkeypatch.setattr(seeds, 'intrinsic_leaf', lambda *args: None)
+    monkeypatch.setattr(seeds, 'm2c_target', lambda *args: 'mips-gcc-c')
+    calls = []
+
+    def repair(*args):
+        calls.append(args)
+        return 's32 f(s32 arg) { return table[arg]; }'
+
+    monkeypatch.setattr(measured_stack_drafts, 'rewrite', repair)
+    assert 'table[arg]' in seeds.generate_from_asm('asm', 'f', 'gcc-2.7.2-kmc', 'header', valid=True)
+    assert seeds.generate_from_asm('asm', 'f', 'gcc-2.7.2-kmc', 'header') == raw
+    assert calls == [(raw, 'f', 'asm', 'header')]
+
+
+def test_larger_stack_recovery_is_used_by_valid_kmc_drafts(monkeypatch):
+    from decomprepair import large_stack_drafts
+
+    raw = 'void f(void) { cursor = sp; }'
+    monkeypatch.setattr(seeds, 'run_m2c', lambda *args: raw)
+    monkeypatch.setattr(seeds, 'intrinsic_leaf', lambda *args: None)
+    monkeypatch.setattr(seeds, 'm2c_target', lambda *args: 'mips-gcc-c')
+    monkeypatch.setattr(large_stack_drafts, 'rewrite', lambda *args: 'void f(void) { u8 buffer[48]; }')
+    assert 'buffer[48]' in seeds.generate_from_asm('asm', 'f', 'gcc-2.7.2-kmc', valid=True)
+    assert seeds.generate_from_asm('asm', 'f', 'gcc-2.7.2-kmc') == raw
+    assert seeds.generate_from_asm('asm', 'f', 'ido-5.3', valid=True) == raw
+
+
+def test_shared_default_draft_recovery_receives_the_original_table(monkeypatch):
+    from decomprepair import shared_default_drafts
+
+    raw = 'void f(void) { case 1: return; }'
+    monkeypatch.setattr(seeds, 'run_m2c', lambda *args: raw)
+    monkeypatch.setattr(seeds, 'intrinsic_leaf', lambda *args: None)
+    monkeypatch.setattr(seeds, 'm2c_target', lambda *args: 'mips-gcc-c')
+    calls = []
+
+    def repair(*args):
+        calls.append(args)
+        return 'void f(void) { switch (1) { case 1: return; } }'
+
+    monkeypatch.setattr(shared_default_drafts, 'rewrite', repair)
+    assert 'switch' in seeds.generate_from_asm('asm', 'f', 'gcc-2.7.2-kmc', 'header', 'table', valid=True)
+    assert seeds.generate_from_asm('asm', 'f', 'ido-5.3', 'header', 'table', valid=True) == raw
+    assert calls == [(raw, 'f', 'asm', 'table', 'header')]
+
+
+def test_valid_kmc_draft_expands_shared_cursor_branch_and_repairs_source(monkeypatch):
+    from decompnet import seeds
+    from decomprepair import likely_branch_cursor
+
+    seen = []
+    monkeypatch.setattr(seeds, 'intrinsic_leaf', lambda *args: None)
+    monkeypatch.setattr(seeds, 'm2c_target', lambda *args: 'mips')
+    monkeypatch.setattr(seeds, 'run_m2c', lambda asm, *args: seen.append(asm) or 'void f(void) {}')
+    monkeypatch.setattr(likely_branch_cursor, 'draft_asm', lambda asm: 'expanded ' + asm)
+
+    def rewrite(source, name, asm, header):
+        assert (source, name, asm, header) == ('void f(void) {}', 'f', 'original', 'header')
+        return 'repaired draft'
+
+    monkeypatch.setattr(likely_branch_cursor, 'rewrite', rewrite)
+    assert seeds.generate_from_asm('original', 'f', 'gcc-2.7.2-kmc', 'header', valid=True) == 'repaired draft'
+    assert seeds.generate_from_asm('original', 'f', 'ido-5.3', valid=True) == 'void f(void) {}'
+    assert seen == ['expanded original', 'original']
+
+
+def test_kmc_repairs_indirect_table_calls_in_fresh_and_recovery_drafts(monkeypatch):
+    asm = """
+sll $v0, $a1, 2
+lui $at, %hi(handlers)
+addu $at, $at, $v0
+lw $v0, %lo(handlers)($at)
+jalr $v0
+move $a0, $s0
+"""
+    raw = """
+extern M2C_UNK handlers;
+void f(void *arg, s32 i) {
+    *(&handlers + (i * 4))(arg);
+}
+"""
+    monkeypatch.setattr(seeds, 'run_m2c', lambda *args, **kwargs: raw)
+    expected = '(*(void (**)())((char *)&handlers + (i * 4)))(arg);'
+    assert expected in seeds.generate_from_asm(asm, 'f', 'gcc-2.7.2-kmc', valid=True)
+    choices = repairs.recovery_drafts(raw, 'f', asm, 'mips', 'gcc-2.7.2-kmc', '', None, {'failures': []})
+    family, draft = next(choices)
+    assert family == 'initial_typed_indirect_call'
+    assert expected in draft
+    assert expected not in seeds.generate_from_asm(asm.replace('jalr $v0', 'jalr $v1'),
+                                                   'f', 'gcc-2.7.2-kmc', valid=True)
+
+
+def test_kmc_recovers_stack_base_for_a_word_clear_in_fresh_and_recovery_drafts(monkeypatch):
+    asm = '''
+addiu $sp, $sp, -32
+move $v1, $sp
+addiu $v0, $zero, 4
+.Lfill:
+sw $zero, ($v1)
+addiu $v0, $v0, -1
+bnez $v0, .Lfill
+addiu $v1, $v1, 4
+addiu $v0, $zero, 1
+.Lidle:
+bnez $v0, .Lidle
+nop
+jr $ra
+addiu $sp, $sp, 32
+'''
+    raw = '''
+void f(void) {
+    s32 *ptr;
+    s32 count;
+    ptr = sp;
+    count = 4;
+    do {
+        *ptr = 0;
+        count -= 1;
+        ptr += 4;
+    } while (count != 0);
+    do {} while (1 != 0);
+}
+'''
+    monkeypatch.setattr(seeds, 'run_m2c', lambda *args, **kwargs: raw)
+    expected = 's32 __repair_clear_words[8];'
+    assert expected in seeds.generate_from_asm(asm, 'f', 'gcc-2.7.2-kmc', valid=True)
+    choices = repairs.recovery_drafts(raw, 'f', asm, 'mips', 'gcc-2.7.2-kmc', '', None, {'failures': []})
+    family, draft = next(choices)
+    assert family == 'initial_stack_word_clear'
+    assert expected in draft
+
+
+def test_measured_word_store_is_tried_in_fresh_and_recovery_drafts(monkeypatch):
+    raw = '''extern M2C_UNK D_A0000000;
+s32 f(s32 offset, s32 value) {
+    *(offset | (s32) &D_A0000000) = value;
+    return 0;
+}
+'''
+    asm = '\n'.join((
+        '/* 00 80000000 3C02A000 */ lui $v0, %hi(D_A0000000)',
+        '/* 04 80000004 02021025 */ or $v0, $s0, $v0',
+        '/* 08 80000008 AC510000 */ sw $s1, %lo(D_A0000000)($v0)',
+    ))
+    monkeypatch.setattr(seeds, 'run_m2c', lambda *args, **kwargs: raw)
+    expected = '*(volatile u32 *)(offset | 0xA0000000U) = value;'
+    assert expected in seeds.generate_from_asm(asm, 'f', 'gcc-2.7.2-kmc', valid=True)
+    assert seeds.generate_from_asm(asm, 'f', 'gcc-2.7.2-kmc', valid=False) == raw
+    family, candidate = next(repairs.recovery_drafts(raw, 'f', asm, 'mips', 'gcc-2.7.2-kmc', '', None, {}))
+    assert family == 'initial_mapped_word_store'
+    assert expected in candidate
+
+
+def test_recovery_tries_unaligned_copies_and_uncached_reads(monkeypatch):
+    from decomprepair import unaligned_stack_drafts, uncached_read_repairs
+
+    source = 'void f(void) {}'
+    monkeypatch.setattr(unaligned_stack_drafts, 'rewrite', lambda *args: 'aggregate copy')
+    monkeypatch.setattr(uncached_read_repairs, 'rewrite', lambda *args: 'typed uncached read')
+    recovered = dict(repairs.recovery_drafts(source, 'f', '', 'mips', 'gcc-2.7.2-kmc', '', None, {}))
+    assert recovered['initial_unaligned_stack_copy'] == 'aggregate copy'
+    assert recovered['initial_uncached_read'] == 'typed uncached read'
+    other = dict(repairs.recovery_drafts(source, 'f', '', 'mips', 'ido-5.3', '', None, {}))
+    assert 'initial_unaligned_stack_copy' not in other
+    assert 'initial_uncached_read' not in other
+
+
+def test_external_call_labels_are_recovered_only_in_mips_drafts(monkeypatch):
+    raw = '''int .L80001000(int); /* extern */
+void f(int arg) {
+    .L80001000(arg);
+}
+'''
+    asm = '/* 0 80000000 0C000400 */ jal .L80001000\n/* 4 80000004 00000000 */ nop'
+    monkeypatch.setattr(seeds, 'run_m2c', lambda *args, **kwargs: raw)
+    monkeypatch.setattr(seeds, 'm2c_target', lambda toolchain: 'mips-ido-c' if toolchain == 'ido-7.1' else 'ppc-c')
+    fresh = seeds.generate_from_asm(asm, 'f', 'ido-7.1', valid=True)
+    assert 'func_80001000(arg);' in fresh
+    assert seeds.generate_from_asm(asm, 'f', 'ido-7.1', valid=False) == raw
+    assert seeds.generate_from_asm(asm, 'f', 'ppc-compiler', valid=True) == raw
+    recovery = dict(repairs.recovery_drafts(raw, 'f', asm, 'mips', 'ido-7.1', '', None, {}))
+    assert recovery['initial_external_call_labels'] == fresh

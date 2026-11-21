@@ -21,6 +21,7 @@ os.environ["DECOMP_HOME"] = tempfile.mkdtemp(prefix="decomp-tests-")
 # and the app looks for installed agents in the background as it starts: here it only looks where they are, and
 # never runs one (agents.detect)
 os.environ["DECOMP_DETECT_AGENTS"] = "off"
+os.environ["DECOMP_AUTO_TOOLS"] = "off"  # no test downloads a tool (permute.ensure_available)
 # nothing a test runs opens a window on the user's screen (app/window.py), a browser tab (webbrowser), or a tray icon
 os.environ["DECOMP_WINDOW"] = "0"
 # helpers connect to the app itself; tests/test_mcp_gateway.py starts the gateway by hand
@@ -28,6 +29,7 @@ os.environ["DECOMP_MCP_GATEWAY"] = "0"
 # tests count compiler invocations; one test's stored objects must not answer another's (tests/test_compile_cache.py
 # turns the persistent object cache on for itself)
 os.environ["DECOMP_OBJECT_CACHE_MB"] = "0"
+os.environ["DECOMP_ATTEMPT_WORKERS"] = "0"  # tests can opt into real worker execution
 os.environ["DECOMP_RENDER_WORKERS"] = "0"  # progress renders in this process, except tests/test_render_worker.py
 os.environ["DECOMP_DEEP_LANES"] = "0"  # deep passes judge in this process (patched searches), except tests/test_deep_lanes.py
 # PS1/PS2 imports would download libretro's title lists (consoles/playstation_titles): tests read an empty folder,

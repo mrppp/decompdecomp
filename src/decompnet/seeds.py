@@ -354,16 +354,126 @@ def intrinsic_leaf(asm_text: str, name: str, toolchain_id: str | None) -> str | 
 
 def generate_from_asm(asm_text: str, name: str, toolchain_id: str | None, context_header: str = "",
                       data_asm: str | None = None, timeout: float = 20, valid: bool = False,
-                      strict: bool = False, options: tuple[str, ...] = ()) -> str | None:
+                      strict: bool = False, options: tuple[str, ...] = (), *, resolve=None) -> str | None:
     """C draft from GNU/splat-style assembly text (plus optional data, for jump tables and strings). `valid`:
     m2c's compilable form (unknown types and expressions as M2C_ macros, see M2C_MACROS), for trying drafts as is.
-    `strict`: a context m2c can't read raises DraftError instead of drafting without it."""
+    `strict`: a context m2c can't read raises DraftError instead of drafting without it.
+    `resolve` looks up project addresses for repairs that need to keep a relocated object separate.
+    """
     if source := intrinsic_leaf(asm_text, name, toolchain_id):
         return source
     target = m2c_target(toolchain_id or "")
     if not target:
         return None
-    return run_m2c(asm_text, name, target, context_header, data_asm, timeout, valid, strict, options)
+    if not valid or toolchain_id != 'gcc-2.7.2-kmc':
+        source = run_m2c(asm_text, name, target, context_header, data_asm, timeout, valid, strict, options)
+        if not valid:
+            return source
+        if target.startswith('mips'):
+            return _compilable(source, name, asm_text, context_header, toolchain_id)
+        return _compilable(source)
+
+    from decomprepair import (
+        aligned_allocator_request,
+        aligned_stack_read,
+        byte_cursor_postincrements,
+        direct_mapped_address,
+        field_snapshot_copies,
+        float_matrix_identity,
+        global_pointer_local_repairs,
+        guard_inversion_repairs,
+        indexed_field_cursor,
+        indirect_call_drafts,
+        kmc_cast_repairs,
+        large_stack_drafts,
+        likely_branch_cursor,
+        loop_storage_shapes,
+        measured_address_repairs,
+        measured_callback_loop,
+        measured_mmio_polling,
+        measured_stack_drafts,
+        measured_word_drafts,
+        ordered_halfword_updates,
+        packed_matrix_conversion,
+        passthrough_argument_repairs,
+        relocated_byte_table,
+        relocated_global_update,
+        shared_default_drafts,
+        shared_return_repairs,
+        short_leaf_drafts,
+        split_dispatch_zero_case,
+        stack_fill_drafts,
+        stack_header_buffer,
+        stack_read_retry,
+        stack_word_index_drafts,
+        unaligned_stack_drafts,
+        uncached_read_repairs,
+    )
+
+    draft_asm = likely_branch_cursor.draft_asm(asm_text)
+    source = _compilable(run_m2c(draft_asm, name, target, context_header, data_asm, timeout, valid, strict, options),
+                         name, asm_text, context_header, toolchain_id)
+    if not source:
+        return None
+    if 'M2C_UNALIGNED32' in source and (draft := unaligned_stack_drafts.rewrite(
+            source, name, asm_text, context_header, resolve)):
+        return draft
+    if words := measured_word_drafts.variants(source, name, asm_text, context_header):
+        return words[0][1]
+    if leaves := short_leaf_drafts.variants(source, name, asm_text, context_header):
+        return leaves[0][1]
+    return (measured_stack_drafts.rewrite(source, name, asm_text, context_header)
+            or large_stack_drafts.rewrite(source, name, asm_text, context_header)
+            or shared_default_drafts.rewrite(source, name, asm_text, data_asm, context_header)
+            or uncached_read_repairs.rewrite(source, name, asm_text, resolve)
+            or measured_callback_loop.rewrite(source, name, asm_text, context_header, resolve)
+            or indirect_call_drafts.rewrite(source, name, asm_text, context_header, resolve)
+            or measured_mmio_polling.rewrite(source, name, asm_text, context_header)
+            or likely_branch_cursor.rewrite(source, name, asm_text, context_header)
+            or relocated_byte_table.rewrite(source, name, asm_text, context_header, resolve)
+            or relocated_global_update.rewrite(source, name, asm_text, context_header, resolve)
+            or relocated_global_update.rewrite_reload_wrapper(source, name, asm_text, context_header, resolve)
+            or relocated_global_update.rewrite_countdown(source, name, asm_text, context_header, resolve)
+            or stack_fill_drafts.rewrite(source, name, asm_text, context_header)
+            or stack_fill_drafts.rewrite_ascending(source, name, asm_text, context_header)
+            or stack_fill_drafts.rewrite_word_clear(source, name, asm_text, context_header)
+            or stack_word_index_drafts.rewrite(source, name, asm_text, context_header)
+            or stack_header_buffer.rewrite(source, name, asm_text, context_header)
+            or stack_read_retry.rewrite(source, name, asm_text, context_header)
+            or stack_read_retry.rewrite_inline(source, name, asm_text, context_header)
+            or float_matrix_identity.rewrite(source, name, asm_text, context_header)
+            or packed_matrix_conversion.rewrite(source, name, asm_text, context_header)
+            or byte_cursor_postincrements.rewrite(source, name, asm_text, context_header)
+            or aligned_allocator_request.rewrite(source, name, asm_text, context_header)
+            or indexed_field_cursor.rewrite(source, name, asm_text, context_header)
+            or split_dispatch_zero_case.rewrite(source, name, asm_text, context_header)
+            or field_snapshot_copies.rewrite(source, name, asm_text, context_header)
+            or ordered_halfword_updates.rewrite(source, name, asm_text, context_header, resolve)
+            or aligned_stack_read.rewrite(source, name, asm_text)
+            or guard_inversion_repairs.rewrite_byte_toggle(source, name, asm_text, context_header)
+            or kmc_cast_repairs.rewrite_float_table(source, name, asm_text, context_header)
+            or direct_mapped_address.rewrite(source, name, asm_text, context_header)
+            or global_pointer_local_repairs.rewrite_list_transfer(source, name, asm_text, context_header)
+            or global_pointer_local_repairs.rewrite_linked_insert(source, name, asm_text, context_header)
+            or shared_return_repairs.rewrite_global_guard(source, name, asm_text)
+            or measured_address_repairs.rewrite_byte_offsets(source, name, asm_text, context_header)
+            or passthrough_argument_repairs.missing_entry_argument(source, name, asm_text, context_header)
+            or loop_storage_shapes.measured_copy_setup(source, name, asm_text, context_header)
+            or source)
+
+
+def _compilable(source: str | None, name='', asm='', header='', toolchain=None) -> str | None:
+    """Repair generated C before the first compiler trial, using the target when available."""
+    if not source:
+        return source
+    from decomprepair import large_switch_drafts
+    source = large_switch_drafts.rewrite(source) or source
+    if asm:
+        from decomprepair import draft_call_recovery
+
+        if repaired := draft_call_recovery.variants(source, name, asm, header, toolchain):
+            return repaired[0][1]
+    return source
 
 
 def drop_saved_register_reads(source: str) -> str:

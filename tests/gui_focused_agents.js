@@ -8,8 +8,9 @@ class Element {
 }
 const parts={},requests=[],errors=[];
 const panel={querySelector:s => parts[s] ||= new Element()};
+let dialogHTML;
 const context={Date,setInterval:()=>1,clearInterval:()=>{},S:{editDirty:false,st:{agents:[{id:'codex',name:'Codex',installed:true,default_model:'test-model',models:[{id:'test-model'}]}],settings:{endpoints:[]}}},
-  poll:async()=>{},esc:s=>s,toast:message=>errors.push(message),dialog:()=>panel,document:{createElement:()=>new Element()},
+  poll:async()=>{},esc:s=>s,toast:message=>errors.push(message),dialog:(_,html)=>{dialogHTML=html;return panel;},document:{createElement:()=>new Element()},
   beginWork:()=>()=>{},showJobError:(_,message)=>errors.push(message),
   api:async(url,options)=>{requests.push({url,options});return url.endsWith('/start')?{job:'create'}:{};},
   followJob:async(id,log,update)=>{update(['Reserving focused worker']);assert(parts['[data-focus-status]'].textContent.includes('Reserving focused worker'));return {started:['worker-1']};}};
@@ -17,11 +18,13 @@ vm.createContext(context);
 vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/decompnet/app/static/js/focused-agents.js'),'utf8'),context);
 (async()=>{
   context.openFocusedAgent('project','function_name');
+  assert.match(dialogHTML, /<input data-focus-tries [^>]*value="300">/);
+  panel.querySelector('[data-focus-tries]').value='6';
   panel.querySelector('[data-focus-minutes]').value='15';
   await parts['[data-focus-start]'].onclick();
   const body=requests[0].options.body;
   assert.equal(body.slug,'project');assert.equal(body.count,1);assert.equal(body.options.model,'test-model');
-  assert.equal(body.options.focus_function,'function_name');assert.equal(body.options.focus_minutes,15);
+  assert.equal(body.options.focus_function,'function_name');assert.equal(body.options.focus_minutes,15);assert.equal(body.options.focus_max_tries,6);
   assert.equal(parts['[data-focus-stop]'].hidden,false);
   assert.equal(parts['[data-focus-start]'].hidden,true);
   assert.equal(parts['[data-focus-model]'].disabled,true);
@@ -34,6 +37,11 @@ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/decompnet/app/static
   assert.equal(parts['[data-focus-heading]'].textContent,'Agent stopped');
   parts['[data-focus-minutes]'].value='0';
   await parts['[data-focus-start]'].onclick();assert.equal(requests.length,2);assert(errors.at(-1).includes('1–240'));
+  parts['[data-focus-minutes]'].value='';
+  parts['[data-focus-tries]'].value='0';
+  await parts['[data-focus-start]'].onclick();assert.equal(requests.length,2);assert(errors.at(-1).includes('tries'));
+  parts['[data-focus-tries]'].value='10';
+  await parts['[data-focus-start]'].onclick();assert.equal(requests[2].options.body.options.focus_minutes,null);
   context.S.editDirty=true;context.openFocusedAgent('project','function_name');assert(errors.at(-1).includes('unsaved'));
   console.log('Focused-agent function, model, duration, stop and validation passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});

@@ -4,8 +4,7 @@ import json
 import re
 import time
 
-_GENERATED = re.compile(r"_?(?:func|fn|FUN|sub)_[0-9a-fA-F]+(?:_[0-9a-fA-F]+)*(?:@.*)?$")
-
+from ..polish_names import generated
 
 # Giving a symbol a compiler builtin's spelling can change calls or reject existing prototypes.
 BUILTIN_NAMES = frozenset("bzero bcopy bcmp memcpy memmove memset memcmp memchr strlen strchr strrchr strcpy strncpy strcmp "
@@ -13,16 +12,15 @@ BUILTIN_NAMES = frozenset("bzero bcopy bcmp memcpy memmove memset memcmp memchr 
                           "abs labs malloc calloc realloc free printf sprintf snprintf puts putchar exit abort".split())
 
 
-def generated(name: str) -> bool:
-    # Overlay/unit suffixes are arbitrary labels appended to an automatic address name.
-    return name.startswith(("func_", "_func_")) or bool(_GENERATED.fullmatch(name))
-
-
 def check_rename(old: str, new: str):
     """A donor's placeholder must never erase an established descriptive symbol."""
     if old != new and not generated(old) and not old.startswith('func_') and new.startswith('func_'):
         from ..network import NetworkError
         raise NetworkError(f"Keep {old}: {new} is a generated function name, not a naming improvement.")
+
+
+def needs_name(fn) -> bool:
+    return generated(json.loads(fn["meta"] or "{}").get("real") or fn["name"])
 
 
 def state(fn) -> dict:
@@ -44,6 +42,10 @@ def record(db, fid, old, new, **provenance):
 _C_TOKEN = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[A-Za-z_]\w*', re.S)
 
 
+def rename_identifiers(source: str, names: dict[str, str]) -> str:
+    return _C_TOKEN.sub(lambda match: names.get(match[0], match[0]), source)
+
+
 def canonical_source(fn, source: str) -> str:
     """Old saved attempts can predate a rename. Replay the function under its current symbol, preserving literals,
     comments and whitespace (period compilers can schedule differently when formatting changes)."""
@@ -55,4 +57,4 @@ def canonical_source(fn, source: str) -> str:
         aliases.add(f"func_{fn['vram']:08X}")
     aliases.discard(None)
     aliases.discard(fn["name"])
-    return _C_TOKEN.sub(lambda m: fn["name"] if m.group() in aliases else m.group(), source)
+    return rename_identifiers(source, dict.fromkeys(aliases, fn["name"]))

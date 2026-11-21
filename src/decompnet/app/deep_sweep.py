@@ -10,7 +10,7 @@ from contextlib import nullcontext
 
 from .. import candidate_scope, claim_stalls, scoring
 from ..network import IN_BUILD, NetworkError
-from . import agent_tokens, deep_permuter, deep_throughput, workers
+from . import agent_tokens, deep_permuter, deep_source_recovery, deep_throughput, workers
 from .deep_activity import Activity
 from .purpose_work import Executor
 
@@ -68,6 +68,7 @@ class Sweeps:
     def __init__(self, net, jobs):
         self.net, self.jobs = net, jobs
         self.active = {}
+        self.started_at = {}
         self.queue_cache = {}
         self.lock = threading.RLock()
         self.ready = set()
@@ -278,16 +279,38 @@ class Sweeps:
                 db.executemany("UPDATE deep_permutation_passes SET state='pending',error='' WHERE function_id=?",[(fid,) for fid in ids])
             with self.lock:self.queue_cache.clear()
 
+    def runtime(self, slug, cfg):
+        started = self.started_at.get(slug)
+        return cfg.get('runtime_seconds', 0) + (time.monotonic() - started if started is not None else 0)
+
+    def finish_runtime(self, slug, cfg):
+        if slug in self.started_at:
+            cfg = cfg | {'runtime_seconds': self.runtime(slug, cfg)}
+            self.save(slug, cfg)
+            del self.started_at[slug]
+
+    def timed_run(self, slug, minutes, variants, log, threads, loop):
+        with self.lock:
+            log.check_cancel()
+            self.started_at[slug] = time.monotonic()
+        try:
+            return self.run(slug, minutes, variants, log, threads, loop)
+        finally:
+            with self.lock:
+                if slug in self.started_at:
+                    self.finish_runtime(slug, self.config(slug))
+
     def control(self, slug):
         """Discover work and controls without scanning saved searches or build inputs."""
-        cfg = self.config(slug)
         with self.lock:
+            cfg = self.config(slug)
+            runtime = self.runtime(slug, cfg)
             current = dict(self.active.get(slug, {}))
         with self.jobs._lock:
             job = self.jobs.jobs.get(current.get('job'), {})
             live = {key:job[key] for key in ('state', 'progress', 'error') if key in job}
         return cfg | {'control_only':True, 'threads_default':workers.default_workers(),
-                      'has_activity':bool(job or cfg.get('metrics_started')), 'state':'idle', **current, **live}
+                      'runtime_seconds':runtime, 'has_activity':bool(job or cfg.get('metrics_started')), 'state':'idle', **current, **live}
 
     def status(self, slug):
         # A status poll must never queue behind a writer to repair old pass records.
@@ -301,13 +324,14 @@ class Sweeps:
                                       "WHERE f.project_id=? AND d.state='completed'", proj['id'])['n']
 
         improvements = self.improvements(proj['id'])
-        cfg = self.config(slug)
-        attention = self.attention(proj)
+        attention = self.attention(proj) + deep_source_recovery.issues(self._store(slug), proj['id'])
         errors = len(attention)
         # Matching the current build can inspect project files. Cache the result briefly so opening
         # details or polling a running pass does not repeatedly hash every completed function.
         ready = counts['ready'] or 0
         with self.lock:
+            cfg = self.config(slug)
+            runtime = self.runtime(slug, cfg)
             current = dict(self.active.get(slug, {}))
         def count_queue():
             shared = candidate_scope.batch_context(self.net, proj)
@@ -341,7 +365,7 @@ class Sweeps:
         reset = self._store(slug).one('SELECT value FROM settings WHERE key=?', f'deep-metrics-reset:{proj["id"]}')
         has_activity = bool(job or improvements or recipes or measurements or wins
                             or cfg.get('metrics_started', bool((completed or errors) and not reset)))
-        return cfg | {'has_activity': has_activity, 'threads_default': workers.default_workers(),
+        return cfg | {'runtime_seconds': runtime, 'has_activity': has_activity, 'threads_default': workers.default_workers(),
                       'total': counts['total'], 'ready': ready, 'queue_done': done_open + done_matched,
                       'queue_left': max(0, ready - done_open - blocked), 'queue_rotated': rotated, 'queue_blocked': blocked, 'awaiting_source': max(0, counts['total'] - ready),
                                    'improved': len(improvements), 'improvements': improvements, 'recipes': recipes, 'recipe_wins': wins,
@@ -372,11 +396,13 @@ class Sweeps:
             if repeat:
                 self.queue_cache.clear()
                 with self._store(slug).tx() as db:
+                    pid = self.net.project_row(slug)['id']
                     db.execute("DELETE FROM deep_permutation_passes WHERE function_id IN "
-                               "(SELECT id FROM functions WHERE project_id=? AND status='open')",
-                               (self.net.project_row(slug)['id'],))
-            self.save(slug, {'enabled': True, 'minutes': minutes, 'max_variants': max_variants, 'threads': threads, 'threads_per_function': threads_per_function, 'compiler_profiles': compiler_profiles, 'metrics_started': True, 'loop': loop, **throughput})
-            job = self.jobs.start('deep-permutation-pass', lambda log: self.run(slug, minutes, max_variants, log, threads, loop),
+                               "(SELECT id FROM functions WHERE project_id=? AND status='open')", (pid,))
+                    deep_source_recovery.reset(db, pid)
+            self.save(slug, {'runtime_seconds': self.config(slug).get('runtime_seconds', 0),
+                             'enabled': True, 'minutes': minutes, 'max_variants': max_variants, 'threads': threads, 'threads_per_function': threads_per_function, 'compiler_profiles': compiler_profiles, 'metrics_started': True, 'loop': loop, **throughput})
+            job = self.jobs.start('deep-permutation-pass', lambda log: self.timed_run(slug, minutes, max_variants, log, threads, loop),
                                   project=slug, cancel_message='Deep pass stopped. Verified improvements and completed passes are saved.')
             self.active[slug] = {'job': job}
         return self.control(slug)
@@ -384,7 +410,11 @@ class Sweeps:
     def stop(self, slug):
         with self.lock:
             cfg = self.config(slug)
-            self.save(slug, cfg | {'enabled': False})
+            cfg = cfg | {'enabled': False}
+            if slug in self.started_at:
+                self.finish_runtime(slug, cfg)
+            else:
+                self.save(slug, cfg)
             job = self.active.get(slug, {}).get('job')
             if job:
                 self.jobs.cancel(job)
@@ -406,8 +436,10 @@ class Sweeps:
         release_repairs.shutdown(self.net,self.jobs)
         # Stop current searches; their completed records remain available for a manual restart.
         with self.lock:
-            for current in self.active.values():
+            for slug, current in self.active.items():
                 self.jobs.cancel(current['job'])
+                if slug in self.started_at:
+                    self.finish_runtime(slug, self.config(slug))
 
     def completed(self, slug, before, minutes, variants, result, build_scope):
         self.improvement(before, result.get('best_score'))
@@ -416,6 +448,23 @@ class Sweeps:
         stable = build_scope == candidate_scope.key(self.net, proj, before)
         self.record(fresh, signature(self.net, proj, fresh, minutes, variants, result.get('compiler_profiles')),
                     'completed' if stable else 'pending', minutes, variants, result)
+
+    def reopen_without_randomizer(self, slug) -> int:
+        """Passes that finished with only the simple rewrites go back to pending once decomp-permuter is here:
+        those that say so in their result, and older ones (no such record) that finished before it was installed."""
+        from . import permute
+        installed = permute.installed_at()
+        if installed is None:
+            return 0
+        with self._store(slug).tx() as db:
+            cur = db.execute("UPDATE deep_permutation_passes SET state='pending',completed_at=NULL WHERE state='completed' "
+                             "AND (json_extract(result,'$.randomizer')=0 OR (json_extract(result,'$.randomizer') IS NULL "
+                             "AND completed_at<?))", (installed,))
+            count = cur.rowcount if cur is not None and cur.rowcount and cur.rowcount > 0 else 0
+        if count:
+            with self.lock:
+                self.queue_cache.clear()
+        return count
 
     def record(self, fn, scope, state, minutes, variants, result=None, error=''):
         with self.lock:
@@ -433,9 +482,50 @@ class Sweeps:
         Blocked functions never occupy a worker. Sleep only when no useful turn is available.
         """
         self.recover_room_transport(slug)
+        from . import permute
+        if permute.ensure_available(log):
+            reopened = self.reopen_without_randomizer(slug)
+            if reopened:
+                log(f'Repeating {reopened} deep searches that finished before decomp-permuter was installed.')
+        else:
+            log(permute.MISSING + ' Install it from Compilers & tools: searches made without it are repeated afterwards.')
+        from .sdk_assembly import discover_known
+        log.check_cancel()
+        with looking(self.net):
+            sdk_set_aside = discover_known(self.net, self.net.project_row(slug), check_cancel=log.check_cancel)
+        if sdk_set_aside:
+            log(f'Identified {sdk_set_aside} SDK library functions before preparing C candidates.')
+        twin_trials = twin_matches = recovered_matches = recovery_trials = 0
+        unscored = set()
+        if slug not in self.net.links:
+            from .. import compiler
+            from .boundary_repairs import blocked
+
+            with looking(self.net):
+                proj = self.net.project_row(slug)
+                if self.net.is_rom(proj) and not self.net.fork_slug(slug):
+                    from . import match_reconciliation
+                    recovered = match_reconciliation.run(self.net, slug, None, None, log, automatic=True)
+                    log.check_cancel()
+                    recovered_matches, recovery_trials = recovered['matched'], recovered['attempts']
+                unscored = {row['id'] for row in self._store(slug).all(
+                    "SELECT id FROM functions WHERE project_id=? AND status='open' "
+                    "AND (best_source IS NULL OR best_score IS NULL) AND " + IN_BUILD, proj['id'])}
+                if unscored:
+                    eligible = unscored - blocked(self.net, proj)
+                    agent, _ = self.net.local_agent('autopilot')
+                    for donor, target in self.net.twins.pairs(proj):
+                        log.check_cancel()
+                        if target in eligible:
+                            with compiler.cancellable(log.check_cancel):
+                                outcome = self.net.twins.try_pair(agent, proj, donor, target)
+                            twin_trials += int(outcome in ('match', 'miss'))
+                            twin_matches += int(outcome == 'match')
+                    if twin_trials:
+                        log(f'Tried matched twins for {twin_trials} functions without scored C; {twin_matches} matched.')
         maximum = getattr(log.compile_pool, 'maximum', False)
         count = deep_throughput.width(True,0) if maximum and not threads else workers.clamp(threads) if threads != 1 else 1
-        stats = {'visited': 0, 'tested': 0, 'matched': 0, 'rotated':0, 'activity': Activity(log)}
+        stats = {'visited': twin_trials + recovered_matches, 'tested': twin_trials + recovery_trials, 'matched': twin_matches + recovered_matches, 'rotated':0, 'activity': Activity(log)}
         visited_turns = set()
         lock = threading.Lock()  # (the counters are shared by every thread's function)
         cycle = 1
@@ -456,15 +546,22 @@ class Sweeps:
                 log.check_cancel()
                 with looking(self.net):
                     proj = self.net.project_row(slug)
-                pending = waiting = 0
+                candidates = []
+                waiting = 0
                 # Shuffle lightweight identities first. Never fingerprint the entire project before
                 # dispatching work; keep at most two turns per worker queued ahead of execution.
                 identities = [dict(r) for r in self._store(slug).all(f"SELECT id,name,size FROM functions WHERE project_id=? AND status='open' AND {IN_BUILD}", proj['id'])]
                 from .boundary_repairs import blocked as boundary_blocked
                 held=boundary_blocked(self.net,proj)
+                if cycle == 1 and not order:
+                    boundary_count = sum(row['id'] in held for row in identities)
+                    if boundary_count:
+                        log(f'{boundary_count} functions need boundary review. See Settings → Code coverage → Review & repair boundaries.')
                 identities=[r for r in identities if r["id"] not in held]
                 if not order:
                     random.shuffle(identities)
+                    # Restore missing baselines before the bounded search queue fills.
+                    identities.sort(key=lambda row: row['id'] not in unscored)
                     order.extend(r["id"] for r in identities)
                 ranks = {fid: i for i, fid in enumerate(order)}
                 identities.sort(key=lambda r: ranks.get(r["id"], len(ranks)))
@@ -472,16 +569,16 @@ class Sweeps:
                 scanned = submitted = 0
                 shared = {'contexts': {}}
                 profiles = self.config(slug).get('compiler_profiles', 1)
-                def preparing(checked, eligible, blocked, done=False, total=total):
-                    stats['activity'].publish({'preparation': {'checked': checked, 'total': total,
-                        'eligible': eligible, 'waiting': blocked, 'done': done}}, force=done)
-                preparing(scanned, pending, waiting)
+                activity = stats['activity']
+                activity.prepare(scanned, total, candidates, waiting)
 
                 failed = threading.Event()
-                def execute(item, blocked, proj=proj, total=total):
+                def execute(item, blocked, pid=proj['id'], total=total):
                     log.check_cancel()
-                    fn = self._store(slug).one('SELECT * FROM functions WHERE id=? AND project_id=?', item['id'], proj['id'])
-                    if not fn or fn['status'] != 'open' or fn['gone_mark'] is not None:
+                    store = self._store(slug)
+                    proj = store.one('SELECT * FROM projects WHERE id=?', pid)
+                    fn = store.one('SELECT * FROM functions WHERE id=? AND project_id=?', item['id'], pid)
+                    if not proj or not fn or fn['status'] != 'open' or fn['gone_mark'] is not None:
                         return
                     # Dispatch always uses fresh inputs, never the producer's shared snapshot.
                     with looking(self.net):
@@ -518,7 +615,7 @@ class Sweeps:
                         AND f.id IN (SELECT value FROM json_each(?))""", proj['id'], json.dumps(ids))}
                     for fid in ids:
                         log.check_cancel()
-                        preparing(scanned, pending, waiting)
+                        activity.prepare(scanned, total, candidates, waiting)
                         scanned += 1
                         fn = rows.get(fid)
                         if fn is None or fid in visited_turns or fid in futures.values():
@@ -526,16 +623,24 @@ class Sweeps:
                         with looking(self.net):
                             fn = deep_permuter.prepare_source(self.net, proj, fn)
                             if not fn['best_source'] or fn['best_score'] is None:
+                                fn = {**dict(fn), **dict(deep_source_recovery.prepare(self.net, proj, fn, log))}
+                                if fn['status'] == 'matched':
+                                    with lock:
+                                        stats['matched'] += 1
+                            if fn['status'] != 'open' or dict(fn).get('gone_mark') is not None:
+                                continue
+                            if not fn['best_source'] or fn['best_score'] is None:
                                 waiting += 1
                                 continue
                             # Never-tried/pending candidates need no costly historical-scope comparison.
                             if (fn['pass_state'] == 'error' or (not loop and fn['pass_state'] == 'completed')) and fn['pass_scope'] == signature(
                                     self.net, proj, fn, minutes, variants, profiles, shared):
                                 continue
-                        pending += 1
+                        candidates.append(fn['name'])
                         if slug in self.net.links and (fn['claim_expires'] or 0) > time.time():
                             waiting += 1
                             continue
+                        activity.prepare(scanned, total, candidates, waiting)
                         while len(futures) >= count * 2:
                             log.check_cancel()
                             finished, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
@@ -547,7 +652,7 @@ class Sweeps:
                             order.remove(fid)
                         order.append(fid)
                         submitted += 1
-                preparing(scanned, pending, waiting, done=True)
+                activity.prepare(scanned, total, candidates, waiting, done=True)
                 if loop and visited_turns and not submitted:
                     cycle += 1
                     visited_turns.clear()
@@ -564,7 +669,7 @@ class Sweeps:
                         futures.pop(future)
                         future.result()
                     continue  # Refill free workers without waiting for the longest turn.
-                if not pending and not waiting:
+                if not candidates and not waiting:
                     self.save(slug, self.config(slug) | {'enabled': False})
                     log('Deep pass finished. Completed bounded passes are saved; this is not an exhaustive search of all C.')
                     if stats['rotated']:
@@ -586,7 +691,7 @@ class Sweeps:
         """One function's bounded turn, on whichever thread is free."""
         log.check_cancel()
         activity = stats["activity"]
-        activity.update(fn["name"])
+        activity.update(fn["name"], {"n_insns": fn["n_insns"]})
         with looking(self.net):
             build_scope = candidate_scope.key(self.net, proj, fn)
         self.record(fn, scope, 'running', minutes, variants)

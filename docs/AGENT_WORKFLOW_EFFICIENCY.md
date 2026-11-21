@@ -442,3 +442,116 @@ resets remain unknown and use the existing conservative fallback waiting.
 This changes scheduling only. It does not bypass quotas, switch providers, resume
 paused agents or issue a model request while waiting. Existing live fallback timers
 are not rewritten by this change.
+
+## Next experiment after repeated instruction output
+
+After two successive unchanged instruction diffs, the retry hint uses the judge's
+normalized rows and the project's processor. Register, stack, call, operand, order
+and control-flow differences prompt different investigations. Compiler and link
+diagnostics take precedence. Release feedback can reuse the latest measurement when
+the current source and build inputs still agree. The advice runs no extra compiles
+and leaves the existing claim budgets and exact verdicts intact.
+
+A scripted comparison used the same homemade demo checksum in ROM mode and an
+imported objdiff project under pinned KMC GCC 2.7.2. Three equivalent spellings of
+the incorrect initializer `0x1235` produced the same diff in each mode. The
+previous hint suggested changing the loop counter's signedness. The one suggested
+trial went from 10 to 410 in ROM mode and from 1 to 121 in project mode. The new
+hint pointed to the differing immediate. Restoring the target's `0x1234` through
+the ordinary patch tool matched in both modes on the first guided retry.
+This measures the prescribed next step for one controlled mismatch in two
+judges. It does not measure autonomous model match rates or token use.
+
+### Handoffs on the next claim
+
+The agent's stall instructions ask for the tested approach, the observed effect
+and one untested step against the candidate the next worker inherits. The step can
+be an advisory investigation or an exact-anchor patch. The release transaction
+publishes it when the claim ends. A push-back leaves the handoff unpublished.
+Ordinary release notes remain available as history.
+
+The new claim and explicit brief show a handoff only for the same candidate,
+target extent and build inputs. The patch view rechecks applicability and suppresses
+a patch that has since been tried. A later attempt supersedes an advisory step.
+Validation reads the existing input fingerprints and runs no new compiler.
+The handoff uses the local project store. Room synchronization continues to carry
+ordinary release notes.
+
+The real ROM and imported-project demo replay compiles three equivalent incorrect
+initializers, releases the stalled claim, and verifies the next worker's claim
+and patch view. It then edits the ROM context or the imported include file
+and verifies that the claim, brief and patch view withhold the handoff.
+
+## Model routing on comparable hard claims
+
+Automatic routing compares completed, tested claims that had already been released at
+least three times when the model took them. Each comparison uses the starting function
+size, saved score band or presence of a draft, and effective compiler profile. ROMs
+use the selected profile, including flags, ranges and per-function overrides. Imported
+builds compare within a unit and a build-control snapshot, including a declared
+per-file compiler where the console exposes one. Imported projects can also obtain
+flags from files outside these recorded build controls.
+
+A routing preference needs at least 20 distinct completed functions per model in the
+same group, with a substantial gap after smoothing. Only recent history counts, and
+the current function must fall in that group. A retry on the same function does
+not become another independent sample. Exact outcomes are credited to the claim
+that did the work under its starting profile. Unfinished, untried and legacy claims
+without a starting snapshot do not train the comparison.
+
+Per-agent and project queue overrides still choose the order explicitly. A deferred
+function can still be claimed when no other eligible work is available.
+
+A fixed-outcome comparison used three held-out hard queues in each of ROM and imported
+mode. The project-wide policy assigned 4 of 6 cases to the model with the better
+record for that case. The comparable policy assigned 6 of 6. The fixtures reverse
+which model is better across compiler profiles and starting score bands. Separate
+demo tests drive both real judges to verify what constitutes a recorded miss and
+an exact win. The fixed outcomes measure assignment behavior without model calls.
+
+## Faster continuation and diagnosis
+
+CLI and API candidate tools share the narrow saved-progress preflight. It reuses
+the acknowledged file index and checks the function's saved C alongside the
+manifest and headers. Relevant changes take the ordinary synchronization path.
+The existing publication and judging guards still apply.
+
+Patch feedback identifies the accepted edit when it remains in the current
+continuation. When the compiler supplies source locations, the reply includes
+uniquely anchored C from that same revision. A variant batch preserves the score
+winner and keeps one other continuation if it recovers a target region. Use
+`get_candidate(base="regional_alternative")` before another attempt, which
+ends that alternate's availability.
+
+`get_search_brief` follows the active continuation by default. Pass
+`base="saved_best"` to inspect the inherited best. The first scored large
+draft gets a short investigation for a structural, call or profile issue when
+its mismatch supports one. Recent measured function-output fingerprints are
+shared across workers for the same build. Repeated-output feedback can surface
+one captured exact repair when the recorded compiler, flags and mismatch agree.
+
+An exact local ROM `compiler_experiments` result can be submitted by
+`suggest(function=..., trial_id=...)`. The receipt supplies source and settings
+to the ordinary fresh judge and approval. Imported diagnostics still follow
+their project-owned compiler approval path.
+
+Automatic low-progress and repeated-output releases publish the attempts and
+remaining measured mismatch as a scoped handoff. An applicable, untested patch
+from an earlier handoff remains available. A fallback diagnostic next check
+uses the ordinary search brief.
+
+## Optional live model routing comparison
+
+Open **Agents → Model routing comparison** for a project and choose a maximum
+of 1–200 sampled claims. About one eighth of comparable hard functions are
+assigned to one of two groups, stable by function for the run. Normal routing
+continues in the control group. The overlap group also makes those functions
+available to other eligible models from the same comparison. Existing work,
+explicit queue orders and model eligibility limits still govern admission.
+
+The cap counts sampled assignments, including claims that ended without a
+compile. Stop ends sampling and lets held claims finish. The results compare
+completed claims grouped by starting candidate, compiler profile and configured
+claim limits, for groups with results on both sides. Helper-hours use elapsed
+time on single-function sampled claims, including waiting in the claim. The
+comparison runs on ordinary agent traffic when enabled and starts no helpers.

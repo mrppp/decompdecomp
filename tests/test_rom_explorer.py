@@ -3,15 +3,19 @@ import hashlib
 import json
 import struct
 import threading
+import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from decompnet.app import rom_explorer
+from decompnet.app import rom_explorer, rom_scan, source_runtime, tools
+from decompnet.app.agents import Manager, Session
 from decompnet.app.engine import RomNetwork
 from decompnet.app.support import Jobs
 from decompnet.network import NetworkError
 from decompnet.rom.explorer import DECODE_BYTES, PAGE_BYTES, analyse
+from tests.test_source_runtime import make_app, worker_checkouts
 
 
 def mapping(name='main',start=0,end=128,vram=0x80000000):
@@ -106,6 +110,16 @@ def project(tmp_path):
     if hasattr(net,'autosave'):net.autosave.close()
 
 
+def test_rescan_refreshes_assets_after_library_update(project, monkeypatch):
+    net, _, _ = project
+    monkeypatch.setattr(rom_explorer, 'version', lambda _: '1')
+    assert not rom_explorer.run(net, 'game', Log()).get('cached')
+    assert rom_explorer.run(net, 'game', Log())['cached']
+    monkeypatch.setattr(rom_explorer, 'version', lambda _: '2')
+    assert not rom_explorer.run(net, 'game', Log()).get('cached')
+    assert rom_explorer.run(net, 'game', Log())['cached']
+
+
 def test_saved_map_preview_annotations_staleness_and_no_progress_side_effects(project,monkeypatch):
     net,pid,root=project
     monkeypatch.setattr(net.progress,'sync',lambda *a,**k:pytest.fail('Explorer must not synchronize or judge saved work'))
@@ -141,6 +155,150 @@ def test_cancelled_rescan_retains_complete_map_and_notes(project):
     log.check_cancel=stop
     with pytest.raises(RuntimeError,match='stopped'):rom_explorer.run(net,'game',log)
     with net.progress.view():assert rom_explorer.listing(net,'game')==before
+
+
+
+def scan_source_with_pause(tmp_path, worker_source):
+    """Hold the real child after analysis, before sending its report to the parent."""
+    waiting, release = tmp_path / "scan-waiting", tmp_path / "scan-release"
+    marker = '        with output.open("w", encoding="utf-8") as stream:'
+    assert marker in worker_source
+    slow = worker_source.replace(marker, f"""        emit("progress", dict(phase="Waiting to return the map", done=1, total=2))
+        Path({str(waiting)!r}).touch()
+        deadline = time.monotonic() + 30
+        while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+{marker}""")
+    return slow, waiting, release
+
+
+def wait_for_scan(jobs, jid, waiting):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and jobs.jobs[jid]["state"] == "running":
+        if waiting.exists() and jobs.jobs[jid].get("progress", {}).get("phase") == "Waiting to return the map":
+            return
+        time.sleep(.02)
+    pytest.fail(f"The scan did not reach its reporting checkpoint: {jobs.jobs[jid]}")
+
+
+def finished_scan(jobs, jid):
+    deadline = time.monotonic() + 10
+    while jobs.jobs[jid]["state"] == "running" and time.monotonic() < deadline:
+        time.sleep(.02)
+    return jobs.jobs[jid]
+
+
+@pytest.mark.parametrize("update_kind", ["source-update", "local-edit"])
+def test_worker_update_finishes_active_scan_and_keeps_agent_session_and_claim(project, monkeypatch, update_kind):
+    net, _, root = project
+    worker = "src/decompnet/app/rom_scan_worker.py"
+    original = rom_scan.WORKER_SOURCE.read_text()
+    old_source, waiting, release = scan_source_with_pause(root, original)
+    new_source = original.replace('        resource_catalog.attach(report)',
+                                  '        report["updated_scan_worker"] = True\n        resource_catalog.attach(report)')
+    assert new_source != original
+    source, staged, revision = worker_checkouts(root, worker, old_source, new_source)
+    monkeypatch.setattr(rom_scan, "WORKER_SOURCE", source / worker)
+    monkeypatch.setattr(source_runtime.edition, "CHECKOUT_ROOT", source)
+    monkeypatch.setattr(source_runtime, "validate", lambda *args: (source, "git"))
+    app = make_app(root)
+    app.net = net
+    app.jobs = jobs = Jobs()
+    app.manager = manager = Manager(net, app.home, "http://localhost/mcp")
+    agent, token = net.local_agent("scan-reload-helper")
+    session = Session("helper", "api", "Scan helper", "game", agent.name, {}, state="working")
+    manager.sessions[session.id] = session
+    manager.assignments[agent.id] = session.slug
+    session_id = manager._session_begin(session)
+    tools.build_mcp(net, lambda ctx: (agent, session.slug), observe=manager.record_agent)
+    runtime = source_runtime.Runtime(app)
+    monkeypatch.setattr(runtime, "prepare", lambda *args: staged)
+    monkeypatch.setattr(runtime, "drain", lambda: pytest.fail("a scan-worker update must keep the app running"))
+
+    def claims():
+        return json.loads(tools.call(net, net.authenticate(token), session.slug, "get_claims", {}))["claims"]
+
+    with ThreadPoolExecutor(max_workers=1) as agent_loop:
+        session.thread = agent_loop.submit(threading.current_thread).result(timeout=5)
+        agent_loop.submit(net.claim_row, agent, "game", "reader").result(timeout=5)
+        held = agent_loop.submit(claims).result(timeout=5)
+        assert held[0]["function"] == "reader" and held[0]["claim_token"]
+        jid = jobs.start("rom-explorer", lambda log: rom_explorer.run(net, "game", log), project="game")
+        try:
+            wait_for_scan(jobs, jid, waiting)
+            if update_kind == "source-update":
+                runtime.run(source, "git", "uv", root, "example/repo")
+                assert runtime.job["state"] == "done", runtime.job
+                assert app.build_id == revision
+            else:
+                edited = (source / worker).with_suffix(".tmp")
+                edited.write_text(new_source)
+                edited.replace(source / worker)
+            assert rom_explorer.status(net, "game", jobs)["job"]["state"] == "running"
+            assert not rom_explorer.listing(net, "game")["available"]
+            assert agent_loop.submit(claims).result(timeout=5) == held
+        finally:
+            release.touch()
+
+        job = finished_scan(jobs, jid)
+        assert job["state"] == "done", job
+        report = rom_explorer.listing(net, "game")
+        assert report["size"] == 128 and not report["stale"] and "updated_scan_worker" not in report
+        assert not rom_explorer.run(net, "game", Log()).get("cached")
+        assert rom_explorer.listing(net, "game")["updated_scan_worker"]
+
+        assert agent_loop.submit(claims).result(timeout=5) == held
+        assert agent_loop.submit(threading.current_thread).result(timeout=5) is session.thread
+        assert manager.sessions[session.id] is session and session.state == "working" and not session.stop.is_set()
+        sessions = net.project_store("game").all("SELECT id, ended_at FROM helper_sessions WHERE helper_id=?", session.id)
+        assert [dict(row) for row in sessions] == [{"id": session_id, "ended_at": None}]
+
+
+def test_stopping_scan_worker_leaves_previous_map_and_annotations(project, monkeypatch):
+    net, _, root = project
+    rom_explorer.run(net, "game", Log())
+    report = rom_explorer.listing(net, "game")
+    rom_explorer.annotate(net, "game", dict(region=report["regions"][0]["id"], image_hash=report["image_hash"],
+                                           name="A saved label"))
+    previous = rom_explorer.listing(net, "game")
+    worker = root / "slow_worker.py"
+    slow_source, waiting, release = scan_source_with_pause(root, rom_scan.WORKER_SOURCE.read_text())
+    worker.write_text(slow_source)
+    monkeypatch.setattr(rom_scan, "WORKER_SOURCE", worker)
+    jobs = Jobs()
+    jid = jobs.start("rom-explorer", lambda log: rom_explorer.run(net, "game", log),
+                     project="game", cancel_message="ROM scan stopped.")
+    try:
+        wait_for_scan(jobs, jid, waiting)
+        assert jobs.cancel(jid)
+        job = finished_scan(jobs, jid)
+        assert job["state"] == "cancelled" and job["error"] == "ROM scan stopped.", job
+        assert rom_explorer.listing(net, "game") == previous
+    finally:
+        release.touch()
+
+
+def test_scan_rejects_a_report_from_before_a_layout_change(project, monkeypatch):
+    net, pid, root = project
+    rom_explorer.run(net, "game", Log())
+    previous = rom_explorer._read(net, net.project_row("game"))
+    worker = root / "slow_worker.py"
+    source, waiting, release = scan_source_with_pause(root, rom_scan.WORKER_SOURCE.read_text())
+    worker.write_text(source)
+    monkeypatch.setattr(rom_scan, "WORKER_SOURCE", worker)
+    jobs = Jobs()
+    jid = jobs.start("rom-explorer", lambda log: rom_explorer.run(net, "game", log), project="game")
+    try:
+        wait_for_scan(jobs, jid, waiting)
+        cfg = dict(net.cfg(net.project_row("game")), segments=[mapping(end=64)])
+        with net.store.tx() as db:
+            db.execute("UPDATE projects SET config=? WHERE id=?", (json.dumps(cfg), pid))
+    finally:
+        release.touch()
+    job = finished_scan(jobs, jid)
+    assert job["state"] == "error" and "layout changed" in job["error"], job
+    assert rom_explorer._read(net, net.project_row("game")) == previous
+    assert rom_explorer.listing(net, "game")["stale"]
 
 
 def test_status_is_scoped_and_never_loads_large_report(project,monkeypatch):
@@ -453,3 +611,52 @@ def test_dialogue_preview_links_open_verified_targets_only():
     assert all(not row['links'] for row in result['table']['rows'][1:])
     assert result['links'] == [dict(label='Translation', region='10', offset=10)]
     assert result['cutscene_links'] == [dict(label='intro.ncs', region='40', offset=40, inspect=True)]
+
+
+def test_validated_preview_at_a_nested_resource_start_takes_precedence():
+    texture = dict(offset=8,size=80,kind='image',media='image',confidence='validated',preview_settings={})
+    model = dict(offset=24,size=12,kind='3d model',media='model',confidence='validated',preview_settings={})
+    for assets in ([texture,model],[model,texture]):
+        rows = analyse(bytes(128),[],[],[],assets=assets)['regions']
+        assert next(row for row in rows if row['start']==8)['detected_asset']==texture
+        assert next(row for row in rows if row['start']==24)['detected_asset']==model
+
+
+def test_region_can_preview_two_detected_assets_at_the_same_offset(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    image = bytes(64)
+    path = tmp_path/'image'
+    path.write_bytes(image)
+    digest = hashlib.sha256(image).hexdigest()
+    settings = dict(source='rom', format='auto', offset=0)
+    model = dict(kind='3d model', media='model', offset=0, preview_settings=settings)
+    texture = dict(kind='image', media='image', offset=0, preview_settings=settings)
+    row = dict(start=0, detected_asset=model, evidence=[model, texture])
+    report = dict(size=len(image), regions=[row])
+    console = SimpleNamespace(asset_scene=lambda *_: None,
+                              asset_preview=lambda _, asset, selection: dict(media=asset['media']))
+    net = SimpleNamespace(console=lambda _: console)
+    monkeypatch.setattr(rom_explorer, '_current', lambda *_: ({}, dict(report=report), row))
+    monkeypatch.setattr(rom_explorer, '_source', lambda *_: dict(path=path))
+    monkeypatch.setattr(rom_explorer, '_resource_links', lambda *_: None)
+
+    request = dict(region='0-40', image_hash=digest)
+    assert rom_explorer.asset_preview(net, 'game', request)['media'] == 'model'
+    assert rom_explorer.asset_preview(net, 'game', request | dict(asset_view='image'))['media'] == 'image'
+    row['evidence'].remove(texture)
+    with pytest.raises(NetworkError, match='no detected asset'):
+        rom_explorer.asset_preview(net, 'game', request | dict(asset_view='image'))
+
+
+def test_scoped_splat_data_symbols_only_cover_their_matching_overlay():
+    segments = [mapping('bank_a', 0, 32), mapping('bank_b', 32, 64)]
+    symbols = [dict(name='D_80000008_bank_b',address=0x80000008,size=4,kind='data'),
+               dict(name='D_80000000_bank_b',address=0x80000010,size=4,kind='data')]
+    report = analyse(bytes(64), segments, [], symbols)
+    scoped = [(row['start'],symbol['ambiguous']) for row in report['regions']
+              for symbol in row['symbols'] if symbol['name'] == symbols[0]['name']]
+    ambiguous = [(row['start'],symbol['ambiguous']) for row in report['regions']
+                 for symbol in row['symbols'] if symbol['name'] == symbols[1]['name']]
+    assert scoped == [(40,False)]
+    assert ambiguous == [(16,True),(48,True)]

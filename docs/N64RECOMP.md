@@ -1,6 +1,18 @@
 # N64Recomp in decompdecomp: a port before the decomp is done, and a reference for every function
 
-Status: phases 0 and 1 are built (Porting → Recompile with N64Recomp, and the `compare_behaviour` tool; `consoles/n64/recomp.py`, `app/recompile.py`, `app/behaviour.py`), and phase 2 for the native build (Play and the app export: `port/wasm/recomp.py`); the rest is a plan. ROADMAP.md, "N64Recomp: a playable game from day one", tracks it.
+Status: phases 0 and 1 are built (Porting → Recompile It, on-demand recompilation, and the `compare_behaviour` tool; `consoles/n64/recomp.py`, `app/recompile.py`, `app/behaviour.py`), and phase 2 for the native build (Play and the app export: `port/wasm/recomp.py`); the rest is a plan. ROADMAP.md, "N64Recomp: a playable game from day one", tracks it.
+
+Use **Recompile It** early to check the ROM split. The results include functions the split missed, functions
+N64Recomp set aside, and generated C that failed to compile. Review those findings before spending time matching
+functions. Builds that use N64Recomp also prepare its output on demand.
+
+The step's meter counts functions whose generated C passed the compiler's syntax check, including discoveries.
+Functions replaced by stubs contribute only to the total. Run N64Recomp again to measure an older report.
+
+The **Missing functions** list shows every discovery, including its ROM offset, proposed size and discovery evidence.
+Open **Review assembly** to inspect the proposed entry and end. Select the entries you want and choose **Add selected to split**. Added entries become ordinary ROM functions for
+review and matching; the judge still checks submitted C against the original bytes. Entries that overlap live
+functions or fall outside the declared code range need a separate boundary review.
 
 ## Why
 
@@ -92,6 +104,12 @@ What was built, beyond the plan below:
 On a racing game, with the backwards race start's `$v0` bug put back in the port, both recorded calls of the
 start-heading helper report `$v0: recompiled 00000800, decompiled 00000000`. With the fix, they're the same. A first
 run takes about a minute and a half (recording, Recompile, the port's build); later ones only record and run.
+
+For a compiling open function, `compare_candidate_behaviour(function, revision)`
+checks the current agent C in a disposable WebAssembly port build. It compares
+return and memory observations for up to three recorded calls and reports the
+first difference per call. Calls reaching a recompiler runtime stub are
+inconclusive. The existing exact compiler judge still decides matches.
 
 **Check behaviour** (Porting) does the same for every matched function at once (`behaviour.batch`):
 - **One run:** the game runs once with a breakpoint on each function. RetroReversing/mupen64plus-core#3 takes

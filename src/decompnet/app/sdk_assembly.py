@@ -9,6 +9,7 @@ from elftools.common.exceptions import ELFError
 from elftools.elf.elffile import ELFFile
 
 from ..elfobj import _function_symbols, section_target
+from ..network import IN_BUILD
 from ..rom import match
 from ..rom.symbols import Symbol
 from .source_assembly import fingerprint, verified
@@ -187,7 +188,7 @@ def save(net,proj,fn,proof):
         if db.execute('SELECT 1 FROM claims WHERE function_id=?',(fn['id'],)).fetchone():return False
         meta=json.loads(fresh['meta'] or '{}');meta['verified_assembly']=proof
         meta['sdk_display']={'name':proof['name'],'names':proof.get('names',[proof['name']]),'corpora':[proof['corpus']]}
-        meta['asm_code']=(('Library code found by library detection' if proof.get('verification_method') in SIGNATURE_METHODS
+        meta['asm_code']=(('Library code found by library detection' if proof.get('verification_method') in (*SIGNATURE_METHODS, 'builtin-sdk-digest')
                            else 'Library C your SDK archive reproduces byte for byte')+'; set aside from C matching by '
                           'this project\'s library setting.' if proof.get('from_c') else 'Verified SDK assembly; excluded from C matching.')
         db.execute("UPDATE functions SET status='asm',meta=? WHERE id=?",(json.dumps(meta),fn['id']))
@@ -397,31 +398,60 @@ def discover(net,proj,limit=32):
 
 
 
-def known_proof(console,proj,fn):
-    """A full-body digest is proof only for curated, reference-free assembly entries."""
-    cfg=json.loads(proj['config'])
-    if cfg.get('kind')=='fork' or json.loads(fn['relocs'] or '[]'):return None
-    code=bytes(fn['target'] or b'')
-    if fn['size']!=len(code):return None
-    found=console.sdk_assembly_identity(code,bool(cfg.get('big_endian',True)))
-    if not found:return None
-    return {**found,'verified':True,'kind':'sdk','verification_method':'builtin-sdk-digest',
-            'alias_schema':1,'fingerprint':fingerprint(proj,fn),
-            'evidence':'Exact complete bytes of a verified self-contained handwritten SDK routine; no C coverage.',
-            'at':time.time()}
+def known_identity(console, cfg, code, *, has_relocs=False):
+    """Identify reference-free SDK assembly or SDK code bound to its original image."""
+    if cfg.get('kind') == 'fork' or not cfg.get('big_endian', True):
+        return None
+    if len(code) in console.sdk_linked_sizes:
+        found = console.sdk_linked_identity(code, cfg.get('rom', {}).get('analysis_sha1', ''))
+        if found and (not found.get('from_c') or cfg.get(SETTING, True)):
+            return found
+    if not has_relocs:
+        return console.sdk_assembly_identity(code)
 
 
-def discover_known(net,proj):
-    """Backfill active ROM projects without SDK files, compiling code or starting agents."""
-    if not net.is_rom(proj) or net.fork_slug(proj['slug']):return 0
-    console=net.console(proj);sizes=console.sdk_assembly_sizes
-    if not sizes:return 0
-    store=net.project_store(proj['id']);count=0
-    rows=store.all("SELECT id,name,project_id,vram,rom_offset,size,target,relocs,status,meta FROM functions WHERE project_id=? AND status IN ('open','asm') AND size IN ("+','.join('?' for _ in sizes)+')',proj['id'],*sizes)
+def known_proof(console, proj, fn):
+    """Bind a curated SDK identity to the current function and its analysis image."""
+    cfg = json.loads(proj['config'])
+    code = bytes(fn['target'] or b'')
+    found = known_identity(console, cfg, code, has_relocs=bool(json.loads(fn['relocs'] or '[]')))
+    if not found or fn['size'] != len(code):
+        return None
+    if found.get('from_c'):
+        evidence = 'Exact SDK library C bytes in a known linked image; excluded from C matching by the library setting.'
+    elif found.get('image_sha1'):
+        evidence = 'Exact SDK assembly bytes in a known linked image; no C coverage.'
+    else:
+        evidence = 'Exact complete bytes of a verified self-contained handwritten SDK routine; no C coverage.'
+    return {**found, 'verified': True, 'kind': 'sdk', 'verification_method': 'builtin-sdk-digest',
+            'alias_schema': 1, 'fingerprint': fingerprint(proj, fn), 'evidence': evidence, 'at': time.time()}
+
+
+def discover_known(net, proj, *, function_id=None, check_cancel=None):
+    """Backfill local ROM targets without SDK files, compiling code or starting agents."""
+    if proj['slug'] in net.links or not net.is_rom(proj) or net.fork_slug(proj['slug']):
+        return 0
+    console = net.console(proj)
+    sizes = sorted(set(console.sdk_assembly_sizes) | set(console.sdk_linked_sizes))
+    if not sizes:
+        return 0
+    store = net.project_store(proj['id'])
+    placeholders = ','.join('?' for _ in sizes)
+    target_filter = ' AND id=?' if function_id is not None else ''
+    args = (proj['id'], *sizes) if function_id is None else (proj['id'], *sizes, function_id)
+    rows = store.all(f"""SELECT id,name,project_id,vram,rom_offset,size,target,relocs,status,meta
+                         FROM functions WHERE project_id=? AND status IN ('open','asm') AND {IN_BUILD}
+                         AND size IN ({placeholders}){target_filter}""", *args)
+    from .maintenance import checkpoint
+
+    count = 0
     for fn in rows:
-        from .maintenance import checkpoint
         checkpoint()
-        if json.loads(fn['meta'] or '{}').get('reopened') or verified(proj,fn):continue
-        proof=known_proof(console,proj,fn)
-        if proof:count+=int(save(net,proj,fn,proof))
+        if check_cancel is not None:
+            check_cancel()
+        if json.loads(fn['meta'] or '{}').get('reopened') or verified(proj, fn):
+            continue
+        proof = known_proof(console, proj, fn)
+        if proof:
+            count += int(save(net, proj, fn, proof))
     return count

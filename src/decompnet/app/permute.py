@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import queue
 import random
 import re
@@ -86,6 +87,50 @@ def weight_family(cfg: dict, vram: int | None, fork: bool, function=None) -> str
 
 def available() -> bool:
     return toolchains.installed(TOOL) is not None
+
+
+MISSING = ('decomp-permuter is not installed (Compilers & tools): random rewrites use the simple '
+           'built-in rewrites only.')
+NOTICE = ('decomp-permuter is not installed, so this search could only use the simple built-in rewrites. '
+          'Install it from Compilers & tools; searches made without it are repeated once it is there.')
+RETRY_AFTER = 600  # seconds before a failed download is tried again
+_auto = {'lock': threading.Lock(), 'failed': 0.0}
+
+
+def installed_at() -> float | None:
+    """When the tool was installed here (its manifest's time), None when it isn't."""
+    try:
+        return (toolchains.path(TOOL) / toolchains.MANIFEST).stat().st_mtime
+    except OSError:
+        return None
+
+
+def ensure_available(report=None) -> bool:
+    """`available()`, after installing the pinned, free tool when it's missing (as objdiff-cli and wibo are):
+    without it every deep search silently ran only the simple rewrites. A failed download is reported to `report`
+    (the job's log) and tried again after RETRY_AFTER seconds, not on every function."""
+    if available():
+        return True
+    if os.environ.get('DECOMP_AUTO_TOOLS', 'on') == 'off':
+        return False
+    with _auto['lock']:
+        if available():
+            return True
+        if time.monotonic() - _auto['failed'] < RETRY_AFTER and _auto['failed']:
+            return False
+        if not toolchains.get(TOOL).supported:
+            return False
+        try:
+            if report:
+                report('Installing decomp-permuter (MIT, pinned download), the random rewrites of the deep search.')
+            toolchains.ensure(TOOL, log=lambda *_: None)
+        except Exception as e:  # the search goes on with the simple rewrites, and says so
+            _auto['failed'] = time.monotonic()
+            log.warning('permuter: could not install decomp-permuter: %s', e)
+            if report:
+                report(f'decomp-permuter could not be installed ({str(e)[:200]}).')
+            return False
+    return available()
 
 
 def permuter_header(header: str, source: str) -> str:
@@ -473,7 +518,6 @@ class Permuter:
             normalization_repairs.extend_frame(candidates, labels, fn['best_source'], fn['name'], proj['arch'], repair_ranking.evidence(self.net,fn['id'],agent.id))
             ranked = repair_ranking.order(dict.fromkeys(labels.get(text, 'draft_repair') for text in candidates),repair_ranking.evidence(self.net,fn['id'],agent.id))
             effect_scope=repair_ranking.effect_scope(self.net,fn,fn['best_source']) if hasattr(self.net,'_context') else None
-            ranked=repair_ranking.demote(self.net,effect_scope,ranked)
             ranked=repair_ranking.private_abi_order(ranked,proj['arch'],fn['asm'] or '',repair_ranking.evidence(self.net,fn['id'],agent.id))
             if not self._hold(agent, fn, count_turn=False):
                 continue
@@ -498,11 +542,11 @@ class Permuter:
                         continue
                     normalization_repairs.extend_frame(candidates, labels, fn['best_source'], fn['name'], proj['arch'], repair_ranking.evidence(self.net,fn['id'],agent.id))
                     ranked = repair_ranking.order(dict.fromkeys(labels.get(text, 'draft_repair') for text in candidates), repair_ranking.evidence(self.net, fn['id'], agent.id))
-                    ranked = repair_ranking.demote(self.net, effect_scope, ranked)
                 from . import adaptive_repairs, permuter_focus
                 policy_rows = repair_ranking.evidence(self.net, fn['id'], agent.id)
                 ranked = adaptive_repairs.order(self.net, proj, fn, policy_rows, ranked)
                 ranked = repair_ranking.private_abi_order(ranked,proj['arch'],fn['asm'] or '',policy_rows)
+                ranked = repair_ranking.demote(self.net, fn, effect_scope, ranked)
                 policy_key = adaptive_repairs.profile(self.net, proj, fn)
                 candidates.sort(key=lambda text: ranked.index(labels.get(text, 'draft_repair')) if labels.get(text, 'draft_repair') in ranked else len(ranked))
                 from . import proposal_progress
@@ -532,7 +576,9 @@ class Permuter:
                     if cursor:cursor.measured(labels.get(candidate),candidate,score)
                     measured=getattr(self.net,'_agent_outcomes',{}).get((agent.id,fn['id']))
                     if measured and measured.get('source')==candidate:
-                        repair_ranking.remember(self.net,effect_scope,labels.get(candidate,'draft_repair'),baseline,measured)
+                        repair_ranking.remember(self.net, fn, effect_scope, baseline,
+                                                [(labels.get(candidate, 'draft_repair'), candidate,
+                                                  measured | {'output_fingerprint': getattr(self, '_trial_output', None)})])
                     with self.net.project_store(proj['id']).tx() as db:
                         db.execute("INSERT OR REPLACE INTO reuse_trials(function_id,signature,outcome,reason) VALUES(?,?,?,?)",
                                    (fn['id'], trial, str(score), "targeted draft repair"))
@@ -651,10 +697,10 @@ class Permuter:
                 # that ran out meanwhile, the function an agent's now, ends the turn)
                 if not self._renew(agent, fn, seconds):
                     return
-            if not available() and callable(getattr(self, 'log', None)):
+            if not ensure_available(self.log if callable(getattr(self, 'log', None)) else None) \
+                    and callable(getattr(self, 'log', None)):
                 # (the deep pass reports to its panel: without the generator only the simple rewrites run)
-                self.log('decomp-permuter is not installed (Compilers & tools): random rewrites use the simple '
-                         'built-in rewrites only.')
+                self.log(MISSING)
             if available():
                 # (a C function's as m2c reads it: what's only for C++ made pycparser refuse a PC game's whole
                 # header; a C++ function's with its C++ branch, where its classes are)
@@ -938,11 +984,12 @@ class Permuter:
         cache = getattr(self, '_baselines', {})
         self._baselines = cache
         if key in cache:
-            score, rows = cache[key]
+            score, rows, fingerprint = cache[key]
             self.net.keep_diff(agent.id, fn['id'], rows)
             if not hasattr(self.net, '_agent_outcomes'):
                 self.net._agent_outcomes = {}
-            self.net._agent_outcomes[agent.id, fn['id']] = {'source': fn['best_source'], 'score': score, 'rows': rows}
+            self.net._agent_outcomes[agent.id, fn['id']] = {'source': fn['best_source'], 'score': score, 'rows': rows,
+                                                             'output_fingerprint': fingerprint}
             return score, 0
         st.add(variants=1, repairs=1)
         # Clear old evidence so a compile/link error cannot leave a misleading diff as today's baseline.
@@ -952,8 +999,10 @@ class Permuter:
         self.net.keep_diff(agent.id, fn['id'], rows)
         if not hasattr(self.net, '_agent_outcomes'):
             self.net._agent_outcomes = {}
-        self.net._agent_outcomes[agent.id, fn['id']] = {'source': fn['best_source'], 'score': score, 'rows': rows}
-        cache[key] = (score, rows)
+        fingerprint = getattr(self, '_trial_output', None)
+        self.net._agent_outcomes[agent.id, fn['id']] = {'source': fn['best_source'], 'score': score, 'rows': rows,
+                                                        'output_fingerprint': fingerprint}
+        cache[key] = (score, rows, fingerprint)
         while len(cache) > 256:
             del cache[next(iter(cache))]
         return score, 1
@@ -973,9 +1022,11 @@ class Permuter:
 
     def _score_work(self, agent, proj, fn, source: str, best: int, fork: str | None) -> int | None:
         self._trial_outcome = 'unscored'
+        self._trial_clean = False
         self._compact_trial = False
         self._trial_output = None
         self._trial_locations = None
+        self._trial_jump_tables = ()
         self._trial_output_granularity = None
         if fork:
             from ..inline_helpers import PREFIX as aggregate_helper_prefix
@@ -988,6 +1039,7 @@ class Permuter:
                                          **({"background": True} if getattr(self, "parallel_claims", False) else {}))
             if res.get('score') is not None:
                 self._trial_outcome = 'scored'
+                self._trial_clean = True
                 measured=res.get('compiled_output') or {}
                 self._trial_output=measured.get('fingerprint')
                 self._trial_output_granularity=measured.get('granularity')
@@ -1036,10 +1088,11 @@ class Permuter:
         from .. import compile_timing
         from .engine.judging import search_evaluation
         with search_evaluation():
-            cand, verdict, _ = self.net._evaluate(fn, proj, result.obj)
+            cand, verdict, problems = self.net._evaluate(fn, proj, result.obj)
         if cand is None:
             return None
         self._trial_outcome = 'scored'
+        self._trial_clean = not problems
         from .experiment_evidence import output
         self._trial_output = output(cand)
         self._trial_output_granularity = 'function'
@@ -1067,9 +1120,10 @@ class Permuter:
                 self._trial_outcome = 'compile_failed'
                 return None
             with search_evaluation():
-                cand, verdict, _ = self.net._evaluate(fn, proj, result.obj)
+                cand, verdict, problems = self.net._evaluate(fn, proj, result.obj)
             if cand is None:
                 return None
+            self._trial_clean = not problems
             self._trial_output = output(cand)
             with compile_timing.phase('score'):
                 d = scoring.diff(target, cand)
@@ -1087,6 +1141,8 @@ class Permuter:
             # Ordinary misses skip export/address reports; search feedback remains available.
             finish=getattr(self.net,'_complete_search_evaluation',self.net._evaluate)
             finish(fn,proj,result.obj)
+            if proj['arch'] == 'mips' and not d.bytes_match and hasattr(self.net, '_candidate_checks'):
+                self._trial_jump_tables = self.net._candidate_checks(fn,proj,result.obj).get('jump_tables', ())
         self._compact_trial = ((current_trial() or {}).get('kind') == 'random rewrite'
                                and source != fn['best_source'] and d.score >= best and not d.bytes_match)
         if not self._compact_trial:

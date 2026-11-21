@@ -1,4 +1,5 @@
 """Applicable local families share one source snapshot, batch budget and ordinary judge."""
+import functools
 import hashlib
 import json
 import re
@@ -53,15 +54,25 @@ EXPERIMENTAL = ('experimental_bitfield_frame',)
 FAMILIES = ('inferred_frame_reservation','frame_branch_tail_sequence','value_trace_bundle','verified_unit_helpers') + independent_address_repairs.FAMILIES + focused_lifetime_repairs.FAMILIES + (prototype_reuse.FAMILY, 'learned_expression', 'address_association', 'call_initialization', *EXPERIMENTAL, 'masked_value_reuse', 'cfg_integer_lifetimes', 'table_slot_lifetime', 'unsigned_assignment_reuse', 'guard_forward_jump', 'constant_register_reuse', 'copy_register_reuse', 'last_shift_reuse', 'signedness','declaration_order','typed_temporary','branch_orientation','narrowing','source_lines',
             'address_temporary','operand_temporary','constant_local','comparison_load','stack_array','loop_induction',
             'parameter_width','value_lifetime','sum_shape','call_result_inline','comparison_reuse','integer_address_order','mmio_address','call_arity','struct_byte_offset','switch_call','paired_load_order','array_index_width','split_scalar_lifetime','pointer_before_store','store_address_lifetime','stack_padding','local_width','pointer_cast_inline',
-            'local_widening','callee_parameter_width','callee_return_width','split_integer_lifetime','merge_integer_lifetimes','branch_call','goto_leaf','switch_layout') + ('mapped_spill_storage','mapped_register_lifetime','hazard_statement_lines',) + draft_repairs.AGENT_FAMILIES
+            'local_widening','callee_parameter_width','callee_return_width','split_integer_lifetime','merge_integer_lifetimes','branch_call','goto_leaf','switch_layout') + ('mapped_spill_storage','mapped_register_lifetime','hazard_statement_lines','floating_initializer_order') + draft_repairs.AGENT_FAMILIES
 
 
-def run(net, agent, slug, function, revision, families=None, max_trials=6, *, seconds=60, provenance_kind='agent batch'):
+def near_match_priority(rows, score, instructions, arch):
+    if not rows or not isinstance(score, int) or not 0 < score <= max(100, (instructions or 0) * 5):
+        return []
+    from .allocation_evidence import plan
+
+    return [family for family in plan(rows, arch)['families'] if family in FAMILIES and family not in EXPERIMENTAL]
+
+
+def run(net, agent, slug, function, revision, families=None, max_trials=6, *, seconds=60, provenance_kind='agent batch', focused_only=False, anchor='', compare=False):
     if isinstance(max_trials,bool) or not isinstance(max_trials,int) or not 1<=max_trials<=6:
         raise NetworkError('Use max_trials from 1 to 6.')
     if families is not None and (not isinstance(families,list) or not families or len(families)>len(FAMILIES)
                                  or any(f not in FAMILIES for f in families)):
         raise NetworkError('Choose supported local families: '+', '.join(FAMILIES))
+    if compare:
+        max_trials = min(max_trials, 3)
     requested = list(dict.fromkeys(families or [f for f in FAMILIES if f not in EXPERIMENTAL]))
     deadline=time.monotonic()+seconds
     fn = net._function(function,slug)
@@ -69,6 +80,8 @@ def run(net, agent, slug, function, revision, families=None, max_trials=6, *, se
         source,actual = agent_tokens.candidate(net,agent,slug,function)
         if actual!=revision:
             raise agent_tokens.stale(net,agent,fn,revision,source,actual)
+        if not isinstance(anchor, str) or len(anchor) > 4096 or (anchor and source.count(anchor) != 1):
+            raise NetworkError('Use an exact, unique C anchor of at most 4096 characters in this candidate revision.')
         checked = agent_evidence.preflight(net,agent,slug,fn,source)
         if checked and checked.get('error'):
             return agent_evidence.blocked_message(checked, actual)
@@ -81,16 +94,38 @@ def run(net, agent, slug, function, revision, families=None, max_trials=6, *, se
             if not hasattr(net, '_agent_outcomes'):
                 net._agent_outcomes={}
             net._agent_outcomes[agent.id,fn['id']]=checked
-        pools = available(net,agent,slug,fn,source,revision,requested,deadline=time.monotonic()+max(0,(deadline-time.monotonic())*0.35),desired=max_trials if families is not None else 0)
+        effect_scope = repair_ranking.effect_scope(net, fn, source)
+        ineffective = repair_ranking.no_effect(net, fn, effect_scope)
+        preferred = []
+        if families is None and checked:
+            preferred = near_match_priority(checked.get('rows'), checked.get('score'), fn['n_insns'],
+                                            net._project(slug)['arch'])
+            if not focused_only:
+                preferred = [family for family in preferred if family not in ineffective]
+        now = time.monotonic()
+        discovery_deadline = now + max(0, (deadline - now) * 0.35)
+        pools = Pools()
+        if preferred:
+            pools = available(net, agent, slug, fn, source, revision, preferred,
+                              deadline=now + (discovery_deadline - now) * 0.8, desired=max_trials)
+        if not focused_only and (anchor or not preferred or sum(map(len, pools.values())) < max_trials):
+            extra = available(net, agent, slug, fn, source, revision,
+                              [family for family in requested if family not in preferred],
+                              deadline=discovery_deadline, desired=max_trials if families is not None else 0)
+            pools.update(extra)
+            pools.incomplete = getattr(pools, 'incomplete', False) or getattr(extra, 'incomplete', False)
         from decomprepair.repair_localisation import order as local_order
         evidence = checked or getattr(net,'_agent_outcomes',{}).get((agent.id,fn['id'])) or {}
+        from .model_replay_evidence import touches_only
+
         for family,pool in pools.items():
-            pools[family] = [candidate for _,candidate in local_order(source,[(family,c) for c in pool],evidence.get('repair_locations'))]
-        effect_scope=repair_ranking.effect_scope(net,fn,source)
+            candidates = [(family,c) for c in pool if not anchor or touches_only(source, c, anchor)]
+            pools[family] = [candidate for _,candidate in local_order(source,candidates,evidence.get('repair_locations'))]
         selected=[];seen=set()
         while len(selected)<max_trials and any(pools.values()):
-            for family,pool in pools.items():
-                if pool and len(selected)<max_trials:
+            effective_left = any(pool for family, pool in pools.items() if family not in ineffective)
+            for family, pool in pools.items():
+                if pool and len(selected)<max_trials and (family not in ineffective or not effective_left):
                     candidate=pool.pop(0)
                     if candidate not in seen:
                         selected.append((family,candidate));seen.add(candidate)
@@ -108,7 +143,8 @@ def run(net, agent, slug, function, revision, families=None, max_trials=6, *, se
                 proj=net._project(slug)
                 header=(net._context(proj['id'],fn['unit']) or {'header':''})['header']
                 explanation += ' '+call_preparation_repairs.explanation(source,fn['name'],header,proj['arch'])
-            return f'No untried applicable local repairs. Revision {actual}; no variants submitted.'+explanation
+            constraint = ' inside the supplied C anchor' if anchor else ''
+            return f'No untried applicable local repairs{constraint}. Revision {actual}; no variants submitted.'+explanation
         scope=agent_tokens.target_scope(net,fn,revision)
         baseline=checked or getattr(net,'_agent_outcomes',{}).get((agent.id,fn['id']))
         if baseline and baseline.get('source')!=source:
@@ -119,10 +155,12 @@ def run(net, agent, slug, function, revision, families=None, max_trials=6, *, se
         focus=classify((baseline or {}).get('rows') or [])
         if time.monotonic() >= deadline:return 'Local repair time budget reached during proposal generation; no variants submitted.'
         result=agent_tokens.variants(net,agent,slug,function,revision,[{'old':source,'new':s} for _,s in selected], 'local repairs',
-                                     seconds=seconds,deadline=deadline,provenance_kind=provenance_kind,variant_families=[family for family,_ in selected])
+                                     seconds=seconds,deadline=deadline,provenance_kind=provenance_kind,variant_families=[family for family,_ in selected],
+                                     **({'present_options': True} if compare else {}))
         observations=getattr(net,'_local_trial_observations',{}).get((agent.id,fn['id']),[])
+        repair_ranking.remember(net, fn, effect_scope, baseline,
+                                ((family, candidate, measured) for (family, candidate), measured in zip(selected, observations)))
         for (family,_), measured in zip(selected,observations):
-            repair_ranking.remember(net,effect_scope,family,baseline,measured)
             if measured and not measured.get('cached'):
                 adaptive_repairs.record(net,policy_profile,focus,family,(baseline or {}).get('score'),
                                         measured.get('score'),measured.get('elapsed_ms',0))
@@ -183,6 +221,14 @@ def _available(net, agent, slug, fn, source, revision, requested):
     flags=compiler_for(cfg,fn['vram'], fn).get('flags',[]) if not net.fork_slug(slug) else []
     debug=any(re.fullmatch(r'-g[1-3]?',flag) for flag in flags)
     pools={family:[] for family in requested}
+
+    @functools.cache
+    def unit_header():
+        if net.fork_slug(slug):
+            return net.forks.permuter_header(slug, fn['name'])
+        ctx = net._context(proj['id'], fn['unit'])
+        return ctx['header'] if ctx else ''
+
     if independent_address_repairs.FAMILIES[0] in pools and net.is_rom(proj):
         header=(net._context(proj['id'],fn['unit']) or {'header':''})['header']
         for family,candidate in _generated(independent_address_repairs.variants, source,fn['name'],proj['arch'],repair_ranking.evidence(net,fn['id'],agent.id),header):
@@ -214,7 +260,7 @@ def _available(net, agent, slug, fn, source, revision, requested):
                 pools[family].append(edited)
     if any(f in pools for f in ('table_slot_lifetime','unsigned_assignment_reuse','guard_forward_jump')):
         ctx = net._context(proj['id'],fn['unit'])
-        header = net.forks.permuter_header(slug,fn['name']) if net.fork_slug(slug) else (ctx['header'] if ctx else '')
+        header = unit_header()
         for family,candidate in _generated(evidence_repairs.variants, source,fn['name'],header):
             if family in pools:
                 pools[family].append(candidate)
@@ -232,12 +278,12 @@ def _available(net, agent, slug, fn, source, revision, requested):
             pools[family].append(candidate)
     if debug_boundary_repairs.FAMILY in pools:
         ctx = net._context(proj['id'],fn['unit'])
-        boundary_header = net.forks.permuter_header(slug,fn['name']) if net.fork_slug(slug) else (ctx['header'] if ctx else '')
+        boundary_header = unit_header()
         for family, candidate in _generated(debug_boundary_repairs.variants, source, fn['name'], flags, boundary_header, limit=None):
             pools[family].append(candidate)
     if any(family in pools for family in copy_lifetime_repairs.FAMILIES):
         ctx = net._context(proj['id'],fn['unit'])
-        copy_header = net.forks.permuter_header(slug,fn['name']) if net.fork_slug(slug) else (ctx['header'] if ctx else '')
+        copy_header = unit_header()
         for family, candidate in _generated(copy_lifetime_repairs.variants, source, fn['name'], copy_header):
             if family in pools:
                 pools[family].append(candidate)
@@ -267,27 +313,31 @@ def _available(net, agent, slug, fn, source, revision, requested):
         from . import targeted_storage_repairs
         measured=getattr(net,'_agent_outcomes',{}).get((agent.id,fn['id']))
         if measured and measured.get('source')==source and measured.get('input_scope')==agent_evidence.build_key(net,fn)[0]:
-            ctx=net._context(proj['id'],fn['unit'])
-            header=net.forks.permuter_header(slug,fn['name']) if net.fork_slug(slug) else (ctx['header'] if ctx else '')
+            header=unit_header()
             for family,text in targeted_storage_repairs.variants(source,fn['name'],header,proj['arch'],measured.get('rows') or [],measured.get('repair_locations')):
                 if family in pools:pools[family].append(text)
     from . import narrow_load_subtraction, parameter_carriers
     for generator in (parameter_carriers,narrow_load_subtraction):
         if generator.FAMILY in pools:
-            pools[generator.FAMILY]=[s for _,s in generator.variants(source,fn['name'],header,proj['arch'])]
+            pools[generator.FAMILY]=[s for _,s in _generated(generator.variants, source, fn['name'], unit_header(), proj['arch'])]
+    if 'floating_initializer_order' in pools:
+        from .allocation_search import floating_proposals
+        measured = getattr(net, '_agent_outcomes', {}).get((agent.id, fn['id']))
+        if (measured and measured.get('source') == source
+                and measured.get('input_scope') == agent_evidence.build_key(net,fn)[0]):
+            pools['floating_initializer_order'] = [text for _,text in floating_proposals(
+                source, fn['name'], unit_header(), measured.get('rows') or [], proj['arch'])]
     if 'scalar_storage_reuse' in pools:
         from decomprepair import scalar_storage_reuse
         measured=getattr(net,'_agent_outcomes',{}).get((agent.id,fn['id']))
         if measured and measured.get('source')==source and measured.get('input_scope')==agent_evidence.build_key(net,fn)[0]:
-            ctx=net._context(proj['id'],fn['unit'])
-            header=net.forks.permuter_header(slug,fn['name']) if net.fork_slug(slug) else (ctx['header'] if ctx else '')
+            header=unit_header()
             pools['scalar_storage_reuse']=[s for _,s in scalar_storage_reuse.variants(source,fn['name'],header,proj['arch'],measured.get('repair_locations'))]
     if any(family in pools for family in ('explicit_loop_backedge','row_number_staging')):
         from . import loop_storage_shapes
         measured=getattr(net,'_agent_outcomes',{}).get((agent.id,fn['id']))
         if measured and measured.get('source')==source and measured.get('input_scope')==agent_evidence.build_key(net,fn)[0]:
-            ctx=net._context(proj['id'],fn['unit'])
-            header=net.forks.permuter_header(slug,fn['name']) if net.fork_slug(slug) else (ctx['header'] if ctx else '')
+            header=unit_header()
             for family in loop_storage_shapes.FAMILIES:
                 if family in pools:
                     pools[family]=[s for tag,s in loop_storage_shapes.variants(source,fn['name'],header,proj['arch'],measured.get('repair_locations')) if tag==family]
@@ -295,8 +345,7 @@ def _available(net, agent, slug, fn, source, revision, requested):
         from . import hazard_line_repairs
         measured=getattr(net,'_agent_outcomes',{}).get((agent.id,fn['id']))
         if measured and measured.get('source')==source:
-            ctx=net._context(proj['id'],fn['unit'])
-            header=net.forks.permuter_header(slug,fn['name']) if net.fork_slug(slug) else (ctx['header'] if ctx else '')
+            header=unit_header()
             pools['hazard_statement_lines']=[s for _,s in hazard_line_repairs.variants(source,fn['name'],header,proj['arch'],measured.get('rows') or [])]
     if 'store_address_lifetime' in pools:
         pools['store_address_lifetime'] = _generated(store_address_repairs.variants, source,fn['name'],proj['arch'])
@@ -311,13 +360,12 @@ def _available(net, agent, slug, fn, source, revision, requested):
         measured=getattr(net,'_agent_outcomes',{}).get((agent.id,fn['id']))
         if measured and measured.get('source')==source:
             from . import branch_frame_recovery
-            ctx=net._context(proj['id'],fn['unit'])
-            header=net.forks.permuter_header(slug,fn['name']) if net.fork_slug(slug) else (ctx['header'] if ctx else '')
+            header=unit_header()
             for family,candidate in branch_frame_recovery.variants(source,fn['name'],header,proj['arch'],measured.get('rows') or []):
                 if family in pools:pools[family].append(candidate)
-    if any(family in pools for family in draft_repairs.AGENT_FAMILIES):
-        ctx=net._context(proj['id'],fn['unit'])
-        header=net.forks.permuter_header(slug,fn['name']) if net.fork_slug(slug) else (ctx['header'] if ctx else '')
+    directly_generated = {parameter_carriers.FAMILY, narrow_load_subtraction.FAMILY}
+    if set(pools).intersection(draft_repairs.AGENT_FAMILIES) - directly_generated:
+        header=unit_header()
         labels={}
         for candidate in draft_repairs.variants(source,fn['name'],proj['arch'],fn['asm'] or '',flags,labels,limit=None,header=header,tables=switch_tables.read(net,proj,fn),callees=draft_repairs.capture_followup_repairs.callee_evidence(net,proj,fn,source),entry_scope=draft_repairs.promoted_entry_repairs.scope(net,proj,fn)):
             family=labels[candidate]
@@ -342,9 +390,11 @@ def _available(net, agent, slug, fn, source, revision, requested):
                 filtered[family].append(candidate)
     pools=filtered
     ranked = repair_ranking.order(pools,repair_ranking.evidence(net,fn['id'],agent.id))
+    if pools.get('floating_initializer_order'):
+        ranked = ['floating_initializer_order', *(family for family in ranked if family != 'floating_initializer_order')]
     effect_scope=repair_ranking.effect_scope(net,fn,source)
-    ranked=repair_ranking.demote(net,effect_scope,ranked)
     ranked=adaptive_repairs.order(net,proj,fn,repair_ranking.evidence(net,fn['id'],agent.id),ranked)
+    ranked=repair_ranking.demote(net,fn,effect_scope,ranked)
     pools = {f:pools[f] for f in ranked}
     return pools
 
@@ -366,7 +416,7 @@ def summary(net, agent, slug, fn, source, revision, *, discover=True):
         # Reading C and its revision must stay cheap even if a single repair stage overruns its budget.
         if not discover and not any(key[:len(prefix)] == prefix for key in tuple(cache)):
             return unchecked
-        count = net.project_store(fn['project_id']).one('SELECT COUNT(*) AS n FROM agent_family_targets WHERE function_id=?',fn['id'])['n']
+        count = net.project_store(fn['project_id']).one("SELECT COUNT(*) AS n FROM agent_family_targets WHERE function_id=? AND scope NOT LIKE 'repair-effect:%'",fn['id'])['n']
         measured = getattr(net,'_agent_outcomes',{}).get((agent.id,fn['id']))
         evidence = hashlib.sha256(repr((measured.get('score'),measured.get('rows')) if measured and measured.get('source')==source else None).encode()).hexdigest()
         from . import rtl_value_trace, verified_unit_context

@@ -20,7 +20,7 @@ from ..compile_sessions import batched
 from ..forks.project import ForkError
 from ..network import NetworkError
 from ..project import compiler_for
-from ..repair_feedback import current_trial
+from ..repair_feedback import current_trial, without_capture
 from ..repair_feedback import trial as repair_trial
 from . import (
     adaptive_repairs,
@@ -29,6 +29,7 @@ from . import (
     allocation_search,
     deep_compilation,
     deep_repair_feedback,
+    deep_resume,
     deep_throughput,
     draft_repairs,
     permuter_focus,
@@ -43,6 +44,7 @@ from . import (
     trial_bookkeeping,
 )
 from .permute import Permuter, State
+from .permute import available as permute_available
 from .trial_bookkeeping import buffered
 
 AFTER_RANDOM_TRIALS = 32
@@ -73,11 +75,17 @@ def prepare_source(net, proj, fn):
     return {**dict(fn), **dict(net._function(fn['name'], proj['slug']))}
 
 
-def validate(net, slug, name, minutes, max_variants):
+def validate_limits(minutes, max_variants):
     if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= 120:
         raise NetworkError('Choose a time limit from 1 to 120 minutes.')
     if isinstance(max_variants, bool) or not isinstance(max_variants, int) or not 1 <= max_variants <= 1000000:
         raise NetworkError('Choose a variant limit from 1 to 1,000,000.')
+
+
+def validate(net, slug, name, minutes, max_variants):
+    validate_limits(minutes, max_variants)
+    from . import library_skew
+    library_skew.ensure(force=True)
     proj = net.project_row(slug)
     fn = net._function(name, slug)
     from .boundary_repairs import blocked
@@ -135,6 +143,7 @@ class Search(Permuter):
         self.refinement_rounds = 0
         self.winner_diff = None
         self.winner_source = None
+        self.winner_jump_tables = ()
         self.winner_output = None
         self.winner_scope = None
         self.trace_variants = True
@@ -209,6 +218,8 @@ class Search(Permuter):
             raise SearchLimit('Time limit reached')
         if self.tested >= self.limit:
             raise SearchLimit('Variant limit reached')
+        if self.phase == 'random rewrites' and self.tested >= getattr(self, 'random_register_limit', float('inf')):
+            raise SearchLimit('Focused register search completed')
 
     def _chart(self, score):
         """A point on the run chart; past 200 every other middle point goes, the first and latest stay."""
@@ -245,7 +256,8 @@ class Search(Permuter):
                            **self.metrics(detail=False), 'variant_limit': self.limit, 'rejected': self.rejected,
                            'seconds_left': max(0, round(self.deadline-time.monotonic())), 'refinement_rounds': self.refinement_rounds,
                            'current_family': self.current_family, 'last_outcome': self.last_outcome,
-                           'last_score': self.last_score, 'visited': self.visited})
+                           'last_score': self.last_score, 'visited': self.visited,
+                           'randomizer': permute_available()})
 
     def recipe(self, fn, source, best, score, outcome, elapsed_ms=0):
         provenance = current_trial() or {'kind': self.phase, 'family': 'unattributed'}
@@ -317,6 +329,8 @@ class Search(Permuter):
         self.report()
         result = run(self.net, proj, fn, self.log, self.check, max_profiles=self.limit-self.tested)
         self.tested += result['tested']
+        self.relinked_baseline = result.get('relinked')
+        self.jump_table_profile = result.get('jump_table_profile')
         if result.get('link'):
             raise NetworkError(result['link']['message'])
         if self.net._function(fn['name'], proj['slug'])['status'] == 'matched' and self.best != 0:
@@ -324,16 +338,156 @@ class Search(Permuter):
             self.improvements += int(bool(result.get('applied')))
         return result
 
+    def operand_order_pass(self, agent, proj, fn, best, fork):
+        """Spend a few of the ordinary trials on a measured operand/register near miss."""
+        rows = self.winner_diff[0] if self.winner_diff else repair_ranking.evidence(self.net, fn['id'], agent.id)
+        from . import generation_calls
+
+        source = _candidate_source(fn, best)
+        header = self.net._context(proj['id'], fn['unit'])['header']
+        asm = dict(fn).get('asm') or ''
+        arch, name = proj['arch'], fn['name']
+        L = 'decomprepair.'
+        calls = [(L + 'packed_word_scheduling.variants', (source, name, arch, asm, header)),
+                 (L + 'float_zero_local_repairs.loop_variants', (source, name, asm, header)),
+                 (L + 'float_stack_call_reuse.variants', (source, name, arch, asm, header)),
+                 (L + 'widen_scaled_local.variants', (source, name, arch, asm, header)),
+                 (L + 'inline_float_vector_scale.variants', (source, name, arch, asm, header)),
+                 (L + 'guard_xor_reuse.variants', (source, name, arch, asm, header)),
+                 (L + 'scoped_cursor_entry.variants', (source, name, arch, asm)),
+                 (L + 'scoped_global_reset.variants', (source, name, arch, asm)),
+                 (L + 'word_byte_loop_carrier.variants', (source, name, arch, asm)),
+                 (L + 'counter_derived_loop_offset.masked_byte_stride_variants', (source, name, arch, asm)),
+                 (L + 'counter_derived_loop_offset.variants', (source, name, arch, asm)),
+                 (L + 'stack_byte_loop_base.variants', (source, name, arch, asm, header)),
+                 (L + 'unsigned_rate_division_scope.variants', (source, name, arch, asm, header))]
+        zero_bound = None
+        if arch == 'mips' and '%lo(' in asm:
+            rename = getattr(self.net, 'rename_tokens', None)
+            current_asm = rename(proj, asm) if rename else asm
+            calls += [(L + 'load_store_order_repairs.component_before_resets', (source, name, current_asm, header)),
+                      (L + 'global_store_repairs.scoped_byte_updates', (source, name, current_asm, header))]
+            zero_bound = len(calls)
+            calls += [(L + 'targeted_switch_labels.zero_bound_variants', (source, name, current_asm)),
+                      (L + 'symbol_width_repairs.guarded_indexed_variants', (source, name, current_asm))]
+        # Existing saved drafts can still use their original address-based entry name.
+        calls.append((L + 'scoped_byte_read_call.variants', (source, name, arch, asm, header)))
+        if arch == 'mips' and (vram := dict(fn).get('vram')) is not None:
+            alias = f'func_{vram:08X}'
+            if alias != name:
+                calls.append((L + 'scoped_byte_read_call.variants', (source, alias, arch, asm, header)))
+        register = permuter_focus.classify(rows, arch) == 'register'
+        if register:
+            calls += [(L + 'near_match_repairs.bitwise_operand_order', (source, name, header)),
+                      (L + 'near_match_repairs.float_update_order', (source, name, header)),
+                      (L + 'near_match_repairs.variants', (source, name)),
+                      (L + 'target_local_repairs.value_lifetimes', (source, name))]
+        results = [generation_calls.pairs(result) for result in generation_calls.library(calls)]
+        if register:
+            results[-2] = [(family, child) for family, child in results[-2] if family == 'arithmetic_operand_order']
+        proposals = []
+        for index, result in enumerate(results):
+            if index == zero_bound:
+                proposals = result + proposals  # linked-case zero-bound labels go before the rest
+            else:
+                proposals += result
+        seen = {source}
+        limit = min(6, (self.limit - self.tested) // 2)
+        for family, child in proposals:
+            if limit <= 0:
+                break
+            if child in seen:
+                continue
+            seen.add(child)
+            self.check()
+            with repair_trial({'kind': 'deep local repair', 'family': family}):
+                score = self._score(agent, proj, fn, child, best, fork)
+            limit -= 1
+            if score is not None and score < best:
+                return score
+        return best
+
+    def stub_note(self):
+        """The stub message when the measured baseline emits under half of the target's instructions, else ''.
+
+        Passes that tune registers, operand order or scheduling judge a body that is not there; they would spend
+        the trial budget on a candidate that must be rebuilt first (diff_summary.stub)."""
+        from ..diff_summary import stub, stub_message
+        found = stub(self.winner_diff[0]) if self.winner_diff else None
+        return stub_message(found) if found else ''
+
+    def loop_vector_shape_pass(self, agent, proj, fn, best, fork):
+        """Climb through the loop and vector-update shapes that only help together (decomp-repair 0.5.130).
+
+        Indexed element access, `const` on read-only locals and sums-then-stores for a vector's components each
+        left a 2,122-instruction function's score nearly unchanged alone and gained a hundred instructions in
+        combination, so a greedy pass that stops at the first non-improvement never finds them. A small beam keeps
+        the three best children of each level, inside the ordinary trial budget; every child is judged normally."""
+        from . import generation_calls
+
+        source = _candidate_source(fn, best)
+        # Interleaving two runs of statements took about 600 compiles to find by beam on a large function, so this
+        # pass may spend more of the budget than the other targeted ones; it stops at the first exact match.
+        budget = min(96, max(0, (self.limit - self.tested) // 2))
+        frontier, seen, lowest = [(best, source)], {source}, best
+        while frontier and budget > 0:
+            children = []
+            for _, parent in frontier:
+                proposals = [pair for result in generation_calls.library([
+                    ('decomprepair.loop_vector_shapes.variants', (parent, fn['name'], proj['arch'])),
+                    ('decomprepair.statement_interleave.variants', (parent, fn['name'], proj['arch']))])
+                    for pair in generation_calls.pairs(result)]
+                for family, child in proposals:
+                    if child in seen or budget <= 0:
+                        continue
+                    seen.add(child)
+                    budget -= 1
+                    self.check()
+                    with repair_trial({'kind': 'deep local repair', 'family': family}):
+                        score = self._score(agent, proj, fn, child, best, fork)
+                    if score == 0:
+                        return 0
+                    if score is not None:
+                        lowest = min(lowest, score)
+                        children.append((score, child))
+            frontier = sorted(children, key=lambda item: item[0])[:3]
+        return lowest
+
+    def loop_cursor_pass(self, agent, proj, fn, best, fork):
+        """Measure fixed-offset cursors, indexed loops and frame cleanup."""
+        from . import generation_calls
+
+        source = _candidate_source(fn, best)
+        name = fn['name']
+        calls = [('decomprepair.pointer_walk_index_repairs.frame_variants', (source, name))]
+        if 'do' in source and '+=' in source:
+            ctx = self.net._context(proj['id'], fn['unit'])
+            header = self.net.forks.permuter_header(fork, name) if fork else (ctx['header'] if ctx else '')
+            calls.append(('decomprepair.parallel_byte_cursors.variants', (source, name, header)))
+        proposals = generation_calls.library(calls)
+        for family, child in generation_calls.pairs([pair for group in proposals for pair in group]):
+            if self.tested >= self.limit:
+                break
+            self.check()
+            with repair_trial({'kind': 'deep local repair', 'family': family}):
+                score = self._score(agent, proj, fn, child, best, fork)
+            if score == 0:
+                return 0
+            if score is not None:
+                best = min(best, score)
+        return best
+
     def call_result_pass(self, agent, proj, fn, best, fork):
         """Judge a small source-only pass before exploring alternate compiler profiles."""
-        from decomprepair.target_local_repairs import call_result_pass
+        from . import generation_calls
 
         stop = self.tested + min(40, (self.limit - self.tested) // 2)
         seen = set()
         while best and self.tested < stop:
             parent = fn['best_source']
             round_best = best
-            for family, child in call_result_pass(parent, fn['name']):
+            for family, child in generation_calls.pairs(generation_calls.library(
+                    [('decomprepair.target_local_repairs.call_result_pass', (parent, fn['name']))])[0]):
                 if child in seen:
                     continue
                 seen.add(child)
@@ -354,9 +508,25 @@ class Search(Permuter):
             self.log(f'Call-result lifetime search reached {best:,}.')
         return best
 
+    def measured_winner(self, fn, source):
+        return (self.winner_diff is not None and self.winner_source == source
+                and self.winner_scope == agent_tokens.target_scope(self.net, {**dict(fn), 'best_source':source}, ''))
+
+    def linked_case_diff(self, fn, source):
+        return self.winner_jump_tables if self.winner_jump_tables and self.measured_winner(fn, source) else ()
+
+    def can_relabel_switch(self, fn):
+        from . import generation_calls
+        source = fn['best_source']
+        cases = self.linked_case_diff(fn, source)
+        return bool(cases and generation_calls.library(
+            [('decomprepair.targeted_switch_labels.variants', (source, fn['name'], list(cases)))])[0])
+
     def _repair_preflight(self, agent, proj, fn, best, fork):
         """A new saved source merits new flag probes before more source mutations."""
         if proj['slug'] in self.net.links or fork or not hasattr(self.net, '_comparison_digest'):
+            return best
+        if self.can_relabel_switch(fn):
             return best
         if (self.winner_diff and self.winner_source == fn['best_source']
                 and allocation_evidence.diagnose(self.winner_diff[0],proj['arch'])['register_cycles']):
@@ -392,12 +562,57 @@ class Search(Permuter):
         # Baseline evidence must come from today's compiler/header, including score-zero open rows.
         self.measuring_baseline = True
         try:
+            recovery = getattr(self, 'relinked_baseline', None)
+            if recovery and not fork and recovery['baseline'] == fn['best_source']:
+                source = recovery['source']
+                digest = recovery['digest']
+                profiles = recovery['candidates']
+                if self.net._comparison_digest(proj, fn, fn['best_source'], profiles) == digest:
+                    state.add(variants=1, repairs=1)
+                    score = self._score(agent, proj, fn, source, float('inf'), fork)
+                    if score is not None and (fn['best_score'] is None or score <= fn['best_score']):
+                        store = self.net.project_store(proj['id'])
+                        with store.tx() as db:
+                            current = self.net._function(fn['name'], proj['slug'])
+                            fresh = self.net.project_row(proj['slug'])
+                            if (current['status'] == 'open' and current['best_source'] == fn['best_source']
+                                    and current['best_score'] == fn['best_score']
+                                    and self.net._comparison_digest(fresh, current, current['best_source'],
+                                                                    profiles) == digest):
+                                db.execute("UPDATE functions SET best_source=?,best_score=?,best_agent_id=? WHERE id=?",
+                                           (source, score, agent.id, fn['id']))
+                        current = self.net._function(fn['name'], proj['slug'])
+                        if current['best_source'] == source or current['status'] == 'matched':
+                            self.log('Recovered stale source names from aligned target relocations.')
+                            return score, 1
             measured = super()._baseline(agent, proj, fn, state, fork)
             if measured[0] is not None or fork:
                 return measured
+            from itertools import chain
+
+            from .. import candidate_quality
+            from . import deep_source_recovery
+            from .function_names import canonical_source
             from .prototype_alignment import variants
+
+            store = self.net.project_store(proj['id'])
             header = self.net._context(proj['id'], fn['unit'])['header']
-            for candidate in variants(fn['best_source'], fn['name'], header):
+            prototypes = ((candidate, 'Repaired a conflicting return type in the candidate.')
+                          for candidate in variants(fn['best_source'], fn['name'], header))
+            saved = ((canonical_source(fn, source), 'Recovered a baseline from a saved attempt.')
+                     for source in deep_source_recovery.saved_sources(
+                         store, deep_source_recovery.saved_attempts(store, fn['id'])))
+            seen = {fn['best_source']}
+            attempts = measured[1]
+            for candidate, message in chain(prototypes, saved):
+                if candidate in seen or candidate_quality.reported_source(self.net, fn, candidate):
+                    continue
+                if self.tested >= self.limit:
+                    break
+                self.check()
+                seen.add(candidate)
+                state.add(variants=1, repairs=1)
+                attempts += 1
                 score = self._score(agent, proj, fn, candidate, float('inf'), fork)
                 fresh = self.net._function(fn['name'], proj['slug'])
                 if score is not None and fresh['status'] == 'open' and fresh['best_source'] == fn['best_source']:
@@ -417,27 +632,102 @@ class Search(Permuter):
                                        (candidate, score, agent.id, fn['id']))
                     fresh = self.net._function(fn['name'], proj['slug'])
                 if score is not None and (fresh['best_source'] == candidate or fresh['status'] == 'matched'):
-                    self.log('Repaired a conflicting return type in the candidate; shared header unchanged. '
-                             'The broken draft is retained in history; the new baseline may have a lower percentage.')
-                    return score, measured[1]+1
-            return measured
+                    self.log(message + ' The broken draft is retained in history.')
+                    return score, attempts
+            return None, attempts
         finally:
             self.measuring_baseline = False
+
+    def better_saved_baseline(self, agent, proj, fn, state, measured):
+        """A historical score is a lead. Only a fresh clean link can beat today's baseline."""
+        from .. import candidate_quality
+        from . import deep_source_recovery, source_preparation
+        from .function_names import canonical_source
+
+        store = self.net.project_store(proj['id'])
+        floor = min(measured, fn['best_score']) if fn['best_score'] is not None else measured
+        attempts = deep_source_recovery.saved_attempts(store, fn['id'], below=floor)
+        if not attempts or not hasattr(self.net, '_judge_with'):
+            return measured
+        snapshot = source_preparation.inputs(self.net, proj, fn)
+        profile = compiler_for(self.net.cfg(proj), fn['vram'], fn)
+        seen = {fn['best_source']}
+        allowance = min(4, max(0, self.limit - self.tested - 1))
+        for historical in deep_source_recovery.saved_sources(store, attempts):
+            if allowance <= 0:
+                break
+            source = canonical_source(fn, historical)
+            if source in seen or candidate_quality.reported_source(self.net, fn, source):
+                continue
+            seen.add(source)
+            self.check()
+            allowance -= 1
+            self.tested += 1
+            self.report()
+            exact, diff, problems = self.net._judge_with(proj, fn, profile['toolchain'], profile['flags'], source)
+            if problems or diff is None or (not exact and diff.score >= floor):
+                continue
+            current = self.net._function(fn['name'], proj['slug'])
+            project = self.net.project_row(proj['slug'])
+            if (current['status'] != 'open' or current['best_score'] != fn['best_score']
+                    or source_preparation.inputs(self.net, project, current) != snapshot):
+                break
+            state.add(variants=1, repairs=1)
+            with repair_trial({'kind': 'deep local repair', 'family': 'rechecked_saved_attempt'}):
+                score = self._score(agent, project, current, source, floor, None)
+            if score is not None and score < floor:
+                updated = self.net._function(fn['name'], proj['slug'])
+                if updated['best_source'] == source or updated['status'] == 'matched':
+                    self.log(f'Rechecked a better saved attempt: {measured:,} → {score:,}.')
+                    return score
+            break
+        return measured
+
+    def near_register_pass(self, agent, proj, fn, state, best, fork):
+        rows = self.winner_diff[0] if self.winner_diff else ()
+        if not allocation_search.near_registers(rows, proj['arch']):
+            return best
+        source = fn['best_source']
+        ctx = self.net._context(proj['id'], fn['unit'])
+        header = self.net.forks.permuter_header(fork, fn['name']) if fork else ctx['header']
+        choices = allocation_search.near_proposals(source, fn['name'], header, rows, proj['arch'])
+        allowance = min(len(choices), max(0, (self.limit-self.tested)//3))
+        if not allowance:
+            return best
+        self.log(f'Trying up to {allowance} focused register-allocation variants.')
+        tried = 0
+        for family, candidate in choices[:allowance]:
+            if candidate in self.local_seen:
+                continue
+            self.check()
+            self.local_seen.add(candidate)
+            tried += 1
+            state.add(variants=1, repairs=1)
+            with repair_trial({'kind': 'deep local repair', 'family': family}):
+                score = self._score(agent, proj, fn, candidate, best, fork)
+            if score is not None and score < best:
+                return score
+        if tried >= 4:
+            self.register_focus = True
+        return best
 
     def allocation_choices(self, proj, fn, source, rows, choices, labels, header, fork):
         """One bounded lane before broad mutation, charged to the same global limit/deadline."""
         diagnosis = allocation_evidence.diagnose(rows,proj['arch'])
-        allowance=allocation_search.allowance(diagnosis)
+        floating = allocation_search.floating_only(rows, proj['arch'])
+        swap = allocation_search.saved_register_swap(rows, proj['arch'])
+        allowance = max(allocation_search.allowance(diagnosis), allocation_search.CHAIN_LIMIT if floating or swap else 0)
         if not allowance or self.allocation_trials >= allowance:
             return choices,set()
         self.log(allocation_evidence.text(rows,proj['arch']))
         evidence = {}
-        from decomprepair import prepared_call_repairs
+        from . import generation_calls
         pending_call = bool(diagnosis['return_copy_rotation'] and any(
-            candidate not in self.local_seen for _,candidate in prepared_call_repairs.variants(source,fn['name'],header,proj['arch'])))
+            candidate not in self.local_seen for _, candidate in generation_calls.pairs(generation_calls.library(
+                [('decomprepair.prepared_call_repairs.variants', (source, fn['name'], header, proj['arch']))])[0])))
         if not fork and proj['slug'] not in self.net.links and getattr(self.net,'is_rom',lambda _:False)(proj):
             evidence = allocation_search.saved(self.net,proj,fn,source)
-            if ((diagnosis['register_only'] or diagnosis['scheduling'] or diagnosis['allocation_schedule'] or diagnosis['return_copy_rotation']) and evidence is None and self.allocation_captures < 2 and self.tested+2 < self.limit
+            if (not floating and (diagnosis['register_only'] or diagnosis['scheduling'] or diagnosis['allocation_schedule'] or diagnosis['return_copy_rotation']) and evidence is None and self.allocation_captures < 2 and self.tested+2 < self.limit
                     and (not diagnosis['return_copy_rotation'] or (self.allocation_trials > 0 and not pending_call))
                     and time.monotonic()+40 < self.deadline):
                 self.allocation_captures += 1
@@ -497,6 +787,37 @@ class Search(Permuter):
         current_scope=agent_tokens.target_scope(self.net,{**dict(fn),'best_source':source},'')
         feedback=deep_repair_feedback.Feedback(source,best,initial_rows,self.winner_output if self.winner_source==source and self.winner_scope==current_scope else None,getattr(self,'winner_output_granularity','function'))
         source_locations={source:getattr(self,'winner_locations',None)}
+        resume_base = source
+        # Recheck prior roots rather than trusting cached results across turns.
+        if (max_trials and proj['slug'] not in self.net.links
+                and (not getattr(self, 'parallel_lane', None) or self.parallel_lane.index == 0)
+                and hasattr(self.net, '_comparison_digest')):
+            from .. import candidate_quality
+            resumed = []
+            for node in deep_resume.roots(self.net, proj, fn):
+                if trials >= max_trials or (phase_deadline is not None and time.monotonic() >= phase_deadline):
+                    break
+                if candidate_quality.reported_source(self.net, fn, node['source']):
+                    continue
+                self.check()
+                trials += 1
+                with repair_trial({'kind': 'deep local repair', 'family': 'resumed_repair_root', 'fresh': True}):
+                    score = self._score(agent, proj, fn, node['source'], 0, fork)
+                if score == 0:
+                    return self._saved_result(proj, fn, 0)
+                if score is None or not getattr(self,'_trial_clean',False) or score > best*2:
+                    continue
+                rows = repair_ranking.evidence(self.net, fn['id'], agent.id)
+                source_rows[node['source']] = rows
+                lineage.paths[node['source']] = node['path'][-(repair_sequences.MAX_STEPS-1):]
+                feedback.record(source,node['source'],lineage.paths[node['source']][-1],
+                                lineage.paths[node['source']][:-1],score,rows,self._trial_output)
+                alternatives.offer(node['source'],score,rows,arch=proj['arch'],baseline=initial_rows,baseline_score=best)
+                resumed.append(node['source'])
+            if resumed:
+                self.log(f'Resuming from {len(resumed)} rechecked repair roots.')
+                source = resumed[0]
+
         from . import layout_frontiers
         layout_state={}
         for saved_layout in layout_frontiers.saved(self.net,proj,fn,source,header):
@@ -529,23 +850,53 @@ class Search(Permuter):
                 entry_scope=draft_repairs.promoted_entry_repairs.scope(self.net,proj,fn))
             # A fresh winner may no longer need an earlier lifetime wrapper. Generate this
             # small inverse pass before the broad proposal pool, sharing all ordinary budgets.
-            from . import repair_cleanup
-            cleanup = [(family, child) for family, child in repair_cleanup.variants(
-                source, fn['name'], header, proj['arch']) if child not in self.local_seen]
+            from . import generation_calls
+            cleanup = [(family, child) for family, child in generation_calls.generate(
+                'repair_cleanup.variants', (source, fn['name'], header, proj['arch']), {})
+                if child not in self.local_seen]
             branch_frames=[]
             incoming=None
-            from . import frame_plateau
-            frame_choices = [(family,child) for family,child in frame_plateau.proposals(source,fn['name'],header,rows,proj['arch']) if child not in self.local_seen]
-            from decomprepair import combined_store_repairs
+            frame_choices = [(family,child) for family,child in generation_calls.generate(
+                'frame_plateau.proposals', (source,fn['name'],header,rows,proj['arch']), {}) if child not in self.local_seen]
             store_choices = [(family, child) for family, child in
-                             combined_store_repairs.variants(source, fn['name'])
+                             generation_calls.generate('combined_store_repairs.variants', (source, fn['name']), {})
                              if child not in self.local_seen]
-            focused_choices = store_choices + frame_choices
+            from . import callee_frame_evidence
+            buffer_choices = []
+            if callee_frame_evidence.observe(self.net, proj, fn, rows):
+                buffer_choices = [(family, child) for family, child in draft_repairs.capture_followup_repairs.variants(
+                    source, fn['name'], header, options['callees'])
+                    if family == 'callee_buffer_extent' and child not in self.local_seen]
+            observed_choices = []
+            if not fork and proj['arch'] == 'mips' and self.measured_winner(fn, source):
+                settings = compiler_for(self.net.cfg(proj), fn['vram'], fn)
+                symbol_table = self.net.symbols(proj['id']) if hasattr(self.net,'symbols') else None
+                resolve_symbol = symbol_table.resolve if symbol_table is not None else None
+                def read_data(symbol, width, project=proj, function=fn, resolve=resolve_symbol):
+                    address = resolve(symbol) if resolve else None
+                    if address is None:
+                        return None
+                    try:
+                        return self.net.reader(project,function)(address,width)
+                    except (NetworkError, OSError):
+                        # A heuristic can skip missing optional data in this overlay.
+                        return None
+
+                observed_choices = [(family, child) for family, child in generation_calls.generate(
+                    'diff_gated_repairs.proposals',
+                    (source, fn['name'], header, proj['arch'], settings.get('toolchain',''),
+                     self.winner_diff[0], fn['asm'], self.winner_jump_tables),
+                    dict(flags=list(settings.get('flags',())), big_endian=bool(proj['big_endian'])),
+                    resolve=resolve_symbol, symbols=symbol_table,
+                    read_data=read_data if hasattr(self.net,'reader') and resolve_symbol else None)
+                    if child not in self.local_seen]
+            observed_order = {child:index for index,(_,child) in enumerate(observed_choices)}
+            focused_choices = observed_choices + buffer_choices + store_choices + frame_choices
             focused_pass = bool(focused_choices)
-            from decomprepair import bit_predicate_repairs
             shape=allocation_evidence.diagnose(rows,proj['arch'])
-            bit_choices = [(family,child) for family,child in bit_predicate_repairs.variants(
-                source,fn['name'],header,proj['arch'],**options['entry_scope'])
+            bit_choices = [(family,child) for family,child in generation_calls.generate(
+                'decomprepair.bit_predicate_repairs.variants', (source,fn['name'],header,proj['arch']),
+                dict(options['entry_scope']))
                 if child not in self.local_seen] if (shape['register_only'] or shape['scheduling'] or shape['allocation_schedule']) else []
             bit_pass = bool(bit_choices) and not focused_pass
             cleanup_pass = bool(cleanup) and not focused_pass and not bit_pass
@@ -576,6 +927,16 @@ class Search(Permuter):
                     self.phase = ordinary_phase
                 else:
                     choices = draft_repairs.variants(*args,labels=labels,**options)
+                if not fork and proj['arch'] == 'mips' and compiler_for(self.net.cfg(proj), fn['vram'], fn).get('toolchain') == 'gcc-2.7.2-kmc':
+                    from . import generation_calls
+                    instructions = repair_ranking.instruction_rows(rows)
+                    focused = [pair for result in generation_calls.library([
+                        ('decomprepair.kmc_operand_repairs.variants', (source, fn['name'], header, instructions)),
+                        ('decomprepair.kmc_type_repairs.variants', (source, fn['name'], header, instructions))])
+                        for pair in generation_calls.pairs(result)]
+                    for family, candidate in focused:
+                        labels[candidate] = family
+                        choices.insert(0, candidate)
                 from . import hazard_line_repairs
                 for family,candidate in hazard_line_repairs.variants(source,fn['name'],header,proj['arch'],rows):
                     labels[candidate]=family
@@ -610,6 +971,11 @@ class Search(Permuter):
                 for family, candidate in permuter_local.variants(source, fn['name']):
                     labels.setdefault(candidate, family)
                     choices.append(candidate)
+            from . import cross_function_repairs
+            cross = cross_function_repairs.variants(self.net, proj, fn, source, header) if not fork else []
+            for family, candidate in cross:
+                labels[candidate] = family
+                choices.append(candidate)
             def prepare_choices(choices,labels=labels,feedback=feedback,source=source,rows=rows,
                                 proj=proj,fn=fn,lineage=lineage,path=path,header=header,
                                 source_locations=source_locations,branch_frames=branch_frames,loan=loan,bit_pass=bit_pass):
@@ -644,7 +1010,8 @@ class Search(Permuter):
                 frame_sources={c for _,c in branch_frames}
                 frame_prefix=[c for _,c in progressed if c in frame_sources]
                 dispatch_prefix=[c for family,c in progressed if family in {'effectful_dispatch_specialization','narrow_snapshot_branches'}][:4]
-                queue = list(dict.fromkeys(frame_prefix+complete+dispatch_prefix+[c for _,c in progressed]))
+                cross_prefix = [c for family,c in progressed if family in cross_function_repairs.FAMILIES]
+                queue = list(dict.fromkeys(cross_prefix+frame_prefix+complete+dispatch_prefix+[c for _,c in progressed]))
                 if loan:queue=feedback.continuation(source,queue,labels,self.local_seen)
                 lane = getattr(self, "parallel_lane", None)
                 if lane is not None:
@@ -666,7 +1033,10 @@ class Search(Permuter):
                         if not queue:continue
                     feedback.order(queue,labels,source,parents)
                     queue=repair_ranking.guarded_first(queue,labels)
+                    if observed_order:
+                        queue.sort(key=lambda child: observed_order.get(child, len(observed_choices)))
                     candidate=queue.pop(0)
+                    observed_order.pop(candidate, None)
                     lane = getattr(self, "parallel_lane", None)
                     if lane is not None and int(hashlib.sha256(candidate.encode()).hexdigest(), 16) % lane.count != lane.index:
                         continue
@@ -761,6 +1131,13 @@ class Search(Permuter):
                         if not any(n['source'] == candidate for n in alternatives.nodes):
                             counters['frontier_pruned'] += 1
                         source_rows[candidate] = measured_rows
+                        if (not getattr(self,'_trial_reused',False) and getattr(self,'_trial_clean',False) and max_trials
+                                and proj['slug'] not in self.net.links
+                                and hasattr(self.net,'_comparison_digest')):
+                            node = next((item for item in alternatives.nodes if item['source'] == candidate), None)
+                            if node and (score < best or node['repaired']):
+                                deep_resume.keep(self.net,proj,fn,candidate,score,measured_rows,measured_output,
+                                                 parent_path+[labels.get(candidate,'local_repair')],len(node['repaired']))
                         lineage.retain(parent_source,candidate,labels.get(candidate,'local_repair'),max_steps=repair_sequences.MAX_STEPS+repair_sequence_lane.EXTRA_DEPTH if candidate in feedback.loan_sources else repair_sequences.MAX_STEPS)
                         if (score<=best*2 and len(parent_path)+1<repair_sequences.MAX_STEPS
                                 and residual_bursts<residual_followups.BURSTS
@@ -812,6 +1189,9 @@ class Search(Permuter):
                     if cleanup_pass or focused_pass or bit_pass:
                         # All inverses were measured/cache-checked. Resume the broad page once;
                         # do not treat a failed cleanup as exhaustion of ordinary repair families.
+                        continue
+                    if resume_base == fn['best_source'] and resume_base not in expanded:
+                        source = resume_base
                         continue
                     detour = next((node for node in alternatives.nodes
                                    if node['source'] not in detours_used and node['source'] not in expanded and node['source'] not in self.local_seen), None)
@@ -882,6 +1262,7 @@ class Search(Permuter):
                     self.winner_source = source
                     # The old diff/output belongs to another profile, even though the pair is exact.
                     self.winner_diff = self.winner_output = self.winner_scope = None
+                    self.winner_jump_tables = ()
                     self.last_outcome, self.last_score = 'matched', 0
                     self.report()
                 return 0
@@ -989,7 +1370,7 @@ class Search(Permuter):
         recent_key = self._recent_key(proj, fn, source, fork)
         recent = getattr(self, '_recent_candidates', None)
         duplicate = recent.get(recent_key) if recent is not None and recent_key is not None else None
-        if duplicate is not None and duplicate[0] >= best:
+        if duplicate is not None and duplicate[0] >= best and not (current_trial() or {}).get('fresh'):
             self.skipped += 1
             self._trial_reused = True
             self._cached_rows = copy.deepcopy(duplicate[1])
@@ -1021,7 +1402,8 @@ class Search(Permuter):
         feedback = json.loads(cached['feedback']) if cached and cached['feedback'] else None
         score = feedback.get('score') if isinstance(feedback, dict) else feedback
         self._cached_rows = feedback.get('rows', []) if isinstance(feedback, dict) else []
-        reused = not self.measuring_baseline and isinstance(score, int) and score >= best
+        reused = (not self.measuring_baseline and not (current_trial() or {}).get('fresh')
+                  and isinstance(score, int) and score >= best)
         self._trial_reused = reused
         self._trial_locations = None
         self._trial_output_granularity = None
@@ -1104,6 +1486,7 @@ class Search(Permuter):
                 self.winner_output = getattr(self,'_trial_output',None)
                 self.winner_output_granularity = getattr(self,'_trial_output_granularity','function')
                 self.winner_locations = getattr(self,'_trial_locations',None)
+                self.winner_jump_tables = getattr(self, '_trial_jump_tables', ())
                 self.winner_scope = scope
         if (recent_key is not None and isinstance(score, int) and score > 0 and score >= best
                 and self.net.project_store(proj['id']).read_version('inputs', proj['id']) == recent_key[0]):
@@ -1135,13 +1518,42 @@ def _row(row):
     return row if isinstance(row, dict) else dict(row)
 
 
-def run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, threads_per_function=1, maximum_throughput=False, compile_slots=0):
+def run(net, slug, name, minutes, max_variants, log, *args, **kwargs):
+    """A deep search of one function. Its result says whether decomp-permuter's randomizer was there: without it
+    only the simple rewrites ran, which the drawer and the sweep's queue must not take for a full search."""
+    from . import permute
+    ready = permute.ensure_available(log)
+    if not ready:
+        log(permute.MISSING)
+    result = _full_run(net, slug, name, minutes, max_variants, log, *args, **kwargs)
+    if isinstance(result, dict):
+        result['randomizer'] = ready
+        if not ready:
+            result['notice'] = permute.NOTICE
+    return result
+
+
+def _full_run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, threads_per_function=1, maximum_throughput=False, compile_slots=0):
+    from .deep_profiles import validate as validate_profiles
+    from .deep_sweep import looking
+
+    validate_profiles(compiler_profiles)
+    validate_limits(minutes, max_variants)
     deep_throughput.options(maximum_throughput, compile_slots)
     if maximum_throughput and getattr(log, 'compile_pool', None) is None and threads_per_function == 1:threads_per_function = min(max_variants, deep_throughput.width(True, compile_slots))
     from .deep_parallel import validate_threads
     validate_threads(threads_per_function)
     # One explicit deep search per function, including credential issuance. Agents may keep working.
     fn = net._function(name, slug)
+    if fn['status'] == 'open' and fn['target']:
+        from .sdk_assembly import discover_known
+        log.check_cancel()
+        with looking(net):
+            found = discover_known(net, net.project_row(slug), function_id=fn['id'], check_cancel=log.check_cancel)
+        if found:
+            reason = 'Identified and set aside as SDK library code'
+            log(reason)
+            return {'matched': False, 'tested': 0, 'reason': reason}
     lock = net.__dict__.setdefault('_deep_run_locks', {}).setdefault(fn['id'], threading.Lock())
     if not lock.acquire(blocking=False):
         raise NetworkError('A deep search is already running for this function.')
@@ -1151,11 +1563,49 @@ def run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, thread
     admission = compiler._SLOTS.capacity(pool.count)
     admission.__enter__()
     try:
+        tried_twin = 0
+        twins = getattr(net, 'twins', None) if slug not in net.links else None
+        proj = None
+        if twins is not None and fn['status'] == 'open':
+            log.check_cancel()
+            with looking(net):
+                proj = net.project_row(slug)
+                from .boundary_repairs import blocked
+                donor = twins.deep_donor(proj, fn) if fn['id'] not in blocked(net, proj) else None
+                if donor:
+                    agent, _ = net.local_agent('autopilot')
+                    with compiler.cancellable(log.check_cancel):
+                        outcome = twins.try_pair(agent, proj, donor[0], fn['id'], partial=donor[1])
+                    tried_twin = int(outcome in ('match', 'miss', 'improved'))
+                    if tried_twin:
+                        log(f'Same-game twin trial: {outcome}.')
+                    if outcome == 'match' or tried_twin == max_variants:
+                        current = net._function(name, slug)
+                        return {'function': name, 'matched': outcome == 'match', 'tested': tried_twin,
+                                'starting_score': fn['best_score'], 'best_score': current['best_score'],
+                                'improvements': int(outcome in ('match', 'improved')),
+                                'reason': 'Matched from a same-game twin' if outcome == 'match' else 'Candidate limit reached',
+                                'throughput': pool.metrics.snapshot()}
+        remaining = max_variants - tried_twin
+        if proj is not None and remaining > 1 and twins.has_open_deep_twin(proj, fn):
+            remaining -= 1  # Reserve a destination compile if this draft improves.
         if threads_per_function > 1:
             from .deep_parallel import run as parallel
-            result = parallel(net, slug, name, minutes, max_variants, log, compiler_profiles, threads_per_function)
+            result = parallel(net, slug, name, minutes, remaining, log, compiler_profiles, threads_per_function)
         else:
-            result = _run(net, slug, name, minutes, max_variants, log, compiler_profiles)
+            result = _run(net, slug, name, minutes, remaining, log, compiler_profiles)
+        result['tested'] += tried_twin
+        if proj is not None and not result['matched'] and result['tested'] < max_variants:
+            with looking(net):
+                current = net._function(name, slug)
+                if current['best_score'] is not None and (fn['best_score'] is None or current['best_score'] < fn['best_score']):
+                    log.check_cancel()
+                    agent, _ = net.local_agent('autopilot')
+                    with compiler.cancellable(log.check_cancel):
+                        outcome = twins.try_improved_deep_twin(agent, proj, current)
+                    if outcome not in ('skip', 'known'):
+                        result['tested'] += 1
+                        log(f'Rejudged the improved draft on a same-game twin: {outcome}.')
         result['throughput'] = pool.metrics.snapshot()
         return result
     finally:
@@ -1167,6 +1617,7 @@ def run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, thread
             lock.release()
 
 
+@without_capture()
 @deep_throughput.search
 @deep_compilation.shared
 @buffered
@@ -1242,13 +1693,16 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
         if review_boundary:
             reason = 'Exact diagnostic needs ordinary review'
         elif not outcome.get('matched'):
-            search._compiler_preflight(proj, fn, state, search.deadline)
+            preflight = search._compiler_preflight(proj, fn, state, search.deadline)
+            if (preflight.get('review_only') and not preflight.get('applied')
+                    and not preflight.get('suggestion_rejected')):
+                reason = PROFILE_LEAD
         if lane is not None:
             lane.prepared()
         proj, fn = net.project_row(slug), net._function(name, slug)
         if fn['status'] == 'matched':
             reason = 'Matched'
-        if reason not in ('Matched', 'Exact diagnostic needs ordinary review'):
+        if reason not in ('Matched', 'Exact diagnostic needs ordinary review', PROFILE_LEAD):
             if not search._hold(agent, fn, count_turn=False):
                 raise NetworkError('This function was claimed meanwhile; try again after it is released.')
             try:
@@ -1258,8 +1712,25 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
                 baseline, _ = search._baseline(agent, proj, fn, state, fork)
                 if baseline is None:
                     raise NetworkError('The saved C does not compile in the current context; fix its declarations before deep search.')
+                fn = net._function(name, slug)
+                if baseline and not fork and (lane is None or lane.index == 0):
+                    baseline = search.better_saved_baseline(agent, proj, fn, state, baseline)
+                    fn = net._function(name, slug)
                 measured_baseline = baseline
-                if baseline and compiler_profiles == 1 and (lane is None or lane.index == 0):
+                relabel = baseline and not fork and search.can_relabel_switch(fn)
+                if baseline and not relabel and (lane is None or lane.index == 0):
+                    baseline = search.near_register_pass(agent, proj, fn, state, baseline, fork)
+                    fn = net._function(name, slug)
+                if baseline and not fork and not relabel and (lane is None or lane.index == 0):
+                    if profile := deep_profiles.tail_dispatch(net, proj, fn):
+                        log('Checking the saved tail dispatcher with the installed GCC sibling-call profile.')
+                        if deep_profiles.probe(search, agent, proj, fn, _candidate_source(fn, baseline), profile) == 0:
+                            baseline = search.best = 0
+                if baseline and not relabel and (lane is None or lane.index == 0):
+                    baseline = search.loop_cursor_pass(agent, proj, fn, baseline, fork)
+                    fn = net._function(name, slug)
+                if (baseline and compiler_profiles == 1 and not relabel
+                        and (lane is None or lane.index == 0)):
                     baseline = search.call_result_pass(agent, proj, fn, baseline, fork)
                     fn = net._function(name, slug)
                 if baseline == 0:
@@ -1268,17 +1739,24 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
                     from .stack_layout import text as stack_text
                     if diagnostic := stack_text(proj['arch'], repair_ranking.evidence(net, fn['id'], agent.id)):
                         log(diagnostic)
-                    if not fork and baseline == measured_baseline:
-                        # A productive source pass continues under its measured compiler.
-                        # (code built with other settings: before the local repairs spend their half of the time,
-                        # measure the profiles its habits point to and climb under one that scores the C better than
-                        # the function's own; profile_climb. At most a few compiles when none does.)
+                    if not relabel and (lane is None or lane.index == 0) and (stub := search.stub_note()):
+                        log('Skipping the operand-order and loop-shape passes. ' + stub)
+                    elif not relabel and (lane is None or lane.index == 0):
+                        baseline = search.operand_order_pass(agent, proj, fn, baseline, fork)
+                        fn = net._function(name, slug)
+                        if baseline == 0:
+                            reason = 'Matched'
+                        if baseline:
+                            baseline = search.loop_vector_shape_pass(agent, proj, fn, baseline, fork)
+                            fn = net._function(name, slug)
+                            if baseline == 0:
+                                reason = 'Matched'
+                    jump_profile = getattr(search, 'jump_table_profile', None)
+                    if baseline and not fork and not relabel and (jump_profile or baseline == measured_baseline):
                         from . import profile_climb
-                        search.phase = 'other compiler profiles'
-                        found = profile_climb.lead(search, agent, proj, fn, fn['best_source'], baseline)
-                        if found is not None and profile_climb.climb(search, agent, proj, fn, fn['best_source'], *found) == 0:
-                            # (exact only under another profile: a compiler suggestion waits; the function isn't
-                            # matched under its own settings, so the matched-only steps below must not run)
+                        search.phase = 'jump-table relocation repair' if jump_profile else 'other compiler profiles'
+                        if profile_climb.explore(search, agent, proj, fn, baseline, jump_profile):
+                            # The usual exact suggestion path verifies the alternate settings.
                             reason = PROFILE_LEAD
                 if baseline != 0 and reason not in ('Matched', PROFILE_LEAD):
                     search.phase = 'local repairs'
@@ -1295,6 +1773,9 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
         if reason not in ('Matched', 'Exact diagnostic needs ordinary review', PROFILE_LEAD):
             search.check()
             search.phase = 'random rewrites'
+            if (getattr(search, 'register_focus', False) and search.winner_diff
+                    and allocation_search.near_registers(search.winner_diff[0], proj['arch'])):
+                search.random_register_limit = search.tested + 24
             search.log('Local repairs finished; generating random rewrites and judging each compiled candidate.')
             search.seconds = max(1, search.deadline-time.monotonic())
             current = net._function(name, slug)
@@ -1346,6 +1827,12 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
     result = {'function': name, 'reason': reason, 'tested': search.tested, 'skipped': search.skipped,
               'rejected': search.rejected, 'refinement_rounds': search.refinement_rounds,
               'matched': net._function(name, slug)['status'] == 'matched', **search.metrics()}
+    if not result['matched'] and search.tested and search.winner_diff:
+        from . import deep_handoff
+        current = net._function(name, slug)
+        if search.measured_winner(current, current['best_source']):
+            if deep_handoff.save(net, proj, current, search.winner_source, search.winner_diff[0]):
+                log('Saved the measured residual for the next agent claim.')
     result['compiler_profiles'] = compiler_profiles
     if sweeps:
         sweeps.completed(slug, fn, minutes, max_variants, result, build_scope)

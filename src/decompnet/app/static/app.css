@@ -36,6 +36,13 @@
   --cc-4: var(--color-status-success-fill); --cc-5: var(--color-status-warning-fill);
   --cc-6: color-mix(in oklch, var(--color-status-info-fill) 50%, var(--color-status-danger-fill));
   --cc-7: color-mix(in oklch, var(--color-status-success-fill) 50%, var(--color-status-info-fill));
+  /* Extra ROM region colours for maps with several types that share a preferred colour. */
+  --rom-color-coral: color-mix(in oklch, var(--cc-3) 65%, var(--cc-5));
+  --rom-color-pink: color-mix(in oklch, var(--cc-3) 65%, var(--cc-6));
+  --rom-color-lavender: color-mix(in oklch, var(--cc-6) 66%, white);
+  --rom-color-sky: color-mix(in oklch, var(--cc-1) 63%, white);
+  --rom-color-mint: color-mix(in oklch, var(--cc-4) 62%, white);
+  --rom-color-olive: color-mix(in oklch, var(--cc-4) 55%, var(--cc-2));
   --move: var(--color-status-info-text); --move-bg: var(--color-status-info-surface);
   --code-bg: var(--color-surface-sunken);
   --btn: var(--button-primary-bg); --btn-hover: var(--button-primary-bg-hover); --btn-ink: var(--button-primary-fg);
@@ -236,6 +243,8 @@ a.ghost, a.primary { text-decoration: none; }
 .joblog-frame > .joblog { padding-right: 64px; }
 .joblog-copy { position: absolute; top: 6px; right: 6px; z-index: 1; padding: 2px 8px; font: inherit; font-size: 11px; line-height: 18px; color: var(--ink-2); background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); cursor: pointer; opacity: .85; }
 .joblog-copy:hover, .joblog-copy:focus-visible { opacity: 1; color: var(--ink); background: var(--bg-alt); }
+.joblog-repair { right: 58px; }
+.joblog-frame:has(> .joblog-repair) > .joblog { padding-top: 36px; }
 .joblog-copy[data-state="done"] { color: var(--match-ink); }
 /* Terminal-like colours for log lines (base.js, joblogHtml), from the theme's status tokens. */
 .joblog .jl-err { color: var(--miss); }
@@ -588,6 +597,8 @@ a.ghost, a.primary { text-decoration: none; }
 @keyframes slide { from { transform: translateX(24px); opacity: .6; } }
 .drawer-head { flex: none; display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 20px 24px; border-bottom: 1px solid var(--line-soft); }
 .drawer-head h2 { font-size: 20px; letter-spacing: -.02em; margin-top: 6px; overflow-wrap: break-word; }  /* a name breaks only when it can't fit whole (func_80000A|A4 broke mid-name) */
+.dialog-heading { min-width:0; }
+#dialogSubtitle { margin:3px 0 0; font-size:12px; }
 .drawer-head .row { flex-wrap: nowrap; gap: 6px; }
 .drawer-head .badge { margin-right: 6px; }
 .dh-title { min-width: 0; }
@@ -1247,6 +1258,7 @@ details.more[open] > summary::before { content: "− "; }
 .deep-empty strong { color: var(--ink-2); font-size: 15px; }
 .deep-empty p { margin: 10px auto 0; max-width: 420px; line-height: 1.6; font-size: 13px; }
 #deepError { color: var(--miss); }
+#deepNotice { color: var(--warn, var(--miss)); }
 @media (max-width: 620px) {
   .deep-heading { flex-direction: column; gap: 10px; }
   .deep-controls .field { flex: 1; width: 130px; }
@@ -1446,6 +1458,10 @@ details.more[open] > summary::before { content: "− "; }
 .compiler-progress[data-finished="true"] .compiler-current-label { display: none; }
 .compiler-progress[data-finished="true"] .compiler-progress-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .compiler-progress[data-finished="true"] .compiler-progress-stats > div { grid-column: auto; }
+.directory-table { max-height: none; }
+.directory-game { display: flex; align-items: center; gap: 8px; }
+.directory-game > div { min-width: 0; }
+.directory-game img { flex: none; object-fit: contain; }
 .compiler-table td button.small-btn { white-space: nowrap; }
 
 /* A selected identity must never label the previous view's data or controls. */
@@ -1464,8 +1480,7 @@ details.more[open] > summary::before { content: "− "; }
 .manual-mcp .mcp-tool, .mcp-connection { padding: 12px 0; }
 
 .deep-activity { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px; margin:16px 0; }
-.deep-worker { border:1px solid var(--line); border-radius:var(--r); padding:14px; min-width:0; }
-.deep-worker[data-active="true"] { border-top:3px solid var(--hl); }
+.deep-worker { border:1px solid var(--line); border-top:3px solid var(--hl); border-radius:var(--r); padding:14px; min-width:0; }
 .deep-worker header { display:flex; justify-content:space-between; gap:10px; }
 .deep-worker header span { font-size:12px; color:var(--muted); }
 .deep-worker p { margin:10px 0; overflow-wrap:anywhere; }
@@ -1734,6 +1749,7 @@ body:has(.pwa-status:not([hidden])) { padding-bottom:80px; }
 /* Deep permuter: primary decisions first, technical controls on demand. */
 .deep-sweep-settings .field { align-self:start; }
 .deep-activity-section > summary { cursor:pointer; font-size:14px; font-weight:600; }
+.deep-activity-count { margin-inline-start:8px; }
 .deep-activity-section[open] > summary { margin-bottom:14px; }
 .deep-advanced { align-self:start; padding:8px 0 0 16px; border-left:1px solid var(--line-soft); }
 .deep-advanced > summary { cursor:pointer; font-size:12px; color:var(--muted); padding:4px 0; }
@@ -2175,7 +2191,7 @@ body:has(.pwa-status:not([hidden])) { padding-bottom:80px; }
 .rom-asset-fields .field { min-width:0; }
 .rom-preview-media { display:block; max-width:100%; max-height:480px; margin:12px 0; }
 img.rom-preview-media { image-rendering:pixelated; background:var(--bg-alt); border:1px solid var(--line); }
-.rom-flow, .rom-asset-preview { border-top:1px solid var(--line); padding-top:14px; margin-top:14px; }
+.rom-flow { border-top:1px solid var(--line); padding-top:14px; margin-top:14px; }
 .rom-flow-chain { padding:10px 0; border-bottom:1px solid var(--line-soft); overflow-wrap:anywhere; }
 .rom-flow-chain ol { padding-left:24px; display:grid; gap:12px; }
 #romLoaderItems, #romLoaderRoleBody { overflow-wrap:anywhere; }
@@ -2190,7 +2206,7 @@ img.rom-preview-media { image-rendering:pixelated; background:var(--bg-alt); bor
 #romTypeStatus { min-height:2.5em; overflow-wrap:anywhere; }
 
 .rom-texture-discovery, .rom-model-inspection { margin-top:18px; padding-top:12px; border-top:1px solid var(--line); }
-.rom-texture-gallery { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(150px,100%),1fr)); gap:12px; margin-top:12px; }
+.rom-texture-gallery, .rom-asset-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(128px,100%),1fr)); gap:12px; margin-top:12px; }
 .rom-texture-gallery > p { grid-column:1/-1; }
 .rom-texture-candidate { height:auto; min-height:190px; display:flex; flex-direction:column; gap:8px; align-items:center; padding:10px; white-space:normal; overflow-wrap:anywhere; }
 .rom-texture-candidate img { width:128px; height:128px; max-width:100%; object-fit:contain; image-rendering:pixelated; background:var(--line); }
@@ -2204,12 +2220,21 @@ img.rom-preview-media { image-rendering:pixelated; background:var(--bg-alt); bor
 
 /* Texture banks reuse the shared panel, field and button styles in both themes. */
 .rom-texture-card { min-width:0; padding-bottom:12px; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
-.rom-texture-open { height:auto; min-height:220px; padding:10px; display:flex; flex-direction:column; gap:6px; width:100%; text-align:left; white-space:normal; }
-.rom-texture-thumb { flex:none; display:flex; align-items:center; justify-content:center; width:100%; min-height:128px; background:var(--bg); overflow-wrap:anywhere; }
-.rom-texture-thumb img { width:128px; height:128px; max-width:100%; image-rendering:pixelated; object-fit:contain; }
-#romAudioPanel, #romModelPanel { min-width:0; }
-#romModelItems, #romModelResult, #romAudioItems, #romAudioResult, #romAudioSequences { min-width:0; overflow-wrap:anywhere; }
-#romModelItems td:last-child, #romModelItems th:last-child, #romAudioItems td:last-child, #romAudioItems th:last-child { position:sticky; right:0; background:var(--panel); }
+.rom-texture-open { height:auto; min-height:0; padding:6px; display:flex; flex-direction:column; gap:6px; width:100%; text-align:left; white-space:normal; }
+.rom-texture-thumb { flex:none; display:flex; align-items:center; justify-content:center; width:100%; min-height:72px; background:var(--bg); overflow-wrap:anywhere; }
+.rom-texture-thumb img { width:80px; height:72px; max-width:100%; image-rendering:pixelated; object-fit:contain; }
+.rom-asset-toolbar { justify-content:space-between; gap:12px; flex-wrap:wrap; }
+.rom-asset-grid { grid-template-columns:repeat(auto-fill,minmax(min(170px,100%),1fr)); }
+.rom-asset-grid dl { display:grid; grid-template-columns:auto minmax(0,1fr); gap:3px 8px; margin:6px 0; font-size:.8rem; }
+.rom-asset-grid dt { color:var(--muted); }
+.rom-asset-grid dd { margin:0; }
+.rom-asset-icon { display:block; text-align:center; font-size:1.25rem; background:var(--bg); margin-bottom:4px; }
+.rom-model-card-open { width:100%; height:auto; padding:6px; text-align:left; white-space:normal; overflow-wrap:anywhere; }
+.rom-model-card-open small { display:block; color:var(--muted); margin-top:3px; }
+.rom-asset-scroll { min-height:1px; }
+#romAssetBrowser [role="tabpanel"] { min-width:0; }
+#romModelItems, #romAudioItems, #romAudioResult, #romAudioSequences { min-width:0; overflow-wrap:anywhere; }
+#romAudioItems td:last-child, #romAudioItems th:last-child { position:sticky; right:0; background:var(--panel); }
 
 /* Settings › Compiler services (compiler-service.js) */
 .cs-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0 16px; }
@@ -2240,19 +2265,28 @@ img.rom-preview-media { image-rendering:pixelated; background:var(--bg-alt); bor
 .port-step.part .meter i { background: var(--work); }
 .port-body { display: grid; gap: 6px; min-width: 0; }
 .port-body p { margin: 0; }
+.port-discoveries { border-top: 1px solid var(--line); padding-top: 10px; display: grid; gap: 8px; min-width: 0; }
+.port-discoveries h4 { margin: 0; }
+.port-discovery-list { list-style: none; margin: 0; padding: 0; max-height: 26rem; overflow: auto; }
+.port-discovery-list li { padding: 8px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.port-discovery-list label { margin-inline-end: 8px; }
+.port-discovery-list input { margin-inline-end: 8px; }
+.port-discovery-list li p, .port-discovery-list details { margin-inline-start: 24px; }
+.port-discovery-list summary { cursor: pointer; color: var(--muted); }
+.port-discovery-list pre { max-height: 14rem; overflow: auto; }
+#portDiscoveryAdd { justify-self: start; }
 .port-runtimes { border: 0; margin: 4px 0 0; padding: 0; display: grid; gap: 8px; min-width: 0; }
 .port-runtimes legend { padding: 0; margin-bottom: 4px; }
 .port-runtime { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; align-items: start; cursor: pointer; }
 .port-runtime > span { display: grid; gap: 2px; min-width: 0; }
 .port-runtime input { margin-top: 2px; }
+#portExportWebSimdChoice { margin-inline-start: 24px; }
+#portExportStatus:empty { display: none; }
 .port-runtime.unavailable { cursor: not-allowed; }
 .port-runtime.unavailable b { color: var(--muted); }
 .port-step-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
 .port-pct { font: 600 13px/1 var(--mono); color: var(--muted); white-space: nowrap; }
 .port-actions { flex-wrap: wrap; gap: 6px; margin-top: 2px; }
-/* a menu whose trigger is a labelled button (Play it's Export…), not the ⋮ icon */
-.agent-menu.labelled > summary { width: auto; height: 30px; font-size: 13px; display: inline-flex; }
-.agent-menu.labelled .agent-menu-items { left: 0; right: auto; }
 .port-details { margin-top: 10px; }
 .port-details summary { cursor: pointer; color: var(--muted); }
 .port-actions button { white-space: normal; max-width: 100%; text-align: left; }
@@ -2270,6 +2304,7 @@ img.rom-preview-media { image-rendering:pixelated; background:var(--bg-alt); bor
 .local-search-card > .pad.local-search-body { gap:18px; padding:0 20px 18px; }
 .local-search-intro { font-size:12px; color:var(--muted); margin:0; }
 .local-search-card .deep-dashboard { gap:16px; padding:0; }
+#deepSweepCounts { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .local-search-card .deep-sweep-counts > button { padding-top:6px; padding-bottom:6px; }
 .local-search-progress { display:grid; gap:8px; min-width:0; }
 .local-search-progress > p { margin:0; }
@@ -2277,13 +2312,15 @@ img.rom-preview-media { image-rendering:pixelated; background:var(--bg-alt); bor
 .local-search-progress .deep-sweep-bar { margin:0; }
 .local-search-progress .deep-queue-details { margin:0; gap:8px 16px; align-items:center; }
 .local-search-progress .deep-queue-details > span:not([hidden]) { border:0; padding:0; }
-.local-search-options-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px; }
-.local-search-options-row > button { padding:4px 8px; }
+#deepSweepQueueTitle:empty { display:none; }
+#deepSweepRuntime { font-variant-numeric:tabular-nums; }
+#deepSweepOptions { white-space:normal; text-align:left; }
 .local-search-card .deep-sweep-tools { padding:0; border:0; gap:8px 16px; align-items:baseline; }
 .local-search-card .deep-sweep-tools > #deepSweepReset { margin-left:auto; }
 .local-search-card .deep-sweep-tools .deep-sweep-help { flex:initial; }
 .local-search-card .deep-sweep-tools .deep-sweep-help[open] { flex-basis:100%; order:1; }
 #deepSweepRecipes:empty { display:none; }
+#deepSweepThroughput { margin:0; }
 .local-search-card .transfer-technical { margin:0; }
 .local-search-options { border:0; padding:0; margin:0; display:grid; gap:18px; min-width:0; }
 .local-search-options legend { font-size:13px; font-weight:600; padding:0 0 16px; }
@@ -2305,4 +2342,8 @@ img.rom-preview-media { image-rendering:pixelated; background:var(--bg-alt); bor
  .local-search-card .deep-sweep-counts > .deep-metric > span { flex-wrap:wrap; gap:4px; }
 }
 
-@media(max-width:420px) { .local-search-option-pair { grid-template-columns:1fr; } }
+@media(max-width:420px) {
+ #deepSweepCounts { grid-template-columns:repeat(2,minmax(0,1fr)); row-gap:8px; }
+ #deepSweepCounts > button:nth-child(odd) { border-left:0; padding-left:0; }
+ .local-search-option-pair { grid-template-columns:1fr; }
+}
