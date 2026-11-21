@@ -30,8 +30,30 @@ from decomprepair import (
     measured_expression_repairs,
     measured_float_grid_stores,
     measured_global_rebase,
+    measured_halfword_stores,
+    measured_halfword_switch,
     measured_immediate_repairs,
     measured_kmc_addresses,
+    measured_kmc_branch_pointer,
+    measured_kmc_byte_and_message,
+    measured_kmc_byte_operations,
+    measured_kmc_byte_stride,
+    measured_kmc_call_setup,
+    measured_kmc_call_stores,
+    measured_kmc_carriers,
+    measured_kmc_command,
+    measured_kmc_cursor_switch,
+    measured_kmc_flag_update,
+    measured_kmc_flow,
+    measured_kmc_input,
+    measured_kmc_lifetimes,
+    measured_kmc_packed_bits,
+    measured_kmc_record_reads,
+    measured_kmc_repeated_reads,
+    measured_kmc_scalar_shapes,
+    measured_kmc_stack_and_call,
+    measured_kmc_vector_square,
+    measured_kmc_wrappers,
     measured_lifetime_shapes,
     measured_memory_order,
     measured_mmio_polling,
@@ -39,8 +61,10 @@ from decomprepair import (
     measured_null_iteration_store,
     measured_pointer_scale,
     measured_scalar_updates,
+    measured_stack_records,
     measured_storage_shapes,
     measured_temporary_repairs,
+    measured_thread_addresses,
     ordered_halfword_updates,
     packed_matrix_conversion,
     passthrough_argument_repairs,
@@ -205,7 +229,31 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
     result += measured_scalar_updates.variants(source, name, header, toolchain, rows, asm)
     if toolchain == 'gcc-2.7.2-kmc':
         result += measured_cursor_schedule.variants(source, name, header, rows, asm or '')
+        result += measured_thread_addresses.variants(source, name, header, rows, resolve)
         result += measured_kmc_addresses.variants(source, name, header, rows, flags)
+        result += measured_kmc_byte_stride.variants(source, name, header, rows)
+        result += measured_kmc_branch_pointer.variants(source, name, header, rows)
+        result += measured_kmc_byte_and_message.variants(source, name, header, rows)
+        result += measured_kmc_byte_operations.variants(source, name, header, rows, resolve=resolve)
+        result += measured_kmc_call_setup.variants(source, name, header, rows)
+        result += measured_kmc_call_stores.variants(source, name, header, rows, resolve)
+        result += measured_kmc_command.variants(source, name, header, rows)
+        result += measured_kmc_carriers.variants(source, name, header, rows)
+        result += measured_kmc_cursor_switch.variants(source, name, header, rows)
+        result += measured_kmc_flag_update.variants(source, name, header, rows)
+        result += measured_kmc_flow.variants(source, name, header, rows)
+        result += measured_kmc_input.variants(source, name, header, rows, resolve)
+        result += measured_halfword_switch.variants(source, name, header, rows)
+        result += measured_halfword_stores.variants(source, name, rows, resolve)
+        result += measured_kmc_repeated_reads.variants(source, name, header, rows, resolve)
+        result += measured_kmc_record_reads.variants(source, name, header, rows, resolve)
+        result += measured_kmc_stack_and_call.variants(source, name, header, rows, resolve)
+        result += measured_kmc_scalar_shapes.variants(source, name, header, rows, resolve=resolve, flags=flags)
+        result += measured_kmc_lifetimes.variants(source, name, header, rows)
+        result += measured_kmc_packed_bits.variants(source, name, header, rows)
+        result += measured_kmc_vector_square.variants(source, name, header, rows)
+        result += measured_kmc_wrappers.variants(source, name, header, rows)
+        result += measured_stack_records.variants(source, name, header, rows)
     if toolchain.startswith('ido-7.1'):
         return result
     target, candidate = (_instructions(rows, side) for side in (1,2))

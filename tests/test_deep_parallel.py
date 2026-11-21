@@ -714,6 +714,23 @@ def test_guarded_offset_index_runs_in_the_bounded_local_lane(monkeypatch):
     assert tried == [child]
 
 
+def test_record_init_shapes_run_in_the_bounded_local_lane(monkeypatch):
+    from decomprepair import record_init_shapes
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    fn = {**net.function(), 'asm': ''}
+    child = fn['best_source'] + '\n/* counter-indexed records */'
+    monkeypatch.setattr(record_init_shapes, 'variants', lambda *args: [('counter_stride_inline', child)])
+    search = deep_permuter.Search(net, 1, 6, Log())
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or 20)
+
+    assert search.operand_order_pass(AGENT, proj, fn, 180, None) == 20
+    assert tried == [child]
+
+
 def test_guarded_offset_index_reaches_the_shared_counter_on_an_m2c_draft():
     """A 3-loop GCC 2.7.2 function's saved best (m2c's guarded do-whiles with byte offsets): the family's last
     child is the one that judged 180 -> 20 there, before the frame trim finished it."""
@@ -802,3 +819,98 @@ def test_loop_cursor_pass_scores_parallel_record_cursor(monkeypatch):
     assert search.loop_cursor_pass(AGENT, net.project_row('game'), fn, 35, None) == 15
     assert len(tried) == 1
     assert 'consume(*base, base[1]);' in tried[0]
+
+
+@pytest.mark.parametrize('module, family', [('case_split_combinations', 'case_temporary_split_combined'),
+                                            ('struct_store_raw_offsets', 'struct_store_raw_offset'),
+                                            ('arm_local_return_fold', 'packed_return_fold')])
+def test_case_split_combinations_and_raw_field_stores_run_in_the_local_lane(monkeypatch, module, family):
+    import importlib
+
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    fn = {**net.function(), 'asm': ''}
+    child = fn['best_source'] + f'\n/* {family} */'
+    monkeypatch.setattr(importlib.import_module('decomprepair.' + module), 'variants', lambda *args: [(family, child)])
+    search = deep_permuter.Search(net, 1, 6, Log())
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or 0)
+
+    assert search.operand_order_pass(AGENT, proj, fn, 240, None) == 0
+    assert tried == [child]
+
+
+def test_float_sum_split_runs_in_the_bounded_local_lane(monkeypatch):
+    from decomprepair import float_sum_split
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    fn = {**net.function(), 'asm': ''}
+    child = fn['best_source'] + '\n/* split float sum */'
+    monkeypatch.setattr(float_sum_split, 'variants', lambda *args: [('float_sum_split', child)])
+    search = deep_permuter.Search(net, 1, 6, Log())
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or 20)
+
+    assert search.operand_order_pass(AGENT, proj, fn, 180, None) == 20
+    assert tried == [child]
+
+
+def test_global_store_forward_runs_in_the_bounded_local_lane(monkeypatch):
+    from decomprepair import global_store_forward
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    fn = {**net.function(), 'asm': ''}
+    child = fn['best_source'] + '\n/* global forwarded */'
+    monkeypatch.setattr(global_store_forward, 'variants',
+                        lambda *args: [('global_store_forward_unsigned', child)])
+    search = deep_permuter.Search(net, 1, 6, Log())
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or 20)
+
+    assert search.operand_order_pass(AGENT, proj, fn, 180, None) == 20
+    assert tried == [child]
+
+
+@pytest.mark.parametrize('module,family', [('arm_store_sink', 'arm_store_sink_swap'),
+                                           ('global_copy_forward', 'global_copy_forward')])
+def test_arm_store_sink_and_global_copy_forward_run_in_the_bounded_local_lane(monkeypatch, module, family):
+    import importlib
+
+    from tests.test_permute import AGENT
+
+    library = importlib.import_module('decomprepair.' + module)
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    fn = {**net.function(), 'asm': ''}
+    child = fn['best_source'] + '\n/* ' + module + ' */'
+    monkeypatch.setattr(library, 'variants', lambda *args: [(family, child)])
+    search = deep_permuter.Search(net, 1, 6, Log())
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or 20)
+
+    assert search.operand_order_pass(AGENT, proj, fn, 180, None) == 20
+    assert tried == [child]
+
+
+def test_loop_symbol_base_block_runs_in_the_bounded_local_lane(monkeypatch):
+    from decomprepair import loop_symbol_base_block
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    fn = {**net.function(), 'asm': ''}
+    child = fn['best_source'] + '\n/* base kept out of the loop pass */'
+    monkeypatch.setattr(loop_symbol_base_block, 'variants',
+                        lambda *args: [('loop_symbol_base_block', child)])
+    search = deep_permuter.Search(net, 1, 6, Log())
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or 20)
+
+    assert search.operand_order_pass(AGENT, proj, fn, 180, None) == 20
+    assert tried == [child]

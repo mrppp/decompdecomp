@@ -27,11 +27,13 @@ from . import (
     boundary_investigations,
     claim_state,
     compiler_experiments,
+    compiler_passes,
     focused_agents,
     local_experiments,
     polish_automation,
     repair_search,
     reviewed_search_seeds,
+    score_permutations,
     search_brief,
 )
 from .engine import RomNetwork
@@ -71,6 +73,7 @@ GUIDES = {
     "asset-discovery": "advisory region claims, format investigations and evidence-based proposals",
     "agent-experiments": "repair families, candidate revisions, compiler trials and recovery",
     "workflow": "the matching loop, reading diffs, priorities",
+    "near-match": "finishing a near-match: combining neutral edits, compiler passes, register priorities",
     "mips": "MIPS registers, calling convention, delay slots, types from instructions",
     "m2c": "reading the machine-generated draft",
     "data": "globals, strings, tables, floats, data you define",
@@ -687,6 +690,10 @@ HANDLERS: dict[str, Callable[..., str]] = {
     "compile_patch": agent_tokens.patch,
     "compile_variants": agent_tokens.variants,
     "compiler_experiments": compiler_experiments.run,
+    "compiler_passes": lambda net, agent, slug, function, revision, passes=None:
+        compiler_passes.run(net, agent, slug, function, revision, passes),
+    "score_permutations": lambda net, agent, slug, function, revision, statements=None, patches=None, max=64:
+        score_permutations.run(net, agent, slug, function, revision, statements, patches, max),
     "get_compiler_trial": compiler_experiments.retrieve,
     "review_search_seed": reviewed_search_seeds.review,
     "get_search_brief": search_brief.read,
@@ -788,7 +795,7 @@ PUBLISH_AFTER = frozenset({"edit_context", "rename_symbol", "split_function", "j
 
 # Tools whose work is judging a candidate: the check before them reads only what a judge reads.
 JUDGE_TOOLS = frozenset({"compile_and_diff", "compile_patch", "compile_variants", "compile_family", "try_local_repairs",
-                         "try_compiler", "compiler_experiments",
+                         "try_compiler", "compiler_experiments", "compiler_passes", "score_permutations",
                          # (they read and write the database, not the saved files: release_function waited 3.2 s
                          # a call for the project's lock, behind other helpers' full checks)
                          "claim_function", "release_function", automatic_assignment.RELEASE, "add_note"})
@@ -797,7 +804,9 @@ REPAIR_CAPTURE_TOOLS = frozenset({'compile_and_diff', 'compile_patch', 'compile_
                                  'edit_file', 'edit_context', 'redraft'})
 
 
-ROM_ONLY = {"watch_in_emulator","compare_behaviour","compare_candidate_behaviour","get_data_unit","compile_data","claim_data","release_data","claim_port_fix","release_port_fix","check_for_pc","fix_for_pc","claim_asset_region","inspect_asset_region","preview_asset_region","propose_asset_region","defer_asset_region","review_search_seed","get_boundary_evidence", "suggest_boundary", "get_context", "edit_context", "split_function", "redraft", "search_flags"}
+ROM_ONLY = {"watch_in_emulator","compare_behaviour","compare_candidate_behaviour","get_data_unit","compile_data","claim_data","release_data","claim_port_fix","release_port_fix","check_for_pc","fix_for_pc","claim_asset_region","inspect_asset_region","preview_asset_region","propose_asset_region","defer_asset_region","review_search_seed","get_boundary_evidence", "suggest_boundary", "get_context", "edit_context", "split_function", "redraft", "search_flags",
+            # GCC pass dumps and the standalone judge worker are ROM-mode (compiler_passes.py, score_permutations.py)
+            "compiler_passes", "score_permutations"}
 FORK_ONLY = {"read_file", "search_code", "edit_file", "file_status", "split_file", "join_functions", "tidy_done", "tidy_file",
              "standins_for"}
 LTCG_ONLY = {"standins_for"}  # only projects of games built with link-time code generation have harness/ files
@@ -1004,15 +1013,17 @@ def _invoke_once(net: RomNetwork, agent: Agent, slug: str, name: str, args: dict
         if progress is not None:
             # (a compile reads only the manifest and the headers: Progress.check_for_judging)
             if _judge_preflight(name, args):
+                # A claim never waits behind the autosave's check of the folder (Progress.check_for_claim).
+                check = progress.check_for_claim if name == 'claim_function' else progress.check_for_judging
                 function = args.get('function', '')
                 if function and ',' not in function:
                     # Resolve on the DB snapshot, then check the held function's
                     # saved files along with the shared judge inputs.
                     with progress.view():
                         function = _named(net, agent, slug, args, name)['function']
-                    progress.check_for_judging(slug, function=function)
+                    check(slug, function=function)
                 else:
-                    progress.check_for_judging(slug)
+                    check(slug)
             else:
                 progress.sync(slug, force=True)
         publish = name in PUBLISH_AFTER
@@ -1092,6 +1103,9 @@ def _dispatch(net,agent,slug,name,args, *, count_usage=True):
         tracking = track_matches(slug, agent.id) if name in REPAIR_CAPTURE_TOOLS else nullcontext([])
         with (net.progress.view() if compact_handshake else nullcontext(), tracking as matches):
             result=HANDLERS[name](net,agent,slug,**named)
+        if name == 'claim_function' and isinstance(result, str):
+            from .claim_state import claimed_name
+            result += focused_agents.convert(net, agent, slug, claimed_name(net, agent, slug, named))
         if name in {'get_function','get_assembly'} and args.get('function') != named.get('function'):
             result = f"Resolved read {str(args.get('function'))[:200]!r} to {named['function']}. This does not rename or create a function.\n"+result
         if handshake and name == 'project_info':
@@ -1351,6 +1365,22 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
         trials may retain earlier C. Each patch starts from the original snapshot. With combine=true, send
         2–5 patches and reserve one trial for nonoverlapping edits that improve different target instructions."""
         return await run(ctx, 'compile_variants', function=function, revision=revision, patches=patches, combine=combine)
+
+    @tool
+    async def compiler_passes(ctx: Context, function: str, revision: str, passes: list[str] | None = None) -> str:
+        """Near-matches: dump 1-4 of the compiler's own passes for your candidate revision (rtl, jump, cse, loop,
+        cse2, flow, combine, sched, lreg, greg, sched2, jump2, dbr; default jump, greg, dbr) and its register
+        allocation priorities. GCC-family compilers in ROM projects; diagnostic only, records nothing."""
+        return await run(ctx, 'compiler_passes', function=function, revision=revision, passes=passes)
+
+    @tool
+    async def score_permutations(ctx: Context, function: str, revision: str, statements: list[str] | None = None,
+                                 patches: list[dict] | None = None, max: int = 64) -> str:
+        """Judge up to 64 candidates at once with the exact judge: every order of 2-6 statements (exact whole lines
+        of your candidate), or every combination of 2-6 old/new patches. Only a candidate that beats the saved best
+        is recorded (through compile_and_diff); otherwise nothing is recorded and no move-on count is spent. ROM projects."""
+        return await run(ctx, 'score_permutations', function=function, revision=revision, statements=statements,
+                         patches=patches, max=max)
 
     @tool
     async def compiler_experiments(ctx: Context, function: str, revision: str, trials: list[CompilerTrial]) -> str:
@@ -1783,8 +1813,8 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
 
     @tool
     async def guide(ctx: Context, topic: str = "") -> str:
-        """Decompilation know-how. Call without a topic for the list (workflow, mips, gcc-kmc, ido, m2c,
-        data, structs, n64, naming)."""
+        """Decompilation know-how. Call without a topic for the list (workflow, near-match, mips, gcc-kmc, ido,
+        m2c, data, structs, n64, naming)."""
         return await run(ctx, "guide", topic=topic)
 
     @tool

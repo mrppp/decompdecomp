@@ -202,7 +202,11 @@ and click **Play**. The adapter uses N64ModernRuntime's VI state and RT64's Meta
 continues to run game threads, input, audio and saves. It sends RT64 a word-swapped RDRAM snapshot and retains the
 software RDP's writes to the game's memory. Decompilation, N64Recomp and MIPS interpretation share the same
 execution path as the built-in runtime. Desktop Play is verified on a partially decompiled demo on Apple Silicon.
-Retail compatibility, RT64 exports, and other desktop platforms remain open.
+The adapter forwards the game's VI feature settings, including gamma. Interlaced modes use both fields from
+libultra's VI mode table and alternate them at retrace, including when the game keeps the same buffer. It uses the
+full scanout from game memory when RT64 has cached only part of the framebuffer selected by the VI. This restored the
+missing lower portion of the picture in a matched SDL3 and Metal replay of a retail race.
+Broader retail renderer accuracy, RT64 exports, and other desktop platforms remain open.
 
 ROM offsets the game uses as numbers (where an archive starts in the cartridge) and the values the N64's boot leaves
 in low memory for libultra are defined by Compile for PC too (`port/fixed_symbols.py`): offsets as symbols at those
@@ -265,6 +269,8 @@ automatic name to the name library detection found (`play.library_names`). What 
 functions it names by its own addresses, goes in `consoles/n64/port_wasm/games/<the ROM's SHA-1, 12 digits>.c`,
 compiled for that game alone (V-Rally's, where the host was written). A function a game runs with no C stops it
 there, named: matched C, or C only the port has (`port/wasm/src/`), lets it go on.
+When matching C relies on the console compiler's stack layout or on a value left in a register, an address in the
+ROM's `.original` file in that same directory selects N64Recomp or the MIPS interpreter. A port-specific source override can supply portable C.
 
 What the matched C gets away with on the console, the build adapts to:
 - arguments left in registers become explicit (`adapt.py`'s thunks, with MIPS register words for the rest);

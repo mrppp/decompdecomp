@@ -854,7 +854,7 @@ function renderAutopilot(ov) {
   const run = $("crossGameRun"), stop = $("crossGameStop");
   stop.hidden = !run._working || $("crossGameLog")._slug !== ov.slug;
   run.hidden = !stop.hidden;
-  const busy = ov.twins?.state === 'running' || ov.autopilot?.state === 'running';
+  const busy = ov.twins?.state === 'running' && !!ov.twins.cross_job;
   run.disabled = !!run._working || busy;
   run.textContent = busy || run._working ? 'Searching…' : 'Start search';
   const logState = $("crossGameLog");
@@ -926,7 +926,7 @@ function renderAutopilot(ov) {
   const count = cross.counts.match || 0, tried = Object.values(cross.counts).reduce((a, b) => a + b, 0);
   $("crossGamePanel").hidden = false;
   $("crossGameEmpty").hidden = !!tried || !!run._working || logState._slug === ov.slug;
-  $("crossGameSummary").innerHTML = `<div class="deep-sweep-counts" aria-label="Cross-game results"><button type="button" class="deep-metric" data-cross-metric="matches" aria-haspopup="dialog"><b class="cross-match-count">${count.toLocaleString()}</b><span>Matched<span aria-hidden="true">↗</span></span></button><button type="button" class="deep-metric" data-cross-metric="improved" aria-haspopup="dialog"><b>${(cross.counts.improved || 0).toLocaleString()}</b><span>Improved<span aria-hidden="true">↗</span></span></button><button type="button" class="deep-metric" data-cross-metric="all" aria-haspopup="dialog"><b>${tried.toLocaleString()}</b><span>Checked<span aria-hidden="true">↗</span></span></button></div>`;
+  $("crossGameSummary").innerHTML = `<div class="deep-sweep-counts" aria-label="Cross-game results"><button type="button" class="deep-metric" data-cross-metric="matches" aria-haspopup="dialog"><b class="cross-match-count">${count.toLocaleString()}</b><span>Matched<span aria-hidden="true">↗</span></span></button><button type="button" class="deep-metric" data-cross-metric="improved" aria-haspopup="dialog"><b>${(cross.counts.improved || 0).toLocaleString()}</b><span>Improved<span aria-hidden="true">↗</span></span></button><button type="button" class="deep-metric" data-cross-metric="all" aria-haspopup="dialog"><b>${tried.toLocaleString()}</b><span>Checked<span aria-hidden="true">↗</span></span></button>${cross.counts.compiler ? `<button type="button" class="deep-metric" data-cross-metric="compiler" aria-haspopup="dialog"><b>${cross.counts.compiler.toLocaleString()}</b><span>Compiler leads<span aria-hidden="true">↗</span></span></button>` : ''}</div>`;
   $("crossGameSummary").querySelectorAll('[data-cross-metric]').forEach(button=>{button.onclick=()=>openCrossGameResults(ov,button.dataset.crossMetric);});
   if(S.dialogKind==='cross-game-results' && $('dialogBody').dataset.crossSlug===ov.slug)renderCrossGameResults(ov);
   const box = $("autopilot"), ap = ov.autopilot, tw = ov.twins, pm = ov.permuter;
@@ -940,7 +940,9 @@ function renderAutopilot(ov) {
     $('apTimingText').textContent = `Generation ${seconds('generation')} · Compiler prep ${seconds('preparation')} · Compile ${seconds('compile')} · Compiler wait ${seconds('compiler_wait')} · Link ${seconds('link')} · Scoring ${seconds('scoring')} · Database reads ${seconds('database_reads')} · Database writes ${seconds('database_writes')}. Cumulative worker time; parallel totals can exceed elapsed time.`;
   }
   const running = ap && ap.state === "running";
-  const twinsRunning = tw && tw.state === "running";
+  const manualSearch = tw?.state === "running" && !!tw.cross_job;
+  const paused = !!ap?.paused_for_search;
+  const twinsRunning = tw && tw.state === "running" && !manualSearch;
   box.classList.toggle("on", !!(running || twinsRunning));
   const queued = !!running && ap.phase === "queued";  // (a few autopilots run at once across every project: engine/autopilot.py)
   const reuseRunning = twinsRunning || (running && ap.phase === "twins");
@@ -950,7 +952,12 @@ function renderAutopilot(ov) {
   const perm = pm && (pm.tried || pm.state === "running")
     ? ` The permuter ${pm.state === "running" ? `is rewriting near misses${pm.threads ? ` on ${plural(pm.threads, "thread")}` : ""}${pm.current ? ` (now ${pm.current})` : ""}` : "rewrote near misses"}: ${plural(pm.tried, "function")}, ${pm.matched} matched.` : "";
   const twinsDone = (ap && ap.twins) || (tw && tw.matched) || 0;
-  if (queued && !twinsRunning) {
+  if (paused) {
+    $("apBar").hidden = true;
+    $("apTitle").textContent = "Autopilot paused for cross-game search";
+    $("apSub").textContent = "Autopilot will resume when the search ends.";
+    $("apBtn").textContent = "Stop";
+  } else if (queued && !twinsRunning) {
     $("apTitle").textContent = "Autopilot: waiting for its turn";
     $("apSub").textContent = `Other games' autopilots are running; this one starts when one of them ends. Agents can work meanwhile.${perm}`;
     $("apBtn").textContent = "Stop";
@@ -990,60 +997,72 @@ function renderAutopilot(ov) {
       : "Autopilot matches identical copies of matched code and tries every function's machine draft (m2c) through the judge") + `; whatever matches costs no agent time.${perm}`;
     $("apBtn").textContent = "Run autopilot";
   }
+  $("apBtn").disabled = !!$("apBtn")._working || (manualSearch && !paused);
   $("apBtn").onclick = async () => {
+    if ($("apBtn").disabled) return;
+    const stopAutopilot = paused || running || twinsRunning;
     const label = $("apBtn").textContent;
+    $("apBtn")._working = true;
     $("apBtn").disabled = true;
-    $("apBtn").textContent = running || twinsRunning ? "Stopping…" : "Starting…";
+    $("apBtn").textContent = stopAutopilot ? "Stopping…" : "Starting…";
     try {
-      S.ov = await api("/api/autopilot", { method: "POST", body: { slug: S.slug, action: running || twinsRunning ? "stop" : "start" } });
+      S.ov = await api("/api/autopilot", { method: "POST", body: { slug: S.slug, action: stopAutopilot ? "stop" : "start" } });
       renderAutopilot(S.ov);
-    } catch (e) { $("apBtn").textContent = label; toast(esc(e.message), "err"); } finally { $("apBtn").disabled = false; }
+    } catch (e) { $("apBtn").textContent = label; toast(esc(e.message), "err"); } finally {
+      $("apBtn")._working = false;
+      $("apBtn").disabled = S.ov?.twins?.state === 'running' && !!S.ov.twins.cross_job && !S.ov?.autopilot?.paused_for_search;
+    }
   };
 }
 
-let crossGameDrawerMatches = null;
+let crossGameDrawerResults = null;
 async function openCrossGameResults(ov, filter='matches') {
   const slug=ov.slug;
-  crossGameDrawerMatches=null;
-  dialog('Matches from other games', `<p class="small muted">Saved results across searches. Only verified byte matches count toward progress.</p><label class="field"><span>Show</span><select id="crossGameFilter"><option value="matches">Verified matches</option><option value="improved">Recent improvements</option><option value="all">Recent checks</option></select></label><p id="crossGameDrawerStatus" class="small muted" role="status"></p><ol class="transfer-list" id="crossGameRecent"></ol>`, 'cross-game-results');
+  crossGameDrawerResults=null;
+  dialog('Matches from other games', `<p class="small muted">Saved results across searches. Only verified byte matches count toward progress.</p><label class="field"><span>Show</span><select id="crossGameFilter"><option value="matches">Verified matches</option><option value="improved">Recent improvements</option><option value="compiler">Compiler leads</option><option value="all">Recent checks</option></select></label><p id="crossGameDrawerStatus" class="small muted" role="status"></p><ol class="transfer-list" id="crossGameRecent"></ol>`, 'cross-game-results');
   $('dialogBody').dataset.crossSlug=slug;
   $('crossGameFilter').value=filter;
   renderCrossGameResults(ov);
   const active=()=>S.slug===slug && S.dialogKind==='cross-game-results' && $('dialogBody').dataset.crossSlug===slug;
   const status=$('crossGameDrawerStatus');
-  const finish=beginWork(status,'Loading saved matches',[], '');
+  const finish=beginWork(status,'Loading saved results',[], '');
   try {
     const data=await api(`/api/cross-game?slug=${encodeURIComponent(slug)}&all_matches=1`);
-    if(active()){ crossGameDrawerMatches=data.results.matches; $('crossGameDrawerStatus').textContent=''; renderCrossGameResults({...ov,cross_game:data.results}); }
-  } catch(error){if(active())showJobError(status,`Could not load all matches: ${error.message}`);}
+    if(active()){ crossGameDrawerResults=data.results; $('crossGameDrawerStatus').textContent=''; renderCrossGameResults({...ov,cross_game:data.results}); }
+  } catch(error){if(active())showJobError(status,`Could not load saved results: ${error.message}`);}
   finally{finish();if(status._workStatus?.dataset.state==='done')status._workStatus.hidden=true;}
 }
 function renderCrossGameResults(ov) {
   const cross = {...(ov.cross_game || {counts:{},recent:[]})};
-  if(crossGameDrawerMatches){
-    const merged=new Map([...crossGameDrawerMatches,...(cross.matches || [])].map(row=>[JSON.stringify([row.target,row.source_slug,row.source,row.created_at]),row]));
-    cross.matches=[...merged.values()].sort((a,b)=>(b.created_at || 0)-(a.created_at || 0));
+  if (crossGameDrawerResults) {
+    for (const key of ['matches', 'compiler_leads']) {
+      const rows = [...(crossGameDrawerResults[key] || []), ...(cross[key] || [])];
+      const merged = new Map(rows.map(row => [JSON.stringify([row.target,row.source_slug,row.source,row.created_at]), row]));
+      cross[key] = [...merged.values()].sort((a,b) => (b.created_at || 0) - (a.created_at || 0));
+    }
   }
   const run = $("crossGameRun"), tried = Object.values(cross.counts).reduce((a,b)=>a+b,0);
-    const filter = $("crossGameFilter").value;
-    const rows = filter === 'matches' ? (cross.matches || cross.recent.filter(r => r.outcome === 'match')) : filter === 'improved' ? cross.recent.filter(r => r.outcome === 'improved') : cross.recent;
+  const filter = $("crossGameFilter").value;
+  const rows = filter === 'matches' ? (cross.matches || cross.recent.filter(r => r.outcome === 'match'))
+    : filter === 'compiler' ? (cross.compiler_leads || cross.recent.filter(r => r.outcome === 'compiler'))
+    : filter === 'improved' ? cross.recent.filter(r => r.outcome === 'improved') : cross.recent;
     const list = $("crossGameRecent");
     const expanded = new Set([...list.querySelectorAll('details[open]')].map(d => d.dataset.transferDetail));
     list.innerHTML = rows.map((r) => {
       const detailKey = encodeURIComponent(JSON.stringify([ov.slug, r.created_at, r.target, r.source_slug, r.source, r.reason]));
-      const matched = r.outcome === 'match', improved = r.outcome === 'improved';
-      const status = matched ? 'Verified byte match' : improved ? 'Improved · not matched' : r.outcome === 'miss' ? 'Not matched' : r.outcome === 'skip' ? 'Skipped' : r.outcome === 'asm' ? 'Assembly only' : r.outcome;
+      const matched = r.outcome === 'match', improved = r.outcome === 'improved', compilerLead = r.outcome === 'compiler';
+      const status = matched ? 'Verified byte match' : compilerLead ? 'Exact with alternate compiler' : improved ? 'Improved · not matched' : r.outcome === 'miss' ? 'Not matched' : r.outcome === 'skip' ? 'Skipped' : r.outcome === 'asm' ? 'Assembly only' : r.outcome;
       const similarity = (r.reason || '').match(/similar code \((\d+)%\)/);
       const score = (r.reason || '').match(/score\s+(\d+)/);
       const previous = (r.reason || '').match(/previous score\s+(\d+|None)/);
-      const scoreText = matched ? 'Exact match' : score ? previous && previous[1] !== 'None' ? `${previous[1]} → ${score[1]}` : previous ? `First score: ${score[1]}` : `Score: ${score[1]}` : 'No score';
+      const scoreText = matched ? 'Exact match' : compilerLead ? 'Review compiler settings' : score ? previous && previous[1] !== 'None' ? `${previous[1]} → ${score[1]}` : previous ? `First score: ${score[1]}` : `Score: ${score[1]}` : 'No score';
       const targetLink = `<button class="fn" type="button" data-transfer-function="${esc(r.target)}" data-slug="${esc(ov.slug)}" title="Open target function"><b>${esc(r.target)}</b></button>`;
       const sourceLink = r.source_slug ? `<button class="fn" type="button" data-transfer-function="${esc(r.source)}" data-slug="${esc(r.source_slug)}" title="Open original function in ${esc(r.game)}">${esc(r.source)}</button>` : esc(r.source);
       const hint = similarity ? `Assembly similarity: ${similarity[1]}%` : '';
       return `<li class="transfer-row"><div class="transfer-target">${targetLink}<span class="transfer-status ${matched ? 'verified' : improved ? 'improved' : ''}">${esc(status)}</span></div>
         <div class="transfer-source"><span>From ${esc(r.game)}</span>${sourceLink}</div>
         <div class="transfer-score ${improved ? 'improved' : ''}" title="${esc(r.reason || (matched ? 'The receiving game verified identical bytes.' : 'No scored result.'))}"><strong>${esc(scoreText)}</strong><span>${matched ? 'Byte for byte' : score ? 'Mismatch score · lower is better' : hint || 'Not compiled'}</span>${score && hint ? `<span>${hint}</span>` : ''}</div>${!matched && r.reason ? `<details class="transfer-diagnostic" data-transfer-detail="${esc(detailKey)}"${expanded.has(detailKey) ? " open" : ""}><summary>Check details</summary><p>${esc(r.reason.split(';').filter(part=>part.trim()!=='transfer').join(' · '))}</p></details>` : ''}</li>`;
-    }).join('') || `<li class="transfer-empty">${filter === 'matches' ? run._working ? 'Searching indexed matches first. Candidate checks and rejection reasons appear here as they finish.' : tried ? 'No exact matches from these checks yet. Choose Recent checks to see why candidates did not pass.' : 'Start a search to check saved matches first, then other projects and local SDKs.' : filter === 'improved' ? 'No partial improvements among recent attempts.' : 'No recent transfer attempts.'}</li>`;
+    }).join('') || `<li class="transfer-empty">${filter === 'matches' ? run._working ? 'Searching indexed matches first. Candidate checks and rejection reasons appear here as they finish.' : tried ? 'No exact matches from these checks yet. Choose Recent checks to see why candidates did not pass.' : 'Start a search to check saved matches first, then other projects and local SDKs.' : filter === 'improved' ? 'No partial improvements among recent attempts.' : filter === 'compiler' ? 'No exact results under alternate compiler settings yet.' : 'No recent transfer attempts.'}</li>`;
 
   $("crossGameRecent").onclick = e => {
     const button = e.target.closest("button[data-transfer-function]");

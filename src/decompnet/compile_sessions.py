@@ -1,4 +1,4 @@
-"""Private, bounded compiler preparation for one worker's search, never a match cache."""
+"""Private, bounded compiler preparation for one worker's search, with no persistent results."""
 import copy
 import functools
 import json
@@ -29,7 +29,9 @@ class Session:
         self.results = OrderedDict()
         self.bytes = 0
         self.targets = OrderedDict()
+        self.links = None
         self.instructions = OrderedDict()
+        self.alignments = OrderedDict()
         self.metrics = {}
         self.comparisons = OrderedDict()
         self.comparison_sizes = {}

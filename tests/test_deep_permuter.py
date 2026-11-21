@@ -1066,6 +1066,9 @@ def test_targeted_register_pass_compiles_bitwise_and_float_lifetime_candidates(m
     assert search.operand_order_pass(AGENT, proj, fn, 5, None) == 5
     assert len(seen) == 2 and any('a = b & a' in candidate for candidate in seen)
 
+    # Give the independent floating fixture its own compile allowance.
+    search.tested = 0
+    seen.clear()
     field = 'M2C_FIELD(obj, f32 *, 4)'
     draft = f'void f(void *obj) {{ {field} = (compute({field}) * 0.5f) + {field}; }}'
     search.winner_diff = ([('r', 'add.s $f2, $f2, $f0', 'add.s $f0, $f0, $f2')], '')
@@ -1117,6 +1120,29 @@ def test_loop_vector_shape_pass_reaches_the_scheduling_boundary_that_matched_a_d
     assert any('do {' in c and 'repair_scope_1' not in c for c in seen) or len(seen) < 64
 
 
+def test_loop_vector_shape_pass_reaches_the_guard_initializer_scope_that_matched_a_timer_loop(monkeypatch):
+    """A guard's `i = 0;` hoisted before it in a one-shot scope, the copy before the guard sunk: 10 -> 0 in one child."""
+    net = setup(monkeypatch)
+    source = ('extern int D_800C078C;\nvoid f(int arg0) {\n  int slot;\n  unsigned count;\n  unsigned i;\n  int saved;\n'
+              '  slot = arg0 << 4;\n  count = *((volatile unsigned *) (slot + ((unsigned) (&D_800C078C))));\n'
+              '  saved = slot;\n  if (count != 0)\n  {\n    i = 0;\n    do\n    {\n      i += 1;\n    }\n'
+              '    while (i < count);\n  }\n}\n')
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=10,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        # the bare hoist alone is worse; the hoist with the copy sunk into the guard is exact
+        return 0 if 'while (0);' in candidate and 'saved = slot;\n    do' in candidate.replace('  saved', 'saved') else 60
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source, name='f'), 10, None) == 0
+
+
 def test_a_stub_baseline_is_named_before_the_tuning_passes(monkeypatch):
     net = setup(monkeypatch)
     fn = net.function()
@@ -1162,3 +1188,43 @@ def test_deep_search_leaves_a_function_the_user_gave_back_to_the_agents(monkeypa
         db.execute("UPDATE functions SET meta='{\"reopened\": true}'")
     assert net.twins.set_aside_function_asm(net.project_row('game'), net.function()) is None
     assert net.function()['status'] == 'open'
+
+
+def test_neutral_plateau_pass_reaches_a_step_that_pays_off_after_same_score_steps(monkeypatch):
+    """A voice-list walk: its call-site constants written again kept 623, and only then did the staged product give
+    0; its loop written with `goto` scored 280 at once and led no further than 200."""
+    from decompnet.app import draft_repairs
+
+    net = setup(monkeypatch)
+    source = 'void f(int a) {\n    g(a);\n}\n'
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=623,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+
+    def variants(parent, name, arch, asm='', flags=(), labels=None, **_):
+        found = []
+        for family, mark in (('goto', '/*g*/'), ('noise', '/*n*/'), ('inline', '/*i*/'), ('product', '/*p*/')):
+            if mark not in parent:
+                child = parent + mark
+                labels[child] = family
+                found.append(child)
+        return found
+
+    def score(agent, proj, fn, candidate, best, fork):
+        search.tested += 1
+        if '/*g*/' in candidate:
+            return 200 if candidate.count('/*') > 1 else 280  # quick, then nowhere
+        if '/*p*/' in candidate:
+            return 0 if '/*i*/' in candidate else 700  # the payoff needs the neutral step before it
+        return 900 if '/*n*/' in candidate else 623
+
+    monkeypatch.setattr(draft_repairs, 'variants', variants)
+    monkeypatch.setattr(search, '_score', score)
+    assert search.neutral_plateau_pass(AGENT, proj, dict(fn, best_source=source), 623, None) == 0
+    assert search.tested <= 20
+
+
+def test_neutral_frontier_spreads_over_families_first():
+    children = [('a', 1), ('a', 2), ('b', 3), ('a', 4), ('c', 5)]
+    assert deep_permuter.Search.neutral_frontier(children, 4) == [('a', 1), ('b', 3), ('c', 5), ('a', 2)]
