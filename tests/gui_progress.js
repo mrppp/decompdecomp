@@ -151,7 +151,7 @@ async function main() {
   }
   // With helpers working, a deep pass asks first: declined, nothing starts and the button stays as it was.
   for (const accept of [false, true]) {
-    const test = setup("steering", '$("deepSweepStart").onclick = async () => {', '\n};', "deepSweepLog", "deepSweepStart");
+    const test = setup("steering", 'async function startDeepSweep() {', '\n}\n', "deepSweepLog", "deepSweepStart");
     test.ctx.setDeepRunVisibility = () => {};
     test.ctx.S.sessions = [{state: "working"}, {state: "waiting"}, {state: "stopped"}];
     let asked = "", requests = 0;
