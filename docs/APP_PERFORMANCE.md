@@ -19,12 +19,21 @@ caches when the database's revisions show the app changed something:
 - **The permuter** (`app/permuter_worker.py`).
 - **Read-only tool calls**, answered by the MCP gateway itself (`gateway/src/native.rs`) or the tool reader
   (`app/tool_reader.py`): docs/MCP_GATEWAY.md.
+- **Compile and judge work for attempts** (`app/attempt_workers.py`). The app keeps claim checks,
+  compiler admission, project locks, source rollback and result recording. The worker compiles,
+  links and compares ROM candidates. For project candidates it sequences the ordinary build and
+  runs objdiff, while the app supervises the build command so it has stopped before source can be
+  restored. Worker updates take effect on the next attempt. Set `DECOMP_ATTEMPT_WORKERS=0` to run
+  the same work in the app.
 - **Progress-folder renders** (`app/render_worker.py`).
   - Every publish renders every function's file or a few of them, and always the whole manifest. On v-rally that is
     about half a second of pure Python, most of it `json.dumps(manifest, indent=1)` (which Python 3.12 can't encode
     in C).
   - Two render processes (`DECOMP_RENDER_WORKERS`, 0 turns them off) render, while the app's thread only waits.
   - The app still checks that a render is current and writes the files.
+  - In a source checkout, each process picks up changes to `render_worker_child.py` on its next
+    save. An in-flight render finishes and the app publishes it through the same checks. Worker-only
+    Git updates do this even with file watching disabled.
   - When no worker answers, or one hits an error the app doesn't expect from a render, the app renders on its own
     thread as before.
   - On a copy of v-rally, worker renders were identical to the app's (2,118 files full, 39 partial). With two

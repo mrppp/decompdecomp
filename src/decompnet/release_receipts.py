@@ -28,8 +28,9 @@ def instruction(net, function_id, agent_id, *, project_id=None):
     if not fn or not claim:
         return 'Claim ended; claim another eligible function. Do not release this function again.'
     lease=token(net,fn,claim)
-    return (f'release_function(function={json.dumps(fn["name"])}, claim_token={json.dumps(lease)}, '
-            'notes="what you tried and what is left")')
+    return (f'release_function(function={json.dumps(fn["name"])}, claim_token={json.dumps(lease)}). '
+            'If you learned something, include notes on the remaining difference and trial outcome. '
+            'You can also include next_experiment with the saved candidate revision and an untested next step.')
 
 
 def operation(kind, *, protect_new=False):
@@ -50,6 +51,11 @@ def operation(kind, *, protect_new=False):
                 row=store.one('SELECT value FROM settings WHERE key=?',key)
                 receipts=json.loads(row['value']) if row else []
                 payload={k:v.get(k) for k in ('notes','not_c','needs','move_on','next_experiment') if k in v}
+                for field in ('handoff', 'room_evidence'):
+                    if v.get(field) is not None:
+                        payload[field] = v[field]
+                if kind == 'function' and payload.get('next_experiment') is None:
+                    payload.pop('next_experiment', None)
                 digest=hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest()
                 supplied=v.get('claim_token') or ''
                 active=current(net,fn,agent)
@@ -79,6 +85,6 @@ def operation(kind, *, protect_new=False):
 
 
 @operation('transport', protect_new=True)
-def transport_release(net, agent, function, notes, project, not_c=False, claim_token=''):
+def transport_release(net, agent, function, notes, project, not_c=False, claim_token='', room_evidence=None):
     """Room requests have the same generation guard as local agent tools; machine calls remain explicit actions."""
-    return net.release(agent,function,notes,project,not_c,claim_token=claim_token)
+    return net.release(agent,function,notes,project,not_c,claim_token=claim_token,room_evidence=room_evidence)

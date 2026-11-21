@@ -31,15 +31,17 @@ from .. import arch, similarity
 from ..elfobj import MASKS_BY_ARCH, Reloc, mask_relocs
 from ..network import NetworkError
 from ..project import compiler_for
+from ..repair_feedback import inherit_capture_policy, without_capture
 from .purpose_work import Executor
 
 log = logging.getLogger("decompdecomp")
 IDENT = re.compile(r"^[A-Za-z_]\w*$")
 _MACHINE = {"EM_PPC": ("ppc", "big"), "EM_PPC64": ("ppc64", "big"), "EM_MIPS": ("mips", None), "EM_ARM": ("arm", "little"),
             "EM_X86_64": ("x86_64", "little"), "EM_386": ("x86", "little")}
-_CACHE_VERSION = 8  # of twins.json: 2 added why code is hand-written assembly, 3 ARM's BIOS call stubs, 4 ARM's
+_CACHE_VERSION = 10  # of twins.json: 2 added why code is hand-written assembly, 3 ARM's BIOS call stubs, 4 ARM's
 # system instructions, 5 COFF objects (PC) and the C names of their symbols, 6 MIPS NOP-only targets, 7 x86-64 ELF
-# objects (PS4), 8 32-bit x86 ELF objects (DOS)
+# objects (PS4), 8 stores the masked prefix for locating donor code inside a ROM function; 9 stores the ELF relocation
+# layout; 10 32-bit x86 ELF objects (DOS)
 # A twin's code that didn't match isn't tried again for this long while neither function's code changes (the
 # same source gives the same result): every agent start's pass would otherwise redo hundreds of compiles (Mario
 # Party 6: about 900, 15 minutes beside the agents). After a while it's tried again: a header can have changed.
@@ -72,6 +74,8 @@ class Print:
     addrs: list[int] = field(default_factory=list)  # ROM projects: the address each relocation fills in
     asm: str = ""  # why no compiler makes this code (asm_reason: consoles/, arch/), or ""
     name: str = ""  # how C writes the function's own name, where its symbol isn't that (Visual C++'s _f@8: f)
+    prefix: str = ""  # first eight masked bytes, for finding a function inside a merged ROM entry
+    layout: list[tuple[int, int]] | None = None  # ELF relocation offsets and types
 
 
 def _mask(code: bytearray, relocs: list[tuple[int, int]], arch: str, order: str) -> None:
@@ -181,6 +185,7 @@ def object_prints(data: bytes) -> dict[str, Print]:
                 name = _watcom_c_name(s.name)
             out[s.name] = Print(_key(bytes(code[lo:lo + s["st_size"]]), [(o, t) for o, t, _ in mine]),
                                 refs, s["st_size"], name=name,
+                                prefix=code[lo:lo + 8].hex(), layout=[(o, t) for o, t, _ in mine],
                                 asm=(reason(raw[lo:lo + s["st_size"]], order == "big", **facts) or "") if reason else "")
     return out
 
@@ -291,6 +296,7 @@ class Job:
     tried: int = 0
     matched: int = 0
     asm: int = 0  # hand-written assembly (twins of asm functions, code no compiler makes), out of agents' way
+    autopilot: bool = False
     cross_job: str | None = None  # UI reconnects to an existing manual search without starting another.
     cross_candidates: int = 0
     cross_tried: int = 0
@@ -397,8 +403,8 @@ class Twins:
         from .metadata_rows import rows as metadata_rows
         rows = metadata_rows(self.net.project_store(proj['id']), ('id','name','unit','meta'), "SELECT id, name, unit, meta FROM functions WHERE project_id=?"
                                   + (" AND status='matched'" if matched_only else "")
-                                  + (" AND id IN (SELECT value FROM json_each(?))" if function_ids is not None else ""),
-                                  proj["id"], *([json.dumps(function_ids)] if function_ids is not None else []))
+                                  + (" AND id IN (SELECT value FROM json_each(?))" if function_ids is not None else "")
+                                  + " ORDER BY id", proj["id"], *([json.dumps(function_ids)] if function_ids is not None else []))
         by_unit: dict[str, list] = defaultdict(list)
         for r in rows:
             by_unit[r["unit"]].append(r)
@@ -426,14 +432,14 @@ class Twins:
                     prints = object_prints(unit.target.read_bytes())
                 except Exception:  # an object pyelftools can't read: no twins for it
                     prints = {}
-                entry = {"mtime": mtime, "prints": {k: [p.key, p.refs, p.size, p.asm, p.name] for k, p in prints.items()}}
+                entry = {"mtime": mtime, "prints": {k: [p.key, p.refs, p.size, p.asm, p.name, p.prefix, p.layout] for k, p in prints.items()}}
                 cache[uname] = entry
                 changed = True
             for r in urows:
                 sym = json.loads(r["meta"] or "{}").get("symbol") or r["name"].split("@")[0]
                 p = entry["prints"].get(sym)
                 if p:
-                    out[r["id"]] = Print(p[0], p[1], p[2], asm=p[3], name=p[4])
+                    out[r["id"]] = Print(p[0], p[1], p[2], asm=p[3], name=p[4], prefix=p[5], layout=p[6])
         if changed:
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -523,6 +529,30 @@ class Twins:
                 db.execute("UPDATE functions SET boost=0 WHERE project_id=? AND boost!=0", (proj["id"],))
                 db.executemany("UPDATE functions SET boost=? WHERE id=?", [(boost, fid) for fid, boost in updates.items()])
         return sum(1 for boost in updates.values() if boost > 0)
+
+    def set_aside_function_asm(self, proj, fn) -> str | None:
+        """One open function whose code no compiler makes (Console.asm_reason: a boot stub with `addi`, a kernel
+        entry...) is set aside as assembly now, so a deep search never spends its time on it: the project-wide pass
+        only runs on its own schedule, and a project the user left idle may not have had it yet. Returns why, or None
+        when the function stays open (or the user gave it back to the agents)."""
+        row = self.net.project_store(proj['id']).one("SELECT * FROM functions WHERE id=? AND status='open'", fn['id'])
+        if row is None or '"reopened"' in (row['meta'] or ''):
+            return None
+        if self.net.fork_slug(proj['slug']):
+            why = getattr(self.prints(proj).get(row['id']), 'asm', '')
+            return why if why and self.net.forks.mark_asm(row, reason=why) else None
+        console = self.net.console(proj)
+        code = row['target'] or b''
+        why = console.asm_reason(code)
+        if not why:  # (asm_reason already refuses an incomplete target: that is not evidence of assembly)
+            return None
+        meta = json.dumps({**json.loads(row['meta'] or '{}'), 'asm_code': why})
+        with self.net.project_store(proj['id']).tx() as db:
+            if not db.execute("UPDATE functions SET status='asm', meta=? WHERE id=? AND status='open' AND meta IS ?",
+                              (meta, row['id'], row['meta'])).rowcount:
+                return None
+            db.execute("DELETE FROM claims WHERE function_id=?", (row['id'],))
+        return why
 
     def set_aside_asm(self, proj) -> int:
         """Unmatched functions whose code no compiler makes (Console.asm_reason) get status 'asm': out of agents'
@@ -641,7 +671,8 @@ class Twins:
                 # In the permuter worker's process: these passes were half of the app's own CPU time
                 return maintenance_tasks.full_pass(self, slug, job)
             except maintenance_tasks.Unavailable:
-                return self._execute_full_pass(slug, job)
+                with without_capture(job.autopilot):
+                    return self._execute_full_pass(slug, job)
 
     def _order_before_pass(self, slug: str, job: Job) -> None:
         """Prepare this project's claim queue before joining the shared background lane."""
@@ -708,7 +739,7 @@ class Twins:
             self.net.cascades.wake()
         return job
 
-    def source_for(self, proj, a, b, includes: bool = False) -> str | None:
+    def source_for(self, proj, a, b, includes: bool = False, *, partial=False) -> str | None:
         """a's code made into b's (names swapped as their relocations say), or None if that can't be said.
         `includes`: (forks) bring a's file's includes along too."""
         prints = self.prints(proj)
@@ -720,7 +751,7 @@ class Twins:
             if names is None:
                 return None
             return self.net.forks.twin_source(proj, a, b, names, includes)
-        source = a["matched_source"]
+        source = a["best_source"] if partial else a["matched_source"]
         if not source:
             return None
         names = rom_renames(self.net.symbols(proj["id"]), source, pa, pb, a["name"], b["name"])
@@ -736,20 +767,71 @@ class Twins:
 
     # ------------------------------------------------------------------ the work
 
-    def try_pair(self, agent, proj, a_id: int, b_id: int) -> str:
-        """match | miss | asm | skip, for a's matched code on its twin b."""
-        a = self.net.project_store(proj['id']).one("SELECT * FROM functions WHERE id=?", a_id)
-        b = self.net.project_store(proj['id']).one("SELECT * FROM functions WHERE id=?", b_id)
-        if a is None or b is None or a["status"] != "matched" or b["status"] != "open":
+    def deep_donor(self, proj, fn):
+        """Prefer a matched twin, then a better saved C draft from this ROM."""
+        if fn['status'] != 'open':
+            return None
+        matched = self.twin_of(proj, fn['id'])
+        if matched is not None:
+            return matched, False
+        if not self.net.is_rom(proj) or self.net.fork_slug(proj['slug']):
+            return None
+        peers = self._deep_peers(proj, fn)
+        eligible = [row for row in peers if row['has_source'] and row['best_score'] is not None and
+                    (fn['best_score'] is None or row['best_score'] < fn['best_score'])]
+        if eligible:
+            return min(eligible, key=lambda row: (row['best_score'], row['id']))['id'], True
+        return None
+
+    def _deep_peers(self, proj, fn):
+        prints = self.prints(proj)
+        target = prints.get(fn['id'])
+        if target is None or target.size < 8 or target.asm:
+            return []
+        ids = [fid for fid, candidate in prints.items() if fid != fn['id'] and candidate.key == target.key]
+        if not ids:
+            return []
+        return self.net.project_store(proj['id']).all(
+            "SELECT id,best_score,best_source IS NOT NULL AS has_source FROM functions WHERE project_id=? AND status='open' "
+            "AND gone_mark IS NULL AND id IN (SELECT value FROM json_each(?))", proj['id'], json.dumps(ids))
+
+    def has_open_deep_twin(self, proj, fn):
+        return self.net.is_rom(proj) and not self.net.fork_slug(proj['slug']) and bool(self._deep_peers(proj, fn))
+
+    def try_improved_deep_twin(self, agent, proj, donor):
+        """Give one worse twin the improved ROM draft through its own judge."""
+        if donor['status'] != 'open' or donor['best_score'] is None or not self.net.is_rom(proj):
+            return 'skip'
+        for peer in self._deep_peers(proj, donor):
+            if peer['best_score'] is None or peer['best_score'] > donor['best_score']:
+                outcome = self.try_pair(agent, proj, donor['id'], peer['id'], partial=True)
+                if outcome not in ('skip', 'known'):
+                    return outcome
+        return 'skip'
+
+    def try_pair(self, agent, proj, a_id: int, b_id: int, *, partial=False) -> str:
+        """Try saved code on an identical target through its own judge."""
+        store = self.net.project_store(proj['id'])
+        a = store.one("SELECT * FROM functions WHERE id=?", a_id)
+        b = store.one("SELECT * FROM functions WHERE id=?", b_id)
+        if (a is None or b is None or a["project_id"] != proj['id'] or b["project_id"] != proj['id']
+                or a['gone_mark'] is not None or b['gone_mark'] is not None or b["status"] != "open"):
             return "skip"
-        if self.net.project_store(proj['id']).one("SELECT 1 FROM claims WHERE function_id=?", b_id):
-            return "skip"  # an agent is on it: its brief names the twin (see twin_of)
+        if partial:
+            if (not self.net.is_rom(proj) or self.net.fork_slug(proj['slug']) or a['status'] != 'open'
+                    or a['best_score'] is None or (b['best_score'] is not None and a['best_score'] >= b['best_score'])):
+                return "skip"
+        elif a["status"] != "matched":
+            return "skip"
+        from .boundary_repairs import blocked
+        if b_id in blocked(self.net, proj) or store.one("SELECT 1 FROM claims WHERE function_id=?", b_id):
+            return "skip"  # A claimed function can still see its twin in the brief.
         with self._lock:
             if b_id in self._trying:
                 return "skip"
             self._trying.add(b_id)
         try:
-            return self._try_pair(agent, proj, a, b)
+            return self._try_pair(agent, proj, a, b, partial=True) if partial else self._try_pair(agent, proj, a, b)
         finally:
             with self._lock:
                 self._trying.discard(b_id)
@@ -1248,8 +1330,8 @@ class Twins:
     def _fork_to_rom(self, agent, proj, other, wanted, mine, job) -> int:
         """Try imported, verified C against identical ROM fingerprints; only the ROM judge accepts it.
 
-        Donor headers are deliberately not installed in the ROM project. Self-contained functions and
-        declarations already available in its context work; missing dependencies remain ordinary misses.
+        Manual searches can verify a donor's per-file compiler and private header before falling back
+        to the destination context.
         """
         from .. import consoles
 
@@ -1262,25 +1344,54 @@ class Twins:
         report(job, 'Reading imported target objects', game=other['name'])
         theirs = self._fork_prints(other, matched_only=True, job=job)
         matched = 0
+        from . import donor_build, donor_relocations
+        from .donor_boundaries import merged_candidates, recover
+        manual = getattr(job, 'cross_exhaustive', False)
+        build = donor_build.Settings(fp) if manual and hasattr(fp, 'root') else None
+        units = {unit.name: unit for unit in fp.units()} if build else {}
+        merged = merged_candidates(self.net, proj, theirs.values(), job) if manual else {}
+        relaxed = donor_relocations.candidates(self.net, proj, theirs.values(), job) if manual else {}
+        label = self.net.symbols(proj['id']).label if relaxed else None
         for a in self.net.project_store(other['id']).all("SELECT id,project_id,name,unit,meta FROM functions WHERE project_id=? AND status='matched'", other["id"]):
             pa = theirs.get(a["id"])
             if pa is None or pa.asm:
                 continue
-            for b_id in wanted.get(pa.key, []):
+            found = list(wanted.get(pa.key, ()))
+            if pa.key in merged and not job.stop.is_set():
+                try:
+                    repaired = recover(self, proj, other, fp, a, pa, merged[pa.key], job)
+                except NetworkError as error:
+                    log.info("twins: unable to recover a boundary for %s: %s", a["name"], error)
+                    repaired = None
+                if repaired is not None:
+                    row, fingerprint = repaired
+                    mine[row['id']] = fingerprint
+                    wanted.setdefault(pa.key, []).append(row['id'])
+                    found.append(row['id'])
+            extra = relaxed.get(pa.key, ())
+            for b_id in dict.fromkeys([*found, *extra]):
                 if job is not None and (job.stop.is_set() or (bounded and (
                         job.reuse_attempts >= job.reuse_limit or time.monotonic() >= job.reuse_deadline))):
                     return matched
                 b = self.net.project_store(proj['id']).one("SELECT * FROM functions WHERE id=? AND status='open'", b_id)
                 if b is None or self.net.project_store(proj['id']).one("SELECT 1 FROM claims WHERE function_id=?", b_id):
                     continue
-                names = renames(pa, mine[b_id], pa.name or a["name"].split("@")[0], b["name"])
+                if b["size"] != pa.size:  # A recovered boundary can shorten an entry from the initial index.
+                    continue
+                target = (mine[b_id] if b_id in found else donor_relocations.donor_refs(pa, b, label))
+                if target is None:
+                    continue
+                names = renames(pa, target, pa.name or a["name"].split("@")[0], b["name"])
                 if names is None or self.net.forks.is_asm(other, a):
                     continue
                 original = self.net.forks._current_source(fp, a)
                 if not original:
                     continue
                 source = apply(original, names)
-                if self._missed(b_id, source, project_id=proj['id']):
+                unit = units.get(a['unit'])
+                settings = build.for_unit(unit) if unit is not None else None
+                known_miss = self._missed(b_id, source, project_id=proj['id'])
+                if known_miss and not settings:
                     continue
                 if job is not None:
                     job.cross_candidates += 1
@@ -1288,14 +1399,25 @@ class Twins:
                 if bounded:
                     job.reuse_attempts += 1
                 report(job, 'Compiling candidate', game=other['name'], function=b['name'], donor=a['name'])
-                outcome, why = self._attempt_twin(agent, proj, a, b, source, origin=f" in {other['name']}", mapping=names)
+                outcome, why = 'skip', ''
+                fallback = None
+                if settings:
+                    try:
+                        outcome, why = donor_build.verify(self.net, proj, b, other, a, names, settings, agent, job, build.headers)
+                    except (NetworkError, OSError, ValueError) as error:
+                        outcome, why = 'skip', str(error)
+                if outcome != 'match' and not known_miss and not (job and job.stop.is_set()):
+                    fallback, detail = self._attempt_twin(
+                        agent, proj, a, b, source, origin=f" in {other['name']}", mapping=names)
+                    if fallback == 'match' or not why:
+                        outcome, why = fallback, detail
                 with self.net.project_store(proj['id']).tx() as db:
                     db.execute("INSERT INTO cross_game_attempts(project_id,function_id,source_project_id,"
                                "source_function_id,outcome,reason,created_at) VALUES(?,?,?,?,?,?,?)",
                                (proj["id"], b_id, other["id"], a["id"], outcome, why[:WHY_CHARS], time.time()))
-                    if outcome == "miss":
+                    if fallback == "miss":
                         db.execute("INSERT OR REPLACE INTO twin_misses(function_id,source_hash,project_id,at,why) "
-                                   "VALUES(?,?,?,?,?)", (b_id, self._miss_key(source), proj["id"], time.time(), why))
+                                   "VALUES(?,?,?,?,?)", (b_id, self._miss_key(source), proj["id"], time.time(), detail))
                 if outcome == "match":
                     if bounded:
                         job.reuse_matched += 1
@@ -1305,9 +1427,9 @@ class Twins:
                         job.cross_matched += 1
         return matched
 
-    def _try_pair(self, agent, proj, a, b) -> str:
+    def _try_pair(self, agent, proj, a, b, *, partial=False) -> str:
         try:
-            source = self.source_for(proj, a, b)
+            source = self.source_for(proj, a, b, partial=True) if partial else self.source_for(proj, a, b)
         except (NetworkError, OSError, ValueError) as e:
             log.info("twins: %s from %s not tried: %s", b["name"], a["name"], str(e)[:WHY_CHARS])
             return "skip"
@@ -1318,8 +1440,15 @@ class Twins:
             return "skip"
         if self._missed(b["id"], source, project_id=proj["id"]):
             return "known"
-        outcome, why = self._attempt_twin(agent, proj, a, b, source)
-        if outcome == "miss":
+        if partial:
+            feedback = {}
+            outcome, why = self._attempt_twin(agent, proj, a, b, source, feedback=feedback, partial=True)
+            if outcome == 'miss' and feedback.get('score') is not None and (
+                    b['best_score'] is None or feedback['score'] < b['best_score']):
+                outcome = 'improved'
+        else:
+            outcome, why = self._attempt_twin(agent, proj, a, b, source)
+        if outcome in ('miss', 'improved'):
             with self.net.project_store(proj['id']).tx() as db:
                 db.execute("INSERT OR REPLACE INTO twin_misses(function_id, source_hash, project_id, at, why) "
                            "VALUES(?,?,?,?,?)", (b["id"], self._miss_key(source), proj["id"], time.time(), why))
@@ -1341,12 +1470,14 @@ class Twins:
         return (res.get("text") or "").splitlines()[0][:WHY_CHARS] if res.get("text") else f"score {res.get('score')}"
 
     def _attempt_twin(self, agent, proj, a, b, source: str, origin: str = "", theirs: bool = False,
-                      similar: bool = False, feedback: dict | None = None, mapping: dict | None = None) -> tuple[str, str]:
+                      similar: bool = False, feedback: dict | None = None, mapping: dict | None = None, *, partial=False) -> tuple[str, str]:
         """match | miss | skip for a's code made into b's (`source`). `theirs`: a is another project's, so the tries
         that take more from a's file (its types, includes, declarations) don't apply: twin_source took its
         declarations already."""
         relation = "adapted from similar verified C in" if similar else "identical to"
         note = f"/* {relation} {a['name']}{origin} (matched), with its names changed by decompdecomp */\n"
+        if partial:
+            note = f"/* Draft from identical target {a['name']}, retargeted and judged independently. */\n"
         if mapping is not None and self.net.is_rom(proj) and not self.net.fork_slug(proj['slug']):
             from .repair_mappings import remember
             remember(self.net, a, b, note + source, mapping)
@@ -1461,7 +1592,7 @@ class Twins:
                 tally['total'] = len(by_target)
                 publish()
                 with Executor(purpose='Identical-function reuse', project=slug, stop=job.stop.set, max_workers=workers) as pool:
-                    list(pool.map(one, by_target.values()))
+                    list(pool.map(inherit_capture_policy(one), by_target.values()))
                 if job.matched == before:
                     break
                 if only is not None:

@@ -1,8 +1,11 @@
+import json
+
 import pytest
 
 from decompnet.app import deep_permuter, draft_repairs, permuter_local
 from decompnet.app.permute import Permuter
 from decompnet.network import NetworkError
+from decompnet.repair_feedback import capture_suppressed
 from tests.test_permute import AGENT, FakeNet, ProjectStub, batches
 
 
@@ -49,6 +52,7 @@ def test_one_function_deep_search_uses_normal_judge_and_keeps_improvements(monke
     net = setup(monkeypatch, imported)
     seen = []
     def judge(self, agent, proj, fn, source, best, fork):
+        assert capture_suppressed()
         seen.append((source, fork))
         score = {'local':20, 'random':0}.get(source, 100)
         if score < best:
@@ -60,6 +64,7 @@ def test_one_function_deep_search_uses_normal_judge_and_keeps_improvements(monke
     batches(monkeypatch, ['local', 'random', 'never tested'])
     log = Log()
     result = deep_permuter.run(net, 'game', 'f', 30, 10, log)
+    assert not capture_suppressed()
     assert result['matched'] and result['tested'] == 2 and result['skipped'] == 1
     assert seen == [('local','fork' if imported else None), ('random','fork' if imported else None)]
     assert net.function()['status'] == 'matched'
@@ -867,3 +872,293 @@ def test_combined_store_reaches_judge_with_one_trial(monkeypatch):
     deep_permuter.run(net, 'game', 'f', 30, 1, Log())
     assert len(seen) == 1
     assert '*out = *p + ((s32)(x * 8) / 2);' in seen[0]
+
+
+def test_deep_local_generator_includes_targeted_mips_repairs():
+    from decompnet.app import draft_repairs
+
+    source = """void f(int flag) {
+    if (flag) { state = 0; goto clean; }
+    if (flag == 2) { send(91, 2); }
+    else { send(91, 3); }
+clean:
+    pending = 0;
+}
+"""
+    asm = 'jal send\naddiu $a0, $zero, 64\njal send\naddiu $a0, $zero, 64\n'
+    labels = {}
+    candidates = draft_repairs.variants(source, 'f', 'mips', asm, labels=labels)
+    assert any(labels[text] == 'target_call_constant' and text.count('send(64,') == 2
+               for text in candidates)
+    assert any(labels[text] == 'out_of_line_guard_failure' and 'decomp_failure:' in text
+               for text in candidates)
+
+
+def test_deep_local_generator_prioritizes_a_proven_loop_sentinel():
+    from decompnet.app import draft_repairs, repair_ranking
+
+    source = """int f(unsigned short *p) {
+    if (*p != 0xFFFF) {
+        do { p++; } while (*p != 0xFFFF);
+    }
+    return *p;
+}
+"""
+    asm = """ori $v0, $zero, 0xffff
+beq $a1, $v0, .Lexit
+nop
+ori $a2, $zero, 0xffff
+.Lloop:
+lhu $a1, 0($a0)
+bne $a1, $a2, .Lloop
+nop
+.Lexit:
+jr $ra
+nop
+"""
+    labels = {}
+    candidates = draft_repairs.variants(source, 'f', 'mips', asm, labels=labels)
+    winner = next(text for text in candidates if labels[text] == 'loop_sentinel_placement')
+    assert 'while (*p != repair_sentinel)' in winner
+    assert repair_ranking.guarded_first([source, winner], labels)[0] == winner
+
+
+def test_linked_case_labels_are_the_first_local_candidate(monkeypatch):
+    from decompnet.app import agent_tokens
+
+    net = setup(monkeypatch)
+    source = 'int f(int k) { switch (k) { case 1: return 3; case 2: return 7; } return 0; }'
+    winner = 'int f(int k) { switch (k) { case 2: return 3; case 1: return 7; } return 0; }'
+    with net.store.tx() as db:
+        db.execute('UPDATE functions SET best_source=?,best_score=1', (source,))
+
+    def measured(search, agent, proj, fn, state, fork):
+        search.winner_source = source
+        search.winner_scope = agent_tokens.target_scope(net,dict(fn),'')
+        search.winner_diff = ([(' ', 'jr $v0', 'jr $v0')], '')
+        search.winner_jump_tables = [{'table':100,'case':1,'target':20,'candidate':10},
+                                     {'table':100,'case':2,'target':10,'candidate':20}]
+        return 1, 0
+
+    seen = []
+    def judge(search, agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        assert best == 1 and candidate == winner
+        with net.store.tx() as db:
+            db.execute("UPDATE functions SET best_source=?,best_score=0,status='matched'", (candidate,))
+        return 0
+
+    monkeypatch.setattr(deep_permuter.Search, '_baseline', measured)
+    monkeypatch.setattr(Permuter, '_score', judge)
+    result = deep_permuter.run(net, 'game', 'f', 30, 1, Log())
+    assert result['matched'] and result['tested'] == 1
+    assert seen == [winner]
+
+
+def test_measured_selector_reaches_judge_before_broad_generation(monkeypatch):
+    from decompnet.app import agent_tokens
+
+    net = setup(monkeypatch)
+    source = 'int f(int n) { int mode = 0; n = helper(n); if (n) mode = 1; return mode; }'
+    with net.store.tx() as db:
+        db.execute('UPDATE functions SET best_source=?', (source,))
+    rows = [('>', '', 'sw $s0, 0x18($sp)'), ('>', '', 'move $s0, $zero'),
+            (' ', 'jal helper', 'jal helper'), (' ', 'nop', 'nop'), ('<', 'move $v1, $zero', '')]
+
+    def measured(search, agent, proj, fn, state, fork):
+        search.winner_source = source
+        search.winner_scope = agent_tokens.target_scope(net,dict(fn),'')
+        search.winner_diff = (rows, '')
+        return 40, 0
+
+    seen = []
+    def judge(search, agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        assert 'n = helper(n); mode = 0;' in candidate
+        with net.store.tx() as db:
+            db.execute("UPDATE functions SET best_source=?,best_score=0,status='matched'", (candidate,))
+        return 0
+
+    monkeypatch.setattr(deep_permuter.Search, '_baseline', measured)
+    monkeypatch.setattr(Permuter, '_score', judge)
+    result = deep_permuter.run(net, 'game', 'f', 30, 1, Log())
+    assert result['matched'] and len(seen)==1
+
+
+def test_measured_float_lifetime_reaches_the_normal_judge_first(monkeypatch):
+    from decompnet.app import agent_tokens
+
+    net = setup(monkeypatch)
+    source = 'void f(void) { float n,d,q; n=read(); d=read(); q=n/d; use(q*q); }'
+    with net.store.tx() as db:
+        db.execute('UPDATE functions SET best_source=?', (source,))
+    rows = [('r','div.s $f2, $f2, $f4','div.s $f6, $f2, $f4'),
+            ('r','mul.s $f2, $f2, $f2','mul.s $f0, $f6, $f6')]
+
+    def measured(search, agent, proj, fn, state, fork):
+        search.winner_source = source
+        search.winner_scope = agent_tokens.target_scope(net,dict(fn),'')
+        search.winner_diff = (rows, '')
+        return 40, 0
+
+    def judge(search, agent, proj, fn, candidate, best, fork):
+        assert 'n /= d; n *= n; use(n);' in candidate
+        with net.store.tx() as db:
+            db.execute("UPDATE functions SET best_source=?,best_score=0,status='matched'", (candidate,))
+        return 0
+
+    monkeypatch.setattr(deep_permuter.Search, '_baseline', measured)
+    monkeypatch.setattr(Permuter, '_score', judge)
+    result = deep_permuter.run(net, 'game', 'f', 30, 1, Log())
+    assert result['matched'] and result['tested']==1
+
+
+def test_volatile_postfix_reaches_judge_before_broad_proposals(monkeypatch):
+    from decompnet.app import agent_tokens
+
+    net = setup(monkeypatch)
+    source = 'extern volatile u8 count; void f(void) { count += 1; consume(); }'
+    with net.store.tx() as db:
+        db.execute('UPDATE functions SET best_source=?', (source,))
+    rows = [
+        (' ', 'lbu $v0, %lo(count)($v0)', 'lbu $v0, %lo(count)($v0)'),
+        (' ', 'addiu $v0, $v0, 1', 'addiu $v0, $v0, 1'),
+        (' ', 'sb $v0, %lo(count)($at)', 'sb $v0, %lo(count)($at)'),
+        (' ', 'jal consume', 'jal consume'),
+        ('|', 'lbu $v0, %lo(count)($v0)', 'nop'),
+    ]
+
+    def measured(search, agent, proj, fn, state, fork):
+        search.winner_source = source
+        search.winner_scope = agent_tokens.target_scope(net,dict(fn),'')
+        search.winner_diff = (rows, '')
+        return 40, 0
+
+    def judge(search, agent, proj, fn, candidate, best, fork):
+        assert candidate==source.replace('count += 1;', 'count++;')
+        with net.store.tx() as db:
+            db.execute("UPDATE functions SET best_source=?,best_score=0,status='matched'", (candidate,))
+        return 0
+
+    monkeypatch.setattr(deep_permuter.Search, '_baseline', measured)
+    monkeypatch.setattr(Permuter, '_score', judge)
+    result = deep_permuter.run(net, 'game', 'f', 30, 1, Log())
+    assert result['matched'] and result['tested']==1
+
+
+def test_targeted_register_pass_compiles_bitwise_and_float_lifetime_candidates(monkeypatch):
+    net = setup(monkeypatch)
+    log = Log()
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=5,best_source=? WHERE name='f'",
+                   ('unsigned f(unsigned x) { unsigned a=x; unsigned b=7; a &= b; return a; }',))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 8, log, fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        return best
+
+    monkeypatch.setattr(search, '_score', score)
+    search.winner_diff = ([('r', 'and $v0, $v0, $v1', 'and $v0, $v1, $v0')], '')
+    assert search.operand_order_pass(AGENT, proj, fn, 5, None) == 5
+    assert len(seen) == 2 and any('a = b & a' in candidate for candidate in seen)
+
+    field = 'M2C_FIELD(obj, f32 *, 4)'
+    draft = f'void f(void *obj) {{ {field} = (compute({field}) * 0.5f) + {field}; }}'
+    search.winner_diff = ([('r', 'add.s $f2, $f2, $f0', 'add.s $f0, $f0, $f2')], '')
+    assert search.operand_order_pass(AGENT, proj, dict(fn, best_source=draft), 5, None) == 5
+    assert any('float repair_float_increment' in candidate for candidate in seen)
+
+
+def test_loop_vector_shape_pass_composes_shapes_that_only_help_together(monkeypatch):
+    net = setup(monkeypatch)
+    source = ('void f(Obj *obj, Bone *bones) {\n    Bone *bone;\n    int k;\n'
+              '    for (k = 0, bone = bones; bone->idx >= 0; k++, bone++) {\n        obj->out[k] = bone->a;\n    }\n}\n')
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=50,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        # neither shape alone helps; the pair is exact
+        return 0 if 'const Bone *bone' in candidate and 'bones[k]' in candidate else 50
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source), 50, None) == 0
+    assert any('const Bone *bone' in c and 'bones[k]' in c for c in seen) and len(seen) <= 15
+
+
+def test_loop_vector_shape_pass_reaches_the_scheduling_boundary_that_matched_a_display_list_function(monkeypatch):
+    """Every source order stayed at 60; splitting the tail with a do { } while (0), its call's global read first, was 0."""
+    net = setup(monkeypatch)
+    source = ('extern int D_8010A4D8;\nextern void *cursor;\nextern void *list;\nint g();\n'
+              'void f(int arg0) {\n    void *t;\n    g(arg0, 2);\n    ((S *)list)->a = 1;\n    ((S *)cursor)->a = 2;\n'
+              '    list += 8;\n    t = cursor + 8;\n    cursor = t;\n    g(arg0, D_8010A4D8, t);\n}\n')
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=60,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        # wrapping alone or hoisting alone stays at 60; the pair is exact
+        return 0 if 'do {' in candidate and 'repair_scope_1 = D_8010A4D8;' in candidate else 60
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source, name='f'), 60, None) == 0
+    assert any('do {' in c and 'repair_scope_1' not in c for c in seen) or len(seen) < 64
+
+
+def test_a_stub_baseline_is_named_before_the_tuning_passes(monkeypatch):
+    net = setup(monkeypatch)
+    fn = net.function()
+    search = deep_permuter.Search(net, 1, 8, Log(), fn)
+    assert search.stub_note() == ''
+    search.winner_diff = ([(' ', 'nop', 'nop')] * 40 + [('<', 'sw $v0, 0($a0)', '')] * 200, '')
+    assert 'it is a stub' in search.stub_note() and '40 of the target' in search.stub_note()
+    search.winner_diff = ([('r', 'addu $v0, $a0, $a1', 'addu $v0, $a1, $a0')] * 240, '')
+    assert search.stub_note() == ''
+
+
+# The ROM's entry point: N64 boot code that clears BSS with `addi` and sets $sp in the delay slot of its jump to main.
+BOOT_STUB = bytes.fromhex('3C08800D25087050' '3C090004252906F0' 'AD000000AD000004' '21080008' '2129FFF8' '1520FFFB' '00000000'
+                          '3C0A8000254A0460' '3C1D8010' '01400008' '27BD2CA0')
+
+
+def _boot_stub_net(monkeypatch, code):
+    from decompnet.app.twins import Twins
+    from decompnet.consoles import get as console
+    net = setup(monkeypatch)
+    net.console = lambda proj: console('n64')
+    net.is_rom = lambda proj: True
+    net.twins = Twins(net)
+    net.forks = None
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET target=?, size=?, meta=NULL", (code, len(code)))
+    return net
+
+
+def test_deep_search_sets_aside_hand_written_assembly_instead_of_searching_it(monkeypatch):
+    net = _boot_stub_net(monkeypatch, BOOT_STUB)
+    monkeypatch.setattr(deep_permuter, '_run', lambda *a, **k: pytest.fail('searched hand-written assembly'))
+    log = Log()
+    result = deep_permuter.run(net, 'game', 'f', 30, 10, log)
+    assert not result['matched'] and result['tested'] == 0 and 'addi' in result['reason']
+    row = net.function()
+    assert row['status'] == 'asm' and 'addi' in json.loads(row['meta'])['asm_code']
+
+
+def test_deep_search_leaves_a_function_the_user_gave_back_to_the_agents(monkeypatch):
+    net = _boot_stub_net(monkeypatch, BOOT_STUB)
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET meta='{\"reopened\": true}'")
+    assert net.twins.set_aside_function_asm(net.project_row('game'), net.function()) is None
+    assert net.function()['status'] == 'open'

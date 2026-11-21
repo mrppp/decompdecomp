@@ -19,6 +19,19 @@ Use try_local_repairs before guessing families: it discovers applicable repairs 
 
 Candidate-quality warnings are agent reports, not proofs. Read get_function(section=quality) for saved compiled alternatives before redoing a historical correction. Use report_candidate_issue with the affected revision and optional compiled alternative rather than relying on prose detection. needs requires original direct-call evidence, never a workaround for exhausted work. Quality reports do not pause agents or automatic workers. Use their evidence to repair the candidate; do not repeat an unchanged failed experiment. An Already tried or No untried response means stop that experiment until source or build inputs change. Use a different evidence-backed repair or release with precise notes. Supporting history and notes: get_function(section=history or notes).
 
+
+## Stalled-claim handoff
+
+When moving on, use release_function with notes explaining why and next_experiment containing
+the saved candidate revision, tried, changed, and title. Describe the tested approach, its
+observed effect or lack of effect, and one untested next step. For an exact patch also give
+old and new; otherwise describe the next diagnostic step in title. If you are on a worse
+candidate, first select the saved best with get_candidate(base="saved_best").
+
+The next claim shows a current handoff, and get_function(section="experiment") supplies its
+validated patch when available. Check the patch through compile_patch. If the candidate or build
+has changed, or the patch has already been tried, work from the new evidence.
+
 ## Assembly paging
 
 Prefer get_assembly(focus='mismatch:N') for a later differing instruction, focus='body' for a bounded post-entry page, or focus='callee_symbol' before reading full assembly pages. get_assembly and last_diff are paged.
@@ -110,3 +123,45 @@ first, within their existing budgets. A larger-score body-correct alternative ca
 a better repair root than a low-score source with misplaced local spills: both are
 retained, but only ordinary exact judging accepts a match. Check the current-input
 failed trials before repeating variants. Unknown store widths are not inferred.
+
+### Search past repairs
+
+When a mismatch persists, call `search_repair_examples(category="types")` (or the
+category that fits). It uses your single live claim for compiler and mismatch context.
+With several claims, pass `function` to choose one or omit it for category-only results.
+Open up to six promising IDs together with `get_repair_examples(ids=[42, 87])`.
+Once an example helps, call `upvote_repair_example(id=42)`. Verify any adapted change
+with the normal judge.
+
+Use `memory_access_order` when the match depends on the sequence or number of loads
+or stores, including volatile accesses. Use `expression_order` for arithmetic and
+other expression ordering, and `addresses` for how an address is calculated.
+
+For a narrow mismatch, pass a unique exact C span as `anchor` to
+`try_local_repairs`. Proposed edits outside that span are skipped. The
+current revision and normal trial limit still apply.
+
+Use `compile_variants(combine=true)` with two to five independent patches
+to reserve one trial for a measured combination. The tool checks two
+nonoverlapping edits together when they recover different target
+instructions from the same measured starting candidate. The normal judge
+decides the combined result.
+
+For a hard claim, `get_function(section="work")` gives the complete current C,
+one objective, the current mismatch and recent measured trials. It reads
+existing measurements. Use the full brief or paged assembly when more
+context would change the next experiment. When Deep Permuter leaves a handoff,
+start with its focused instruction block and the listed measured trials. Test a
+different hypothesis against the saved draft and keep the best verified result
+for the next sweep.
+
+`try_local_repairs(compare=true)` measures up to three choices under the same
+claim budget. Look for the option that recovers your target region, then use
+`get_candidate(base="measured_option", option=NUMBER)` to choose it. The option
+expires when the lease, last attempt or build inputs change. A measured
+regional objective kept in saved C can be handed to the next claim.
+
+For a compiling candidate on an N64 ROM, `compare_candidate_behaviour` can
+compare up to three emulator-recorded calls on the current revision. Use it
+when a return value, sign, or memory write may be wrong. It reports the first
+observable difference and leaves code and exact verdicts to the ordinary judge.

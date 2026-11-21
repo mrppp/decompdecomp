@@ -104,6 +104,26 @@ def job_error(e: BaseException, log_path: Path | None = None) -> str:
             f"the log{where}")
 
 
+class JobLock:
+    """Track the registry owner so a stalled request can report its stack."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.owner = None
+        self._depth = 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.owner = threading.get_ident()
+        self._depth += 1
+
+    def __exit__(self, *exc):
+        self._depth -= 1
+        if not self._depth:
+            self.owner = None
+        self._lock.release()
+
+
 class Jobs:
     """Background work the GUI can follow: imports and installs. A job always ends: done, or an error that says why
     (never `running` forever because of an error nobody caught). Everything goes to the log file too."""
@@ -112,7 +132,7 @@ class Jobs:
         self.jobs: dict[str, dict] = {}
         self.cancel_events: dict[str, threading.Event] = {}
         self.foreground_events: dict[str, threading.Event] = {}
-        self._lock = threading.RLock()  # Some routes reserve a job under this lock before start().
+        self._lock = JobLock()  # Reservations may reenter through start(). Keep this lock free of I/O.
         self.log_path = log_path
         self.logger = file_log(log_path) if log_path else logging.getLogger("decompdecomp")
 
@@ -139,7 +159,7 @@ class Jobs:
         self.closing=True
         for cancel in list(self.cancel_events.values()):cancel.set()
 
-    def start(self, kind: str, fn, *, foreground=True, project=None, cancel_message="Opening the saved project was cancelled.") -> str:
+    def start(self, kind: str, fn, *, foreground=True, project=None, include_recent_log=True, cancel_message="Opening the saved project was cancelled.") -> str:
         """Start a user job immediately; automatic callers opt into background scheduling."""
         with self._lock:
             self.check_start()
@@ -154,7 +174,6 @@ class Jobs:
             self.jobs[jid] = job
             if getattr(self, "closing", False):cancel.set()  # admission may have closed during reservation
         logger = self.logger
-        logger.info("job %s %s started", kind, jid)
 
         def log(line: str) -> None:
             check_cancel()
@@ -182,6 +201,7 @@ class Jobs:
         def run():
             job["thread_id"] = threading.get_native_id()
             try:
+                logger.info("job %s %s started", kind, jid)
                 check_cancel()
                 from ..compiler import background_thread
                 if not interactive.is_set():background_thread()
@@ -206,7 +226,7 @@ class Jobs:
                     job["trace"] = traceback.format_exc()[-TRACE_CHARS:]
                 job["error"] = job_error(e, self.log_path)
                 logger.error("job %s %s failed: %s\n%s", kind, jid, job["error"], traceback.format_exc())
-                tail=recent_log(self.log_path)
+                tail=recent_log(self.log_path) if include_recent_log else ""
                 details=job.get('trace','')
                 if details and details.strip() not in tail:
                     job['log'].extend(['Failure details:',*details.splitlines()])
@@ -368,6 +388,10 @@ class Settings:
     def remove_endpoint(self, eid: str) -> None:
         self.data["endpoints"] = [e for e in self.endpoints() if e["id"] != eid]
 
+    @property
+    def auto_compiler(self) -> bool:
+        return bool(self.data.get("auto_compiler", True))
+
     def public(self) -> dict:
         def masked(e: dict) -> dict:
             out = {k: v for k, v in e.items() if k != "api_key"}
@@ -379,7 +403,7 @@ class Settings:
         return {"agent_accounts": [a | {"signin": agent_kind(a["kind"]).account_signin(a["config_dir"])}
                                     for a in self.accounts()], "endpoints": eps, "api": eps[0] if eps else {},
                 "per_session": self.data.get("per_session", PER_SESSION), "last_project": self.data.get("last_project"),
-                "agent_local_enabled":bool(self.data.get('agent_local_enabled',False)),
+                "agent_local_enabled":bool(self.data.get('agent_local_enabled',True)),
                 "agent_local_trials":self.data.get('agent_local_trials',2),
                 "agent_local_seconds":self.data.get('agent_local_seconds',5),
                 "reuse_auto": self.data.get("reuse_auto", True), "reuse_seconds": self.data.get("reuse_seconds", 120),
@@ -397,7 +421,7 @@ class Settings:
                 "iterative_threads": self.data.get("iterative_threads", 0),
                 "autopilot": self.data.get("autopilot", True), "budget_usd": self.data.get("budget_usd") or 0,
                 "auto_update": bool(self.data.get("auto_update")), "check_updates": self.data.get("check_updates", True) is not False,
-                "auto_compiler": bool(self.data.get("auto_compiler")),
+                "auto_compiler": self.auto_compiler,
                 "rom_library": str(self.data.get("rom_library") or ""),
                 "bridges_removed_seen": bool(self.data.get("bridges_removed_seen")),
                 "launcher": _launcher(self.data.get("launcher") or {}), "recent_models": self.data.get("recent_models") or {}}

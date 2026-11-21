@@ -113,14 +113,22 @@ function tokenBreakdown(r) {
 async function renderCosts(force = false) {
   if (!force && S.costsAt && Date.now() - S.costsAt < COSTS_EVERY_MS && S.costsSlug === S.slug) return;
   S.costsAt = Date.now(); S.costsSlug = S.slug;
+  const slug = S.slug;
   let rows;
-  try { rows = await api(`/api/modelcosts?slug=${encodeURIComponent(S.slug)}`); } catch { return; }
+  try { rows = await api(`/api/modelcosts?slug=${encodeURIComponent(slug)}`); } catch { return; }
+  if (S.slug !== slug) return;
   const box = $("modelCosts");
   $("costPanel").hidden = !rows.length;
   const per = (r) => r.matches ? (r.usd ? `${money(r.usd / r.matches)} a match` : `${Math.round(r.tokens / r.matches / 1000)}k total tokens a match`) : "no match yet";
   setHtml(box, `<ul class="mini-list">${rows.map((r) => `<li><b>${esc(r.model || r.kind)}</b> <span class="muted small">${esc(r.kind)}</span>
       <span class="small">${r.matches.toLocaleString()} ${r.matches === 1 ? "match" : "matches"} · ${per(r)}${r.usd ? ` · ${money(r.usd)} in all` : ""}</span>
-      <span class="small muted" title="Reported token categories; cached tokens are included in the total and do not have the same price as uncached input">${tokenBreakdown(r)}</span></li>`).join("")}</ul>`);
+      <span class="small muted" title="Reported token categories; cached tokens are included in the total and do not have the same price as uncached input">${tokenBreakdown(r)}</span>
+      ${r.claim_results?.length ? `<details><summary>Match rate by starting difficulty</summary>
+        <p class="small muted">Recent completed hard claims with a judge attempt. Function size is measured in instructions.</p>
+        <ul class="mini-list">${r.claim_results.map(({band, claims, matches}) => {
+          const [size, start] = band.split(":");
+          return `<li>${esc(size)} · ${esc(start)} — ${matches} of ${claims} matched (${Math.round(100 * matches / claims)}%)</li>`;
+        }).join("")}</ul></details>` : ""}</li>`).join("")}</ul>`);
   const advice = rows.filter((r) => r.advice && r.advice_model)
     .map((r) => ({ model: r.advice_model, text: r.advice }));
   const dismissed = dismissedModelAdvice();
@@ -212,7 +220,7 @@ function agentMetrics(s, stats) {
   const ago = seconds == null ? "None yet" : seconds < 60 ? `${Math.floor(seconds)}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
   return `<div class="agent-results-summary">${s.task === 'readable' ? `<span><strong>${stats?.polished || 0}</strong> polished</span>` : metric('matched',stats?.matched || 0)}${metric('improved',stats?.improved || 0)}${metric('worked',stats?.worked || 0)}</div>
     ${s.task === "boundary" ? `<p class="small"><b>Boundary investigation:</b> ${esc(s.boundary_function || "selected function")} · advice only · no compilation or layout edits</p>` : ""}
-    ${s.focus_function ? `<p class="small"><b>Focused:</b> ${esc(s.focus_function)} · deadline ${s.focus_until ? esc(new Date(s.focus_until*1000).toLocaleTimeString()) : "starting"}</p>` : ""}
+    ${s.focus_function ? `<p class="small"><b>Focused:</b> ${esc(s.focus_function)}${s.focus_max_tries ? ` · ${esc(s.focus_tries_used || 0)} of ${esc(s.focus_max_tries)} tries used` : ""}${s.focus_until ? ` · deadline ${esc(new Date(s.focus_until*1000).toLocaleTimeString())}` : ""}</p>` : ""}
     <div class="agent-timing"><span>${runtime} <span class="muted">since latest start</span></span><span><span class="muted">${polishing ? 'Last polish' : 'Last improvement'}</span> ${ago === 'None yet' ? ago : ago + ' ago'}</span></div>`;
 }
 function agentEfficiency(s) {
@@ -220,7 +228,7 @@ function agentEfficiency(s) {
     const per = e.tokens_per_match;
     const ratios = e.matches ? `${e.compiles_per_match.toFixed(1)} compiles / match · ${Math.round(e.seconds_per_match)} helper seconds / match` : 'No matches in this cohort yet';
     const usage = per ? `${Math.round(per.input_tokens).toLocaleString()} uncached input · ${Math.round(per.cache_read_tokens).toLocaleString()} cache reads · ${Math.round(per.cache_write_tokens).toLocaleString()} cache writes · ${Math.round(per.output_tokens).toLocaleString()} output tokens / match` : 'Token averages unavailable: no matches or incomplete usage reporting';
-    return `<div class="small muted" title="${esc(e.note)}"><b>Completed sessions · ${esc(e.model || e.kind)} · ${esc(e.compiler)} · cohort ${esc(e.cohort)}</b><br>${e.sessions} sessions · ${e.matches} matches · ${ratios}<br>${usage}${e.average_function_instructions != null ? `<br>${Math.round(e.average_function_instructions)} instructions / attempted function` : ''}<br>Averages include unsuccessful work; compare the same cohort, model and similar function sizes.</div>`;
+    return `<div class="small muted" title="${esc(e.note)}"><b>Completed sessions · ${esc(e.model || e.kind)} · ${esc(e.compiler)}${e.automatic_assignment ? " · automatic assignment" : ""} · cohort ${esc(e.cohort)}</b><br>${e.sessions} sessions · ${e.matches} matches · ${ratios}<br>${usage}${e.average_function_instructions != null ? `<br>${Math.round(e.average_function_instructions)} instructions / attempted function` : ''}<br>Averages include unsuccessful work; compare the same cohort, model and similar function sizes.</div>`;
   }).join('');
 }
 
@@ -270,7 +278,7 @@ async function switchToAlternative(s, button) {
 const agentRestarts = new Map();
 
 function canRestartAgent(session) {
-  return session.state === "stopped" && !session.configuration_error;
+  return !LIVE.includes(session.state) && !session.configuration_error;
 }
 
 function renderAgentRestart(sessions) {
@@ -292,12 +300,12 @@ $("restartAll").onclick = async () => {
   const restart = { running: true, feedback };
   agentRestarts.set(slug, restart);
   renderSessions(sessions, false);
-  const finish = beginWork(log, "Restarting stopped agents");
+  const finish = beginWork(log, "Restarting agents");
   let message;
   try {
     const { restarted, errors } = await api("/api/agents/restart", { method: "POST", body: { slug } });
     message = restarted.length ? `Started ${plural(restarted.length, "agent")}.`
-      : errors.length ? "No agents restarted." : "No stopped agents to restart.";
+      : errors.length ? "No agents restarted." : "No agents are ready to restart.";
     if (errors.length) {
       log.setAttribute("role", "alert");
       const list = log.appendChild(document.createElement("ul"));
@@ -359,9 +367,9 @@ function renderSessions(sessions, refreshCosts = true) {
     return `${head}<div class="session${rowTint(s.agent)}" data-state="${esc(s.state)}"><div class="session-top"><span class="dot ${dot}"></span><b title="${esc(s.agent)}">${esc(s.label)}</b>
         ${live ? `<button class="ghost" data-stop="${id}" type="button">Stop</button>` : s.configuration_error ? `<button class="ghost" data-change-model="${id}" type="button">Choose another model</button>` : `<button class="ghost" data-again="${id}" type="button"${restarting && canRestartAgent(s) ? ' disabled' : ''}>Start again</button>`}
         <details class="agent-menu" data-agent-menu="${id}" ${agentMenusOpen.has(s.id) ? 'open' : ''}><summary aria-label="Actions for ${esc(s.label)}" title="Agent actions">⋮</summary><div class="agent-menu-items">
-          <button data-rename="${id}" type="button">Rename</button>${!S.st?.agents?.find(a=>a.id===s.kind)?.uses_endpoints ? `<button data-change-model="${id}" type="button">Change model</button>` : ""}<button data-queue="${id}" type="button">Work settings</button><button data-agent-prompts="${id}" type="button">Prompts</button><button data-agent-tools="${id}" type="button">Tools</button>
+          <button data-rename="${id}" type="button">Rename</button>${!S.st?.agents?.find(a=>a.id===s.kind)?.uses_endpoints ? `<button data-change-model="${id}" type="button">Change model</button>` : ""}${s.focus_id ? "" : `<button data-queue="${id}" type="button">Work settings</button>`}<button data-agent-prompts="${id}" type="button">Prompts</button><button data-agent-tools="${id}" type="button">Tools</button>
           <button data-log="${id}" type="button" aria-pressed="${S.logFor === s.id}">${S.logFor === s.id ? 'Back to everything' : 'What it said and did'}</button>
-          ${["readable","boundary","assets","data","port"].includes(s.task) ? "" : `<button data-retry-paused="${id}" type="button">Retry paused functions</button>`}
+          ${s.focus_id || ["readable","boundary","assets","data","port"].includes(s.task) ? "" : `<button data-retry-paused="${id}" type="button">Retry paused functions</button>`}
           <button data-reset-metrics="${id}" type="button" class="agent-menu-reset">Reset metrics</button>
           ${live ? '' : `<button data-remove="${id}" type="button"${restarting && canRestartAgent(s) ? ' disabled' : ''}>Remove agent</button>`}</div></details></div>
       ${agentMetrics(s, b)}
@@ -369,14 +377,14 @@ function renderSessions(sessions, refreshCosts = true) {
       ${["starting", "working"].includes(s.state) && s.startup_stage ? `<progress class="workbar" aria-label="Agent startup"></progress>` : ""}
       ${todo ? `<span class="todo-line">${esc(todo)}</span>${s.can_login && !live && /login|sign.?in/i.test(s.todo || "") ? `<button class="ghost" type="button" data-login="${id}">Sign in to ${esc(s.kind_name)}</button>` : ""}` : ''}
       ${limitAlternativeButton(s)}
-      ${s.provider_waiting ? `<button class="ghost" data-retry-provider="${id}" type="button" ${s.provider_retry_requested ? "disabled" : ""}>${s.provider_retry_requested ? "Provider retry requested…" : "Retry provider now"}</button>` : !["readable","boundary","assets","data","port"].includes(s.task) && s.state === "waiting" ? `<button class="ghost" data-retry-paused="${id}" type="button">Retry paused functions</button>` : ""}
+      ${s.provider_waiting ? `<button class="ghost" data-retry-provider="${id}" type="button" ${s.provider_retry_requested ? "disabled" : ""}>${s.provider_retry_requested ? "Provider retry requested…" : "Retry provider now"}</button>` : !s.focus_id && !["readable","boundary","assets","data","port"].includes(s.task) && s.state === "waiting" ? `<button class="ghost" data-retry-paused="${id}" type="button">Retry paused functions</button>` : ""}
       ${agentUsage(s)}
       <details class="agent-details" data-agent-details="${id}" ${agentDetailsOpen.has(s.id) ? 'open' : ''}><summary>Details</summary><div class="agent-details-body">
       <span class="facts-line">${facts.join(' · ')}</span>
       ${rate == null ? '' : `<span class="small muted">${compactAgentNumber(rate)} reported tokens / match${s.estimated_cost != null && b?.matched ? ` · ≈ ${money(s.estimated_cost / b.matched)} / match` : ''}</span>`}
       ${agentEfficiency(s)}
       ${s.metrics_since ? `<span class="small muted">Metrics since reset · ${new Date(s.metrics_since * 1000).toLocaleString()}</span>` : ''}
-      <span class="small muted">Work settings · ${s.per_session || 8} ${s.task==='assets'?'regions':s.task==='data'?'data units':'functions'}/session${["readable","assets","boundary","data","port"].includes(s.task) ? "" : ` · ${esc(QUEUE_STRATEGIES.find(([v]) => v === (s.selection?.strategy || ""))?.[1] || "Automatic")}${s.selection?.model_untried ? " · never checked by this model" : ""}${s.selection?.match_below != null ? ` · below ${esc(s.selection.match_below)}%` : ""}${s.selection?.stall_compiles ? ` · move on after ${esc(s.selection.stall_compiles)} without improvement` : ""}${s.selection?.max_tries ? ` · max ${esc(s.selection.max_tries)} tries` : ""}`}</span>
+      ${s.focus_id ? "" : `<span class="small muted">Work settings · ${s.per_session || 8} ${s.task==='assets'?'regions':s.task==='data'?'data units':'functions'}/session${["readable","assets","boundary","data","port"].includes(s.task) ? "" : ` · ${esc(QUEUE_STRATEGIES.find(([v]) => v === (s.selection?.strategy || ""))?.[1] || "Automatic")}${s.automatic_assignment ? " · automatic assignment" : ""}${s.selection?.model_untried ? " · never checked by this model" : ""}${s.selection?.match_below != null ? ` · below ${esc(s.selection.match_below)}%` : ""}${s.selection?.stall_compiles ? ` · move on after ${esc(s.selection.stall_compiles)} without improvement` : ""}${s.selection?.max_tries ? ` · max ${esc(s.selection.max_tries)} tries` : ""}`}</span>`}
       ${s.last_message ? `<div class="agent-message"><b class="small">Latest agent reply${["starting", "working", "waiting"].includes(s.state) ? " · helper continues" : ""}</b><q class="said">${esc(s.last_message)}</q></div>` : ''}
       </div></details></div>`;
   }).join("");
@@ -510,7 +518,7 @@ $("removeStopped").onclick = async () => {
 
 /* ------------------------------------------------------------------ the launcher: agent, model, how many */
 const LZ = { kind: null, model: "", customModel: false, apiSingleModel: null, apiCustomModel: "", models: [],
-  multiple: false, endpointModels: {}, byKind: {}, count: 1, per: null, effort: "", task: "", selection: {} };
+  multiple: false, endpointModels: {}, byKind: {}, count: 1, per: null, effort: "", task: "", selection: {}, automaticAssignment: false };
 const QUEUE_STRATEGIES = [
   ["", "Automatic (recommended)", "Uses default/adaptive routing: easiest for ROM projects, finish source files for imported projects."],
   ["easiest", "Easiest first", "Favours reusable matches and smaller functions; deprioritises abandoned functions and poorly performing regions."],
@@ -715,6 +723,7 @@ async function startAgents(a, model, count, btn, extra = {}, models = []) {
       if(!run){const prepared=await api('/api/rom-explorer/discovery',{method:'POST',body:{slug,action:'prepare',scope}});run=prepared.run;}
       options.asset_run=run;options.asset_scope=scope;
     }
+    if (!LZ.task && LZ.automaticAssignment) options.automatic_assignment = true;
     if (!LZ.task) options.selection = btn?.closest(".lz-body")?.querySelector("[data-selection-strategy]")
       ? readSelection(btn.closest(".lz-body")) : LZ.selection;
     if (replacement && replacement.slug !== slug) throw new Error("Reopen Change model in the agent's project.");
@@ -740,6 +749,7 @@ async function startAgents(a, model, count, btn, extra = {}, models = []) {
     const total = LZ.multiple ? models.length * count : count;
     toast(replacement ? "Agent replaced. The original history and saved work are kept." : `${esc(a.uses_endpoints ? "Your API model" : a.name)}: ${total} ${total === 1 ? "agent is" : "agents are"} starting. ${LZ.task === "readable" ? "Matched functions get real names, types and a comment, one by one" : LZ.task==="assets" ? "Review discoveries in ROM Explorer" : LZ.task==="data" ? "Port readiness counts the data in C" : LZ.task==="port" ? "Port readiness counts what still doesn't build for a PC" : "Watch the map fill in"}; Agents says what each one does.`, "match");
     if(LZ.task==='assets'&&S.slug===slug&&S.tab==='rom')loadAssetAgents();
+    LZ.automaticAssignment = false;
     poll(false);
     loadNav();
   } catch (e) {
@@ -843,6 +853,7 @@ function renderLauncher(box, compact = true) {
   if (!tasks && !LZ.replacement) LZ.task = "";
   box.innerHTML = `${LZ.replacement ? `<p>Replace <b>${esc(LZ.replacement.label)}</b> with the chosen model. Its task, account and work settings are kept. The original stops after the replacement is created; its history stays in Agents.</p>` : `${tasks}<div class="lz-kinds">${kinds}</div>`}
     <div class="lz-body">${body}
+      ${ready && !LZ.task && !LZ.replacement ? `<label class="check"><input data-automatic-assignment type="checkbox" ${LZ.automaticAssignment ? "checked" : ""}><span>Automatically assign the next function after a match or release</span></label>` : ""}
       ${ready && !LZ.task && !LZ.replacement ? `<details data-launch-selection><summary>Work selection (for these agents)</summary>${selectionFields(LZ.selection)}</details>` : ""}
       ${ready ? `<div class="lz-row">
         ${LZ.replacement ? "" : `<div class="field"><span>How many</span><span class="stepper"><button type="button" data-step="-1">−</button><output>${LZ.count}</output><button type="button" data-step="1">+</button></span></div>
@@ -852,6 +863,8 @@ function renderLauncher(box, compact = true) {
         <pre class="joblog" data-start-log hidden></pre>
         <p class="muted small">${a.uses_endpoints ? "A built-in agent loop drives the model through the decomp tools." : esc(a.signin)} Each agent takes a different function; a fresh session every few functions keeps its context small.</p>` : ""}
     </div>`;
+  const assignment = box.querySelector("[data-automatic-assignment]");
+  if (assignment) assignment.onchange = () => { LZ.automaticAssignment = assignment.checked; };
   const selectionBox = box.querySelector("[data-launch-selection]");
   if (selectionBox) selectionBox.onchange = () => {
     updateSelectionDescription(selectionBox);
@@ -1041,6 +1054,7 @@ function showLaunch() {
 function hideLaunch(back = false) {
   if ($("launchPop").hidden) return;
   $("launchPop").hidden = true;
+  LZ.automaticAssignment = false;
   LZ.replacement = null;
   $("phStart").setAttribute("aria-expanded", "false");
   if (back) $("phStart").focus();
@@ -1224,6 +1238,15 @@ function addActivity(events, attempts, first) {
   // in the same second, the attempt before its match: else the match closed the line and the attempt opened a new one
   items.sort((a, b) => a.t - b.t || (a.at ? 0 : 1) - (b.at ? 0 : 1));
   for (const it of items) {
+    // Saved rechecks keep the original author's credit, but the app ran the compile.
+    if (it.at?.via === "saved_recheck") {
+      const fn = fnLink(it.at.function);
+      const result = it.at.score === 0
+        ? `<span class="ok">✓</span> Verified saved match for ${fn}`
+        : `<span class="bad">Couldn’t verify saved match for ${fn}</span>`;
+      addLine(it.t, result, first);
+      continue;
+    }
     const improvement = it.at && improvementActivityHtml(it.at);
     if (improvement) addLine(it.t, improvement, first, it.at.agent);
     const auto = (who) => who === AUTO || who === "@" + AUTO;  // ours, or the room host's

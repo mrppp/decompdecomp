@@ -101,6 +101,16 @@
   use existing background source-restoration locks. Hosts accept legacy permutation
   claim/release requests without leases, and startup clears only legacy permutation claims.
 
+- Done: N64 imports recover shared overlay slots from indexed DMA tables and adjacent loaders'
+  cache bounds. Branches in one occupant of a shared slot cannot cut a closed function in another
+  occupant. Rebuildable exports for overlapping overlay banks remain planned.
+- Done: N64 imports map audited inline data spans separately from executable text when their
+  full surrounding fingerprints match. This prevents constants and alignment words from cutting
+  otherwise closed function bodies.
+- Done: N64 imports recover gzip-compressed boot programs using loader addresses and verified
+  text/data member boundaries. Rebuildable exports check the linked bytes against those members
+  before retaining the cartridge's original gzip encoding. Audited embedded tables use full-span
+  fingerprints to keep their bytes out of the function inventory.
 - Done: N64 imports recover a whole gap between two code segments that share a mapping
   when the game's data stores the gap's start as a pointer and the gap is one balanced
   frame (a racing game's command handlers, 3.5 and 8 KB, called only through a table).
@@ -482,6 +492,20 @@ source/header/profile for one entry without neighbour confirmation. Disabled aut
 for review; legacy single-function range suggestions with saved C recheck on Apply. Broader
 ranges and imported file/build settings retain their existing verification workflows.
 
+Implemented: N64 ROM imports and Deep Permuter identify known linked C runtime routines by the
+complete function and analysis-image digests. The library setting controls whether they are set aside.
+Known relocation-free `guMtxCatF` assembly variants use the libultra SDK assembly path.
+The same detection covers EPI raw DMA, priority enqueue/yield, CPU register and interrupt helpers,
+and additional `guScaleF` and `bcopy` variants. ROM analysis splits a verified
+merged scheduler target into dispatch, cleanup, and interrupt-mask entries before assigning SDK names.
+
+Implemented: N64 ROM imports name and set aside exact libultra matrix conversion, cache maintenance,
+and scheduler queue-pop assembly variants as SDK code before agents can claim them. The Deep Permuter also
+checks existing local ROM projects for these signatures before searching C candidates.
+
+Implemented: N64 ROM imports recognise an exact low-word-first 64-bit multiply helper and set it aside
+before agents can claim it. Fresh imports name a unique unnamed copy `mul64_low_first`.
+
 Implemented: NOP-only MIPS targets remain rebuildable as set-aside assembly in ROM imports and project objects;
 Check again applies the same classification to existing targets.
 Incomplete nonzero targets still receive advisory boundary review; original bytes, symbols, matches and explicit
@@ -715,7 +739,36 @@ CodeWarrior PS2 2.3.3/3.0.1 also run through native Mac wibo after explicit
 license acceptance. Both pass homemade-demo matching, C++ method and export checks
 on Apple Silicon; physical Intel Mac and retail-game checks remain planned.
 
+- Extend donor-based discovery to code in unmapped ROM regions, including N64 USO overlays. Decode and
+  validate the original image and preserve each overlay's relocation and address scope before judging C.
+  Extend merged-function recovery to ROM-to-ROM donors and processors with other boundary rules.
+
+- Donor-assisted coverage review now previews exact function spans from same-ROM imported ELF projects.
+  N64 reads bounded raw and Yay0 USO text sections. The review can add non-overlapping entries, while
+  conflicts stay available for manual boundary review. Add relocation-aware location evidence, support
+  more overlay formats, and rebuild the new banks from C on export.
+
+- N64 ROM import now reads native symbol anchors in raw and Yay0-compressed USO text and
+  recovers corroborated closed functions in separate banks. It needs no imported project.
+  Matching uses the original loader symbol and kind for each text relocation and compares the
+  pre-relocation bytes exactly. Exports compile matched C into raw or Yay0-compressed USO text,
+  keeping the original relocation and data sections. Rebuilding private overlay data from C,
+  translating public symbol names to USO aliases and supporting other overlay formats remain planned.
+- Native UV modules now import into separate module-relative text banks. The loader's entry,
+  local calls and relocated text pointers anchor function recovery. Exact pre-relocation bytes
+  and section bindings gate rebuilding matched overlay text. Donor review for UV modules,
+  module data rebuilds and functions without closed boundaries remain planned.
+- Startup-registered N64 overlay directories now supply scoped banks for imports, including
+  a reserved index between populated records. The directory and its loader establish the ROM
+  bounds and shared RAM base. Rebuildable export for overlapping raw banks remains planned.
+- Resident N64 directory copy loops now establish overlay ROM bounds and instruction-cache
+  ranges. Banks that reuse a RAM range keep separate symbols and function boundaries.
+
 ## What works where
+
+Polishing can ask helpers to check 64-bit PC compilation and repair casts between pointers and 32-bit integers.
+ROM projects can use the built-in compiler check. A built-in check for project mode is planned. Until then,
+helpers use the project's own 64-bit build where available.
 
 Each feature and the platforms it covers today. A — is a gap: pick one up (the notes under the table say where to
 start). Keep this table true when a feature ships or reaches another platform. Each column's code is its console's
@@ -724,7 +777,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Feature | N64 | PS1 | PS2 | PS3 | PS4 | PSP | GBA | GameCube · Wii | Windows PC | Xbox | DS | Public decomps | DOS (32-bit) |
 | :-- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
 | Loader/buffer tracing, named contracts and small wrappers | ✓ MIPS / named PI DMA | ✓ MIPS static | ✓ MIPS EE EABI | — | — | ✓ shared MIPS reader | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
-| Automatic texture banks (CI4/CI8, mixed CI8 palettes, RGBA32, RGBA16 mipmaps, RNC 1/2 and byte-sum RNC banks, named four-block banks, embedded ZIP packs, textures loaded by uncompressed display lists, I64 images in a chunked-RNC filesystem, model textures in a deflated asset table, UVTX files in a UV FORM filesystem, a texture table of back-reference-packed textures with inferred widths, display-list textures and sprites in a table of relocatable VPK0 files, image packs and model bitmaps in a party-game series' main filesystem, FLA2-packed texture banks; a fork's own splat image segments, JSON asset lists and sno texture sheets) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — image adapter | — image adapter | — | — image adapter | ✓ forks with the game file (N64 checked) | — |
+| Automatic texture banks (CI4/CI8, mixed CI8 palettes, RGBA32, RGBA16 mipmaps, RNC 1/2 and byte-sum RNC banks, named four-block banks, embedded ZIP packs, textures loaded by uncompressed display lists, I64 images in a chunked-RNC filesystem, model textures in a deflated asset table, UVTX files in a UV FORM filesystem, a texture table of back-reference-packed textures with inferred widths, display-list textures and sprites in a table of relocatable VPK0 files, image packs and model bitmaps in a party-game series' main filesystem, FLA2-packed texture banks, zlib RGBA members with stored dimensions, named textures in Iain block archives, RDP textures in paired ROM resource directories; a fork's own splat image segments, JSON asset lists and sno texture sheets) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — image adapter | — image adapter | — | — image adapter | ✓ forks with the game file (N64 checked) | — |
 | Audio browser, filters, sortable samples and explicit WAV preparation | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | Indexed dialogue scripts with scene and speaker browsing, verified voice playback and related cutscene scripts | ✓ ROM | — | — | — | — | — | — | — | — | — | — | — | — |
 | ELv9 sector extents, PATH keyframes and NCS command inspection | ✓ ROM | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -732,11 +785,11 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Native directory roles: animation, collision, placements, grid, sequences and demos | ✓ validated schema / linked records | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | Native ADPCM animation, linked textures and source-family I4 fonts | ✓ bounded native previews | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | Text/pointer record inspectors and PSF2 glyph atlas | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
-| Model browser and automatic indexed geometry / local mesh wireframes (raw, RNC 1/2, EMsh in byte-sum RNC and RNX with linked effect textures, embedded ZIP) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
+| Model browser and automatic indexed geometry / local mesh wireframes (raw, RNC 1/2, EMsh in byte-sum RNC and RNX with linked effect textures, embedded ZIP, zlib packed vertex-cache commands, named Iain scene meshes, paired cartridge F3DEX2 lists) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | PD3V textures, static assemblies, linked scenery and glTF export | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
-| B1 (including relocated controls) / libmus PtrTablesV2 audio banks, table evidence and mono VADPCM/PCM16 previews | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
+| B1 (including relocated and bit-packed controls and parallel cartridge tables) / libmus PtrTablesV2 audio banks, table evidence and mono VADPCM/PCM16 previews | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | Native frame/palette/mip selection and explicit animation | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
-| Image, texture/palette and audio previews | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | ✓ forks with the game file (N64 checked) | — |
+| Image, texture/palette and audio previews (including split libmus songs and sequenced effects on N64) | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | ✓ forks with the game file (N64 checked) | — |
 | Agent asset discovery, automatic checks, independent review and similar regions | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | Indexed Eurocom EDL archives, texture and local-mesh previews, and companion resource tables | ✓ ROM | — | — | — | — | — | — | — | — | — | — | — | — |
 | ROM Explorer: whole analysis image, references, clues and notes | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — image adapter planned | — image adapter planned | — | — image adapter planned | ✓ forks with the game file (image and segments; no function references yet) | — not run yet |
@@ -747,8 +800,12 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Local register-chain and jump/delay-slot search hints | ✓ | ✓ | ✓ | — | — | ✓ | — | — reader planned | — reader planned | — | — reader planned | ✓ MIPS; other readers planned | — |
 | Per-model pauses and bounded fresh-turn retry | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓; room model metadata falls back to worker | — |
 | Targeted scalar scheduling repairs and experiment costs | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓ | — |
+| Resolve competing saved progress on pull from origin | ✓ portable save | ✓ portable save | ✓ portable save | ✓ portable save | — | ✓ portable save | ✓ portable save | — | — | — | — | — source-unit integration planned | — |
 | Portable last-exact evidence | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓ historical, own build | — |
 | Stack slot layout diagnostics | ✓ | ✓ | ✓ | — | — | ✓ | — | — reader planned | — reader planned | — | — reader planned | — GUI adapter planned | — |
+| Linked switch case diff and caller-backed matched return review | ✓ bounded MIPS ROM | ✓ shared MIPS conditions | ✓ shared MIPS conditions | — | — | ✓ shared MIPS conditions | — | — | — | — | — | — owned-build adapter planned | — |
+| Callee stack-write diagnostics and floating-point initializer search | ✓ MIPS | ✓ shared MIPS conditions | ✓ shared MIPS conditions | — | — | ✓ shared MIPS conditions | — | — | — | — | — | ✓ MIPS floating-register diff only; caller stack-write adapter planned | — |
+| Diff-gated deep source repairs | ✓ KMC, EGCS and selected IDO MIPS | ✓ shared MIPS conditions | ✓ shared MIPS conditions | — | — | ✓ shared MIPS conditions | — | — | — | — | — | — build evidence adapter planned | — |
 | Learned repair sequences, scoped brief evidence and sweep rotation | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓ build-scoped | — |
 | Last-exact failed-recheck alerts | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓ local judgments only | — |
 | Public dtk SDK binary identification | — own corpus planned; local archives supported | — own corpus planned; local archives supported | — own corpus planned; local archives supported | — | — | — own corpus planned; local archives supported | — | ✓ built targets; direct evidence, advisory references | — own corpus planned; local archives supported | — | — own corpus planned; local archives supported | ✓ GameCube/Wii targets; other corpora planned | — |
@@ -806,6 +863,8 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Struct layouts from loads and stores (`guess_struct`) | ✓ | ✓ | ✓ | — | — | ✓ | — | — | ✓ | ✓ | — | — | ✓ (Watcom's register arguments read as arguments) |
 | The game's own debug symbols: names, types, prototypes | — | — | ✓ symbol table, STABS, DWARF 1; the compiler of each object file | names (types and prototypes: —) | — | ✓ symbol table, DWARF 1 | — | — | ✓ PDB (Visual C++ 6.0's PDB 2.0, MSF 7.00), linker map, COFF symbols (64-bit games': untested) | — (an XBE has none) | — | — | — |
 | Twins across your games | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | ✓ (between project-mode games; not run on two GameCube games yet) | ✓ (between PC projects) | ✓ (as PC's; not run on two Xbox games yet) | ✓ (between project-mode games; not run on two DS games yet) | — | runs; not shown yet (no two games of one Watcom here) |
+| Find imported donor code inside a merged function during manual search | ✓ MIPS ROM target | ✓ shared MIPS path | ✓ shared MIPS path | ✓ shared MIPS path | — separate owned build | ✓ shared MIPS path | — ARM/Thumb boundary reader planned | — separate owned build | — separate owned build | — separate owned build | — separate owned build | ✓ verified ELF donor to MIPS ROM | — |
+| Preview and add exact same-ROM donor code | ✓ mapped raw and USO text | — image adapter planned | — image adapter planned | — image adapter planned | — separate build | — image adapter planned | — image adapter planned | — separate build | — separate build | — separate build | — separate build | ✓ ELF donor for supported ROM destinations | — |
 | Named Claude accounts, assigned per helper; recorded usage per account | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Grouped ROM variants: selector, identities, checked shared C and single-repository export | ✓ demo + two real releases verified | — adapter validation pending | — adapter validation pending | — | — | — adapter validation pending | — | — object adapter planned | — object adapter planned | — | — object adapter planned | — object adapter planned | — |
 | Other releases of a game: found, paired, names, header types and code brought over | ✓ | — not yet run | — not yet run | — | — | — not yet run | — | — object pairing planned | — object pairing planned | — | — object pairing planned | — object pairing planned | — |
@@ -814,18 +873,20 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Shared knowledge (two models agree) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Tidy each source file once it's polished (shared types in one header, names, dead declarations) | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Polish matched code (still matching) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (`make_readable`) |
+| Per-game portability checklist for polishing | ✓ | ✓ | ✓ | ✓ | — polishing support pending | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Small polish plans, prepared evidence and verified identical-helper reuse | ✓ shared path | ✓ shared path | ✓ shared path | — | — | ✓ shared path | — | ✓ shared path | ✓ shared path | — | ✓ shared path | ✓ shared path | — |
 | Real names for the game's symbols (`rename_symbol`) | ✓ | ✓ | ✓ | ✓ | ✓ functions | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | dtk and ds-decomp projects | ✓ |
 | Save and restore (`progress/`, Open a saved project); remember each project's save destination | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | partly: the project's git, best attempts saved; a new copy starts without them | partly: the project's git, best attempts saved; a new copy starts without them | the project's git; best attempts saved; the PE view made again from your XBE or disc | partly: the project's git, best attempts saved; a new copy starts without them | the project's git; best attempts saved | partly: the project's git, best attempts saved; a new copy starts without them |
 | Pause and resume automatic rechecks of saved matches | ✓ ROM | ✓ ROM | ✓ ROM | ✓ ROM | — | ✓ ROM | ✓ ROM | — uses project build | — uses project build | — uses project build | — uses project build | — uses project build | — |
 | Saved README preserves notes, with completion bar and function map | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Reimport: a new split, matched work kept (Settings) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | — | ✓ (Ghidra again, the newest rules) | ✓ | — | — | ✓ (the analysis again from your copy; a shareware game kept its matches and rebuilt identical) |
-| Rebuildable export | ✓ | ✓ | ✓ | — | — | ✓ | ✓ | the project | the project (`ninja rebuild`) | the project (`ninja rebuild` writes your default.xbe back, byte for byte) | the project | the project | the code object (`ninja rebuild`) |
+| Rebuildable export (ROM modes also create a verified local Git repository on new import) | ✓ | ✓ | ✓ | — | — | ✓ | ✓ | the project | the project (`ninja rebuild`) | the project (`ninja rebuild` writes your default.xbe back, byte for byte) | the project | the project | — |
 | Set up as a project folder (import checkbox or Export panel; guessed `units.json`; edits to `src/<segment>/<function>.c` judged by the ROM judge on Refresh) | ✓ demo: 14 of 16 files found | ✓ demo: 1 of 18 files found (no padding between objects) | ✓ demo: 1 of 18 files found (functions padded like files) | — | — | — offered; demo not run (no PSP compiler build for Apple Silicon) | — | the project | the project | — | the project | the project | the project |
 | The reversing emulator for agents (`watch_in_emulator`: which code writes an address, what a function is called with, on the user's ROM) | ✓ mupenRE (Linux, macOS) | — no emulator pinned yet | — no emulator pinned yet | — | — | — no emulator pinned yet | — | — no emulator pinned yet | — no emulator pinned yet | — | — no emulator pinned yet | — no ROM to run | — |
 | Code the game loads, found by running it (import and Reimport, consoles/n64/loaded_code.py) | ✓ when mupenRE is installed | — no emulator pinned yet | — no emulator pinned yet | — | — | — no emulator pinned yet | — | — no emulator pinned yet | — no emulator pinned yet | — | — no emulator pinned yet | — no ROM to run | — |
-| Static recompile (Recompile with N64Recomp, docs/N64RECOMP.md phase 0) | ✓ N64Recomp (Linux, macOS; bounded native-crash isolation, explicit stubs) | — no recompiler pinned | — no recompiler pinned | — | — | — no recompiler pinned | — | — no recompiler pinned | — no recompiler pinned | — | — no recompiler pinned | — no ROM to recompile | — |
+| Static recompile (N64Recomp, docs/N64RECOMP.md phase 0) | ✓ N64Recomp (Linux, macOS; bounded native-crash isolation, explicit stubs) | — no recompiler pinned | — no recompiler pinned | — | — | — no recompiler pinned | — | — no recompiler pinned | — no recompiler pinned | — | — no recompiler pinned | — no ROM to recompile | — |
 | Behaviour checked against the original (`compare_behaviour`, docs/N64RECOMP.md phase 1) | ✓ (recorded in mupenRE, run through N64Recomp's C and the WebAssembly port's) | — no emulator or recompiler yet | — no emulator or recompiler yet | — | — | — no emulator or recompiler yet | — | — no emulator or recompiler yet | — no emulator or recompiler yet | — | — no emulator or recompiler yet | — no ROM to run | — |
+| Open-candidate behavior checks (`compare_candidate_behaviour`) | ✓ (sampled emulator calls against a disposable candidate port) | — no recorded-call harness | — no recorded-call harness | — | — | — no recorded-call harness | — | — no recorded-call harness | — no recorded-call harness | — no recorded-call harness | — no ROM to run | — | — |
 | Port readiness report (docs/PORTING.md, phase 0) | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared project report |
 | Data in C, judged by bytes (`compile_data`, docs/PORTING.md phase 1) | ✓ (data after the last code segment, `.bss`; Start agents → Write data as C) | — no `bss_start` reader | — no `bss_start` reader | — | — | — no `bss_start` reader | — | — project mode: data is in the project's sources | — project mode | — | — project mode | — | — |
 | The game's C compiled for a PC (Porting → Compile for PC, docs/PORTING.md phase 3) | ✓ (pinned Zig's clang, 64-bit x86 Linux target; nothing linked yet) | — no port kit yet | — no port kit yet | — | — | — no port kit yet | — | — project mode not read yet | — project mode not read yet | — | — project mode not read yet | — | — |
@@ -834,6 +895,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | What stops the C linking for a PC (Porting, from Compile for PC's objects, docs/PORTING.md phase 3) | ✓ (undefined and twice-defined symbols, sorted by what fixes each; nothing linked yet) | — no port kit yet | — no port kit yet | — | — | — no port kit yet | — | — project mode not read yet | — project mode not read yet | — | — project mode not read yet | — | — |
 | Port fixes judged twice (Start agents → Fix C for the PC, `fix_for_pc`, docs/PORTING.md phase 4) | ✓ (console match by the function judge, PC build by the pinned Zig's clang) | — no port kit yet | — no port kit yet | — | — | — no port kit yet | — | — project mode not read yet | — project mode not read yet | — | — project mode not read yet | — | — |
 | Port: a native build of a finished game (docs/PORTING.md) | — planned: libultraship, Torch | — planned: PsyCross | — | — | — | — | — | — | — | — | — | — | — |
+| RT64 compatibility Play (Porting → N64ModernRuntime) | ✓ macOS preview, verified on a partial demo; — retail validation, exports and other systems | — | — | — | — | — | — | — | — | — | — | — | — |
 | iPhone/iPad Xcode export (Porting; offline browser port, touch controls; device playthrough pending) | ✓ wrapper compiles; packaging and input tested | — no browser port kit | — no browser port kit | — | — | — no browser port kit | — | — project mode not read yet | — project mode not read yet | — project mode not read yet | — project mode not read yet | — project mode not read yet | — |
 | Verified Git export sync (explicit Settings action) | build.json export | shared export adapter | shared export adapter | — | — | shared export adapter | — | source already in checkout | source already in checkout | — | source already in checkout | source already in checkout | source already in checkout |
 | Commit and push bound portable progress | ✓ | ✓ | ✓ | — | — | ✓ | — | — own checkout UI planned | — own checkout UI planned | — | — own checkout UI planned | — own checkout UI planned | — |
@@ -1065,6 +1127,12 @@ per-file compiler context, template readers and SDK source placement must be int
 Project-mode similar-transfer support is planned: align target-object relocations and adapt file-local declarations before trying
 similar C through objdiff. Other processors need an instruction reader for this search.
 
+The Deep Permuter's two-move pass (`app/paired_moves.py`, judged through `app/judge_pool.py`: a pool of `decomp
+judge-worker` processes) runs for ROM projects, whose functions carry target bytes the worker judges exactly. Project
+mode (GameCube/Wii/PC/DS) has no standalone exact judge yet: objdiff judges there, so the pass is skipped. Planned: a
+judge worker for project-mode units, then the same pass. It found nothing on the first function it was built for
+(docs/COMPILER_MATCHING_LEARNINGS.md); a register-allocation-priority search is the next step for that kind of diff.
+
 ## Recently done
 
 - **Agents & models controls.** Collapsible sections show installed agent apps, prompt templates, optional tool
@@ -1109,13 +1177,15 @@ behaviour** runs it over every matched function the game reaches in one run of t
 like the original", the counts and the functions that differ), saved per function and redone only where the C
 changed. Left: calls that wait on another thread, which time out today, and calls past the first.
 
-### The game as C before the decomp is done: Recompile with N64Recomp
+### The game as C before the decomp is done: N64Recomp
 
-Porting's **Recompile with N64Recomp** turns a ROM project's every function into C by N64Recomp (MIT, pinned with
-its five libraries and built from source like Torch): from the split, and the user's own ROM, into build/recomp
+Supported port builds and behaviour checks run N64Recomp on demand to translate a ROM project's functions into C
+(MIT, pinned with its five libraries and built from source like Torch). It reads the split and the user's own ROM
+and writes to build/recomp
 (`consoles/n64/recomp.py` through `Console.recompiler`, `app/recompile.py`). It finds the code the split doesn't list
 by the calls into it, sets aside as stubs what N64Recomp can't translate, with its reason, and checks the C with the
-computer's compiler. Port readiness shows the last run. On a racing game: 2,125 functions and 12 more, 14 stubs, the
+computer's compiler. Porting lists every discovery for review and can add selected ranges to the split.
+Port readiness shows the last run. On a racing game: 2,125 functions and 12 more, 14 stubs, the
 rest compiling, in 16 seconds. docs/N64RECOMP.md phase 0; next, phase 1 (each function's recorded calls run through
 its recompiled and decompiled C).
 
@@ -1563,10 +1633,25 @@ planned; asset format descriptions are advisory text.
 
 ### ROM Explorer
 
+Indexed LZ banks expose named textures, including RDP textures drawn in separately paletted strips. Their object
+records expose local F3DEX2 meshes and levels of detail, and packed Standard MIDI banks offer stereo playback.
+
+BAM3 and counted big-endian TIM sprite banks expose individual textures and palettes after bounded decompression.
+Unnamed B1 relocators can establish a nearby sample-table address, including uncached cartridge addresses.
+Detached compact MIDI tables offer stereo previews when a unique validated wave bank matches the scores.
+
+Iguana resource archives now expose CI4 and CI8 bitmap banks with palette-backed previews
+and padded texture row support. Their QMesh resources also expose wireframe geometry from
+validated vertex and triangle commands. The same archive directory pairs relocated B1 wave
+banks with compact MIDI sequences and locates DEAN commentary clips for bounded playback.
+Packed archive directories also support playback using codebooks recovered from the
+checksummed program output.
+
 Audio browser now prepares selected samples without autoplay. Native libmus pointer
 banks validate tuning/loop/book graphs and uniquely fitting marked wave tables, with
-explicitly editable preview rates because the banks store none. Archived channel-table
-sequences are tentative metadata only; synthesis and additional bank adapters remain planned.
+explicitly editable preview rates because the banks store none. Validated raw libmus
+tracks with a uniquely resolved wave bank have bounded stereo previews. Archived
+channel-table playback and additional bank adapters remain planned.
 
 The byte strip also has a rounded-square region type map using the function map renderer,
 with image/audio evidence and local 3D model classifications. Evidence-based grouping joins
@@ -2644,11 +2729,19 @@ Line Tools; queues that never wait, so decompdecomp's thread glue) or N64ModernR
 queues and timers; the RT64 renderer, complete S2DEX; reads the ROM at run time, so no extraction; RT64 needs full
 Xcode on macOS for its Metal shaders). The kit becomes a list per console (`Console.port_kits`), the readiness report
 and link check read the chosen one, and Port readiness shows the choice with what each needs on this computer.
-Started: the Porting tab's Play step lists the kit's runtimes (`PortKit.runtimes`), WebAssembly (playable now) and
-both native ones, each with the checklist steps it still waits for; the native ones can't be chosen until
-decompdecomp builds on them.
-Tried on a Mac: libultraship and its libraries built from source; N64ModernRuntime built; RT64 stopped for want of
-Xcode's `metal`.
+Porting separates the build mode from the runtime. The N64 compatibility build preserves the game's 32-bit
+memory layout. Play can use the local macOS RT64 adapter when configured. The adapter uses ModernRuntime's VI
+registers and presents in an SDL3 Metal window. It keeps the compatibility host's scheduler, input, audio, saves,
+and original RDRAM writes from the software RDP. The direct 64-bit C option and libultraship remain planned.
+
+An Apple Silicon end-to-end demo used saved C, N64Recomp and the interpreter in one run and submitted the expected
+framebuffer to RT64. A native graphics task captured in the reference emulator also reached RT64. Retail saves
+still need live playthroughs. Raw cartridge DMA can now fill RAM and compatibility stack buffers, and local buffers
+retain the eight-byte alignment required by original loader code. Two retail boot paths still need work: one
+loads a relocated copy of libultra whose scheduler calls need to reach the host, and another calls its game entry
+through a TLB mapping after a boot helper returns. Next: verify more microcodes and games, support RT64 export,
+replace the compatibility scheduler and device services where ModernRuntime can take them over, and add other
+desktop builds.
 
 ### Ports: a native build of a finished game
 
@@ -2894,6 +2987,15 @@ snapshots local source/header/build inputs (at most 10,000 files / 32 MiB).
 
 Cross-game transfer results use compact, responsive rows with separate provenance, result labels and score changes; recent partial improvements can be filtered independently.
 
+Deep Permuter rechecks historical matches with the current header on local ROM projects before trying matched
+same-game twins or searching candidates. The standalone saved-match recovery action can still try historical
+headers. Saved-progress sync preserves scored drafts when their saved copies disappear or a replacement fails.
+Project-wide passes can fill missing scored C by recompiling saved attempts, then trying Machine Drafts where
+available. Room members receive recovered candidates through the host.
+Compiler preflight pairs a corrected single-precision square-root call with narrowly scoped profile trials.
+Exact fast-math results require per-function review. Register-only diffs get bounded operand-order and lifetime
+trials. Boundary review highlights overlapping entries and corroborated PC-relative halfword table reads.
+
 Cross-game checks live below Deep permuter in project Settings. Manual searches check all eligible candidates without time or trial budgets, including unfinished C, until finished or stopped. One stage indicator shows current donor/target progress. Shared metric buttons open results in a side drawer; full saved matches load on demand. Active manual searches reconnect to their existing server job after reopening the window. Automatic matching passes retain their existing limits.
 
 Cross-game results can be collapsed per project without losing state on live refresh; Run now launches a dedicated, bounded cross-game check with progress and duplicate-run protection, in ROM and imported modes.
@@ -3058,6 +3160,71 @@ is a regression result, not a new game match. Mixed/context-dependent examples r
   call-only diagnostics, entry-context/NOP/record advisories, and rejected-preflight-suggestion recovery share
   ordinary judges and budgets. Other processors' address/entry evidence adapters: **—**, planned work; imported
   projects retain build-owned compiler profiles and ROM-only entry diagnostics do not alter their setup.
+## More complete linked comparison and call evidence
+
+MIPS ROM comparisons show differing destinations for recognized guarded jump tables.
+Other dispatch formats need their own extent and relocation readers. Matched signature
+review requires a direct caller and processor proof of the consumed return register.
+Callee stack-write diagnostics need a trustworthy caller frame and a bounded pointer
+write footprint. Imported builds need an adapter that provides the same cross-function
+evidence before those checks can run. The floating initializer lane requires a
+register-only MIPS comparison and independent ordinary C field loads.
+
+Deep search can use a single linked table's closed case permutation to propose
+explicit source labels. It also routes observed KMC frame, reload, loop,
+conversion, division and allocation differences to bounded C candidates.
+Follow-up gates cover selectors across calls, the first field guard, loop-tail
+bounds, grouped stores, stack records and strided field relocations. Signed
+halfword uses and floating lifetimes also have bounded source candidates.
+The same lane handles measured float argument order, divide-and-square reuse,
+indexed store lifetimes, loop edges, clamps, paired byte decoders and guarded
+store constants. Wide clears require an aligned resolved address and one typed
+64-bit object.
+Measured follow-ups include volatile byte reloads, branch-local offsets, split
+loads, loop-exit resets, and arithmetic lifetime changes. IDO 5.3 can try a
+direct countdown-field update from its own delay-slot evidence. Signed
+multiply-high reconstruction requires big-endian MIPS.
+EGCS square staging requires floating-register-only differences. These lanes
+use the current input scope and ordinary compile budget. Imported builds still
+need reliable per-unit compiler and linked table evidence. Other processors
+need their own diff signatures before the corresponding source rules can run.
+
+Measured KMC conversion and scheduling diffs can also coalesce an inequality around
+a conditional call, reuse dead argument registers for packed float-to-int results,
+swap independent float products, and keep a modulo switch selector in one local.
+Additional gates select reciprocal reuse, earlier conversion indices, one explicit
+strided table offset, signed high-word bounds, and an image-verified double bias.
+The corresponding IDO gate reorders independent stores around a final argument
+reload. These use the ROM-mode measured MIPS lane and the same byte-exact judge.
+
+The measured KMC lane also tries offset-initializer shifts, clamp fallbacks on
+the store edge, a shared zero-result label for list searches, and narrow
+selector-load and float-store scheduling changes. Other gates cover masked
+bounds, previous-record addressing, guarded float numerators, float word
+stores, and address arithmetic after a single volatile base read.
+
+Additional KMC gates cover the increment on a continue edge, float call-result
+reuse, and reversed multiply operands from a halfword load. They also isolate
+duplicate conversion bias, unaligned record copies, saved float zero across a
+loop and call, shared-store branch polarity, packed-key load order, interleaved
+float field updates, and a proven same-address spelling for a second call.
+
+The measured guard and width gates cover non-null body pointer aliases,
+fallthrough float reloads, resolved upper-word masks, normalized masked
+booleans, cursor bias, byte-flag lifetimes, guard delay-slot immediates,
+separate loop entry seeds, ordinary stack halfword reads, and signed-byte
+adjustment lifetimes.
+
+Measured inline and storage gates also cover shared halfword returns, split
+indexed byte addresses, reuse of dead float locals across calls, unsigned-byte
+entry guards, coordinate schedules, pointer-object qualifiers, narrowed call
+arguments, explicit no-op cases, shared multipliers, and typed float stores.
+
+Additional measured memory gates cover volatile pointer lifetimes, IDO mixed-width
+zero chains, stack mask scheduling, paired float loads, split output store scopes,
+narrowing after a guarded copy, default-case scaling, isolated unaligned word copies,
+loop invariant argument order, and a shared null/success epilogue.
+
 ## Register-only local lifetime search
 
 Shared draft, agent-local and deep searches offer bounded branch-tail locals, scalar call staging
@@ -3316,11 +3483,15 @@ remain planned: the initial browser toolchain has no matching build-context adap
 ### Post-match repair analysis and cost evidence
 
 - Done: bounded automatic frozen-output ablation for new supported captures, a Repair examples toggle,
-  persisted reports, and source-free summary exports; no progress adoption or review changes.
+  persisted reports, and source-free summary exports.
+- Done: bounded installed-rule verification for agent ROM matches with a comparable failed attempt.
+  The original linker must approve a generated candidate before a fresh capture is filtered.
+  The winning attempt retains the rule and failed-attempt identity.
 - Done: paired native-GCC phase comparisons gated on unchanged compiler output, mismatch-shape-specific
   exact repair sequence hints, and per-profile/focus compile and elapsed-trial-time efficiency rates.
 - Planned: copied-build replay adapters for imported projects and phase diagnostics for other compiler
-  backends. They explicitly skip instead of using guessed standalone build settings. Timing currently
+  backends. Imported-project repair examples remain available for review until an exact replay has
+  captured the original per-file build inputs. Timing currently
   measures summed trial elapsed time; per-child CPU accounting across compiler runtimes remains planned.
 
 ### Repair capture follow-ups
@@ -3701,9 +3872,10 @@ Done: the function dialog can create one configured CLI/API agent for a named fu
 and a 1–240 minute wall-clock allowance. Shared claim enforcement pins the function by
 stable ID (including batch claims, PROJECT mode and room requests), preserving normal
 leases. Busy targets wait before a paid session starts. Context rotations stay on the
-same target; matches/set-aside status or expiry stop the worker through normal process
-termination and claim release. Deadlines persist across app restart; a manual agent
-restart grants a new allowance. The Agents card shows the target and deadline; the
+same target. The app owns the claim and stops the worker on a verified match, the
+configured try limit, set-aside status or an optional deadline. Try budgets and deadlines
+persist across app restart; a manual agent restart grants a new allowance. The Agents card
+shows the target and try count, and the function panel shows progress. The
 launcher has its own Stop control. No model is started until the user clicks Start.
 The function drawer groups AI and local search in matching shared collapsible boxes,
 with aligned cost labels and controls in both themes and narrow layouts.
@@ -3712,7 +3884,7 @@ with aligned cost labels and controls in both themes and narrow layouts.
 ## Focused conversation continuity
 
 Focused workers bypass ordinary 80-tool/160,000-character rotation and receive a continuous-work
-prompt until match, user stop or deadline. Codex and Claude persist and resume their exact provider
+prompt until match, try limit, user stop or an optional deadline. Codex and Claude persist and resume their exact provider
 conversation between turns (never a global latest session), leaving native compaction enabled.
 The compatible API loop removes its ordinary step/function cap for focused runs and summarizes
 older context in place near its context budget, preserving instructions and the latest complete
@@ -4335,6 +4507,13 @@ ABI analysis and automatic source/profile selection remain planned.
   creating a commit, changing another upstream or force-pushing. ROM progress and
   imported project checkouts share the push-only path. Full repair archives stay local.
 
+- Done: pulling from origin can merge linked portable save histories, keeping a saved
+  match or the lower comparable score with its source and preserving both Git parents.
+  Confirming a pull also checkpoints eligible uncommitted progress locally before the
+  comparison. The checkpoint is recoverable if the merge needs manual review.
+  Build-owned projects still need a source-unit adapter that judges competing functions
+  and preserves their file and build context.
+
 - Done: single-function deep-permuter jobs appear in the Working filter and ROM map throughout their nonexclusive search, including before any compile. Live activity and map snapshots clear the display when jobs stop, finish, fail or match without taking another worker’s lease.
 
 - Done: non-match compiler trials read metadata first, then prepare and judge up to eight functions independently; avoid implicit saved-file synchronization and whole-project payload loading, and hash common compiler/symbol inputs once per pass.
@@ -4542,3 +4721,9 @@ probes are cancellable and bounded. Synthetic compiler/recompiler regressions co
 ROM port placement also preserves compiler-declared call targets with data-style names. Repeated helper context
 gets a private identity per module, retaining the caller's own helper body and original pointer addresses while
 leaving the public owner function authoritative. The linker still rejects unresolved duplicate ownership.
+
+### Recorded-call checks for additional consoles and imported projects
+
+Extend the open-candidate behavior check to consoles and imported builds as
+they gain compatible record/replay and isolated candidate runners. Sampled
+behavior remains advisory for the exact judge.

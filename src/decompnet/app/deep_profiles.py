@@ -50,11 +50,33 @@ def selected(net, proj, count, fn=None):
     return result[:count]
 
 
+def tail_dispatch(net, proj, fn):
+    """One installed sibling-call profile for the saved source of a proven tail dispatcher."""
+    from .. import consoles, toolchains
+    from ..project import compiler_for
+    from .wrapper_contracts import tail_dispatch_hint
+
+    if not tail_dispatch_hint(proj, fn):
+        return None
+    cfg = net.cfg(proj)
+    compiler = 'gcc-4.4.0-n64'
+    if not any(option.id == compiler for option in consoles.of(cfg).compilers):
+        return None
+    profile = {'toolchain': compiler, 'flags': consoles.default_flags(cfg, compiler)}
+    own = compiler_for(cfg, fn['vram'], fn)
+    if profile != _profile(own) and toolchains.installed(compiler):
+        return profile
+    return None
+
+
 def probe(search, agent, proj, fn, source, profile):
     """Cache misses separately by profile; only a reverified exact bundle can change settings."""
-    from . import agent_tokens
+    from . import agent_tokens, ido_compat
     search.check()
     search.visited += 1
+    # (a draft IDO cannot build, for want of a `char *` cursor, is judged as the text that does build: that text is
+    # what a match is rechecked with and saved as)
+    source = ido_compat.adapted(profile['toolchain'], source)
     scope = agent_tokens.target_scope(search.net, {**dict(fn), 'best_source':source}, '')
     key = 'deep-profile-v1:'+hashlib.sha256(repr((scope, source, profile)).encode()).hexdigest()
     cached = search.net.project_store(proj['id']).one('SELECT outcome FROM reuse_trials WHERE function_id=? AND signature=?', fn['id'], key)

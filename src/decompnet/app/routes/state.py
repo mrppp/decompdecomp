@@ -8,6 +8,7 @@ import json
 import platform
 import secrets
 import shutil
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -21,7 +22,11 @@ from ...agents.api import API_PRESETS
 from ...forks.project import SCOPES
 from ...network import NetworkError
 from ...read_cache import ReadPending
-from .. import build_info, cleanup, edition, picker, saves, updates, window
+from ...rom.export import ExportError
+from .. import build_info, cleanup, edition, picker, repository_setup, saves, updates, window
+from ..app_repair import KIND as APP_REPAIR_KIND
+from ..app_repair import available as repair_available
+from ..app_repair import desktop
 from ..engine import COMPILERS, TOOLS
 from ..support import MAX_DISC, job_error, static_file
 from . import App
@@ -208,7 +213,11 @@ def register(app: App) -> None:
 
     @mcp.custom_route("/api/state", methods=["GET"])
     async def api_state(request: Request) -> Response:
-        return guard(request) or JSONResponse(await (app.ui_call or call)(state))
+        if bad := guard(request):
+            return bad
+        data = await (app.ui_call or call)(state)
+        data["app_repair"] = repair_available() and desktop(request, app)
+        return JSONResponse(data)
 
     @mcp.custom_route('/api/agent-prompts', methods=['GET', 'POST'])
     async def agent_prompts(request: Request) -> Response:
@@ -286,7 +295,7 @@ def register(app: App) -> None:
                 else:
                     selected = definitions
                 return JSONResponse({'tools':[{**t.model_dump(mode='json', by_alias=True),
-                    'calls':usage.get(t.name, {}).get('calls', 0), 'task_calls':tasks.get(t.name, {}), 'schema_chars':len(json.dumps(t.model_dump(mode='json', by_alias=True))), 'required':t.name in tool_policy.REQUIRED,
+                    'calls':usage.get(t.name, {}).get('calls', 0), 'task_calls':tasks.get(t.name, {}), 'schema_chars':len(json.dumps(t.model_dump(mode='json', by_alias=True))), 'required':t.name in tool_policy.REQUIRED or t.name == 'release_and_continue',
                     'global_disabled':t.name in blocked, 'enabled':t.name not in blocked | own}
                     for t in selected], 'helper':helper.id if helper else None,
                     'presets':[{'id':key, 'label':label, 'tools':sum(t.name not in tool_policy.preset_disabled(key) and (not helper or t.name not in blocked) for t in selected)} for key,(label,_) in tool_policy.PRESETS.items()],
@@ -446,18 +455,28 @@ def register(app: App) -> None:
         def work(log):
             if all_compilers:  # a project console's build needs its compiler from the start: installed first
                 install_project_compilers(game, accept, log)
+            new_roms = []
             try:
                 slug = net.import_rom(game, toolchain=toolchain, confirmed=True, name=name, log=log, scope=scope,
-                                     options=options, project_layout=project_layout)
+                                     options=options, project_layout=project_layout, on_new_rom=new_roms.append)
             finally:
                 if uploaded:
                     shutil.rmtree(game.parent, ignore_errors=True)
             if all_compilers:
                 net.install_compilers(slug, accept, retest=toolchain is None, log=log)
+            result = {"slug": slug}
+            if new_roms and consoles.EXPORT in net.console(net.project_row(slug, sync=False)).features:
+                try:
+                    repository_setup.run(net, slug, "init", "", log)
+                except (NetworkError, ExportError, OSError, subprocess.SubprocessError, toolchains.ToolchainError) as e:
+                    warning = (f"Imported the game, but repository setup failed. {job_error(e)} "
+                               "Retry from Settings → Save your progress.")
+                    log(warning)
+                    result["repository_warning"] = warning
             settings.data["last_project"] = slug
             settings.save()
             autopilot(slug)
-            return {"slug": slug}
+            return result
         try:
             return JSONResponse({"job": await app.control(lambda: jobs.start("import", work))})
         except ValueError as e:
@@ -584,6 +603,8 @@ def register(app: App) -> None:
         if (bad := guard(request)):
             return bad
         job = jobs.jobs.get(request.query_params.get("id", ""))
+        if job and job["kind"] == APP_REPAIR_KIND and not desktop(request, app):
+            return fail(NetworkError("Open the desktop window to review app repairs."), 403)
         return await app.control(lambda: JSONResponse(job)) if job else fail(ValueError("no such job"), 404)
 
     @mcp.custom_route("/api/job/cancel", methods=["POST"])
@@ -591,7 +612,11 @@ def register(app: App) -> None:
         if (bad := guard(request, write=True)):
             return bad
         data = await body(request)
-        return JSONResponse({"cancelled": await app.control(lambda: jobs.cancel(str(data.get("id") or "")))})
+        jid = str(data.get("id") or "")
+        job = jobs.jobs.get(jid)
+        if job and job["kind"] == APP_REPAIR_KIND and not desktop(request, app):
+            return fail(NetworkError("Open the desktop window to stop app repairs."), 403)
+        return JSONResponse({"cancelled": await app.control(lambda: jobs.cancel(jid))})
 
     app.autopilot = autopilot
 

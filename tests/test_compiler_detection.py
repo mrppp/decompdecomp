@@ -3,6 +3,8 @@ that fits (profile_climb), instead of only probing other profiles for an exact m
 import struct
 from types import SimpleNamespace
 
+import pytest
+
 from decompnet.app import compiler_fingerprints as cf
 from decompnet.app import profile_climb
 
@@ -181,3 +183,107 @@ def test_profile_proposal_generation_observes_the_search_deadline():
     with pytest.raises(SearchLimit, match='Time limit reached'):
         profile_climb.climb(search, None, PROJ, FN, FN['best_source'], LATE, 10)
     assert search.tested == 0
+
+
+def test_nearby_exact_profiles_supply_one_exact_only_trial(monkeypatch):
+    own = {'toolchain': 'own-cc', 'flags': ['-O2']}
+    alternate = {'toolchain': 'neighbor-cc', 'flags': ['-O1']}
+    neighbours = [
+        {'name': 'first', 'rom_offset': 10, 'vram': 20},
+        {'name': 'second', 'rom_offset': 12, 'vram': 22},
+    ]
+    cfg = {'compiler': own, 'function_compilers': {
+        f"{row['rom_offset']}:{row['vram']}": {**alternate, 'vram': row['vram']}
+        for row in neighbours
+    }}
+    monkeypatch.setattr(cf, 'ranked', lambda *a, **k: [(0, LATE)])
+    tried = []
+
+    def search_with_score(value, limit=100):
+        search = Search({}, limit)
+        search.net.cfg = lambda p: cfg
+        search.net.project_store = lambda ident: SimpleNamespace(all=lambda *a: neighbours)
+        def judge(proj, fn, toolchain, flags, source):
+            tried.append(toolchain)
+            score = value if toolchain == 'neighbor-cc' else 500
+            return score == 0, SimpleNamespace(score=score), ''
+
+        search.net._judge_with = judge
+        return search
+
+    assert profile_climb.lead(search_with_score(0), None, PROJ, FN, FN['best_source'], 155) == (alternate, 0)
+    assert tried == ['late-cc', 'neighbor-cc']
+    tried.clear()
+    assert profile_climb.lead(search_with_score(5), None, PROJ, FN, FN['best_source'], 155) is None
+    assert tried == ['late-cc', 'neighbor-cc']
+    tried.clear()
+    assert profile_climb.lead(search_with_score(0, limit=1), None, PROJ, FN, FN['best_source'], 155) is None
+    assert tried == ['late-cc']
+    tried.clear()
+    neighbours.pop()
+    assert profile_climb.lead(search_with_score(0), None, PROJ, FN, FN['best_source'], 155) is None
+    assert tried == ['late-cc']
+
+
+def test_deep_climb_tries_disable_cross_block_cse_for_repeated_addresses(monkeypatch):
+    from decompnet.app.profile_hypotheses import kmc_cse_address_probe
+
+    own = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O2']}
+    high, low = 'lui $a1, %hi(table)', 'addiu $a1, $a1, %lo(table)'
+    repeat = [(' ', high, high), (' ', low, low)]
+    rows = repeat + [('<', high, ''), ('<', low, '')] * 2
+    assert kmc_cse_address_probe(own, repeat) is None
+    assert kmc_cse_address_probe(own, rows[:-2]) is None
+    flags = ['-O2', '-fno-cse-skip-blocks']
+    assert kmc_cse_address_probe(own, rows) == flags
+    assert kmc_cse_address_probe(dict(own, flags=flags), rows) is None
+
+    monkeypatch.setattr('decompnet.project.compiler_for', lambda *args: own)
+    monkeypatch.setattr(cf, 'ranked', lambda *args, **kwargs: [(2, LATE)])
+    search = Search({})
+    search.net._last_diffs = {(None, FN['id']): (rows, '')}
+    measured = []
+
+    def judge(project, function, toolchain, flags, source):
+        measured.append(flags)
+        return False, SimpleNamespace(score=1160 if '-fno-cse-skip-blocks' in flags else 2391), ''
+
+    search.net._judge_with = judge
+    assert profile_climb.lead(search, None, PROJ, FN, FN['best_source'], 2391) == (dict(own, flags=flags), 1160)
+    assert measured[0] == flags
+
+
+def test_profile_phase_shares_remaining_time_with_local_repairs(monkeypatch):
+    clock = [20.0]
+    monkeypatch.setattr(profile_climb.time, 'monotonic', lambda: clock[0])
+    logs = []
+    search = SimpleNamespace(deadline=60.0, check=lambda: None, log=logs.append)
+    visited = []
+
+    def lead(search, agent, proj, fn, source, baseline, *, check):
+        check()
+        clock[0] = 28.0
+        return LATE, 10
+
+    def climb(search, agent, proj, fn, source, profile, score, *, require_clean, check):
+        check()
+        visited.append((profile, score))
+        clock[0] = 30.0
+        check()
+        pytest.fail('Alternate profile ran through its deadline')
+
+    monkeypatch.setattr(profile_climb, 'lead', lead)
+    monkeypatch.setattr(profile_climb, 'climb', climb)
+    assert not profile_climb.explore(search, None, PROJ, FN, 155)
+    assert visited == [(LATE, 10)]
+    assert clock[0] < search.deadline
+    assert any('continuing with the current settings' in line for line in logs)
+
+
+def test_profile_phase_propagates_user_cancellation(monkeypatch):
+    def cancelled():
+        raise RuntimeError('cancelled')
+
+    search = SimpleNamespace(deadline=profile_climb.time.monotonic() + 100, check=cancelled)
+    with pytest.raises(RuntimeError, match='cancelled'):
+        profile_climb.explore(search, None, PROJ, FN, 155)

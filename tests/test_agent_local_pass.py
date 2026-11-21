@@ -5,7 +5,7 @@ from tests.test_claims import _game
 from tests.test_rom import built  # noqa: F401
 
 
-def test_pass_is_opt_in_bounded_and_returns_selected_revision_without_recursive_tools(tmp_path,monkeypatch):
+def test_pass_honors_explicit_disable_and_returns_selected_revision_without_recursive_tools(tmp_path,monkeypatch):
     net,pid=_game(tmp_path,[('f',10,'open')]);agent,_=net.local_agent('solver')
     source='int f(){return 1;}'
     with net.store.tx() as db:
@@ -20,6 +20,7 @@ def test_pass_is_opt_in_bounded_and_returns_selected_revision_without_recursive_
         agent_tokens.outcome(net,a,fn,'int f(){return 2;}','score 5')
     monkeypatch.setattr(agent_local_pass.local_experiments,'run',run)
     text='score 10\nBudget: old; Candidate revision old.'
+    agent_local_pass.configure(net,{'agent_local_enabled':False})
     assert agent_local_pass.after_tool(net,agent,'game','compile_patch',{'function':'f'},text)==text
     agent_local_pass.configure(net,{'agent_local_enabled':True,'agent_local_trials':2,'agent_local_seconds':3})
     result=agent_local_pass.after_tool(net,agent,'game','compile_patch',{'function':'f'},text)
@@ -35,6 +36,7 @@ def test_shared_dispatch_runs_pass_for_api_and_mcp_entry_points(monkeypatch):
     monkeypatch.setattr(tool_policy, 'record', lambda *a, **kw: None)
     seen=[]
     monkeypatch.setitem(tools.HANDLERS,'project_info',lambda *a,**kw:'facts')
+    monkeypatch.setattr(tools,'project_tools',lambda *a,**kw:['project_info'])
     monkeypatch.setattr(agent_local_pass,'after_tool',lambda *args:seen.append(args[3]) or args[-1])
     from types import SimpleNamespace
     assert tools._dispatch(SimpleNamespace(),SimpleNamespace(id=1),'game','project_info',{})=='facts'
@@ -89,3 +91,23 @@ def test_real_compile_submission_can_match_in_the_local_pass(tmp_path,monkeypatc
 
     capture=net.store.one('SELECT status FROM repair_examples ORDER BY id DESC LIMIT 1')
     assert capture['status']=='implemented'
+
+
+def test_optional_repair_failure_preserves_compile_reply(tmp_path, monkeypatch, caplog):
+    net, _ = _game(tmp_path, [('f', 10, 'open')])
+    agent, _ = net.local_agent('solver')
+    source = 'int f(void){return 1;}'
+    fn = net.claim_row(agent, 'game', 'f')
+    net._record(fn, agent, 10, source, 0)
+    net._agent_outcomes = {(agent.id, fn['id']): {'source': source, 'score': 10}}
+    agent_local_pass.configure(net, {'agent_local_enabled': True})
+
+    def fail(*args, **kwargs):
+        raise UnboundLocalError('test generator error')
+
+    monkeypatch.setattr(agent_local_pass.local_experiments, 'run', fail)
+    reply = agent_local_pass.after_tool(net, agent, 'game', 'compile_patch', {'function': 'f'}, 'score 10')
+    assert reply.startswith('score 10\n')
+    assert 'Your submission was judged' in reply
+    assert 'test generator error' in caplog.text
+    assert net._function('f', 'game')['best_score'] == 10

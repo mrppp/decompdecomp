@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import agent_notes, agents, scoring
+from . import agent_notes, agents, claim_routing, routing_experiment, scoring
 from .candidate_work import trial
 from .compiler import compile_source
 from .elfobj import FunctionObj, Reloc, extract_function
@@ -47,6 +47,7 @@ MODEL_FAMILIES = {"opus": "claude", "sonnet": "claude", "haiku": "claude", "fabl
 # ones get few; big ones get more, as long as the score keeps falling.
 STALL_BUDGET = ((32, 3), (64, 4), (128, 6), (256, 8))
 STALL_BUDGET_BIGGEST = 10
+LARGE_PLATEAU_BUDGET = 4
 STALL_LOOKBACK = 16  # compiles stall_note reads back: more than the biggest budget
 # The game's own code (an SQL condition on `functions`): not what the project sets aside as library code, middleware
 # or the C runtime (config/<version>/set_aside.json, objdiff.game_measures; while its scope is the game's own code).
@@ -79,6 +80,7 @@ NOTES_FOUND = 20  # search_notes' answer at most
 # Opus helper claimed at once. After that the function still comes to it last.
 SELF_RELEASE_WINDOW = RELEASE_COOLDOWN
 MACHINE_AGENTS = ("autopilot", "permuter", "deep-permuter")  # decompdecomp's own workers: their claims never mean "given up on"
+NON_MODEL_AGENTS = (*MACHINE_AGENTS, "you")
 # (the deep permuter, the user's long search of one function, is a worker of its own, not "permuter": sharing that
 # identity let it renew or let go of the automatic permuter's claim on the same function, and a claim by one looked
 # like its own to the other, #244)
@@ -118,16 +120,8 @@ def assembly_blocker(why):
     return None
 
 
-# Routing between models (claim_row): on an N64 game free models matched 14-25% of the functions they claimed and
-# spent 17-31 compiles a match, stronger ones 42-77% and 3-6, and every model was handed the functions the others
-# gave up on. A model well behind the strongest one at work leaves functions given up on ESCALATE_AFTER times to it;
-# the strongest takes those first. A model's share: its matches over its claims in the project, pulled towards the
-# game's overall share while it has made few.
+# Reserve difficult claims where comparable starting candidates support a preference (claim_routing.py).
 ESCALATE_AFTER = 3
-WEAK_SHARE = 0.6  # of the strongest model's share: below it, a model is the weaker one
-ROUTE_PRIOR = 10  # claims' worth of the overall share
-ROUTE_ACTIVE_SECONDS = 3600  # the models at work: claimed something this recently
-ROUTE_MIN_CLAIMS = 20  # claims a model has made in the project before it's judged
 # Twins first (see app/twins.py): a function whose code the game has more than once (boost: how many more times)
 # and isn't too big or given up on, best value per instruction first; its twins (boost -1) last, as they match for
 # free once it does.
@@ -260,6 +254,7 @@ _INFRA_NOTE = re.compile(
 # notes in one project: "plain C plateaus here" at 68.3% on a function another agent took to 95.1%)
 _CEILING = re.compile(r"plateau|ceiling|not reachable|unreachable|can'?t (?:get|reach|go|be matched|match)|cannot|"
                       r"impossible|dead[- ]end|capped|stuck at|won'?t match|best possible|no way to|maxed", re.I)
+_NOTE_NEXT_STEP = re.compile(r'^\s*(?:untested )?next step:[^\n]*\S', re.I | re.M)
 _PERCENT = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d+)?)\s*%")
 _SCORE = re.compile(r"\bscore\s*(?:of\s*|=\s*|:\s*)?(\d+)\b", re.I)
 
@@ -277,7 +272,7 @@ def _superseded(text: str, best_score: int | None, best_percent: float | None) -
 
 
 def brief_notes(rows, fn, best_at: float | None = None, best_text: str = "", show: int | None = None,
-                when: bool = True) -> list[str]:
+                when: bool = True, *, current_inputs: str | None = None) -> list[str]:
     """A function's notes as its brief lists them (rows newest first: text, created_at, name). Notes about the
     setup (_INFRA_NOTE) are left out, with a line saying how many; a note given word for word more than once is
     shown once; an older note that said it can't get closer, or described less than the best now (`best_text`,
@@ -302,9 +297,10 @@ def brief_notes(rows, fn, best_at: float | None = None, best_text: str = "", sho
         if key in seen:
             seen[key][1] += 1
             continue
-        item = [n, 1, False]
+        changed_inputs = agent_notes.changed_inputs(current_inputs, n.get('handoff_inputs'))
+        item = [n, 1, False, changed_inputs]
         seen[key] = item
-        if fn["status"] != "matched" and says_matched(text):
+        if changed_inputs or (fn["status"] != "matched" and says_matched(text)):
             stale.append(item)  # stale_note marks it below
         elif (best_at is not None and best_score is not None and (n["created_at"] or 0) < best_at
                 and _superseded(text, best_score, best_percent)):
@@ -313,13 +309,23 @@ def brief_notes(rows, fn, best_at: float | None = None, best_text: str = "", sho
         else:
             fresh.append(item)
     lines = []
-    for n, count, old in (fresh + stale)[:show]:
+    # Put actionable handoffs ahead of other notes tested against the same inputs.
+    fresh.sort(key=lambda item: not _NOTE_NEXT_STEP.search(item[0]['text'] or ''))
+    for n, count, old, changed_inputs in (fresh + stale)[:show]:
         text = stale_note((n["text"] or "").strip(), fn["status"])
+        if not changed_inputs and (step := _NOTE_NEXT_STEP.search(text)):
+            finding = (text[:step.start()] + text[step.end():]).strip()
+            text = step[0].strip() + ('\n' + finding if finding else '')
         if old:
             text = f"(superseded: best is now {best_text or fn['best_score']}) {text}"
         if count > 1:
             text += f" [noted {count} times]"
         who = f"{n['name']}, {_ago(n['created_at'])}" if when else f"{n['name']}"
+        before, after = n.get('score_before'), n.get('score_after')
+        if after is not None:
+            who += f"; saved score {before} → {after}" if before is not None and before != after else f"; saved score {after}"
+        if changed_inputs:
+            text = f"[Inputs changed since testing ({changed_inputs}); recheck before relying on it.] {text}"
         lines.append(f"- ({who}) {text}")
     if infra:
         lines.append(f"- ({infra} note{'s' * (infra != 1)} about builds that broke or agents that stopped left out: "
@@ -374,6 +380,11 @@ def stall_budget(n_insns: int) -> int:
     return next((after for under, after in STALL_BUDGET if n_insns < under), STALL_BUDGET_BIGGEST)
 
 
+def large_plateau(fn):
+    """Restrict the shorter lease budget to large functions with a saved score and repeated releases."""
+    return (fn['n_insns'] or 0) >= 128 and fn['abandons'] >= ESCALATE_AFTER and (fn['best_score'] or 0) > 0
+
+
 def stall_budget_text() -> str:
     """The budget in words: the prompt and the guides say exactly this. Each function has one number (its brief
     names it, every compile_and_diff result shows where you stand against it, release_function goes by it): the
@@ -386,7 +397,7 @@ def move_on_brief(fn, after=None) -> str:
     """The brief's line naming the function's own move-on number (the one compile_and_diff counts against)."""
     custom = after is not None
     after = after if custom else stall_budget(fn["n_insns"] or 0)
-    basis = "your worker setting" if custom else "this function’s size"
+    basis = "your current claim policy" if custom else "this function’s size"
     return (f"move on after {after} compiles in a row without a better score ({basis}; "
             f"each compile_and_diff result shows the count). Recovery above the inherited best does not reset it. "
             'To leave earlier with a reason, use release_function(move_on=true, claim_token="the current claim_token", notes="what you tried and why").')
@@ -417,7 +428,7 @@ def claim_query(strategy: str) -> str:
     # functions waiting for another to match come last (WAITING); the ones they wait for, and those whose
     # wait is over, first (after what the release rules put back, before model routing's escalations)
     return (f"""SELECT f.* FROM functions f LEFT JOIN {_REGION} r ON r.region = f.vram / {REGION_BYTES}
-            WHERE f.project_id=:pid AND f.status='open' AND (:weak = 0 OR f.abandons < :escalate)
+            WHERE f.project_id=:pid AND f.status='open' AND f.id NOT IN (SELECT value FROM json_each(:route_deferred))
             AND (:batch_unit IS NULL OR (f.unit=:batch_unit AND f.n_insns<=:batch_limit AND f.boost>=0
                  AND f.id NOT IN ({WAITING})))
             AND f.id NOT IN (SELECT value FROM json_each(:batch_sdk))
@@ -445,7 +456,7 @@ def claim_query(strategy: str) -> str:
                                 AND created_at > :cooled) END,
                      CASE WHEN :custom THEN 0 ELSE f.id IN ({READY}) END DESC, CASE WHEN :custom THEN 0 ELSE f.id IN ({WANTED}) END DESC,
                      CASE WHEN :custom THEN 0 ELSE f.id IN (SELECT value FROM json_each(:machine_pending)) END,
-                     :strong AND f.abandons >= :escalate DESC, {STRATEGIES[strategy]} LIMIT 1""")
+                     f.id IN (SELECT value FROM json_each(:route_preferred)) DESC, {STRATEGIES[strategy]} LIMIT 1""")
 
 
 def _ago(ts: float | None) -> str:
@@ -453,6 +464,13 @@ def _ago(ts: float | None) -> str:
         return "never"
     s = int(time.time() - ts)
     return f"{s}s ago" if s < 120 else f"{s // 60}m ago" if s < 7200 else f"{s // 3600}h ago"
+
+
+def score_candidate(target, candidate, verdict):
+    diff = scoring.diff(target, candidate)
+    if verdict is not None:
+        return scoring.DiffResult(0 if verdict else max(1, diff.score), diff.max_score, diff.rows, verdict)
+    return diff
 
 
 class Network:
@@ -493,6 +511,7 @@ class Network:
         self._context_rejections = OrderedDict()
         self._context_trial_locks = {}
         self._compiled: OrderedDict[str, dict] = OrderedDict()  # compile_key -> result, for repeat_of
+        self._compiled_lock = threading.Lock()
 
     def project_store(self, project: int | str) -> Store:
         """Select one operational file by catalog ID or slug, with no fallback.
@@ -513,6 +532,8 @@ class Network:
         Reimports select the existing owner. Legacy library callers retain their
         original one-file atomic transaction until app startup upgrades them.
         """
+        if existing is None and config.get('kind') == 'rom':
+            config = {'auto_commit_matches': True, **config}
         if existing is None and self._project_files is not None:
             values = (slug,name,description,arch,int(big_endian),str(root),json.dumps(config))
             with self._project_files.create(values) as result:yield result
@@ -851,29 +872,42 @@ class Network:
         split, an edit_file): earlier compile results no longer stand for a repeat of the same source."""
         self._generation[project_id] = self._generation.get(project_id, 0) + 1
 
-    def compile_key(self, fn, *state: str) -> str:
+    def compile_key(self, fn, *state: str, verbatim=False) -> str:
         """What a compile's result depends on besides the source: the function, the project's generation and `state`
         (the header, the file around the function...). Sources are compared without per-line indentation and
         trailing spaces (line numbers stay, for __LINE__)."""
         h = hashlib.sha1(f"{fn['id']}\0{self._generation.get(fn['project_id'], 0)}".encode())
         for part in state:
-            h.update(b"\0" + normalized_source(part).encode("utf-8", "replace"))
+            text = part if verbatim else normalized_source(part)
+            h.update(b"\0" + text.encode("utf-8", "replace"))
         return h.hexdigest()
 
-    def repeat_of(self, key: str, agent: Agent, fn) -> dict | None:
+    def judged_object_key(self, fn, proj, header, source, obj):
+        """Key a displayed miss on the actual object and current link inputs."""
+        snapshot = self._compile_snapshot(proj, fn, header, source)
+        store = self.project_store(fn['project_id'])
+        symbols = store.read_version('scope_symbols', fn['project_id'])
+        state = (snapshot, symbols, self._generation.get(fn['project_id'], 0),
+                 fn['rom_offset'], fn['unit'], fn['size'], fn['asm'])
+        return hashlib.sha256(repr(state).encode() + hashlib.sha256(obj).digest()).hexdigest()
+
+    def repeat_of(self, key: str, agent: Agent, fn, *, checked_object=False) -> dict | None:
         """An earlier compile of the same source in the same state: its result again, marked as a repeat, without
         building anything or counting toward the move-on number (in one project, 3,639 of 9,611 compiles were
         byte-identical to an earlier one of the same function)."""
-        hit = self._compiled.get(key)
-        if hit is None:
-            return None
-        self._compiled.move_to_end(key)
+        with self._compiled_lock:
+            hit = self._compiled.get(key)
+            if hit is None:
+                return None
+            self._compiled.move_to_end(key)
         if hit.get('diff'):
             rows, legend = hit['diff']
             self.keep_diff(agent.id, fn['id'], rows, legend)
         who = "your" if hit["agent_id"] == agent.id else f"{self._agent_name(hit['agent_id'])}'s"
-        head = (f"🔁 REPEAT: this source is the same (indentation aside) as {who} compile #{hit['n']} of {fn['name']} "
-                f"({_ago(hit['at'])}), and nothing it depends on changed since, so it wasn't built again and doesn't "
+        reused = ("the same object was produced, so its judge result was reused" if checked_object
+                  else "nothing it depends on changed since, so it wasn't built again")
+        head = (f"🔁 REPEAT: this source is the same as {who} compile #{hit['n']} of {fn['name']} "
+                f"({_ago(hit['at'])}); {reused} and this doesn't "
                 "count toward the move-on number. That compile's result:\n")
         return {"text": head + hit["text"] + self.stall_note(fn["id"], agent.id, project_id=fn["project_id"]), "score": hit["score"],
                 "matched": False, "exact": False, "new_match": False, "adopted": False, "repeat": True}
@@ -883,10 +917,11 @@ class Network:
         store = self.project_store(fn["project_id"])
         n = store.one("SELECT COUNT(*) AS n FROM attempts WHERE function_id=? AND agent_id=?", fn["id"],
                            agent.id)["n"]
-        self._compiled[key] = {"text": text, "score": score, "agent_id": agent.id, "n": n, "at": time.time(),
-                               "diff": self._last_diffs.get((agent.id, fn["id"])) if score is not None else None}
-        while len(self._compiled) > REPEATS_KEPT:
-            self._compiled.popitem(last=False)
+        with self._compiled_lock:
+            self._compiled[key] = {"text": text, "score": score, "agent_id": agent.id, "n": n, "at": time.time(),
+                                   "diff": self._last_diffs.get((agent.id, fn["id"])) if score is not None else None}
+            while len(self._compiled) > REPEATS_KEPT:
+                self._compiled.popitem(last=False)
 
     def same_score_note(self, fn_id: int, agent_id: int, score: int | None, source: str, *, project_id=None) -> str:
         """When a new variant only reproduces a score an earlier, different source of this claim had: which compile
@@ -1218,10 +1253,18 @@ class Network:
             return None
         name = agent.name if isinstance(agent, Agent) else agent['name']
         project = self.project_store(fn['project_id']).one("SELECT slug FROM projects WHERE id=?", fn['project_id'])
-        return self.selection(project['slug'], name).get('stall_compiles')
+        configured = self.selection(project['slug'], name).get('stall_compiles')
+        if configured is not None:
+            return configured
+        if name not in NON_MODEL_AGENTS and large_plateau(fn):
+            return LARGE_PLATEAU_BUDGET
+        return None
 
     def attempt_limit(self, agent: Agent, fn) -> tuple[int | None, int]:
         store = self.project_store(fn["project_id"])
+        from .app.focused_agents import limits
+        if (focused := limits(self, agent, fn, store)) is not None:
+            return focused
         slug = store.one("SELECT slug FROM projects WHERE id=?", fn["project_id"])["slug"]
         limit = self.selection(slug, agent.name).get("max_tries")
         used = store.one("SELECT COUNT(*) AS n FROM attempts WHERE function_id=? AND agent_id=?",
@@ -1246,7 +1289,9 @@ class Network:
         with timed_lock(store.lock,'write_lock_wait'):
             lock = self._attempt_locks.setdefault((agent.id, fn["id"]), threading.RLock())
         with timed_lock(lock,'candidate_lock_wait'):
+            from .app.focused_agents import check_target
             self.ensure_agent_active(agent)
+            check_target(self, agent, fn)
             self.check_attempt_limit(agent, fn)
             yield
 
@@ -1258,9 +1303,12 @@ class Network:
         limit, used = self.attempt_limit(agent, fn)
         if limit is None or used < limit:
             return
+        from .app.focused_agents import scope
+        if scope(self, agent):
+            raise NetworkError(f"Focused try limit reached ({used}/{limit}). Your best attempt is saved.")
         held = store.one("SELECT 1 FROM claims WHERE function_id=? AND agent_id=?", fn["id"], agent.id)
         if held:
-            Network.release(self, agent, fn["name"], f"User's max tries reached ({used}/{limit}); best attempt retained.",
+            Network.release(self, agent, fn["name"], "",
                             store.one("SELECT slug FROM projects WHERE id=?", fn["project_id"])["slug"])
         raise NetworkError(f"Max tries reached for {fn['name']} ({used}/{limit}). Your work is saved. "
                            "Call claim_function for another function, or ask the user to raise the limit.")
@@ -1492,8 +1540,7 @@ class Network:
                         raise NetworkError(f"{fn['name']} is claimed by the user in the C editor. The user can select Let agents work on this; choose another eligible function meanwhile")
                     raise NetworkError(f"{fn['name']} is claimed by {owner} "
                                        f"for another {int(other['expires_at'] - now) // 60} min")
-                db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + self.claim_ttl))
-                self._event(db, fn["project_id"], agent.id, "claim", fn["name"])
+                self._open_claim(db, fn, agent, now, proj)
             else:
                 if plan is None:  # its claim ran out (or a batch started) since the look before the transaction
                     plan = self._claim_plan(store, proj, agent, strategy, now, blocked=blocked,
@@ -1510,19 +1557,35 @@ class Network:
                     fn = self._claim_pick(lambda sql, args: db.execute(sql, args).fetchone(), *plan)
                 if fn is None:
                     return None
+                trial_plan = plan[1].get('routing_trial') or {}
+                if fn['id'] in trial_plan.get('arms', {}) and not routing_experiment.available(db, proj['id'], fn['id'], trial_plan):
+                    normal = plan[1] | {'route_preferred': trial_plan['normal_preferred'],
+                                        'route_deferred': trial_plan['normal_deferred']}
+                    fn = self._claim_pick(lambda sql, args: db.execute(sql, args).fetchone(), plan[0], normal)
+                    if fn is None:
+                        return None
+                    trial_plan = {}
                 if fn['id'] in retry_grants and fn['id'] not in claim_stalls.grants(self,proj,agent):
                     return None  # a same-model worker consumed this grant before our claim transaction
-                db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + self.claim_ttl))
-                self._event(db, fn["project_id"], agent.id, "claim", fn["name"])
+                self._open_claim(db, fn, agent, now, proj)
+                if trial_plan:
+                    routing_experiment.start(db, fn, agent, now, trial_plan)
             if proj is not None and fn['id'] in retry_grants:claim_stalls.consume(self,proj,fn,agent,db)
             # a wait that's over has had its turn at the front once it's claimed
             db.execute("DELETE FROM waits WHERE function_id=? AND needs_id IN (SELECT id FROM functions "
                        "WHERE status='matched')", (fn["id"],))
         return fn
 
+    def _open_claim(self, db, fn, agent, now, proj):
+        db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + self.claim_ttl))
+        self._event(db, fn["project_id"], agent.id, "claim", fn["name"])
+        if fn['abandons'] >= ESCALATE_AFTER and agent.name not in NON_MODEL_AGENTS:
+            proj = proj or db.execute("SELECT * FROM projects WHERE id=?", (fn['project_id'],)).fetchone()
+            claim_routing.start(db, fn, agent, now, claim_routing.build_profiles(proj)(fn), proj)
+
     def _claim_plan(self, store, proj, agent: Agent, strategy: str, now: float, *, blocked, retry_grants, sdk,
                     batch_from):
-        """The automatic claim's query and its named arguments, and the agent's model route. Only reads, through
+        """The automatic claim's query and its named arguments. Only reads, through
         `store` (a snapshot outside the transaction, or the writer's own connection inside it): what it reads orders
         and filters the queue, and the claim transaction re-checks the function it takes."""
         policy = self.selection(proj["slug"], agent.name)
@@ -1535,13 +1598,19 @@ class Network:
         names = {r["id"]: r["name"] for r in self.store.all("SELECT id, name FROM agents")}
         # Explicit user ordering wins over adaptive routing and release penalties. Leases and the
         # agent's recent-release exclusion still prevent two workers or a tight retry loop.
-        route = None if custom else self._route(store, proj["id"], agent, now, names)
+        preferred, deferred = [], []
+        if not custom and json.loads(proj['config']).get('claim_order') not in CLAIM_ORDERS:
+            preferred, deferred = claim_routing.routes(store, proj, agent, now, names)
+        routing_trial = routing_experiment.plan(store, proj, preferred, deferred, policy) if batch_from is None else {}
+        if routing_trial:
+            overlap = {fid for fid, side in routing_trial['arms'].items() if side == 'overlap'}
+            preferred = preferred + [fid for fid in deferred if fid in overlap]
+            deferred = [fid for fid in deferred if fid not in overlap]
         family = model_family(agent.name)
         kin = [agent_id for agent_id, name in names.items() if model_family(name) == family]
         tried = store.one("SELECT SUM(status = 'matched') AS won, SUM(status = 'matched' OR attempts > 0) "
                           "AS tried FROM functions WHERE project_id=? AND status != 'asm'", proj["id"])
         overall = (tried["won"] or 0) / tried["tried"] if tried["tried"] else 0.5
-        escalate = self._escalation(store, proj["id"]) if route else ESCALATE_AFTER
         args = {"retry_grants": json.dumps(retry_grants),
                 "batch_sdk": json.dumps(batch_from.get("deferred", []) if batch_from is not None else []),
                 "batch_unit": batch_from["unit"] if batch_from is not None else None,
@@ -1549,11 +1618,12 @@ class Network:
                 "model_tried": json.dumps(list(excluded)), "stalled": json.dumps(blocked), "sdk": json.dumps(list(sdk)),
                 "pid": proj["id"], "agent": agent.id, "name": agent.name, "kin": json.dumps(kin),
                 "cooled": now - RELEASE_COOLDOWN,
-                "overall": overall, "escalate": escalate, "weak": route == "weak", "strong": route == "strong",
+                "overall": overall, "route_preferred": json.dumps(preferred), "route_deferred": json.dumps(deferred),
+                "routing_trial": routing_trial,
                 "mine": self._own_release_cutoff(store, agent.id, now, proj), "custom": custom,
                 "below": policy.get("match_below"), "tries": policy.get("max_tries"),
                 "machine_pending": json.dumps(self._machine_pending(proj, agent))}
-        return claim_query(strategy), args, route
+        return claim_query(strategy), args
 
     def _machine_pending(self, proj, agent: Agent) -> list[int]:
         """The functions autopilot's running pass will still try (a machine draft through the judge, or a
@@ -1571,62 +1641,23 @@ class Network:
         return sorted(pending.copy()) if pending else []  # (a copy in one step: autopilot's lanes take from it)
 
     @staticmethod
-    def _claim_pick(read, query: str, args: dict, route: str | None):
+    def _claim_pick(read, query: str, args: dict):
         """The function the claim query puts first, through `read(sql, named_args)`; a weak model that finds only
         what stronger models are for takes it anyway: better tried than idle."""
         fn = read(query, args)
-        if fn is None and route == "weak":
-            fn = read(query, args | {"weak": False})
+        if fn is None and args["route_deferred"] != "[]":
+            fn = read(query, args | {"route_deferred": "[]"})
         return fn
 
-    @staticmethod
-    def _escalation(store, project_id: int) -> int:
-        """How many give-ups make an open function the strongest model's (model routing): ESCALATE_AFTER, until every
-        open function has had that many; then more than the median open function has, so a weak model keeps the
-        less tried half. On an Xbox game whose 1,146 open functions had all been given up on 5 or more times, the
-        weak model fell back to the whole queue: 3,183 claims and $138 for 10 matches in a night, while the strong
-        model matched 27 of its 138."""
-        given_up = sorted(r[0] for r in store.all("SELECT abandons FROM functions WHERE project_id=? AND "
-                                                  "status='open'", project_id))
-        if not given_up or given_up[0] < ESCALATE_AFTER:
-            return ESCALATE_AFTER
-        return given_up[(len(given_up) - 1) // 2] + 1
-
-    def _route(self, store, project_id: int, agent: Agent, now: float, names: dict[int, str]) -> str | None:
-        """"weak" for a model at work in the project well behind the strongest one at work, "strong" for that one
-        while a weak one works too (see ESCALATE_AFTER), None otherwise: no routing until both are told apart by
-        ROUTE_MIN_CLAIMS claims each. `names`: agent ID -> name, from the catalog."""
-        claims, won, busy = collections.Counter(), collections.Counter(), {model_of(agent.name)}
-        # idx_events_agent_kind_time answers this from the index, in agent order (no sort of every claim event)
-        for r in store.all("SELECT agent_id, COUNT(*) AS n, MAX(created_at) AS last FROM events WHERE project_id=? "
-                           "AND kind='claim' GROUP BY agent_id", project_id):
-            if names.get(r["agent_id"], MACHINE_AGENTS[0]) not in MACHINE_AGENTS:
-                claims[model_of(names[r["agent_id"]])] += r["n"]
-                if r["last"] > now - ROUTE_ACTIVE_SECONDS:
-                    busy.add(model_of(names[r["agent_id"]]))
-        for r in store.all("SELECT matched_agent_id AS id, COUNT(*) AS n FROM functions WHERE project_id=? "
-                           "AND status='matched' GROUP BY matched_agent_id", project_id):
-            if names.get(r["id"], MACHINE_AGENTS[0]) not in MACHINE_AGENTS:
-                won[model_of(names[r["id"]])] += r["n"]
-        overall = sum(won.values()) / sum(claims.values()) if sum(claims.values()) else 0.5
-        share = {m: (won[m] + ROUTE_PRIOR * overall) / (claims[m] + ROUTE_PRIOR) for m in busy
-                 if claims[m] >= ROUTE_MIN_CLAIMS}
-        mine = model_of(agent.name)
-        if mine not in share or len(share) < 2:
-            return None
-        best = max(share.values())
-        if share[mine] < WEAK_SHARE * best:
-            return "weak"
-        weak = any(s < WEAK_SHARE * best for s in share.values())
-        return "strong" if share[mine] == best and weak else None
-
     @release_operation("release")
-    def release(self, agent: Agent, function: str, notes: str, project: str | None = None, not_c: bool = False, claim_token: str = "") -> str:
+    def release(self, agent: Agent, function: str, notes: str, project: str | None = None, not_c: bool = False, claim_token: str = "", *, handoff=None, room_evidence=None) -> str:
         """An agent gives a function back: its claim ends, its notes stay for the next agent, and the function
         counts one more give-up (the claim order puts those later). `not_c`: the agent found no C makes its code
         (NOT_C_AGENTS)."""
         fn = self._function(function, project)
         store = self.project_store(fn["project_id"])
+        from .search_notes import boilerplate
+        notes = "" if boilerplate(notes) else notes
         if not_c and not notes.strip():
             raise NetworkError("say in notes why no C makes it: the next agents and the user read it")
         progress = self.claim_progress(agent, fn)
@@ -1637,10 +1668,14 @@ class Network:
             from .app import agent_review
             review_facts = (agent_review.facts(self,store.one('SELECT * FROM projects WHERE id=?',fn['project_id']),fn)
                             if agent_review.CONCERN.search(notes) or agent_review.load(self,agent_review.PREFIX+str(fn['id']),project_id=fn['project_id']) else None)
+            if handoff is not None:
+                db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',
+                           (agent_review.EXPERIMENT + str(fn['id']), json.dumps(dict(handoff, released_at=time.time()))))
             db.execute("DELETE FROM claims WHERE function_id=?", (fn["id"],))
             db.execute("UPDATE functions SET abandons=abandons+1 WHERE id=?", (fn["id"],))
-            if notes.strip() and notes.strip() != "Deep permutation turn ended; improvements shared.":
-                agent_notes.save(db, fn["project_id"], fn["id"], agent.id, notes.strip(), agent_name=agent.name)
+            if notes.strip() and agent_notes.save(db, fn["project_id"], fn["id"], agent.id, notes.strip(), agent_name=agent.name,
+                                                room_evidence=room_evidence):
+                self._event(db, fn["project_id"], agent.id, "note", fn["name"])
             self._event(db, fn["project_id"], agent.id, "release", fn["name"])
             said = self._not_c(db, fn, agent, notes.strip()) if not_c else ""
         from . import claim_stalls
@@ -1649,8 +1684,10 @@ class Network:
         candidate_quality.capture(self,fn,agent,notes,progress)
         from .app import agent_review
         agent_review.observe(self,fn,agent,notes,progress,snapshot=review_facts)
-        return (f"Released {fn['name']}. Your best attempt and notes are saved so the next agent starts "
-                f"where you left off.{said} Call claim_function for a new one.")
+        saved = 'Your best attempt is kept.'
+        if notes.strip():
+            saved += ' Your findings are saved for the next agent.'
+        return f"Released {fn['name']}. {saved}{said} Call claim_function for a new one."
 
     def _not_c(self, db, fn, agent: Agent, why: str) -> str:
         """An agent's verdict that no C makes fn's code; with NOT_C_AGENTS agents of NOT_C_MODELS models agreeing, fn
@@ -1768,18 +1805,15 @@ class Network:
                        (json.dumps({**meta, "reopened": True}), fn["id"]))
             self._event(db, fn["project_id"], None, "reopen", f"{fn['name']}: open again (you gave it back to the agents)")
 
-    def release_stopped(self, agent_ids, why: str, *, project: str | None = None) -> list[str]:
-        """The claims of agents whose process is gone, released at once with a note (`why`), instead of holding their
+    def release_stopped(self, agent_ids, *, project: str | None = None) -> list[str]:
+        """The claims of agents whose process is gone, released at once instead of holding their
         functions until CLAIM_TTL runs out: after an update or a restart of the app, every open function looked held
         by helpers that had died with it. Not counted as giving up. Each function freed gets a 'freed' event (one
         without a function when the agent held none), which ends the agent's run: what it released before no longer
         keeps it off those functions (SELF_RELEASE_WINDOW). Returns the functions released."""
-        now, freed = time.time(), []
+        freed = []
         agent_ids = list(agent_ids)
         if not agent_ids:return freed
-        own = self._machine_agent_ids()
-        names = {r['id']:r['name'] for r in self.store.all(
-            'SELECT id,name FROM agents WHERE id IN (SELECT value FROM json_each(?))', json.dumps(agent_ids))}
         # A single helper belongs to one project. Stopping it must not open or
         # write every idle project's operational database. Shutdown keeps the full sweep.
         if project is not None:
@@ -1796,10 +1830,6 @@ class Network:
                                       "WHERE c.agent_id=?" + scope, args).fetchall()
                     for r in rows:
                         db.execute('DELETE FROM claims WHERE function_id=? AND agent_id=?', (r['id'], aid))
-                        if aid not in own:
-                            agent_notes.save(db, r['project_id'], r['id'], aid,
-                                             f"Released because its agent stopped ({why}); its attempts are kept.",
-                                             now, agent_name=names.get(aid))
                         self._event(db, r['project_id'], aid, 'freed', r['name'])
                         freed.append(r['name'])
                     if not rows:
@@ -1809,14 +1839,14 @@ class Network:
                             self._event(db, pid, aid, 'freed', '')
         return freed
 
-    def release_local_claims(self, why: str) -> list[str]:
+    def release_local_claims(self) -> list[str]:
         """When the app starts: none of its own helpers (origin 'local') is running yet, so whatever they hold is left
         over from the last run. Agents that run elsewhere (a room's members, an agent using the MCP server) may still
         be working: theirs keep the CLAIM_TTL rule; so do the user's own claims and decompdecomp's workers'."""
         ids = [r["id"] for r in self.store.all("SELECT id FROM agents WHERE origin='local' AND name NOT IN "
                                                f"({', '.join('?' * (1 + len(MACHINE_AGENTS)))})",
                                                "you", *MACHINE_AGENTS)]
-        return self.release_stopped(ids, why)
+        return self.release_stopped(ids)
 
     def get_function(self, function: str, project: str | None = None, agent: Agent | None = None) -> str:
         return self._brief(self._function(function, project), agent, header="VIEW")
@@ -1873,6 +1903,10 @@ class Network:
         notes = self.notes_for_brief(fn)
         if notes:
             lines += ["", "### Notes from previous agents on this function", *notes]
+        from .app.knowledge import service
+        from .app.repair_ranking import evidence
+        if tips := service(self).relevant(fn, evidence(self, fn['id'], agent.id if agent else None)):
+            lines += ['', *tips]
         lines += self.dependency_brief(fn)
         if fn["unit"] and fn["unit"] in self._unit_contexts(proj["id"]):
             lines.insert(2, f"source unit {fn['unit']}: call get_context with function=\"{fn['name']}\" for its header")
@@ -1884,10 +1918,12 @@ class Network:
     def notes_for_brief(self, fn, best_text: str = "", show: int | None = None, when: bool = True) -> list[str]:
         """A function's notes for its brief (brief_notes), with when its best score was first reached."""
         store = self.project_store(fn["project_id"])
-        rows = store.all("SELECT n.text,n.created_at,n.agent_id FROM notes n "
+        rows = store.all("SELECT n.text,n.created_at,n.agent_id,n.score_before,n.score_after,n.handoff_inputs FROM notes n "
                               f"WHERE n.function_id=? AND n.text != 'Deep permutation turn ended; improvements shared.' "
                               f"ORDER BY n.created_at DESC,n.id DESC LIMIT {BRIEF_NOTES * 8}", fn["id"])
         from .app.project_labels import label
+        if not rows:
+            return []
         rows = label(self, rows, {'name':'agent_id'})
         best_at = None
         if fn["status"] != "matched" and fn["best_score"] is not None:
@@ -1895,7 +1931,8 @@ class Network:
                                  fn["id"], fn["best_score"])
             best_at = row["t"] if row else None
         from .search_notes import useful
-        return brief_notes(useful(rows), fn, best_at, best_text, show, when)
+        inputs = agent_notes.current_inputs(self, store, fn) if any(row['handoff_inputs'] for row in rows) else None
+        return brief_notes(useful(rows), fn, best_at, best_text, show, when, current_inputs=inputs)
 
     def _next_step(self, proj, ctx) -> str:
         """The brief's last line for the agent that claimed the function."""
@@ -1909,6 +1946,9 @@ class Network:
         fn = self._function(function, project)
         limit, used = self.attempt_limit(agent, fn)
         if fn["status"] == "open" and limit is not None and used >= limit:
+            from .app.focused_agents import scope
+            if scope(self, agent):
+                return f"\nFocused try limit reached ({used}/{limit}). Your best attempt is saved. End this session."
             return (f"\nMax tries reached ({used}/{limit}); this function is released and your best attempt is saved. "
                     "Call claim_function for the next function.")
         return ""
@@ -1947,7 +1987,8 @@ class Network:
                     if same:
                         source = fn["matched_source"]
                     self._record(fn, credit, 0, source, ctx["version"], matched=True,
-                                 via="saved_recheck", effective_settings=settings, retain_match_credit=same)
+                                 via="saved_recheck", effective_settings=settings, retain_match_credit=same,
+                                 verified_replacement=True)
                     db.execute("UPDATE functions SET readable=? WHERE id=? AND readable IS NOT ?",
                                (int(readable), fn["id"], int(readable)))
                     return True
@@ -1986,10 +2027,10 @@ class Network:
         return False, None, getattr(result, "effective_settings", None)
 
     def _score_candidate(self, fn, proj, cand, verdict):
-        diff = scoring.diff(self._target_obj(fn, proj), cand)
-        if verdict is not None:
-            return scoring.DiffResult(0 if verdict else max(1, diff.score), diff.max_score, diff.rows, verdict)
-        return diff
+        from .app import attempt_workers
+
+        args = (self._target_obj(fn, proj), cand, verdict)
+        return attempt_workers.run("score", args, lambda: score_candidate(*args))
 
     def _attempt_unlimited(self, agent: Agent, function: str, source: str, project: str | None = None) -> dict:
         """Compile, score and record one attempt. Returns {"text", "score", "matched"} (score None: didn't compile)."""
@@ -2005,6 +2046,12 @@ class Network:
         identities = expiry_ids(self, store)
         with store.tx() as db:
             self._expire_claims(db, **identities)
+            current = db.execute("SELECT * FROM functions WHERE id=?", (fn["id"],)).fetchone()
+            if current is None:
+                raise NetworkError("This function was removed. Call claim_function for the next function.")
+            if current["status"] == "matched" and fn["status"] != "matched":
+                raise NetworkError(f"{current['name']} is already matched. Call claim_function for the next function.")
+            fn = current
             claim = db.execute("SELECT agent_id FROM claims WHERE function_id=?", (fn["id"],)).fetchone()
             scratch = fn["status"] == "matched"
             if not scratch:
@@ -2013,8 +2060,7 @@ class Network:
                     if held:
                         from .app.claim_state import ownership_hint
                         raise NetworkError(ownership_hint(self,agent,fn["project_id"]))
-                    db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + self.claim_ttl))
-                    self._event(db, fn["project_id"], agent.id, "claim", fn["name"])
+                    self._open_claim(db, fn, agent, now, proj)
                 elif claim["agent_id"] != agent.id:
                     owner = self._agent_name(claim['agent_id'])
                     hint = ('the user in the C editor. The user can select Let agents work on this to release it; choose another eligible function meanwhile.' if owner == 'you' else owner)
@@ -2023,9 +2069,6 @@ class Network:
                     db.execute("UPDATE claims SET expires_at=? WHERE function_id=?", (now + self.claim_ttl, fn["id"]))
 
         ctx = self._context(proj["id"], fn["unit"])
-        key = self.compile_key(fn, ctx["header"], str(ctx["version"]), proj["config"] or "", source)
-        if not scratch and (again := self.repeat_of(key, agent, fn)) is not None:
-            return again
         result = self._attempt_compilation(proj, ctx["header"], source, fn)
 
         if not result.ok:
@@ -2033,22 +2076,24 @@ class Network:
                 raise NetworkError("Toolchain infrastructure failure; this did not consume a repair attempt. Fix the compiler/converter setup before retrying.\n" + result.log.strip())
             self._record(fn, agent, None, source, ctx["version"], effective_settings=getattr(result,"effective_settings",None))
             text = f"❌ COMPILE ERROR (context v{ctx['version']})\n{result.log.strip()}"
-            self.remember_compile(key, agent, fn, text, None)
             return {"text": text, "score": None, "matched": False}
+
+        key = self.judged_object_key(fn, proj, ctx['header'], source, result.obj)
+        if not scratch and (again := self.repeat_of(key, agent, fn, checked_object=True)) is not None:
+            return again
 
         cand, verdict, problems = self._evaluate(fn, proj, result.obj)
         if cand is None:
             self._record(fn, agent, None, source, ctx["version"], effective_settings=getattr(result,"effective_settings",None))
             text = (f"❌ Compiled, but the object has no function named `{fn['name']}`. "
                     f"Define it with exactly that name (non-static).")
-            self.remember_compile(key, agent, fn, text, None)
             return {"text": text, "score": None, "matched": False}
         d = self._score_candidate(fn, proj, cand, verdict)
         checks = self._candidate_checks(fn, proj, result.obj)
         matched_now = d.bytes_match and not scratch
         last = store.one("SELECT score FROM attempts WHERE function_id=? AND agent_id=? AND score IS NOT NULL "
                               "ORDER BY id DESC LIMIT 1", fn["id"], agent.id)
-        self._record(fn, agent, d.score, source, ctx["version"], matched=matched_now, effective_settings=getattr(result,"effective_settings",None))
+        self._record(fn, agent, d.score, source, ctx["version"], matched=matched_now, effective_settings=getattr(result,"effective_settings",None), mismatch_rows=d.rows)
         self.keep_diff(agent.id, fn["id"], self._search_rows(fn, proj, result.obj, d.rows))
         compiled_output = {'fingerprint': cand.fingerprint(), 'granularity': 'function'}
 
@@ -2073,8 +2118,11 @@ class Network:
                             ": an encoding the listing doesn't show (branch form, an immediate, a relocation)."))
         if checks.get("link"):
             head += "\n" + checks["link"]["message"]
-        if checks.get("address_mismatches"):
+        if checks.get("address_mismatches") or checks.get("jump_tables"):
             head += "\n" + checks["message"]
+        from .app.callee_frame_evidence import messages as callee_writes
+        if getattr(self, "is_rom", lambda _:False)(proj):
+            head += ''.join('\n'+message for message in callee_writes(self, proj, fn, d.rows))
         warn = f"\ncompiler output:\n{result.log.strip()}" if result.log.strip() else ""
         if problems:
             warn += "\nwhen linking your code at the function's address:\n" + "\n".join(f"- {p}" for p in problems)
@@ -2143,7 +2191,7 @@ class Network:
         release was refused with the last 4 of 7 no better, then let through after exactly one more compile, so
         agents spent a compile to get past the check (446 push-backs, 36 of them improved after it)."""
         store = self.project_store(project_id) if project_id is not None else self.store
-        row = store.one("SELECT n_insns, project_id FROM functions WHERE id=?", function_id)
+        row = store.one("SELECT n_insns, project_id, abandons, best_score FROM functions WHERE id=?", function_id)
         custom = self.agent_stall_budget(row, agent_id=agent_id) if row else None
         after = custom if custom is not None else stall_budget((row["n_insns"] if row else 0) or 0)
         claim = store.one("SELECT claimed_at FROM claims WHERE function_id=? AND agent_id=?", function_id, agent_id)
@@ -2239,9 +2287,11 @@ class Network:
     def _record(self, fn, agent: Agent, score: int | None, source: str, ctx_version: int, matched: bool = False,
                 compiled: bool | None = None, via: str = "agent", effective_settings=None,
                 prepared_header=None, prepared_inputs=None, prepared_compiler=None, before_record=None, restoring_exact=False, prepared_assembly=False, write_wait=None, exact_inputs=None,
-                best: bool = True, retain_match_credit: bool = False):
+                best: bool = True, retain_match_credit: bool = False, mismatch_rows=(), handoff_inputs=None,
+                verified_replacement: bool = False):
         """An attempt. `best`: False for one whose code can't stay in the source (it breaks matched neighbours), so
-        it never becomes the best that briefs offer and a release puts back."""
+        it never becomes the best that briefs offer and a release puts back.
+        Only explicit, verified source updates may publish over an existing match."""
         store = self.project_store(fn["project_id"])
         now = time.time()
         compiled = score is not None if compiled is None else compiled
@@ -2250,6 +2300,11 @@ class Network:
             if before_record is not None:
                 before_record()  # scoped callers can reject revoked or stale work before any writes
             current = db.execute("SELECT * FROM functions WHERE id=?", (fn["id"],)).fetchone()
+            if current is None:
+                raise NetworkError("The target inputs changed during compilation. Recheck the updated project.")
+            already_matched = current['status'] == 'matched'
+            if already_matched and (matched or fn['status'] != 'matched') and not verified_replacement:
+                raise NetworkError(f"{current['name']} is already matched. Call claim_function for the next function.")
             if exact_inputs is not None:
                 if not matched or score != 0:
                     raise NetworkError('Only a freshly verified exact match can preserve its compile context.')
@@ -2277,7 +2332,8 @@ class Network:
                 prepared_inputs = publish_profile(self, db, current, prepared_inputs, prepared_compiler, agent)
             # A compiler check can finish while this candidate is still compiling with the old flags.
             # Keep that attempt as evidence, but never turn its old-profile verdict into a new green status.
-            config = json.loads(db.execute("SELECT config FROM projects WHERE id=?", (fn["project_id"],)).fetchone()["config"])
+            proj = db.execute("SELECT * FROM projects WHERE id=?", (fn["project_id"],)).fetchone()
+            config = json.loads(proj["config"])
             used = (effective_settings or {}).get("compiler")
             own = compiler_for(config, current["vram"], current) if used else None
             stale = bool(score is not None and used and any(used.get(k) != own.get(k) for k in ("toolchain", "flags")))
@@ -2290,9 +2346,17 @@ class Network:
                     raise NetworkError("The prepared candidate no longer improves this function. Run the pass again.")
                 ctx_version = promote_context(self, db, current, prepared_inputs, prepared_header, agent)
                 current = db.execute("SELECT * FROM functions WHERE id=?", (fn['id'],)).fetchone()
-            attempt = db.execute("INSERT INTO attempts(function_id,agent_id,score,compiled,context_version,source,created_at,via) "
-                       "VALUES(?,?,?,?,?,?,?,?)", (fn["id"], agent.id, score, compiled, ctx_version, source, now, via)).lastrowid
-            self.repair_feedback.attempt(db, current, attempt, ctx_version, effective_settings)
+            if via == 'agent' and score is not None and config.get('kind') != 'fork':
+                tested = current if prepared_header is not None else fn
+                handoff_inputs = agent_notes.rom_inputs(store.one, proj, tested, ctx_version, used)
+            attempt = db.execute("INSERT INTO attempts(function_id,agent_id,score,compiled,context_version,source,created_at,via,handoff_inputs) "
+                       "VALUES(?,?,?,?,?,?,?,?,?)",
+                       (fn["id"], agent.id, score, compiled, ctx_version, source, now, via, handoff_inputs)).lastrowid
+            self.repair_feedback.attempt(db, current, attempt, ctx_version, effective_settings,
+                                         mismatch_rows if score and score > 0 else ())
+            if mismatch_rows or matched:
+                from .app.stub_candidates import record as record_stub
+                record_stub(db, fn["id"], source, () if matched else mismatch_rows)
             if matched and not stale:
                 from .match_bundle import capture as capture_bundle
                 capture_bundle(db,current,attempt,source,ctx_version,effective_settings)
@@ -2306,17 +2370,23 @@ class Network:
             reported = not matched and candidate_quality.reported_source(self, current, source)
             if score is not None and not stale and not reported and best:
                 improved = db.execute("UPDATE functions SET best_score=?, best_source=?, best_agent_id=?, last_improved=CASE WHEN ? THEN ? ELSE last_improved END "
-                                      "WHERE id=? AND status='open' AND (best_score IS NULL OR best_score > ?)",
-                                      (score, source, agent.id, score < fn["n_insns"] * 100, now, fn["id"], score)).rowcount
+                                      "WHERE id=? AND status='open' AND (best_source IS NULL OR best_score IS NULL OR best_score > ?)",
+                                      (score, source, agent.id, score < (fn["n_insns"] or 0) * 100, now, fn["id"], score)).rowcount
                 if improved:
+                    if via == 'agent' and score > 0:
+                        claim_routing.remember_focus(db, current, proj['arch'], mismatch_rows, handoff_inputs, ctx_version)
                     from .app.permuter_inputs import external_seed
                     external_seed(db, current, source, agent.name)
+            if (via == "agent" and not stale and current['status'] == 'open'
+                    and current['abandons'] >= ESCALATE_AFTER and agent.name not in NON_MODEL_AGENTS):
+                claim_routing.tested(db, proj, current, agent, matched and score == 0 and not retain_match_credit)
             if matched and not stale and not retain_match_credit:
                 db.execute("UPDATE functions SET status='matched', matched_source=?, matched_agent_id=?, "
                            "matched_at=?, best_score=0, best_source=? WHERE id=?",
                            (source, agent.id, now, source, fn["id"]))
                 self._release_matched_claim(db,fn['id'],agent.id)
-                self._event(db, fn["project_id"], agent.id, "match", fn["name"])
+                if not already_matched:
+                    self._event(db, fn["project_id"], agent.id, "match", fn["name"])
             db.execute('UPDATE attempts SET score_before=?,score_improved=? WHERE id=?',
                        (current['best_score'], int(bool(improved or (matched and not stale and current['status'] != 'matched'))), attempt))
 
@@ -2525,6 +2595,9 @@ class Network:
         fn = self._function(function, proj["slug"]) if function else None
         if not text.strip():
             raise NetworkError("empty note")
+        from .search_notes import boilerplate
+        if boilerplate(text):
+            return "No function findings to save."
         with self.project_store(proj["id"]).tx() as db:
             measured = (score_before, score_after) if all(type(v) is int and v >= 0 for v in (score_before, score_after)) else None
             # Keep one current deep-search summary per runner/function. Other function
@@ -2536,8 +2609,11 @@ class Network:
                 if row:
                     db.execute('UPDATE notes SET text=?,created_at=?,score_before=?,score_after=? WHERE id=?',
                                (text.strip()[:NOTE_CHARS], time.time(), *(measured or agent_notes.current_scores(db, fn['id'], time.time())), row['id']))
+                    self._event(db, proj['id'], agent.id, 'note', fn['name'])
                     return 'Updated the deep permuter summary.'
-            agent_notes.save(db, proj["id"], fn["id"] if fn else None, agent.id, text.strip()[:NOTE_CHARS], measured=measured, agent_name=agent.name)
+            if agent_notes.save(db, proj["id"], fn["id"] if fn else None, agent.id, text.strip()[:NOTE_CHARS],
+                                measured=measured, agent_name=agent.name):
+                self._event(db, proj['id'], agent.id, 'note', fn['name'] if fn else '')
         return "Noted. Other agents will see it" + (f" when they open {fn['name']}." if fn else " in their briefings.")
 
     def search_notes(self, project: str | None, query: str) -> str:

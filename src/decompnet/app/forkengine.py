@@ -28,7 +28,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .. import arch, classes, coffobj, consoles, similarity, structs, toolchains
+from .. import agent_notes, arch, classes, coffobj, consoles, similarity, structs, toolchains
 from ..forks import (
     compiler_info,
     convention,
@@ -68,6 +68,7 @@ from ..network import (
     set_aside,
 )
 from ..release_receipts import operation as release_operation
+from ..repair_feedback import without_capture
 from ..request_timing import build as timed_build
 from ..rom import RomError
 from ..scoring import percent_text
@@ -681,8 +682,17 @@ class ForkEngine:
         return builds.build(unit, lambda units: self._build_units(proj, fp, units))
 
     def _build_units(self, proj, fp: ForkProject, units: list) -> list[tuple[bool, str]]:
+        from . import attempt_workers
+
         with self._build_locks[proj["id"]]:  # (and nothing changes the build's files meanwhile)
-            return fp.build_units(units)
+            return attempt_workers.run("project-build", (fp.root, units), lambda: fp.build_units(units),
+                                       build=fp._execute)
+
+    @staticmethod
+    def _attempt_diff(fp, unit, symbol):
+        from . import attempt_workers
+
+        return attempt_workers.run("project-diff", (fp.root, unit, symbol), lambda: fp.diff(unit, symbol))
 
     def _build_all(self, proj, fp: ForkProject, failed: list[str] | None = None) -> tuple[bool, str]:
         with self._build_locks[proj["id"]]:
@@ -734,7 +744,7 @@ class ForkEngine:
         if not ok or unit.base is None or not unit.base.exists():
             return None, False
         try:
-            d = fp.diff(unit, None)
+            d = self._attempt_diff(fp, unit, None)
         except (ObjdiffError, ForkError):
             return None, True
         self._keep_scores(proj, unit, text, d.unit_scores)
@@ -1540,8 +1550,10 @@ class ForkEngine:
         return {"linked": linked, "failed": failed}
 
     def _verify(self, proj, fp: ForkProject) -> tuple[bool, str]:
+        from . import attempt_workers
+
         with self._build_locks[proj["id"]]:
-            return fp.verify()
+            return attempt_workers.run("project-verify", (fp.root,), fp.verify, build=fp._execute)
 
     def _file_done(self, slug: str, proj, fp: ForkProject, unit, scores: dict, agent: Agent | None) -> str:
         """When every function of a file matches: link it (in the background), or say what its data still needs."""
@@ -2905,6 +2917,7 @@ class ForkEngine:
             src_text = p.read_text(errors="replace", encoding="utf-8") if p.exists() else None
         else:
             lines.append("this unit has no source file yet, so it can't be decompiled from here")
+        knowledge_rows = []
         try:
             d = fp.diff(unit, meta.get("symbol") or fn["name"])
             pct = ("not in your build yet" if d.match_percent is None else
@@ -2924,6 +2937,7 @@ class ForkEngine:
             elif d.match_percent is not None and not d.matched:
                 d.rows = with_constant_values(d.rows, consoles.get(cfg.get("platform")), fp)
                 lines += ["", "### Diff against the current build", d.render()]
+                knowledge_rows = d.rows
         except (ObjdiffError, ForkError) as e:
             lines.append(f"(objdiff couldn't diff this function: {e})")
         _, span = self._find(src_text, self._names(meta, fn)) if src_text else (None, None)
@@ -2949,6 +2963,9 @@ class ForkEngine:
                           self._method_draft(fp, cfg, fn, seed).strip(), "```"]
         lines += self._class_brief(fp, cfg, fn) + self._struct_brief(fp, cfg, fn)
         lines += self._debug_brief(fp, cfg, fn)
+        from .knowledge import service
+        if tips := service(self.net).relevant(fn, knowledge_rows):
+            lines += ['', *tips]
         lines += self._ltcg_brief(fp, meta, fn, unit)
         lines += self._method_brief(fp, cfg, meta, fn)
         if found := self._unresolved_lines(fp, meta, fn, unit, src_text[span[0]:span[1]] if span else None):
@@ -3416,7 +3433,9 @@ class ForkEngine:
                 quiet: int | None = None, comment: bool = False, *, background: bool = False) -> dict:
         if background and (keep or slug in self.net.links):
             raise NetworkError("Concurrent trials must restore unfinished source and run on the host project.")
-        with self.net.attempt_turn(agent, self._fn(slug, function)):
+        from . import attempt_workers
+
+        with self.net.attempt_turn(agent, self._fn(slug, function)), attempt_workers.attempt(self.net):
             result = self._attempt_and_share(agent, slug, function, source, keep, prelude, quiet, comment,
                                            **({"background": True} if background else {}))
             for key in ('exact','new_match','adopted'):result.setdefault(key,False)
@@ -3472,7 +3491,8 @@ class ForkEngine:
         identities = expiry_ids(self.net, store)
         with store.tx() as db:
             self.net._expire_claims(db, **identities)
-            if fn["status"] != "open" or db.execute("SELECT 1 FROM claims WHERE function_id=?", (fn["id"],)).fetchone():
+            current = db.execute("SELECT status FROM functions WHERE id=?", (fn["id"],)).fetchone()
+            if current is None or current["status"] != "open" or db.execute("SELECT 1 FROM claims WHERE function_id=?", (fn["id"],)).fetchone():
                 return None
             db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + 300))
         return fn["id"]
@@ -3553,7 +3573,8 @@ class ForkEngine:
         return code, after, path, before
 
     def _attempt(self, agent: Agent, slug: str, function: str, source: str, keep: bool = True, prelude: str = "",
-                 quiet: int | None = None, comment: bool = False, diagnostic: bool = False, *, background: bool = False) -> dict:
+                 quiet: int | None = None, comment: bool = False, diagnostic: bool = False, *,
+                 background: bool = False, exact_only: bool = False) -> dict:
         proj, fp, cfg = self.get(slug)
         fn = self._fn(slug, function)
         meta = self._meta(fn)
@@ -3583,6 +3604,11 @@ class ForkEngine:
         symbol = meta.get("symbol") or fn["name"]
         linked = fp.source_is_linked(unit)  # the game is built from this file: changes must keep it identical
         with self._tree(proj).exclusive() if linked else self._tree(proj).shared(), self._unit_lock(proj, unit.name):
+            fn = self._fn(slug, function)
+            if exact_only and (fn['status'] != 'open' or source != fn['best_source']):
+                return {"matched": False, "score": None}
+            if not keep and not diagnostic and fn['status'] == 'matched':
+                return {"text": f"{fn['name']} is already matched.", "matched": False, "score": None}
             code, after, path, before = self._place(proj, fp, unit, fn, source, names, comment, prelude)
             from .local_claims import expiry_ids
             store = self.net.project_store(slug)
@@ -3595,8 +3621,7 @@ class ForkEngine:
                 now = time.time()
                 if not background:
                     if claim is None and fn["status"] != "matched":
-                        db.execute("INSERT INTO claims VALUES(?,?,?,?)",
-                                   (fn["id"], agent.id, now, now + self.net.claim_ttl))
+                        self.net._open_claim(db, fn, agent, now, proj)
                     elif claim is not None:
                         db.execute("UPDATE claims SET expires_at=? WHERE function_id=?",
                                    (now + self.net.claim_ttl, fn["id"]))
@@ -3613,15 +3638,21 @@ class ForkEngine:
                 protected = {n for n, pct in (self._last_scores(proj, unit) or {}).items()
                              if n != symbol and n not in held and pct is not None and pct >= 100}
                 was_matched = fn["status"] == "matched"
+            if was_matched and not keep and not diagnostic:
+                return {"text": f"{fn['name']} is already matched.", "matched": False, "score": None}
             # the same file as an earlier compile of this function made, nothing it depends on changed since: that
             # compile's result, not another build
-            agents_try = keep and quiet is None and not was_matched
-            # (an LTCG project's driver and stand-ins are part of what the unit builds with: harness/<unit>.*.cpp)
-            harness = "".join(p.read_text(errors="replace", encoding="utf-8")
-                              for p in sorted((fp.root / "harness").glob(f"{unit.name}.*.cpp")))
-            key = self.net.compile_key(fn, unit.name, after, harness)
-            if agents_try and (again := self.net.repeat_of(key, agent, fn)) is not None:
-                return again
+            agents_try = keep and quiet is None and not was_matched and not structor
+            if agents_try:
+                from ..candidate_scope import key as build_scope
+
+                # The unit, build controls, target and headers may change outside the app.
+                harness = "".join(p.read_text(errors="replace", encoding="utf-8")
+                                  for p in sorted((fp.root / "harness").glob(f"{unit.name}.*.cpp")))
+                key = self.net.compile_key(fn, unit.name, after, harness, build_scope(self.net, proj, fn),
+                                           verbatim=True)
+                if (again := self.net.repeat_of(key, agent, fn)) is not None:
+                    return again
             renamed: dict[Path, str] = {}
             if structor:
                 try:
@@ -3673,6 +3704,7 @@ class ForkEngine:
                 _rewrite(path, before)
                 unname()
 
+            handoff_inputs = agent_notes.project_inputs(fp, unit, fn) if quiet is None and not diagnostic else None
             try:
                 ok, log = self._build_unit(proj, fp, unit)
             except BaseException:
@@ -3698,7 +3730,7 @@ class ForkEngine:
                 return {"text": f"❌ BUILD ERROR (your change was undone){why}\n{log[-3000:]}", "score": None,
                         "matched": False}
             try:
-                d = fp.diff(unit, symbol)
+                d = self._attempt_diff(fp, unit, symbol)
             except (ObjdiffError, ForkError) as e:
                 undo()
                 return {"text": f"❌ objdiff couldn't compare (your change was undone): {e}", "score": None, "matched": False}
@@ -3718,7 +3750,7 @@ class ForkEngine:
                 if d.match_percent is not None:
                     own = max(1, len(d.literals)) if d.literals else scaled(d.match_percent, fn["n_insns"])
                 if quiet is None:  # an attempt, never the best: release puts the best back in the file
-                    self.net._record(fn, agent, own, code, 0, compiled=True, best=False)
+                    self.net._record(fn, agent, own, code, 0, compiled=True, best=False, mismatch_rows=d.rows, handoff_inputs=handoff_inputs)
                 listed = ", ".join(broken[:8])
                 if own is None:
                     text = (f"❌ REJECTED and undone: your change breaks matched function(s) {listed}. Check you "
@@ -3759,14 +3791,14 @@ class ForkEngine:
             pct = d.match_percent if d.match_percent is not None else 0.0
             score = max(1, len(d.literals)) if d.literals else scaled(pct, fn["n_insns"])
             matched = d.matched
-            if diagnostic:
+            if diagnostic or (exact_only and not matched):
                 undo()
                 return {**evidence,'text': ('MATCH! diagnostic only' if matched else f'score {score} ({pct:.1f}%)')+'; source restored.',
                         'score':score,'matched':matched,'percent':pct,'rows':d.rows,'line_note':line_note}
             if not matched and not keep and not was_matched:  # tried, not kept: the file stays as it was
                 undo()
                 if quiet is None or score < quiet:
-                    self.net._record(fn, agent, score, code, 0, compiled=True)
+                    self.net._record(fn, agent, score, code, 0, compiled=True, mismatch_rows=d.rows, handoff_inputs=handoff_inputs)
                 return {**evidence,"text": f"{percent_text(pct)} match (score {score}); not kept in {unit.source}", "score": score,
                         "matched": False, "percent": pct}
             best = fn["best_score"]
@@ -3776,7 +3808,7 @@ class ForkEngine:
                 # the one the notes and the brief call the best (an agent found its 91.8% try there, not its 92.3%)
                 undo()
                 if quiet is None:
-                    self.net._record(fn, agent, score, code, 0, compiled=True)
+                    self.net._record(fn, agent, score, code, 0, compiled=True, mismatch_rows=d.rows, handoff_inputs=handoff_inputs)
                 stall = self.net.stall_note(fn["id"], agent.id)
                 text = remembered(f"{percent_text(pct)} match (score {score}), worse than the best so far (score "
                                   f"{best}), so {unit.source} keeps what it had; your attempt is recorded.\n"
@@ -3797,7 +3829,7 @@ class ForkEngine:
                                                         f"Edited by {agent.name} with decompdecomp.")
                 return {**evidence,"text": f"✅ {fn['name']} still matches; your tidier version is committed.{_renamed_note(d)}",
                         "score": 0, "matched": True, "adopted": True}
-            self.net._record(fn, agent, score, code, 0, matched=matched)
+            self.net._record(fn, agent, score, code, 0, matched=matched, mismatch_rows=d.rows, handoff_inputs=handoff_inputs)
             self._apply_scores(proj, fn["unit"], d.unit_scores, skip=fn["id"], agent=agent, text=after,
                                via=f"unit diff after a compile of {fn['name']}")
             self._remember(proj, fp, unit, d)
@@ -4162,7 +4194,8 @@ class ForkEngine:
                     f"now match, {counts['closer']} closer ({counts['in_file']} already in their files)")
         return counts
 
-    def autopilot_one(self, agent: Agent, proj, fid: int) -> str:
+    @without_capture()
+    def autopilot_one(self, agent: Agent, proj, fid: int, *, retry_draft=False) -> str:
         """match | near | far | fail | skip, for one function's drafts, each built and diffed like an agent's, until
         one matches. A draft autopilot already judged as it is now is skipped: autopilot tries a function again when
         its drafts changed (the background drafter asks it to after the headers changed, app/drafts.py)."""
@@ -4188,7 +4221,7 @@ class ForkEngine:
                 inputs += (refresh,)
             input_key = draft_reports.key(repr(inputs), self._known(fp,unit), '', fn)
             previous = draft_reports.read(self.net, fid, project_id=proj['id'])
-            if previous.get('key') == input_key and previous.get('complete'):
+            if not retry_draft and previous.get('key') == input_key and previous.get('complete'):
                 return 'skip'
             report = {'key':input_key, 'compiled':False, 'scored':False, 'matched':False, 'trials':0, 'failures':[]}
             outcomes = []
@@ -4396,13 +4429,16 @@ class ForkEngine:
         return f"With yours, {len(said)} agents of {len(models)} models agree: {done}. The game still builds byte for byte."
 
     @release_operation("release")
-    def release(self, agent: Agent, slug: str, function: str, notes: str, not_c: bool = False, claim_token: str = "") -> str:
+    def release(self, agent: Agent, slug: str, function: str, notes: str, not_c: bool = False, claim_token: str = "", *, handoff=None, room_evidence=None) -> str:
         fn = self._fn(slug, function)
         if (link := self.net.links.get(slug)) is not None:
-            link.call("/collab/release", agent, function=fn["name"], notes=notes, not_c=not_c)
+            evidence = agent_notes.room_handoff(self.net.project_store(slug), fn, agent, notes)
+            link.call("/collab/release", agent, function=fn["name"], notes=notes, not_c=not_c,
+                      note_evidence=evidence)
         if not _BEST_LEFT.get():  # (the release tool did it already, before its project lock: never again under it)
             self.leave_best(agent, slug, function)
-        return Network.release(self.net, agent, function, notes, slug, not_c, claim_token=claim_token)
+        return Network.release(self.net, agent, function, notes, slug, not_c, claim_token=claim_token, handoff=handoff,
+                               room_evidence=room_evidence)
 
     def leave_best(self, agent: Agent, slug: str, function: str) -> None:
         """Put the function's file back at its best state for the next agent, when this agent's last try was worse.

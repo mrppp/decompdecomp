@@ -30,6 +30,7 @@ from . import (
     agent_shutdown,  # noqa: F401  # imported now, not at quit: an AppImage's files can be gone by then
     agents,
     collab,
+    library_skew,  # noqa: F401  (noting the library versions at startup is its import's job)
     maintenance,
     progress,
     routes,
@@ -118,6 +119,8 @@ def build(net: RomNetwork, home: Path, port: int, secret: str, *, headless: bool
         stopped=bounded('Saving agent recovery and releasing claims',lambda notify:manager.shutdown(notify=notify),30)
         # Tool-call counts are buffered for FLUSH_SECONDS: a quit soon after the agents' last calls lost them.
         bounded('Saving tool usage counts',lambda _:tool_policy.flush(net),3)
+        if net.attempt_workers is not None:
+            bounded('Stopping compile and judge workers',lambda _:net.attempt_workers.close(),5)
         if stopped:
             bounded('Saving remaining project progress',lambda notify:flush_progress(status,notify),max(0,deadline-time.monotonic()))
         else:
@@ -164,7 +167,7 @@ def build(net: RomNetwork, home: Path, port: int, secret: str, *, headless: bool
                            settings.data.get('iterative_threads', 0))
     net.permuter.configure(settings.data)
     workers.configure(net.permuter.parent_threads(settings.data.get("worker_threads")))
-    net.auto_compiler = bool(settings.data.get("auto_compiler"))
+    net.auto_compiler = settings.auto_compiler
     from .agent_local_pass import configure as configure_local_repairs
     configure_local_repairs(net,settings.data)
     manager.budget = lambda: float(settings.data.get("budget_usd") or 0)
@@ -231,7 +234,8 @@ def build(net: RomNetwork, home: Path, port: int, secret: str, *, headless: bool
                          name='stale-file-watch').start()
     from .database_cleanup import Retention
     net.database_retention = Retention(net,jobs)
-    from . import render_worker
+    from . import attempt_workers, render_worker
+    net.attempt_workers = attempt_workers.start(home)
     net.progress.renderers = render_worker.start(net, home)  # progress-folder renders off this process's lock
     net.autosave = saves.Autosave(net, settings)
     net.autosave.start()
@@ -384,7 +388,8 @@ def build(net: RomNetwork, home: Path, port: int, secret: str, *, headless: bool
     # threads holding its lane (lane_watch.py), which named nothing before when the fast lane jammed for minutes.
     from ..lane_watch import Watch
     from ..ui_diagnostics import current_route
-    lanes = Watch(home / "logs" / "request-lane-stacks.log")
+    lanes = Watch(home / "logs" / "request-lane-stacks.log",
+                  job_lock_owner=lambda: getattr(jobs._lock, "owner", None))
 
     def laned(lane, limiter, view=True):
         async def run(fn, *args):
@@ -426,7 +431,7 @@ def build(net: RomNetwork, home: Path, port: int, secret: str, *, headless: bool
     # whose autopilot and with_project they use
     app = routes.App(net, mcp, home, port, secret, mcp_url, build_id, manager, jobs, settings, allowed_hosts,
                      guard, body, call, fail, ui_call=ui_call, fast_call=fast_call, live_call=live_call, stream_call=stream_call, control_call=control_call, updater=updates.Updater(before_restart, port, secret),
-                     busy=busy, quit_app=quit_app, web_login=net.web_login, headless=headless)
+                     busy=busy, quit_app=quit_app, web_login=net.web_login, headless=headless, reader=reader)
     from . import web_login
     web_login.register(app)
     for part in (pages, state, projects, repair_feedback, repository_sync, forks, setup, life, rooms, pairing, browser_bridge, data_directories):

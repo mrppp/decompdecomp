@@ -25,6 +25,7 @@ class Worker:
     def __init__(self):
         self.process = subprocess.Popen(limits.capped([sys.executable,str(Path(__file__).with_name('deep_proposal_worker.py'))],memory=2<<30),
             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=NO_WINDOW,
+            env={**os.environ,'DECOMP_PROPOSAL_WORKER':'1'},
             start_new_session=os.name!='nt')
         self.lines = queue.Queue(maxsize=1)
         self.closed = threading.Event()
@@ -42,15 +43,29 @@ class Worker:
                 try:self.lines.put(None,timeout=.05);break
                 except queue.Full:pass
 
-    def run(self, request, check):
+    def run(self, request, check, handlers=None):
         write_errors = []
+        self.input_lock = threading.Lock()
 
         def send():
             try:
-                self.process.stdin.write(request+b'\n')
-                self.process.stdin.flush()
+                with self.input_lock:
+                    self.process.stdin.write(request+b'\n')
+                    self.process.stdin.flush()
             except (OSError, ValueError) as error:
                 write_errors.append(error)
+
+        def answer(question):
+            """A question the child asked while generating (the project's symbols, original bytes): the reply goes down
+            its stdin; a handler that fails answers None, so a heuristic skips what it can't read."""
+            handler = (handlers or {}).get(question.get('op'))
+            try:
+                value = handler(*question.get('args', ())) if handler else None
+            except Exception:  # noqa: BLE001 (a missing optional datum is not a failure of the generation)
+                value = None
+            with self.input_lock:
+                self.process.stdin.write(json.dumps({'rpc_result': value}, ensure_ascii=False).encode() + b'\n')
+                self.process.stdin.flush()
 
         # A large request can fill the pipe before a stuck child reads it.
         # Keep checking cancellation during both the send and the response.
@@ -64,9 +79,14 @@ class Worker:
                     raise write_errors[0]
                 try:
                     line = self.lines.get(timeout=.05)
-                    break
                 except queue.Empty:
-                    pass
+                    continue
+                if line is not None and line.startswith(b'P'):
+                    return line.strip()  # a pickled answer to an offloaded call (decompnet.app.offload)
+                if line is not None and b'"rpc"' in line[:12] and 'rpc' in (question := json.loads(line)):
+                    answer(question['rpc'])
+                    continue
+                break
             if line is None:
                 raise NetworkError('Local proposal generator stopped. Retry the repair.')
             result = json.loads(line)

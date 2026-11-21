@@ -197,9 +197,50 @@ def variants(source, name, asm, processor, header=''):
 
 
 def recovery_drafts(draft, name, asm, processor, toolchain, context, data, report, generate=None):
-    """At most two extra m2c runs and six recovery candidates after ordinary drafts fail to compile."""
+    """Try bounded recovery candidates and at most two extra m2c runs after ordinary drafts fail to compile."""
     from . import draft_reports
     generate = generate or seeds.generate_from_asm
+    if processor == 'mips' and any(
+            item.get('phase') == 'compiler' and any(
+                diagnostic in item.get('reason', '') for diagnostic in (
+                    "Unacceptable operand of '+'.", "Unacceptable operand of '-'.",
+                    'Bad operand type for += or -=',
+                ))
+            for item in report.get('failures', [])):
+        # The IDO diagnostic works for both selected ROM compilers and project builds.
+        from decomprepair import void_pointer_drafts
+
+        if candidate := void_pointer_drafts.rewrite(draft, name):
+            yield 'initial_void_pointer_offsets', candidate
+    if processor == 'mips':
+        from decomprepair import draft_call_recovery
+
+        yield from draft_call_recovery.variants(draft, name, asm, context, toolchain)
+    if toolchain == 'gcc-2.7.2-kmc':
+        from decomprepair import (
+            indirect_call_drafts,
+            stack_fill_drafts,
+            stack_word_index_drafts,
+            unaligned_stack_drafts,
+            uncached_read_repairs,
+        )
+
+        for family, rewrite in (
+            ('initial_unaligned_stack_copy', unaligned_stack_drafts.rewrite),
+            ('initial_typed_indirect_call', indirect_call_drafts.rewrite),
+            ('initial_stack_word_clear', stack_fill_drafts.rewrite_word_clear),
+            ('initial_indexed_stack_words', stack_word_index_drafts.rewrite),
+        ):
+            if candidate := rewrite(draft, name, asm, context):
+                yield family, candidate
+        if candidate := uncached_read_repairs.rewrite(draft, name, asm):
+            yield 'initial_uncached_read', candidate
+    if toolchain == 'gcc-2.7.2-kmc':
+        from decomprepair import integer_address_store_drafts, measured_word_drafts
+
+        yield from measured_word_drafts.variants(draft, name, asm, context)
+        for family, candidate in integer_address_store_drafts.variants(draft, name, asm):
+            yield 'initial_' + family, candidate
     for family, source in variants(draft, name, asm, processor, context):
         yield family, source
     alternative = callback_context(draft, context, asm, processor)

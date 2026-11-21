@@ -5,8 +5,12 @@
   aliases for its modules. The console gives it the MIPS code reader its audio and fonts use (`asset_regions`).
 - rom.py: the ROM file: its byte order (.z64, .v64, .n64), header and a first guess at the compiler.
 - code.py: code splat's own look misses: segments the game loads later, and code kept compressed in the ROM.
+- uso.py / uso_match.py: bounded USO text and relocations, matching and cartridge reconstruction.
 - loader_code.py: full-bank closed-body recovery with CPU call, callback and adjacency evidence.
 - loader_mapping.py: bank mappings corroborated by constant arguments to independent loader helpers.
+- indexed_overlays.py: shared RAM slots and DMA bounds recovered from loader arrays and cache calls.
+- inline_data.py: verified constants and alignment bytes embedded among code.
+- boot_gzip.py: programs in paired gzip members placed at addresses supplied by the boot loader.
 - boot_mapping.py: returning TLB boot stubs separated from code with a strongly supported later load mapping.
 - sdk_assembly.py: exact self-contained libultra body fingerprints, classified before C claims.
 - port.py: its port kit, libultraship and Torch: what they replace and which graphics microcode they render.
@@ -20,13 +24,17 @@ Its demo game is projects/demo-rom (the Demo Quest game in projects/demo-n64/ori
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
 from ...rom import Picked, RomError
 from .. import EXPORT, RECOMMENDED, ROM, Compiler, Console
-from . import emulator, recomp
+from . import emulator, recomp, sdk_assembly, sdk_linked
 from .port import KIT as PORT_KIT
+
+# Store only a digest of the entire body, including the return delay slot.
+_MUL64_LOW_FIRST_SHA256 = "3de77e7c110a869794ff2998de80fb3fd6e4a7fc046d21378dc764a11b1676d0"
 
 
 class Nintendo64(Console):
@@ -187,15 +195,121 @@ class Nintendo64(Console):
             src.unlink()
         return True
 
-    sdk_assembly_sizes = (160,272)
+    known_assembly_sizes = (52,)
+
+    def known_assembly_name(self, code: bytes) -> str | None:
+        if len(code) in self.known_assembly_sizes and hashlib.sha256(code).hexdigest() == _MUL64_LOW_FIRST_SHA256:
+            return "mul64_low_first"
+        return None
+
+    def asm_reason(self, code: bytes) -> str | None:
+        if self.known_assembly_name(code):
+            return "Exact signature of the low-word-first 64-bit multiply assembly helper."
+        return super().asm_reason(code)
+
+    sdk_assembly_sizes = sdk_assembly.SIZES
+    sdk_entry_stub = True
     # libultra 2.0I-2.0L as decompals/ultralib rebuilds it, so a user without the SDK still has its library found
     sdk_table = str(Path(__file__).with_name("ultralib_signatures.tsv"))
     # n_audio (libgn_audio.a 2.0J-2.0L), which ultralib doesn't rebuild: the SDK archives' fingerprints and names
-    sdk_tables = (str(Path(__file__).with_name("naudio_signatures.tsv")),)
+    # plus hand-written runtime code that cartridges share but no archive rebuilds (fingerprints of functions found
+    # byte for byte, relocations aside, in unrelated games: runtime_signatures.tsv)
+    sdk_tables = (str(Path(__file__).with_name("naudio_signatures.tsv")), str(Path(__file__).with_name("runtime_signatures.tsv")))
 
     def sdk_assembly_identity(self, code, big_endian=True):
-        from .sdk_assembly import identify
-        return identify(code,big_endian)
+        return sdk_assembly.identify(code, big_endian)
+
+    sdk_linked_sizes = sdk_linked.SIZES
+
+    def sdk_linked_identity(self, code: bytes, image_sha1: str) -> dict | None:
+        return sdk_linked.identify(code, image_sha1)
+
+    def import_table_ranges(self, image, segments):
+        from .code import relocated_switch_ranges
+
+        return relocated_switch_ranges(image, segments)
+
+    def function_target_meta(self, fn):
+        info = getattr(fn, 'uso', None)
+        return {'uso': info} if info is not None else {}
+
+    def target_from_row(self, fn, cfg):
+        import json
+
+        from .uso_match import Target
+
+        target = super().target_from_row(fn, cfg)
+        row = dict(fn)
+        offset = row.get('rom_offset')
+        banks = cfg.get('donor_overlays') or {}
+        if not banks or offset is None or offset < min(banks.values()):
+            return target
+        info = json.loads(row.get('meta') or '{}').get('uso', {})
+        if (banks.get(str(info.get('section'))) != offset - target.vram
+                or info.get('start') != target.vram or info.get('size') != len(target.code)):
+            info = {'section': None, 'relocs': None}
+        return Target(**vars(target), uso=info)
+
+    def target_object(self, fn, cfg, symbols):
+        from ...rom.match import canonical_target
+        from .uso_match import Target, symbolic_target
+
+        target = self.target_from_row(fn, cfg)
+        return symbolic_target(target) if isinstance(target, Target) else canonical_target(target, symbols)
+
+    def link_function(self, obj, name, target, symbols, read):
+        from . import uso_match
+
+        if isinstance(target, uso_match.Target):
+            return uso_match.link(obj, name, target.code, target.uso)
+        return super().link_function(obj, name, target, symbols, read)
+
+    def export_overlay(self, target):
+        from .uso_match import Target
+
+        return target.uso if isinstance(target, Target) and target.uso['relocs'] is not None else None
+
+    def rebuild_overlays(self, image, entries):
+        from .uso import rebuild
+
+        return rebuild(image, entries)
+
+    def function_asm(self, fn):
+        from dataclasses import replace
+
+        import rabbitizer
+
+        from .uso_match import alias
+
+        info = getattr(fn, 'uso', None)
+        if not info or not info['relocs']:
+            return super().function_asm(fn)
+        lines = list(fn.lines)
+        for at, kind, index in info['relocs']:
+            line = lines[at // 4]
+            name = alias(info['section'], index)
+            if kind in (4, 5, 6):
+                field = line.word & (0x3ffffff if kind == 4 else 0xffff)
+                mask = {4: '', 5: '%hi', 6: '%lo'}[kind]
+                immediate = name if not mask else f'{mask}({name})'
+                if field:
+                    # Keep the encoded addend visible when it is more than a symbol reference.
+                    immediate = f'{immediate} /* encoded addend 0x{field:X} */'
+                insn = rabbitizer.Instruction(line.word, line.vram)
+                parts = insn.disassemble(immOverride=immediate).split(None, 1)
+                if len(parts) == 2:
+                    lines[at // 4] = replace(line, operands=parts[1])
+        return super().function_asm(replace(fn, lines=lines))
+
+    def split_game(self, workdir: Path, picked: Picked, *, symbols: list[str] | None = None, log=print):
+        from .code import recover_terminal_display_lists
+        from .uso import add_to_split
+
+        result = super().split_game(workdir, picked, symbols=symbols, log=log)
+        sdk_linked.split_scheduler(result, picked.info.get('sha1', ''))
+        recover_terminal_display_lists(result, (workdir / result.image).read_bytes(), log)
+        add_to_split(result, workdir, picked.data, log)
+        return result
 
     def read_game(self, file, name: str = "") -> Picked:
         from .rom import read_info
@@ -221,13 +335,28 @@ class Nintendo64(Console):
 
     def add_code(self, config: Path, workdir: Path, image: str, picked: Picked, log=print) -> str:
         from .code import add_segments
+        from .inline_data import apply
 
-        return add_segments(config, workdir, image, log)
+        expanded = add_segments(config, workdir, image, log)
+        apply(config, (workdir / expanded).read_bytes(), log)
+        return expanded
+
+    donor_layout = True
+
+    def donor_text_regions(self, image: bytes) -> list:
+        from .uso import read
+
+        return read(image)
 
     def missed_functions(self, config: Path, image: bytes, log=print) -> list[tuple[int, int, int]] | None:
         from .code import missed_functions
 
         return missed_functions(config, image, log)
+
+    def import_pointer_is_data(self, image, offset):
+        from .packed_pointers import is_data
+
+        return is_data(image, offset)
 
     def up_front_guide(self, compiler: str) -> str:
         compiler = compiler.lower()  # (a fork of a public decomp: "project", its own build's)

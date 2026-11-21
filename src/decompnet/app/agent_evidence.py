@@ -188,11 +188,16 @@ def track(net,agent,slug,fn):
     states[key]={'seen':seen,'repeated':count}
     while len(states)>128:
         del states[next(iter(states))]
-    limit=net.selection(slug,agent.name).get('unchanged_compiles',8)
+    from .focused_agents import scope as focused_scope
+    limit=0 if focused_scope(net,agent) else net.selection(slug,agent.name).get('unchanged_compiles',8)
     if limit and count>=limit and net._function(fn['name'],slug)['status']=='open':
         held=net.project_store(fn['project_id']).one('SELECT 1 FROM claims WHERE function_id=? AND agent_id=?',fn['id'],agent.id)
         if held:
-            result=net.release(agent,fn['name'],f'Moved on after {count} trials returning previously seen scored instruction diffs. Best source retained.',slug)
+            from .agent_review import automatic_handoff
+            reason = f'Moved on after {count} trials returning previously seen scored instruction diffs.'
+            evidence = automatic_handoff(net, agent, slug, fn, measured, reason)
+            result = net.release(agent, fn['name'], reason + ' Best source retained.', slug,
+                                 **({'handoff': evidence} if evidence else {}))
             from .. import claim_stalls
             claim_stalls.released(net,fn,exhausted=True,agent=agent)
             return 'Unchanged-output limit reached. '+result+' Automatic claims pause until the candidate, build context or repair rules change.'

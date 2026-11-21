@@ -259,6 +259,32 @@ def test_generated_address_references_link_across_objects(tmp_path):
     assert linked.returncode != 0 and "unknown_data" in linked.stderr
 
 
+def test_export_split_uses_bss_boundaries_when_a_sized_symbol_crosses_them(tmp_path):
+    from decompnet.rom.export import _export_segments
+
+    config = {
+        'options': {'platform': 'n64', 'basename': 'demo', 'target_path': 'demo.z64',
+                    'base_path': '.', 'create_bss_pads': True},
+        'segments': [
+            {'name': 'code', 'type': 'code', 'start': 0, 'vram': 0x80000000, 'bss_size': 0x10,
+             'subsegments': [[0, 'asm', 'text'], {'type': 'bss', 'vram': 0x80000008}]},
+            [8],
+        ],
+    }
+    (tmp_path/'demo.z64').write_bytes(bytes.fromhex('03e0000800000000'))  # jr $ra, nop
+    (tmp_path/'symbol_addrs.txt').write_text(
+        'entry = 0x80000000; // type:func size:0x8\n'
+        'overlapping = 0x80000010; // type:func size:0x10\n', encoding='utf-8')
+    exported = _export_segments(config, [{'vram': 0x80000000, 'size': 8}])
+    (tmp_path/'splat.yaml').write_text(yaml.safe_dump(exported), encoding='utf-8')
+
+    result = subprocess.run([sys.executable, '-m', 'splat', 'split', 'splat.yaml'], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert config['options']['create_bss_pads'] is True
+    assert exported['segments'] == config['segments']
+
+
 def test_export_moves_data_boundary_past_known_function_tail():
     from decompnet.rom.export import _export_segments
 
@@ -268,7 +294,7 @@ def test_export_moves_data_boundary_past_known_function_tail():
     result = _export_segments(config, [{'vram': 0x80000010, 'size': 12}])
     assert result['segments'][0]['subsegments'][1][0] == 0x11c
     assert config['segments'][0]['subsegments'][1][0] == 0x118  # the project's config stays unchanged
-    assert _export_segments(config, [{'vram': 0x80000010, 'size': 8}]) == config
+    assert _export_segments(config, [{'vram': 0x80000010, 'size': 8}])['segments'] == config['segments']
 
 
 def test_export_refuses_to_consume_an_entire_data_segment():
@@ -288,8 +314,8 @@ def test_export_requires_a_single_constant_pool_base():
 
 
 def test_export_detects_extra_function_definitions():
-    from decompnet.arch.mips_image import linked_object
     from decompnet.rom.export import _single_definition
+    from tests.mips_elf_fixture import linked_object
     obj = linked_object('target', 0x80001000, bytes(8))
     assert _single_definition(obj, 'target')
     assert not _single_definition(obj, 'other')
@@ -335,8 +361,8 @@ def test_export_preserves_judged_constant_address_despite_object_alignment(tmp_p
 
 @pytest.mark.parametrize('symbol',['target__4Mathi','_ZN4Math6targetEi'])
 def test_cpp_single_definition_uses_judge_symbol_mapping(symbol):
-    from decompnet.arch.mips_image import linked_object
     from decompnet.rom.export import _single_definition
+    from tests.mips_elf_fixture import linked_object
     obj=linked_object(symbol,0x80001000,bytes(8))
     assert _single_definition(obj,'target')
     assert not _single_definition(obj,'unrelated')
@@ -346,8 +372,8 @@ def test_cpp_overloads_are_not_hidden_by_export_name_mapping():
     import struct
     from io import BytesIO
 
-    from decompnet.arch.mips_image import linked_object
     from decompnet.rom.export import _single_definition
+    from tests.mips_elf_fixture import linked_object
     first,second='target__4Mathi','target__4Mathf'
     obj=bytearray(linked_object(first+'\0'+second,0x80001000,bytes(16)))
     elf=ELFFile(BytesIO(obj));symtab=elf.get_section_by_name('.symtab')
@@ -502,3 +528,21 @@ def test_assembly_naming_an_address_outside_the_game_links():
     text = ".word func_8C000000\n.word D_80001000\nglabel D_80001000\n.word .L80001234\n"
     found = export._auto_addresses([text], {"D_80001000"})
     assert found["func_8C000000"] == 0x8C000000 and "D_80001000" not in found
+
+
+def test_export_preserves_bss_extent_when_text_owns_its_labels(tmp_path):
+    from decompnet.rom.export import remove_shadowed_bss
+
+    data = tmp_path / 'asm' / 'data'
+    text = tmp_path / 'asm' / 'nonmatchings'
+    data.mkdir(parents=True)
+    text.mkdir()
+    (text / 'unit.s').write_text('dlabel target_label\n    nop\n    nop\n')
+    bss = data / 'layout.bss.s'
+    bss.write_text(
+        'nonmatching target_label, 4\ndlabel target_label\n    .space 4\nenddlabel target_label\n'
+        'glabel entry\n    .space 16\nenddlabel entry\n'
+        'dlabel real_data\n    .space 8\nenddlabel real_data\n'
+    )
+    remove_shadowed_bss(tmp_path, [{'name': 'entry'}])
+    assert bss.read_text() == '    .space 4\n    .space 16\ndlabel real_data\n    .space 8\nenddlabel real_data\n'

@@ -59,7 +59,7 @@ def grow(source, name, arch, rows):
             for count in (delta, delta//2)]
 
 
-def measured(source, name, arch, rows):
+def measured(source, name, arch, rows, *, evidence=None):
     """Place one explicitly inferred reservation after existing outer declarations.
 
     A consistent frame/save delta is evidence for storage, not its original purpose.
@@ -69,9 +69,12 @@ def measured(source, name, arch, rows):
     from decomprepair.pattern_repairs import close
     part=view(source,name)
     fresh='__repair_stack_padding'
-    if not part or re.search(r'\b(?:volatile|asm|__asm__|'+fresh+r')\b',part.clean):return []
-    reader=arches.get(arch).stack_layout
-    evidence=reader(rows) if reader else {}
+    if (not part or re.search(r'\b(?:volatile|asm|__asm__)\b',part.body)
+            or re.search(r'\b'+fresh+r'\b', part.clean)):
+        return []
+    if evidence is None:
+        from .stack_layout import diagnose
+        evidence = diagnose(arch,rows) or {}
     delta=evidence.get('inferred_growth')
     if delta is None:return []
     # Keep all existing declaration order and physical lines. In particular, do
@@ -90,3 +93,25 @@ def measured(source, name, arch, rows):
         last=pos=end+1
     note='\n/* Inferred frame reservation; original purpose unknown. */\nchar '+fresh+'['+str(delta)+'];'
     return [('inferred_frame_reservation',source[:last]+note+source[last:])]
+
+
+def layout_candidates(source, name, header, arch, rows, symbols=None, flags=(), *, asm=None):
+    """Share the measured KMC layout pass with exact replay."""
+    from decomprepair import frame_padding_repairs, measured_layout_repairs, stack_object_size_repairs
+
+    from .stack_layout import diagnose
+
+    report = diagnose(arch,rows) or {}
+    result = []
+    if arch == 'mips' and asm and (report.get('frame_delta') or 0) > 0:
+        result += frame_padding_repairs.forwarded_variants(source, name, header, rows, asm, report['frame_delta'])
+    # A named buffer explains a larger frame when every changed row is a stack difference.
+    if asm and (report.get('frame_delta') or 0) > 0 and all(marker in (' ', 's') for marker, _, _ in rows):
+        result += stack_object_size_repairs.variants(source, name, asm)
+        if report.get('frame_only_gap'):
+            result += stack_object_size_repairs.record_variants(source, name, asm, header)
+    result += measured_layout_repairs.unused_frame_array(source,name,rows,report)
+    if scoped := measured_layout_repairs.scoped_frame_array(source, name, rows, report):
+        result.append(('inferred_frame_reservation', scoped))
+    result += measured(source,name,arch,rows,evidence=report)
+    return result + measured_layout_repairs.paired_word_copy(source,name,header,rows,symbols,flags)

@@ -7,6 +7,7 @@ import shutil
 import sys
 import threading
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -15,7 +16,7 @@ from starlette.testclient import TestClient
 from decompnet import agents as kinds
 from decompnet import toolchains
 from decompnet.agents import api
-from decompnet.app import agents, window
+from decompnet.app import agents, repository_setup, window
 from decompnet.app.engine import RomNetwork
 from decompnet.app.server import build
 
@@ -25,15 +26,16 @@ needs_demo = pytest.mark.skipif(toolchains.installed("gcc-2.7.2-kmc") is None or
 PORT, SECRET = 6499, "s3cret-for-tests"
 
 
-def test_agent_local_pass_settings_are_opt_in_and_validate_budgets(app):
+def test_agent_local_pass_settings_can_be_disabled_and_validate_budgets(app):
     client,net,*_=app
-    assert not net.agent_local_repairs['enabled']
+    assert net.agent_local_repairs['enabled']
     headers={'X-Decomp':'1'}
     for bad in ({'agent_local_trials':True},{'agent_local_trials':7},{'agent_local_seconds':16},{'agent_local_enabled':'yes'}):
         assert client.post('/api/settings',json=bad,headers=headers).status_code==400
     response=client.post('/api/settings',json={'agent_local_enabled':True,'agent_local_trials':3,'agent_local_seconds':4},headers=headers)
-    assert response.status_code==200 and net.agent_local_repairs=={'enabled':True,'trials':3,'seconds':4}
-    client.post('/api/settings',json={'agent_local_enabled':False},headers=headers)
+    assert response.status_code==200 and net.agent_local_repairs=={'enabled':True,'trials':3,'seconds':4,'targeted_only':False}
+    response=client.post('/api/settings',json={'agent_local_enabled':False},headers=headers)
+    assert response.status_code==200 and not net.agent_local_repairs['enabled']
 
 
 def test_try_route_keeps_exact_credit_and_adoption_separate(app,monkeypatch):
@@ -113,6 +115,27 @@ def test_saved_match_recheck_pause_is_validated_saved_and_applied_live(app, monk
     assert not net.progress.matched_rechecks_paused
 
 
+def test_two_cli_sessions_claim_different_open_functions(app):
+    """match-function: a session with no function named claims an open one under its own holder, so two sessions
+    working at once never get the same function; release gives it back to the queue."""
+    from .test_loading import tiny_game
+    client,net,_=app
+    tiny_game(net,'parallel-claims',functions=3)
+    h={'X-Decomp':'1'}
+    first=client.post('/api/claim',headers=h,json={'slug':'parallel-claims','holder':'claude-a'})
+    second=client.post('/api/claim',headers=h,json={'slug':'parallel-claims','holder':'claude-b'})
+    assert first.status_code==200 and second.status_code==200,(first.text,second.text)
+    a,b=first.json()['name'],second.json()['name']
+    assert a!=b and {a,b}<={'func_0','func_1','func_2'}
+    # asking again while holding one is that same claim, renewed
+    assert client.post('/api/claim',headers=h,json={'slug':'parallel-claims','holder':'claude-a'}).json()['name']==a
+    assert client.post('/api/claim',headers=h,json={'slug':'parallel-claims','holder':'bad holder!'}).status_code==400
+    assert client.post('/api/release',headers=h,json={'slug':'parallel-claims','name':a,'holder':'claude-a'}).status_code==200
+    held={r['name'] for r in net.project_store(net._project('parallel-claims')['id']).all(
+        'SELECT f.name FROM claims c JOIN functions f ON f.id=c.function_id')}
+    assert held=={b}
+
+
 @pytest.fixture(scope="module")
 def app(tmp_path_factory):
     home = tmp_path_factory.mktemp("home")
@@ -127,6 +150,159 @@ def app(tmp_path_factory):
 
 
 WINDOW = {"User-Agent": f"Mozilla/5.0 AppleWebKit/605.1.15 {window.TOKEN_AGENT}{SECRET}"}
+
+
+def test_polishing_checklist_is_saved_per_game(app, tmp_path):
+    client, net, _ = app
+    for slug in ("polish-one", "polish-two"):
+        with net.project_registration(slug=slug, name=slug, description="", arch="mips",
+                                      big_endian=True, root=tmp_path, config={"kind": "rom"}):
+            pass
+
+    path = "/api/polishing-checklist"
+    headers = {**WINDOW, "X-Decomp": "1"}
+    defaults = {"selected": ["require_name"], "name_format": "camelCase"}
+    assert client.get(path, params={"slug": "polish-one"}).json() == defaults
+
+    def save(selected, name_format="snake_case"):
+        return client.post(path, headers=headers, json={
+            "slug": "polish-one", "selected": selected, "name_format": name_format,
+        })
+
+    project_id = net.project_row("polish-one", sync=False)["id"]
+    with net.project_store(project_id).tx() as db:
+        db.execute("INSERT INTO settings VALUES (?, ?)",
+                   (f"polishing-checklist:{project_id}", '["pointer_casts"]'))
+    assert client.get(path, params={"slug": "polish-one"}).json() == {
+        **defaults, "selected": ["require_name", "pointer_casts"],
+    }
+
+    selected = {"selected": ["require_name", "compile_64bit", "pointer_casts"], "name_format": "snake_case"}
+    assert save(["pointer_casts", "compile_64bit", "pointer_casts", "require_name"]).json() == selected
+    assert save(["unknown"]).status_code == 400
+    assert save(["require_name"], "invalid").status_code == 400
+    assert client.get(path, params={"slug": "polish-one"}).json() == selected
+    assert client.get(path, params={"slug": "polish-two"}).json() == defaults
+    assert save([]).json() == {"selected": [], "name_format": "snake_case"}
+    assert client.get(path, params={"slug": "polish-one"}).json()["selected"] == []
+
+
+
+def test_port_recompile_discovery_reuses_the_project_job(app, tmp_path, monkeypatch):
+    from decompnet.app import recompile, recompile_review
+
+    client, net, _ = app
+    for slug, kind in (("recompile-rom", "rom"), ("recompile-source", "project")):
+        with net.project_registration(slug=slug, name=slug, description="", arch="mips",
+                                      big_endian=True, root=tmp_path, config={"kind": kind, "platform": "n64"}):
+            pass
+
+    entered, release = threading.Event(), threading.Event()
+
+    def run(net, slug, log):
+        assert slug == "recompile-rom"
+        entered.set()
+        assert release.wait(5)
+        log.check_cancel()
+
+    monkeypatch.setattr(recompile, "run", run)
+    path, headers = "/api/recompile", {"X-Decomp": "1"}
+    source = client.get(path, params={"slug": "recompile-source"}).json()
+    assert source == {"mode": "project", "recomp_available": False, "job": None}
+    assert client.post(path, headers=headers, json={"slug": "recompile-source"}).status_code == 400
+    payload = {"slug": "recompile-rom"}
+    try:
+        job = client.post(path, headers=headers, json=payload).json()["job"]
+        assert entered.wait(3)
+        assert client.get(path, params=payload).json()["job"]["id"] == job
+        assert client.get(path, params={"slug": "recompile-source"}).json()["job"] is None
+        assert client.post(path, headers=headers, json=payload).json()["job"] == job
+        assert client.post("/api/job/cancel", headers=headers, json={"id": job}).status_code == 200
+    finally:
+        release.set()
+    for _ in range(100):
+        status = client.get("/api/job", params={"id": job}).json()
+        if status["state"] != "running":
+            break
+        time.sleep(.01)
+    assert status["state"] == "cancelled"
+
+    address = 0x80000440
+    monkeypatch.setattr(recompile_review, "preview", lambda net, proj, revision, addr:
+                        {"assembly": f"{proj['slug']} {revision} {addr}"})
+    assert client.get(path, params={**payload, "preview": address, "revision": 42}).json() == {
+        "assembly": f"recompile-rom 42.0 {address}"}
+    monkeypatch.setattr(recompile_review, "add", lambda net, slug, revision, addresses, log:
+                        {"added": [slug, revision, *addresses]})
+    response = client.post(path, headers=headers, json={**payload, "revision": 42, "addresses": [address]})
+    job = response.json()["job"]
+    for _ in range(100):
+        status = client.get("/api/job", params={"id": job}).json()
+        if status["state"] != "running":
+            break
+        time.sleep(.01)
+    assert status["kind"] == "recompile-review"
+    assert status["result"] == {"added": ["recompile-rom", 42, address]}
+
+
+def test_port_export_selections_and_batch_are_scoped_to_the_project(app, tmp_path, monkeypatch):
+    from decompnet.network import NetworkError
+    from decompnet.port.wasm import export
+
+    client, net, _ = app
+    slug, other = "multi-export-one", "multi-export-two"
+    for name in (slug, other):
+        root = tmp_path / name
+        root.mkdir()
+        with net.project_registration(slug=name, name=name, description="", arch="mips",
+                                      big_endian=True, root=root, config={"kind": "rom"}):
+            pass
+
+    options, build_route = "/api/port-export-options", "/api/play-export"
+    headers = {"X-Decomp": "1"}
+    selected = ["ios", "steamdeck", "web", "simd"]
+    payload = {"slug": slug, "targets": selected}
+    assert client.get(options, params={"slug": slug}).json()["targets"] == []
+    assert client.post(options, headers=headers, json=payload).json() == {"targets": selected}
+    assert client.post(options, headers=headers, json={**payload, "targets": ["missing"]}).status_code == 400
+    assert client.post(build_route, headers=headers, json={**payload, "targets": ["simd"]}).status_code == 400
+    assert client.get(options, params={"slug": slug}).json()["targets"] == selected
+    assert client.get(options, params={"slug": other}).json()["targets"] == []
+
+    entered, proceed = threading.Event(), threading.Event()
+    calls = []
+
+    def build_target(net, project, kind, log, simd=False):
+        calls.append((project, kind, simd))
+        log.progress({"phase": "Building", "step": 1, "steps": 2, "done": 1, "total": 2})
+        if kind == "ios":
+            entered.set()
+            assert proceed.wait(10)
+            raise NetworkError("Xcode project could not be generated.")
+        return {"kind": kind, "path": str(tmp_path / kind)}
+
+    monkeypatch.setattr(export, "export", build_target)
+    try:
+        job = client.post(build_route, headers=headers, json=payload).json()["job"]
+        assert entered.wait(3)
+        active = client.get(options, params={"slug": slug}).json()["job"]
+        assert active["id"] == job
+        assert active["progress"]["done"] == 25 and active["progress"]["total"] == 300
+        assert client.get(options, params={"slug": other}).json()["job"] is None
+        assert client.post(build_route, headers=headers, json=payload).json()["job"] == job
+    finally:
+        proceed.set()
+    for _ in range(100):
+        status = client.get("/api/job", params={"id": job}).json()
+        if status["state"] != "running":
+            break
+        time.sleep(.01)
+    assert status["state"] == "done", status
+    assert [result["kind"] for result in status["result"]["exports"]] == ["steamdeck", "web"]
+    assert "Xcode project could not be generated." in status["result"]["failures"][0]
+    assert calls == [(slug, "ios", False), (slug, "steamdeck", False), (slug, "web", True)]
+    assert client.post(options, headers=headers, json={**payload, "targets": []}).json() == {"targets": []}
+    assert client.get(options, params={"slug": slug}).json()["targets"] == []
 
 
 def test_deep_permuter_job_can_be_found_and_stopped_from_the_function(app, monkeypatch):
@@ -450,6 +626,10 @@ def test_import_demo_and_follow_it_live(app):
         time.sleep(0.1)
     assert j["state"] == "done", j
     slug = j["result"]["slug"]
+    state = repository_setup.status(net, slug)
+    assert state["rebuildable"] and state["repository"]
+    assert not state["checkpoint"] and not state["origin"]
+    assert (Path(state["root"]) / ".gitignore").is_file()
     st = client.get("/api/state").json()
     assert any(a["id"] == "api" for a in st["agents"])
     listed = client.get("/api/projects").json()[0]
@@ -801,7 +981,7 @@ def test_a_picked_api_model_survives_restart_and_resume(tmp_path, monkeypatch):
     client = TestClient(mcp.streamable_http_app(transport_security=security, host="127.0.0.1"),
                         base_url=f"http://127.0.0.1:{PORT}", headers=WINDOW)
     started = client.post("/api/agents/start", headers={"X-Decomp": "1"}, json={
-        "kind": "api", "slug": "game", "options": {"endpoints": [entry["id"]], "model": "picked-single"},
+        "kind": "api", "slug": "game", "options": {"endpoints": [entry["id"]], "model": "picked-single", "automatic_assignment": True},
     })
     assert started.status_code == 200, started.text
     selected = client.post("/api/agents/start", headers={"X-Decomp": "1"}, json={
@@ -813,6 +993,7 @@ def test_a_picked_api_model_survives_restart_and_resume(tmp_path, monkeypatch):
     picked = dict(zip(started.json()["started"] + selected.json()["started"], ["picked-single", "picked-multiple"]))
     for sid, model in picked.items():
         assert manager.sessions[sid].options["model"] == model
+        assert manager.sessions[sid].snapshot()["automatic_assignment"] == (model == "picked-single")
 
     client.post("/api/settings", headers={"X-Decomp": "1"}, json={
         "endpoint": {"id": entry["id"], "model": "endpoint-default-changed"},
@@ -823,6 +1004,7 @@ def test_a_picked_api_model_survives_restart_and_resume(tmp_path, monkeypatch):
         assert restarted.status_code == 200, restarted.text
         assert manager.sessions[sid].options["model"] == model
         assert manager.sessions[sid].state == "starting"
+        assert manager.sessions[sid].snapshot()["automatic_assignment"] == (model == "picked-single")
 
         manager.stop(sid)
         session = manager.sessions[sid]
@@ -1137,8 +1319,18 @@ def test_a_job_always_ends_and_says_why(tmp_path):
     assert "KeyError" in "\n".join(job["log"]) and "Traceback" in "\n".join(job["log"])
     assert "dtk took longer than 30 minutes" in wait(jobs.start("import", slow))["error"]
     assert wait(jobs.start("build", failed))["error"] == "ninja failed (2): ld: undefined symbol foo"
+    def blocked_pull(log):
+        from decompnet.network import NetworkError
+
+        log("Checking origin")
+        raise NetworkError("Resolve merge conflicts in your Git client.")
+
+    pull = wait(jobs.start("repository-pull", blocked_pull, include_recent_log=False))
+    assert pull["error"] == "Resolve merge conflicts in your Git client."
+    assert pull["log"] == ["Checking origin"]
     logged = (tmp_path / "logs" / "decomp.log").read_text()
     assert "reading the ROM" in logged and "KeyError" in logged and "Traceback" in logged
+    assert pull["error"] in logged
 
 
 def test_a_panel_finds_the_running_job_of_its_own_project():
@@ -1409,14 +1601,14 @@ def test_the_map_brings_polished_and_set_aside_and_changes_when_a_function_is_po
     client = TestClient(mcp.streamable_http_app(transport_security=security, host="127.0.0.1"),
                         base_url=f"http://127.0.0.1:{PORT}", headers=WINDOW)
     with net.store.tx() as db:
-        db.execute("UPDATE functions SET status='matched' WHERE name='func_0'")
+        db.execute("UPDATE functions SET status='matched', name='updateWorld' WHERE name='func_0'")
     before = client.get("/api/map?slug=game").json()
     with net.store.tx() as db:
-        db.execute("UPDATE functions SET readable=1 WHERE name='func_0'")
+        db.execute("UPDATE functions SET readable=1 WHERE name='updateWorld'")
     after = client.get(f"/api/map?slug=game&since={before['sig']}").json()
     assert {"polished", "not_c"} <= set(after["keys"]) and "same" not in after
     rows = {r[after["keys"].index("name")]: dict(zip(after["keys"], r)) for r in after["rows"]}
-    assert rows["func_0"]["polished"] and not rows["func_1"]["polished"]
+    assert rows["updateWorld"]["polished"] and not rows["func_1"]["polished"]
 
 
 def test_rom_library_setting_and_background_lookup(app, tmp_path, monkeypatch):
@@ -3681,16 +3873,100 @@ def test_the_project_list_answers_same_for_an_unchanged_signature(app, monkeypat
     assert changed['sig'] != first['sig'] and changed['projects'][0]['matched'] == 2
 
 
-def test_play_refuses_a_runtime_it_cant_build_on_yet(app):
-    """The Play step's native runtimes are planned: asked for one, Play says so and starts nothing."""
+@pytest.mark.skipif(sys.platform != "darwin" or not os.getenv("DECOMPNET_RT64_ADAPTER"),
+                    reason="requires a local RT64 adapter and a macOS desktop")
+def test_rt64_play_runs_saved_c_and_both_fallbacks(app, tmp_path, monkeypatch):
+    """Exercise the Porting request with a real native renderer and three distinct code paths."""
+    import hashlib
+    import struct
+
+    from decompnet.port.wasm import play
+
+    if any(toolchains.installed(tool) is None for tool in ("sdl3", "zig", "wabt", "n64recomp")):
+        pytest.skip("requires the pinned compatibility and SDL3 tools")
+    client, net, _ = app
+    slug = "rt64-play-demo"
+    folder = tmp_path / "progress"
+    (folder / "src").mkdir(parents=True)
+    (folder / "include").mkdir()
+    rom = bytearray(0x3000)
+    for address, words in ((0, (0x80371240, 0, 0x80000400)), (0x1000, (0x08000108, 0)),
+                           (0x1020, (0x03E00008, 0)), (0x1080, (0x24020007, 0x03E00008, 0)),
+                           (0x1200, (0x24020008, 0x03E00008, 0))):
+        struct.pack_into(">" + "I" * len(words), rom, address, *words)
+    rom[0x3E] = ord("E")
+    (tmp_path / "demo.z64").write_bytes(rom)
+    image = {"sha1": hashlib.sha1(rom).hexdigest(), "file": "demo.z64", "title": "RT64 demo"}
+    code = """void entry(void) {
+        volatile unsigned short *frame = (unsigned short *)0x80010000;
+        unsigned short color = func_80000480() + func_80000600() == 15 ? 0x07C1 : 0xF801;
+        for (int i = 0; i < 320 * 240; i++) frame[i] = color;
+        osViSwapBuffer((void *)frame);
+    }"""
+    (folder / "src/entry.c").write_text(code)
+    (folder / "include/common.h").write_text(
+        "int func_80000480(void); int func_80000600(void); void osViSwapBuffer(void *);")
+    layout = [{"name": name, "vram": vram, "size": size, "rom_offset": offset}
+              for name, vram, size, offset in (("entry", 0x80000420, 8, 0x1020),
+                                               ("func_80000480", 0x80000480, 12, 0x1080),
+                                               ("func_80000600", 0x80000600, 12, 0x1200))]
+    (folder / "decompdecomp.json").write_text(json.dumps({"format": 2, "game": image, "platform": "n64", "layout": layout}))
+    config = {"kind": "rom", "platform": "n64", "big_endian": True, "rom": image,
+              "segments": [{"name": "demo", "rom_start": 0x1000, "rom_end": 0x1100, "vram": 0x80000400}]}
+    with net.project_registration(slug=slug, name=slug, description="", arch="mips", big_endian=True,
+                                  root=tmp_path, config=config) as (db, pid):
+        for function, source in zip(layout[:2], (code, None)):
+            offset, size = function["rom_offset"], function["size"]
+            db.execute("INSERT INTO functions(project_id,name,size,n_insns,target,vram,rom_offset,status,matched_source)"
+                       " VALUES(?,?,?,?,?,?,?,?,?)",
+                       (pid, function["name"], size, size // 4, bytes(rom[offset:offset + size]), function["vram"],
+                        offset, "matched" if source else "open", source))
+
+    dump = tmp_path / "frame.rdram"
+    monkeypatch.setenv("PORT_RAM_DUMPS", f"8:{dump}")
+    monkeypatch.setenv("PORT_RECOMP_CALLS", "80000480")
+    monkeypatch.setenv("PORT_INTERP_TRACE", "1")
+    selection = {"slug": slug, "build_mode": "compatibility", "runtime": "n64modernruntime"}
+    headers = {"X-Decomp": "1"}
+    try:
+        response = client.post("/api/play", headers=headers, json=selection)
+        assert response.status_code == 200, response.json()
+        job = response.json()["job"]
+        for _ in range(600):
+            result = client.get("/api/job", params={"id": job}).json()
+            if result["state"] != "running":
+                break
+            time.sleep(.2)
+        assert result["state"] == "done", result
+        assert result["result"]["native"]
+        for _ in range(40):
+            if dump.exists() and dump.stat().st_size >= 0x10002:
+                break
+            time.sleep(.05)
+        assert dump.read_bytes()[0x10000:0x10002] == bytes.fromhex("07C1")
+        log = (tmp_path / "port/wasm/build/play.log").read_text()
+        assert "RT64 compatibility frame submitted" in log
+        assert "recompiled 80000480" in log and "interpreter: 80000600" in log
+        assert client.post("/api/play", headers=headers, json={"slug": slug, "stop": True}).json()["stopped"]
+    finally:
+        play.stop(slug)
+
+
+def test_play_and_export_refuse_an_unavailable_build_or_runtime(app):
     from .test_loading import tiny_game
 
     client, net, _ = app
     slug = "play-runtime"
     tiny_game(net, slug)
-    response = client.post("/api/play", headers={"X-Decomp": "1"}, json={"slug": slug, "runtime": "libultraship"})
-    assert response.status_code == 400 and "WebAssembly build only" in response.json()["error"]
-    net.remove_project(slug)
+    try:
+        for route in ("/api/play", "/api/play-export"):
+            for unsupported in ({"runtime": "libultraship"}, {"build_mode": "direct", "runtime": "wasm"}):
+                response = client.post(route, headers={"X-Decomp": "1"},
+                                       json={"slug": slug, "targets": ["web"], **unsupported})
+                assert response.status_code == 400
+                assert "Choose N64 compatibility and the decompdecomp runtime" in response.json()["error"]
+    finally:
+        net.remove_project(slug)
 
 
 def test_startup_does_not_stop_at_one_projects_half_written_save(tmp_path, monkeypatch):
@@ -3774,17 +4050,18 @@ def test_function_settings_recheck_is_one_job_a_returning_panel_finds(app, monke
     assert client.post('/api/compiler/unverified', json={'slug':slug, 'action':'other'}, headers=headers).status_code == 400
 
 
-def test_restart_all_restarts_only_stopped_agents_on_the_project(app, monkeypatch):
+def test_restart_all_restarts_eligible_agents_on_the_project(app, monkeypatch):
     client, _, manager = app
     monkeypatch.setattr(manager, "sessions", {})
     agents_to_restart = [
         ("stopped", "game", "stopped", False),
         ("blocked", "game", "stopped", False),
         ("second", "game", "stopped", False),
-        ("invalid-model", "game", "stopped", True),
+        ("invalid-model", "game", "paused", True),
         ("paused", "game", "paused", False),
         ("working", "game", "working", False),
-        ("other-project", "other", "stopped", False),
+        ("waiting", "game", "waiting", False),
+        ("other-project", "other", "paused", False),
     ]
     for name, slug, state, rejected in agents_to_restart:
         session = agents.Session(name, "codex", name, slug, name, {}, state=state)
@@ -3800,10 +4077,116 @@ def test_restart_all_restarts_only_stopped_agents_on_the_project(app, monkeypatc
     response = client.post("/api/agents/restart", json={"slug": "game"}, headers={"X-Decomp": "1"})
     assert response.status_code == 200
     assert response.json() == {
-        "restarted": ["stopped", "second"],
+        "restarted": ["stopped", "second", "paused"],
         "errors": [{"label": "blocked", "message": "blocked is still stopping: try again in a moment"}],
     }
     assert {sid: s.state for sid, s in manager.sessions.items()} == {
-        name: "starting" if name in {"stopped", "second"} else state
+        name: "starting" if name in {"stopped", "second", "paused"} else state
         for name, _, state, _ in agents_to_restart
     }
+
+
+def test_knowledge_edits_work_without_synchronizing_saved_code(app, tmp_path, monkeypatch):
+    client, net, _ = app
+    slug = 'findings'
+    with net.store.tx() as db:
+        pid = db.execute(
+            'INSERT INTO projects(slug,name,root,config) VALUES(?,?,?,?)',
+            (slug, 'Findings', str(tmp_path), json.dumps({'kind': 'rom', 'platform': 'n64'})),
+        ).lastrowid
+        ids = [
+            db.execute("INSERT INTO knowledge(project_id,text,status,created_at) VALUES (?,?,'proposed',1)",
+                       (pid, text)).lastrowid
+            for text in ('Technique', 'Equivalent technique', 'Compiler trial')
+        ]
+    monkeypatch.setattr(net.progress, 'sync', lambda *a, **kw: pytest.fail('Finding edits need no compiler check'))
+    headers = {'X-Decomp': '1'}
+    merged = client.post('/api/knowledge/merge', headers=headers, json={
+        'slug': slug, 'target': ids[0], 'sources': [ids[1]], 'text': 'Combined technique',
+    })
+    assert merged.status_code == 200, merged.text
+    moved = client.post('/api/knowledge/profile', headers=headers, json={'slug': slug, 'ids': [ids[2]]})
+    assert moved.status_code == 200, moved.text
+    assert [item['id'] for item in client.get('/api/knowledge/profile', params={'slug': slug}).json()['items']] == ids[2:]
+
+
+def test_repair_examples_route_accepts_vote_sort(app, tmp_path):
+    client, net, *_ = app
+    with net.store.tx() as db:
+        pid = db.execute("INSERT INTO projects(slug,root,config) VALUES('repair-vote-sort',?,'{}')",
+                         (str(tmp_path),)).lastrowid
+        fid = db.execute("INSERT INTO functions(project_id,name) VALUES(?,'example')", (pid,)).lastrowid
+        ids = [db.execute('INSERT INTO repair_examples(project_id,function_id,created_at,evidence) VALUES(?,?,?,?)',
+                          (pid, fid, index, json.dumps({'after': {'source_sha256': str(index)}}))).lastrowid
+               for index in range(2)]
+        db.execute('INSERT INTO repair_example_votes(example_id,agent_id) VALUES(?,99)', (ids[0],))
+    route = '/api/repair-examples?slug=repair-vote-sort'
+    assert [row['id'] for row in client.get(route).json()['examples']] == ids[::-1]
+    ranked = client.get(route + '&sort=upvotes')
+    assert ranked.status_code == 200
+    assert [(row['id'],row['upvotes']) for row in ranked.json()['examples']] == [(ids[0],1), (ids[1],0)]
+    second = client.get(route + f'&sort=upvotes&before={ids[0]}&before_votes=1')
+    assert [row['id'] for row in second.json()['examples']] == [ids[1]]
+    assert client.get(route + '&sort=invalid').status_code == 400
+
+
+def test_community_directory_reports_matching_library_roms(app, tmp_path, monkeypatch):
+    import hashlib
+
+    from decompnet.forks import directory
+
+    client, _, _ = app
+    headers = {"X-Decomp": "1"}
+    library = tmp_path / "library"
+    nested = library / "cartridges"
+    nested.mkdir(parents=True)
+    rom = b"\x80\x37\x12\x40" + bytes(0x40000 - 4)
+    (nested / "renamed.v64").write_bytes(b"".join(bytes((b, a)) for a, b in zip(rom[::2], rom[1::2])))
+    (library / "different.z64").write_bytes(rom[:-1] + b"\x01")
+    archived = rom[:-1] + b"\x02"
+    (library / "ignored.zip").write_bytes(archived)
+    repo = "https://github.com/example/game"
+    projects = [
+        {"repo_url": repo, "platform": "n64", "rom_sha1s": [hashlib.sha1(rom).hexdigest()]},
+        {"repo_url": repo + "-archived", "platform": "n64", "rom_sha1s": [hashlib.sha1(archived).hexdigest()]},
+        {"repo_url": repo + "-unknown", "platform": "n64", "rom_sha1s": []},
+    ]
+    monkeypatch.setattr(directory, "listing", lambda: projects)
+
+    assert client.get("/api/fork/directory").json()["projects"] == [
+        {"repo_url": p["repo_url"], "platform": p["platform"]} for p in projects
+    ]
+    assert client.post("/api/fork/directory/library", headers=headers).json() == {"job": None}
+    assert client.post("/api/settings", headers=headers, json={"rom_library": str(library)}).status_code == 200
+    started = client.post("/api/fork/directory/library", headers=headers)
+    assert started.status_code == 200
+    for _ in range(100):
+        job = client.get("/api/job", params={"id": started.json()["job"]}).json()
+        if job["state"] != "running":
+            break
+        time.sleep(.01)
+    assert job["state"] == "done", job
+    assert job["result"]["matches"] == [["n64", repo]]
+    assert str(library) not in str(job)
+
+
+def test_deep_permuter_tab_accepts_the_older_routes_field_names(app, monkeypatch):
+    """`function` and `max_variants` (the older permuter route's names) mean `name` and `variants` here, not function
+    '' and the 500-variant default."""
+    from decompnet.app import deep_permuter
+
+    client, net, _ = app
+    calls, done = [], threading.Event()
+    monkeypatch.setattr(deep_permuter, "validate", lambda *args: None)
+
+    def run(net, slug, name, minutes, variants, log, **options):
+        calls.append((name, minutes, variants))
+        done.set()
+        return {"function": name}
+
+    monkeypatch.setattr(deep_permuter, "run", run)
+    response = client.post("/api/deep-permuter", headers={"X-Decomp": "1"},
+                           json={"slug": "tab-game", "function": "g", "minutes": 3, "max_variants": 3000})
+    assert response.status_code == 200, response.text
+    assert done.wait(2)
+    assert calls == [("g", 3, 3000)]

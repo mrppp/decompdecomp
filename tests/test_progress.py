@@ -621,6 +621,37 @@ def test_an_invalid_merged_rename_does_not_write_the_manifest(project):
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize("first_sync", [False, True])
+def test_a_database_rename_reconciles_a_saved_source_edit(project, first_sync):
+    from decompnet.app.function_names import record
+
+    net, folder, judged = project
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET status='matched',matched_source='int f(void) { return 1; } /* good */' "
+                   "WHERE name='f'")
+    net.progress.sync("game", force=True)
+    old = folder / "src/f.c"
+    old.write_text('int f(void) { return 2; } /* good f */\n')
+    with net.store.tx() as db:
+        fid = db.execute("SELECT id FROM functions WHERE name='f'").fetchone()["id"]
+        db.execute("UPDATE functions SET name='renamed',matched_source='int renamed(void) { return 1; } /* good */' "
+                   "WHERE id=?", (fid,))
+        record(db, fid, "f", "renamed")
+        if first_sync:
+            db.execute("DELETE FROM progress_state")
+    if first_sync:
+        net.progress = Progress(net)
+    net.progress.sync("game", force=True)
+    layout = json.loads((folder / saves.MANIFEST).read_text())["layout"]
+    assert {entry["name"] for entry in layout} == {"renamed", "g"}
+    assert not old.exists()
+    edited = 'int renamed(void) { return 2; } /* good f */\n'
+    assert (folder / "src/renamed.c").read_text() == edited
+    assert ("renamed", edited) in judged
+    assert net._function("renamed", "game")["status"] == "matched"
+    assert not net.progress.sync("game", force=True)
+
+
 def test_a_failed_edited_match_keeps_the_last_match_as_a_best_backup(project):
     net, folder, _ = project
     with net.store.tx() as db:
@@ -967,18 +998,24 @@ def test_background_compile_discards_results_if_progress_changes(worker, project
             net.permuter._score(agent, proj, fn, "draft", 10, None)
 
 
-def test_a_best_attempt_can_be_edited_and_deleted(project):
-    net, folder, _ = project
+def test_saved_draft_edit_and_deletion_keep_the_last_scored_candidate(project):
+    net, folder, judged = project
     (folder / "best").mkdir()
     path = folder / "best/f.c"
     path.write_text("first attempt", encoding="utf-8")
     net.progress.sync("game", force=True)
-    path.write_text("worse attempt", encoding="utf-8")
+    before = net._function("f", "game")
+    path.write_text("compile error", encoding="utf-8")
     net.progress.sync("game", force=True)
-    assert net._function("f", "game")["best_source"] == "worse attempt"
+    assert judged[-1] == ("f", "compile error")
+    assert path.read_text().strip() == "first attempt"
     path.unlink()
     net.progress.sync("game", force=True)
-    assert net._function("f", "game")["best_source"] is None
+    current = net._function("f", "game")
+    assert [current[key] for key in ("best_source", "best_score", "best_agent_id")] == [
+        before[key] for key in ("best_source", "best_score", "best_agent_id")]
+    assert path.read_text().strip() == "first attempt"
+    assert not net.progress.sync("game", force=True)
 
 
 def test_an_uninstalled_compiler_does_not_clear_existing_work(project, monkeypatch):
@@ -2306,6 +2343,34 @@ def test_restore_batches_set_aside_rows_and_keeps_same_address_overlays_separate
     assert [row['name'] for row in store.all('SELECT name FROM restored_updates ORDER BY rowid')] == ['f', 'g']
 
 
+def test_saved_verdict_preserves_current_local_sdk_evidence(project):
+    import hashlib
+
+    from decompnet.app.boundary_repairs import reason
+
+    net, _, _ = project
+    proj = net.project_row('game', sync=False)
+    store = net.project_store(proj['id'])
+    target = bytes.fromhex('000020210c00040000000000')
+    proof = {'kind': 'sdk', 'verified': True, 'verification_method': 'builtin-sdk-digest',
+             'bytes': len(target), 'target_sha256': hashlib.sha256(target).hexdigest()}
+    with store.tx() as db:
+        db.execute("UPDATE functions SET status='asm',target=?,meta=? WHERE name='f'",
+                   (target, json.dumps({'verified_assembly': proof})))
+        db.execute("UPDATE functions SET status='asm',target=?,meta=? WHERE name='g'",
+                   (target[:-4], json.dumps({'verified_assembly': proof})))
+    items = [{'name': name, 'vram': vram, 'verified_assembly': {**proof, 'verified': False},
+              'asm_code': 'Saved assembly verdict'} for name, vram in [('f', 4096), ('g', 4100)]]
+    for _ in range(2):
+        saves._restore_set_aside(store, proj['id'], items)
+    rows = {row['name']: row for row in store.all('SELECT name,status,target,meta FROM functions')}
+    assert json.loads(rows['f']['meta']) == {
+        'verified_assembly': proof, 'asm_code': 'Saved assembly verdict',
+    }
+    assert reason(net.console(proj), rows['f']) is None
+    assert json.loads(rows['g']['meta'])['verified_assembly']['verified'] is False
+
+
 def test_saved_verdict_notes_and_list_order_are_not_shared_linking_inputs():
     from copy import deepcopy
 
@@ -2347,7 +2412,7 @@ def test_foreground_judge_finishes_while_saved_compile_is_waiting(project, monke
     monkeypatch.setattr(net, 'attempt', MethodType(RomNetwork.attempt, net))
     monkeypatch.setattr(net, '_attempt', ordinary_attempt)
     waiting, compilation = threading.Event(), Future()
-    def checks(net, proj, folder, files, by_name, by_vram, saved, judge_code, check_cancel, verifying=()):
+    def checks(net, proj, folder, files, by_name, by_vram, saved, judge_code, check_cancel, verifying=(), rejudge_best=()):
         for name in saved:
             prepared = ('synthetic saved compile', compilation) if name == 'f' else None
             waiting.set()
@@ -3378,7 +3443,7 @@ def test_stale_saved_compile_retries_without_holding_project_lock(project,monkey
         assert result.snapshot==net._compile_snapshot(proj,fn,ctx['header'],text), 'Stale compiler result reached the judge'
         return original(agent,name,text,slug)
     monkeypatch.setattr(net,'attempt',attempt)
-    def checks(net,proj,folder,files,by_name,by_vram,saved,judge_code,check_cancel,verifying=()):
+    def checks(net,proj,folder,files,by_name,by_vram,saved,judge_code,check_cancel,verifying=(),rejudge_best=()):
         ready=Future();ready.set_result(None)
         for name in saved:
             yield name,saved[name],'src',files['src/'+name+'.c'],name,('stale snapshot',ready) if prefetched else None
@@ -3838,6 +3903,26 @@ def test_a_compile_tool_call_checks_only_what_its_judge_reads(project, monkeypat
     assert forced == [1], "other work tools still check the whole folder first"
 
 
+def test_judge_tool_nested_lookups_reuse_verified_saved_inputs(project, monkeypatch):
+    from decompnet.app import tools
+
+    net, _, _ = project
+    agent, _ = net.local_agent('worker')
+    calls = []
+    real = net.progress._sync_checked
+    monkeypatch.setattr(net.progress, '_sync_checked',
+                        lambda *a, **kw: calls.append(kw) or real(*a, **kw))
+
+    def dispatch(*args):
+        for _ in range(3):
+            net.project_row('game')
+        return 'judged'
+
+    monkeypatch.setattr(tools, '_dispatch', dispatch)
+    assert tools._invoke(net, agent, 'game', 'compile_variants', {}) == 'judged'
+    assert calls == []
+
+
 # A big game lost 415 of its 658 matches over three restarts: a header its project no longer used
 # (include/common_main.h) made every sync recheck all saved C, quitting cut each pass off after under a minute,
 # and the matches it hadn't reached stayed open with their C gone from the folder.
@@ -4010,7 +4095,9 @@ def test_an_automatic_resume_only_uses_c_judged_with_todays_header(project):
     assert any(header == "" for _, header, _ in every)  # (the manual recovery may bring an old header back)
     current = match_reconciliation.candidates(net, proj, fn, {}, current_header=True)
     assert current and all(header == "today" for _, header, _ in current)
-    assert [origin for *_, origin in current] == ["match kept as best attempt"]
+    assert [origin for *_, origin in current] == [
+        "match kept as best attempt", "distinct exact attempt, current header",
+    ]
 
 
 def test_a_read_only_tool_never_waits_for_a_recheck(project, monkeypatch):
@@ -4131,3 +4218,49 @@ def test_editor_attempt_checks_inputs_once_and_leaves_publication_to_autosave(pr
 
     saves.Autosave(net).run_once(force=False)
     assert source in (folder / "src" / "f.c").read_text()
+
+
+@pytest.mark.parametrize('edited', [False, True])
+def test_waiter_coalesces_only_an_acknowledged_unchanged_recheck(project, monkeypatch, edited):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Condition, Event
+
+    from decompnet.app.progress import _config_key, _Recheck
+
+    net, folder, _ = project
+    worker = net.progress
+    row = net.project_row('game', sync=False)
+    signature = worker._signature(folder)
+    active = _Recheck(folder, signature)
+    worker.rechecking['game'] = active
+    entered = Event()
+    real_wait = Condition.wait
+
+    def on_wait(condition, timeout=None):
+        if condition._lock is worker._project_lock('game'):
+            entered.set()
+        return real_wait(condition, timeout=timeout)
+
+    monkeypatch.setattr(Condition, 'wait', on_wait)
+    decisions = []
+    checked = worker._joined_recheck
+
+    def joined(*args):
+        value = checked(*args)
+        decisions.append(value)
+        return value
+
+    monkeypatch.setattr(worker, '_joined_recheck', joined)
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(worker.sync, 'game', force=True)
+        try:
+            assert entered.wait(3)
+        finally:
+            with worker._project_lock('game'):
+                active.acknowledged = signature, _config_key(row, net.cfg(row))
+                if edited:
+                    manifest = folder / saves.MANIFEST
+                    manifest.write_text(manifest.read_text() + '\n')
+                worker.rechecking.pop('game', None)
+        future.result(timeout=5)
+    assert decisions == [not edited]

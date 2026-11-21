@@ -8,6 +8,30 @@ while keeping `-O2`. Debug line labels can prevent the old assembler moving an i
 A matching result proves the flags for that function; keep the override scoped to the verified address range.
 The automatic compiler survey also checks these debug variants on saved attempts.
 
+## Recheck the same C before changing a close candidate
+
+- If the target fills jump, call, or return delay slots and the current build leaves
+  `nop`s, try omitting `-g` or `-g3` with the other flags fixed. One N64 candidate went
+  from score 600 to exact without a source edit. A second recovered three switch-arm
+  loads in their jump delay slots and still had other differences.
+- With `-O1`, an interleaved prologue or a store displaced from a branch is a reason
+  to try `-fschedule-insns -fschedule-insns2` together. One candidate scored 410 with
+  plain `-O1`, 450 and 270 with the passes enabled individually, and 0 with both.
+  A replay on a second candidate improved from 1165 to 235. Keep the plain
+  `-O1` result as a control: on another routine it was exact and enabling both
+  passes raised the score to 840.
+- If a loop walks fixed-size records by incrementing a pointer, compare ordinary
+  typed indexing with strength reduction enabled. In a 12-byte record search, removing
+  `-fno-strength-reduce` improved the byte-offset version from 760 to 60. The typed
+  record version reached exact under the same revised profile.
+
+For grouped copies, three consecutive `lw`s followed by three `sw`s from the same
+respective bases can come from assigning a three-word struct. Verify width, alignment,
+and field offsets. With `lwc1` and `swc1`, check the float field types before trying an
+integer copy. An unused local aggregate can account for a frame gap without adding
+memory traffic. Use that as a diagnostic while checking conversion expansions,
+callee output extents, and the original local layout.
+
 ## Near-match checklist
 
 For loop-related plateaus, audit intermediate controls before increasing the budget. Integer-one
@@ -100,7 +124,10 @@ Calls and prototypes
 
 switch
 - Dense cases become a jump table (`jtbl_` in .rodata, `jr $reg`); sparse ones become compare chains.
-  Your jump table must equal the ROM's, so case values and order matter.
+  Your jump table must equal the ROM's, so case values and order matter. The linked diff can show the target
+  and candidate destination for each differing case even when the instructions match.
+  Deep search can turn a closed permutation into a single relabeling of explicit cases
+  when one source switch accounts for all the differences.
 
 Measured large-function findings (`-O2 -g3`, 32-bit MIPS)
 - Try a bounded small `__builtin_memcpy` when explicit loads/stores copy a short string. Preserve the
@@ -140,7 +167,33 @@ Expression and frame shape
 
 See `docs/COMPILER_MATCHING_LEARNINGS.md` for controlled evidence and failed experiments.
 
+### Computed operands near calls and stores
+
+When two computed float arguments change registers or order, try swapping the
+evaluation order of independent expressions while keeping their call positions.
+For a division followed by squaring, a dead numerator local can carry both
+results when the target uses a single FPR. Give a final indexed store group its
+own offset local if the register changes are confined to that group.
+
+If a volatile byte counter reloads after its increment in the target, try
+postfix increment when compound assignment omits the reload. For an index
+wrapping around a search, try a separate global load and decrement if the
+target performs both in the existing index register.
+
 ### Address association and call initialization
+
+Compare the first actual use of a scalar selector with its initialization. When
+the target materializes it after a call and the candidate holds it in an extra
+saved register across the call, move only the initializer. For a loop whose
+backedge uses a differently scheduled invariant bound, check whether its C
+assignment belongs just before the tail test. KMC can still hoist the bound
+but schedule its register copy differently.
+
+With equal total frames and stable save slots, compare the accesses to the stack
+buffer before adding padding. An adjacent unused local can donate space without
+increasing the total. For a missing field reload after a store, compare the
+reload's position to intervening writes. Capturing the read at the later copy
+can leave the schedule wrong.
 
 Equivalent byte-pointer expressions can schedule differently in KMC GCC. The bounded
 `address_association` family tries constant displacement grouping, including candidate-owned
@@ -176,6 +229,11 @@ combine these changes and can stage field loads in target-observed offset order.
 uses the ordinary judge; do not change shared prototypes or accept a lower score as a match.
 
 ### A few remaining register operands
+
+When only floating-point register operands differ, try reordering independent field loads
+into float locals, including comma-separated initializers. Keep arithmetic and stores in
+place. In a linked `-O2` replay, one of eight load orderings closed a score of 75 to an exact
+match.
 
 With `-G0 -mips3 -mgp32 -mfp32 -O2 -g3`, a verified large routine needed separate
 lexical blocks for two draw-pair paths, block-local coordinates, and staged second-call arguments.
@@ -249,7 +307,10 @@ Do not tune setup order before allocation is plausible: 896 legal setup ordering
 earlier checkpoint. A lower score also hid an enlarged frame. Compare register substitutions,
 frame size and spill offsets alongside score, and preserve structurally different alternatives.
 Use `allocation_initialization_order`, `pointer_argument_alias`, `spill_declaration_order`,
-`byte_fill_constant` and the bounded `allocation_schedule_bridge` when offered. They automate
+`byte_fill_constant` and the bounded `allocation_schedule_bridge` when offered. In a large switch with a
+register-only difference, also `case_temporary_split` / `case_temporary_merge` (one local per case, or locals that
+never meet merged) and `phantom_wide_local` (an unused `long long` at a block start, which breaks an allocation
+tie by moving one insn). They automate
 subsets of these observations, not the complete historical search. Exact results do not prove
 original variable names, types or source spelling. See `docs/COMPILER_MATCHING_LEARNINGS.md`.
 
@@ -1638,3 +1699,32 @@ reads as `const` (`const f32 *arg0`, or `M2C_FIELD(arg0, const f32 *, 0)` for ea
 
 combine reassociates `a + g + 0xFFFC` and may put the constant on `a`. When the target adds it to the loaded global,
 write `t = g + 0xFFFC; return (a + t) & 0xFFFF;`: a separate statement keeps the constant where it was written.
+
+## A very large switch function: a checklist from one 4,399-instruction match
+
+Work from a local compile-and-compare loop and the pass dumps (`-dL` for loops, `-dS` for scheduling); the judge
+decides at the end. What moved the most instructions, in order:
+- Give each inlined copy of a test its own pointer local, and one scratch `s8` flag for the whole function: the
+  saved registers follow. A flag tested through `addu v0,s0,zero` is `s8`, not `u8` or `s32`.
+- Read fields as struct members (a one-member struct cast is enough): only then do field loads move above stores
+  to scalar globals, as the original's did.
+- Frame order: a scalar gets its slot at its first `&`, a struct at its declaration. `(void)&x;` and nested blocks
+  place them without emitting code.
+- Identical tails merge into the last textual copy. Where the target keeps an earlier one, put the later `case`
+  label inside that block. `if (!f()) A(); else B();` and its mirror give opposite branch senses once both merge.
+- `x = K; goto shared;` in a draft is usually two full calls. Keep `default:` where the target's block is, and add
+  `case 0: break;` when a test or a table's range shows it.
+- A loop reloads a constant instead of hoisting it when the loop is long enough: check `-dL`, and see
+  docs/COMPILER_MATCHING_LEARNINGS.md, "A 4,399-instruction state machine", for the rest.
+- Two arms that each compute one float field, with `$f0`/`$f2` swapped: update the field in place (`+=`) in each
+  arm rather than through a result local stored after the join, and reuse one float local in both arms so it
+  spans blocks. docs/COMPILER_MATCHING_LEARNINGS.md, "swapped `$f0`/`$f2` roles in a two-branch field update".
+
+## A loop over records: write the index where it is used, and check the frame
+
+When m2c's draft carries a masked loop index in a variable and names temporaries from it (`temp = var_v1 * 0x68;
+ptr = temp + base;`), write `(i & 0xFFFF) * 0x68 + base` at each use instead, offset first: GCC shares the repeated
+expression into the register the temporary would have copied from. A frame larger than the draft's, with nothing else
+explaining the gap between the argument area and the lowest saved register, is a `volatile u64 scratch;` the original
+had. If the member form of `M2C_FIELD` fixes the loads but moves a store late, put that one access back to the pointer
+form. See docs/COMPILER_MATCHING_LEARNINGS.md, "A 189-instruction record loop".

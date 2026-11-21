@@ -95,13 +95,13 @@ async function openProject(slug, tab = "overview") {
   if (S.ov.missing) { renderMissingProject(S.ov); return; }
   document.querySelectorAll("#ptabs [data-ptab]").forEach((a) => { a.href = `#/p/${slug}/${a.dataset.ptab}`; });
   const fork = S.ov.kind === "fork";
-  $("mapTitle").textContent = fork ? "Function map" : "ROM map";
   $("mapHint").textContent = fork ? "Every square is a function, grouped by source file. Click one to see it." : "Every square is a function, in ROM order. Click one to see it.";
   $("thAddr").textContent = fork ? "File" : "Address";
   groups.clear(); S.claimSig = "";
   L.q = ""; L.filter = "all"; L.limit = FUNCTION_ROWS; $("fnSearch").value = "";
   $("instrEdit").value = S.ov.instructions || "";
   renderClaimOrder(S.ov);
+  renderRoutingExperiment(S.ov);
   renderHeader(S.ov);
   markNav();
   const setup = fork && !S.ov.ready;
@@ -264,8 +264,7 @@ function renderMissingProject(ov) {
 }
 
 function setTab(tab) {
-  if(tab!=='rom' && typeof stopRomAudioBrowser==='function')stopRomAudioBrowser();
-  if(tab!=='rom' && typeof stopRomModelBrowser==='function')stopRomModelBrowser();
+  if(tab!=='rom' && typeof stopRomAssetBrowser==='function')stopRomAssetBrowser();
   if (!TABS.includes(tab)) tab = "overview";
   S.tab = tab;
   document.querySelectorAll("#ptabs [data-ptab]").forEach((a) => {
@@ -278,7 +277,12 @@ function setTab(tab) {
   if (tab === "functions") renderList();
   if (tab === "rom") loadRomExplorer();
   if (tab === "porting" && typeof loadPortReadiness === "function") loadPortReadiness();
-  if (tab === "agents") { renderSessions(S.sessions); renderLog(); loadStats(); }
+  if (tab === "agents") {
+    renderPolishChecklist(S.slug, S.ov?.kind === "fork");
+    renderSessions(S.sessions);
+    renderLog();
+    loadStats();
+  }
   if (tab === "matching") renderDeepSweep();
   if (tab === "settings") renderProjectSettings();
   if (tab === "variants") loadVariants(S.slug);
@@ -1309,6 +1313,11 @@ async function installToolchain(id, proprietary, force = false) {
 /* A community decomp, forked by its repository address (decomp.dev, which listed them, is gone). */
 function showCatalog() {
   show("catalog");
+  if (S.st) {
+    if (directoryProjects) syncDirectoryLibrary();
+  } else {
+    loadState().then(() => { if (directoryProjects) syncDirectoryLibrary(); }).catch(() => {});
+  }
 }
 
 /* What's wrong with a repository address, in a sentence, or "" when it's one decompdecomp can fork: the shape the
@@ -1334,33 +1343,147 @@ $("repoFork").onclick = () => {
 };
 
 /* RetroReversing's directory of community decomps: only decompilations, each imported with a click. */
-let directoryLoading = false;
-$("decompDirectory").addEventListener("toggle", async () => {
-  if (!$("decompDirectory").open || directoryLoading || $("decompDirectoryList").childElementCount) return;
-  directoryLoading = true;
-  $("decompDirectoryWork").hidden = false;
-  $("decompDirectoryStatus").textContent = "Reading the directory…";
+let directoryLoading = false, directoryProjects = null, directoryLibraryFolder;
+let directoryLibraryJob = null, directoryLibraryBusy = false, directoryMatches = new Set();
+let directorySort = { key: "last_commit_at", direction: -1 };
+const directoryKey = (platform, repo) => JSON.stringify([platform, repo]);
+
+function renderDecompDirectory() {
+  const platform = $("decompDirectoryPlatform").value;
+  const rows = directoryProjects.filter(p => !platform || p.platform === platform);
+  const headings = [["name", "Game"], ["platform_name", "Console"], ["status", "Status"], ["last_commit_at", "Last commit"]];
+  const status = p => p.archived ? "Archived" : p.status || "";
+  const { key, direction } = directorySort;
+  const value = p => key === "status" ? status(p) : p[key] || "";
+  rows.sort((a, b) => Number(!value(a)) - Number(!value(b)) || direction * value(a).localeCompare(value(b)));
+  const count = platform ? `${rows.length} of ${directoryProjects.length}` : rows.length;
+  $("decompDirectoryCount").textContent = `${count} decompilations`;
+  const list = $("decompDirectoryList");
+  setHtml(list, rows.length ? `<table class="data"><thead><tr>${headings.map(([column, label]) =>
+    `<th scope="col" aria-sort="${column === key ? direction === 1 ? "ascending" : "descending" : "none"}"><button class="table-sort" type="button" data-dir-sort="${column}">${label}<span aria-hidden="true">${column === key ? direction === 1 ? " ↑" : " ↓" : " ↕"}</span></button></th>`).join("")}
+    <th scope="col"></th></tr></thead><tbody>${rows.map((p, i) => `<tr>
+      <td><div class="directory-game">${p.artwork_url ? `<img src="${esc(p.artwork_url)}" alt="" width="44" height="44" loading="lazy" decoding="async" referrerpolicy="no-referrer">` : ""}
+        <div><b>${esc(p.name)}</b>${directoryMatches.has(directoryKey(p.platform, p.repo_url)) ? ' <span class="small ok">ROM available</span>' : ""}<br><span class="mono small muted">${esc(p.repo_url)}</span></div>
+      </div></td>
+      <td>${esc(p.platform_name)}</td>
+      <td>${esc(status(p))}${p.ai_used === true ? " · uses AI" : p.ai_used === false ? " · no AI" : ""}</td>
+      <td>${esc((p.last_commit_at || "").slice(0, 10))}</td>
+      <td><button class="ghost small-btn" type="button" data-dir-import="${i}">Import</button></td></tr>`).join("")}</tbody></table>` : "");
+  list.querySelectorAll(".directory-game img").forEach(img => {
+    img.addEventListener("error", () => { img.hidden = true; }, { once: true });
+    if (img.complete && !img.naturalWidth) img.hidden = true;
+  });
+  list.querySelectorAll("[data-dir-sort]").forEach(b => {
+    b.onclick = () => {
+      const column = b.dataset.dirSort;
+      directorySort = { key: column, direction: column === key ? -direction : column === "last_commit_at" ? -1 : 1 };
+      renderDecompDirectory();
+      list.querySelector(`[data-dir-sort="${column}"]`).focus();
+    };
+  });
+  list.querySelectorAll("[data-dir-import]").forEach(b => {
+    const p = rows[Number(b.dataset.dirImport)];
+    b.onclick = () => openForkDialog({ name: p.repo_url.replace(/\/+$/, "").split("/").pop().replace(/\.git$/, ""), repo_url: p.repo_url, platform: p.platform, platform_name: p.platform_name, id: p.repo_url });
+  });
+}
+
+async function checkDirectoryLibrary() {
+  const button = $("decompDirectoryLibrary"), log = $("decompDirectoryLibraryLog");
+  if (directoryLibraryBusy) return;
+  directoryLibraryBusy = true;
+  $("decompDirectoryChecking").hidden = false;
+  const finish = beginWork(log, "Checking the ROM library", [button], "ROM library checked.");
+  showJobError(log, "");
+  log.hidden = true;
+  log.textContent = "";
   try {
-    const { projects } = await api("/api/fork/directory");
-    $("decompDirectoryStatus").textContent = projects.length ? "" : "The directory lists no decompilations for the consoles decompdecomp supports.";
-    $("decompDirectoryCount").textContent = `${projects.length} decompilations`;
-    setHtml($("decompDirectoryList"), `<table class="data"><thead><tr><th scope="col">Game</th><th scope="col">Console</th><th scope="col">Status</th><th scope="col">Last commit</th><th scope="col"></th></tr></thead><tbody>${projects.map((p, i) => `<tr>
-      <td><b>${esc(p.name)}</b><br><span class="mono small muted">${esc(p.repo_url)}</span></td>
-      <td class="small">${esc(p.platform_name)}</td>
-      <td class="small">${esc(p.archived ? "Archived" : p.status || "")}${p.ai_used === true ? " · uses AI" : p.ai_used === false ? " · no AI" : ""}</td>
-      <td class="small">${esc((p.last_commit_at || "").slice(0, 10))}</td>
-      <td><button class="ghost small-btn" type="button" data-dir-import="${i}">Import</button></td></tr>`).join("")}</tbody></table>`);
-    $("decompDirectoryList").querySelectorAll("[data-dir-import]").forEach((b) => {
-      const p = projects[Number(b.dataset.dirImport)];
-      b.onclick = () => openForkDialog({ name: p.repo_url.replace(/\/+$/, "").split("/").pop().replace(/\.git$/, ""), repo_url: p.repo_url, platform: p.platform, platform_name: p.platform_name, id: p.repo_url });
-    });
+    const { job } = await api("/api/fork/directory/library", { method: "POST" });
+    if (!job) {
+      log._workStatus.textContent = "Set a ROM library folder in Settings to check for games.";
+      log._workStatus.dataset.state = "done";
+      return;
+    }
+    directoryLibraryJob = job;
+    button.textContent = "Stop ROM library check";
+    button.disabled = false;
+    const result = await followJob(job);
+    if (directoryLibraryFolder !== (S.st?.settings?.rom_library || "")) return;
+    showJobError(log, "");
+    log.hidden = true;
+    directoryMatches = new Set(result.matches.map(([platform, repo]) => directoryKey(platform, repo)));
+    log._workStatus.textContent = result.message;
+    log._workStatus.dataset.state = "done";
+    renderDecompDirectory();
   } catch (e) {
-    $("decompDirectoryStatus").textContent = e.message;
+    showJobError(log, e.message);
   } finally {
-    directoryLoading = false;
-    $("decompDirectoryWork").hidden = true;
+    directoryLibraryJob = null;
+    directoryLibraryBusy = false;
+    $("decompDirectoryChecking").hidden = true;
+    button.textContent = "Check ROM library";
+    finish();
+    syncDirectoryLibrary();
   }
+}
+
+$("decompDirectoryPlatform").onchange = renderDecompDirectory;
+$("decompDirectoryLibrary").onclick = async () => {
+  if (!directoryLibraryJob) return checkDirectoryLibrary();
+  const button = $("decompDirectoryLibrary"), log = $("decompDirectoryLibraryLog");
+  const job = directoryLibraryJob;
+  button.disabled = true;
+  button.textContent = "Stopping ROM library check…";
+  try {
+    await api("/api/job/cancel", { method: "POST", body: { id: job } });
+  } catch (e) {
+    if (directoryLibraryJob !== job) return;
+    showJobError(log, e.message);
+    button.textContent = "Stop ROM library check";
+    button.disabled = false;
+  }
+};
+
+$("decompDirectory").addEventListener("toggle", async () => {
+  if (!$("decompDirectory").open || directoryLoading) return;
+  if (!directoryProjects) {
+    directoryLoading = true;
+    $("decompDirectoryWork").hidden = false;
+    $("decompDirectoryStatus").textContent = "Reading the directory…";
+    try {
+      const { projects } = await api("/api/fork/directory");
+      directoryProjects = projects;
+      const platforms = new Map(projects.map(p => [p.platform, p.platform_name]));
+      for (const [id, name] of [...platforms].sort((a, b) => a[1].localeCompare(b[1]))) {
+        $("decompDirectoryPlatform").add(new Option(name, id));
+      }
+      $("decompDirectoryFilters").hidden = !projects.length;
+      $("decompDirectoryStatus").textContent = projects.length ? "" : "The directory lists no decompilations for the consoles decompdecomp supports.";
+      renderDecompDirectory();
+    } catch (e) {
+      $("decompDirectoryStatus").textContent = e.message;
+      return;
+    } finally {
+      directoryLoading = false;
+      $("decompDirectoryWork").hidden = true;
+    }
+  }
+  syncDirectoryLibrary();
 });
+
+function syncDirectoryLibrary() {
+  if (!S.st) return;
+  const folder = S.st.settings?.rom_library || "";
+  $("decompDirectoryLibrary").hidden = !folder && !directoryLibraryBusy;
+  if (folder === directoryLibraryFolder || directoryLibraryBusy || $("catalog").hidden || !$("decompDirectory").open) return;
+  directoryLibraryFolder = folder;
+  directoryMatches.clear();
+  renderDecompDirectory();
+  const log = $("decompDirectoryLibraryLog");
+  if (log._workStatus) log._workStatus.textContent = "";
+  showJobError(log, "");
+  log.hidden = true;
+  if (folder && directoryProjects.length) void checkDirectoryLibrary();
+}
 
 /* What the project's own files say about AI, word for word, before anything is cloned. */
 function policyHtml(pol, acknowledge = true) {
@@ -1762,6 +1885,8 @@ function renderCodeCoverage(ov) {
   review.onclick=()=>{ $("codeAuditPanel").open=true; $("codeAuditPanel").scrollIntoView({behavior:"smooth",block:"start"}); };
   const missed=$("missedFunctionsBtn");missed.hidden=!ov.missed_functions;
   missed.onclick=()=>addMissedFunctions();
+  $("donorCodeBtn").hidden=!ov.donor_layout;
+  $("donorCodeBtn").onclick=openDonorCode;
   const key=ov.slug+":"+c.audit_revision;
   if (c.completion_audit_required && !coverageAuditRunning && !completionAuditAttempts.has(key)) {
     completionAuditAttempts.add(key);
@@ -1785,6 +1910,91 @@ async function runCoverageAudit() {
     if (S.slug!==slug) return;
     S.ov=ov;renderStats(ov);renderNext(ov);
   } catch(error) {if(S.slug===slug) {status.textContent="Scan failed: "+error.message+". You can try again.";showJobError(log,error.message);}} finally {coverageAuditRunning=false;finish();}
+}
+
+async function openDonorCode() {
+  const slug=S.slug;
+  const body=dialog("Review code from imported decomp", `<div data-donor-code>
+    <p class="small muted">Compare function bytes from a decomp that uses your exact ROM. Review the results before adding open functions.</p>
+    <label class="field">Imported decomp <select data-donor disabled></select></label>
+    <div class="row"><button class="primary" data-preview disabled>Preview</button>
+    <button class="primary" data-apply hidden>Add verified functions</button>
+    <button class="ghost" data-stop hidden>Stop</button></div>
+    <div data-results aria-live="polite"></div><pre class="joblog" data-log hidden></pre>
+  </div>`, "donor-code");
+  const pane=body.querySelector("[data-donor-code]");
+  const active=()=>S.slug===slug && pane.isConnected && S.dialogKind==="donor-code";
+  const select=pane.querySelector("[data-donor]"), preview=pane.querySelector("[data-preview]");
+  const add=pane.querySelector("[data-apply]"), stop=pane.querySelector("[data-stop]");
+  const results=pane.querySelector("[data-results]"), log=pane.querySelector("[data-log]");
+  let report=null;
+  select.onchange=()=>{report=null; add.hidden=true; results.textContent="";};
+  function show(data) {
+    report=data;
+    const banks=new Map(data.overlays.map(row=>[row.id,row]));
+    const group=(title, rows)=>rows.length ? `<details><summary>${esc(title)} (${rows.length})</summary>
+      <ul>${rows.map(row=>`<li><code>${esc(row.name)}</code> · ${esc(banks.get(row.region)?.name || "Raw ROM")}
+      · ${hex8(row.vram)} · ${row.size} bytes${row.overlaps.length ? " · overlaps " + esc(row.overlaps.join(", ")) : ""}</li>`).join("")}</ul></details>` : "";
+    results.innerHTML=`<p>${data.counts.raw} new raw functions · ${data.counts.overlay} new overlay functions · ${data.counts.review} boundary conflicts</p>
+      ${data.counts.overlay ? '<p class="small muted"><label><input type="checkbox" data-include-overlays> Add overlay functions too</label><br>Overlay banks use module-relative addresses. Export keeps the cartridge’s original bytes for these banks.</p>' : ''}
+      ${data.overlays.length ? `<details><summary>Verified overlay sections (${data.overlays.length})</summary><ul>${data.overlays.map(bank=>`<li>${esc(bank.name)} · ${bank.size} bytes${bank.compressed?' · Yay0':''}</li>`).join('')}</ul></details>` : ''}
+      ${group("New raw functions",data.functions.filter(row=>row.state==="new" && row.region==="raw"))}
+      ${group("New overlay functions",data.functions.filter(row=>row.state==="new" && row.region!=="raw"))}
+      ${group("Boundary conflicts for review",data.functions.filter(row=>row.state==="review"))}`;
+    add.hidden=data.counts.raw+data.counts.overlay===0;
+    add.disabled=!data.counts.raw;
+    const options=results.querySelector("[data-include-overlays]");
+    if(options) options.onchange=()=>{add.disabled=!options.checked && !data.counts.raw;};
+  }
+  async function run(action, existing=null) {
+    const finish=beginWork(log,action==="apply" ? "Adding verified functions" : "Verifying donor bytes",[preview,select,add]);
+    try {
+      const request=existing || await api("/api/donor-code",{method:"POST",body:{slug,action,
+        donor:action==="apply"?report?.donor:select.value,token:report?.token,
+        include_overlays:results.querySelector("[data-include-overlays]")?.checked===true}});
+      if (!active()) return;
+      const id=request.job || request.id;
+      stop.hidden=false;
+      stop.onclick=async()=>{
+        stop.disabled=true;
+        try {await api("/api/job/cancel",{method:"POST",body:{id}});}
+        catch(error){showJobError(log,error.message);stop.disabled=false;}
+      };
+      const result=await followJob(id,log,null,active);
+      if (!active() || !result) return;
+      if (request.kind==="donor-code-apply") {
+        report=null;
+        add.hidden=true;
+        results.textContent=`Added ${result.added} open functions.`;
+        await refreshMap(true);
+        if (active()) {
+          const ov=await api("/api/project?slug="+encodeURIComponent(slug));
+          if(active()){S.ov=ov;renderStats(ov);renderNext(ov);}
+        }
+      } else show(result);
+    } catch(error) {if(active())showJobError(log,error.message);}
+    finally {stop.hidden=true;stop.disabled=false;finish();
+      if(report) add.disabled=!report.counts.raw && !results.querySelector("[data-include-overlays]")?.checked;}
+  }
+  preview.onclick=()=>run("preview");
+  add.onclick=()=>run("apply");
+  const finish=beginWork(log,"Finding imports of this ROM");
+  try {
+    let state=await api("/api/donor-code?slug="+encodeURIComponent(slug));
+    if (!active()) return;
+    if (state.job) {
+      const existing=state.job;
+      finish();
+      await run(existing.kind==="donor-code-apply" ? "apply" : "preview",existing);
+      if (!active()) return;
+      state=await api("/api/donor-code?slug="+encodeURIComponent(slug));
+    }
+    if (!active()) return;
+    select.replaceChildren(...(state.donors || []).map(row=>new Option(row.name,row.slug)));
+    if (report) select.value=report.donor;
+    select.disabled=preview.disabled=!select.options.length;
+    if (!select.options.length && !report) results.textContent="Import a public decomp with the same local base ROM first.";
+  } catch(error){if(active())showJobError(log,error.message);} finally {finish();}
 }
 
 /* The import's search for functions the split left as data, run on the project as it is (no reimport). */

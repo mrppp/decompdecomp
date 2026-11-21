@@ -19,6 +19,7 @@ from ...network import NetworkError
 from ...project import compiler_for
 from ...rom import DisassemblyTimeout, Picked, RomError, split
 from ...rom.symbols import AUTO_NAME, Symbol, SymbolTable
+from .. import recompile_review
 from .common import BASE_HEADER, GP_NOTE, data_preview, slugify
 
 # what the first header defines already: the game's typedefs of these names are left out (consoles/ps2/cheader.py)
@@ -59,12 +60,13 @@ def pair_old_functions(rows, functions) -> dict:
 class ImportMixin:
     def import_rom(self, data: bytes | Path, *, toolchain: str | None = None, flags: list[str] | None = None,
                    confirmed: bool = False, name: str = "", log=print, scope: str | None = None,
-                   options: dict | None = None, project_layout: bool = False) -> str:
+                   options: dict | None = None, project_layout: bool = False, on_new_rom=None) -> str:
         """Import a game the user owns (ROM bytes, or a file such as a disc image): split it, store every function
         as a target. Returns the slug. `scope`: what the project covers, where its console sets library code aside
         ("game", the default, or "program": forks/project.py SCOPES). `options`: answers to the console's
         import_options. `project_layout`: a ROM-mode game also gets its project folder (setup_project_layout);
-        if that fails the import still stands, and the project page can set it up again."""
+        if that fails the import still stands, and the project page can set it up again.
+        `on_new_rom` receives the slug only when the ROM split created a project."""
         if not confirmed:
             raise NetworkError("confirm that this is your own legally obtained copy of the game")
         if isinstance(data, Path) and data.is_dir():  # a game that is a folder (a PC game: its .exe and DLLs)
@@ -72,7 +74,7 @@ class ImportMixin:
             log(f"the game's program in that folder: {data.name}")
         console = consoles.identify(data)
         slug = console.import_game(self, data, toolchain=toolchain, flags=flags, name=name, log=log, scope=scope,
-                                   options=options)
+                                   options=options, on_new_rom=on_new_rom)
         if project_layout and not self.fork_slug(slug):  # a project-mode game is a project folder already
             from ...rom.export import ExportError
             try:
@@ -93,10 +95,12 @@ class ImportMixin:
         return path
 
     def import_split(self, console: consoles.Console, picked: Picked, *, toolchain: str | None = None,
-                     flags: list[str] | None = None, log=print, reimport_slug: str | None = None) -> str:
+                     flags: list[str] | None = None, log=print, reimport_slug: str | None = None,
+                     on_new_rom=None) -> str:
         """ROM mode: split the program `console` read from the user's file, store every function as a target."""
         if reimport_slug is None:
-            return self._import_split(console, picked, toolchain=toolchain, flags=flags, log=log)
+            return self._import_split(console, picked, toolchain=toolchain, flags=flags, log=log,
+                                      on_new_rom=on_new_rom)
         with self.progress.rebuilding(reimport_slug):
             return self._reimport_split(console, picked, toolchain=toolchain, flags=flags, log=log,
                                         reimport_slug=reimport_slug)
@@ -111,6 +115,8 @@ class ImportMixin:
         root = Path(proj["root"])
         if not root.is_dir():
             raise NetworkError("the project folder is missing; restore it before reimporting")
+        if (root / ".git").exists() or (root / ".git").is_symlink():
+            raise NetworkError("Reimport would replace files in the project folder's Git checkout. Move the checkout out of the analysis folder first.")
         log("Building the replacement analysis in a temporary folder; the current project is safe until the new split is ready.")
         stage = Path(tempfile.mkdtemp(prefix=f".{reimport_slug}-reimport-", dir=root.parent))
         try:
@@ -120,7 +126,7 @@ class ImportMixin:
             shutil.rmtree(stage, ignore_errors=True)
 
     def _import_split(self, console: consoles.Console, picked: Picked, *, toolchain: str | None = None,
-                      flags: list[str] | None = None, log=print, reimport=None, workdir: Path | None = None) -> str:
+                      flags: list[str] | None = None, log=print, reimport=None, workdir: Path | None = None, on_new_rom=None) -> str:
         rom, info = picked.data, picked.info
         check_cancel = getattr(log, "check_cancel", lambda: None)
         check_cancel()
@@ -173,6 +179,10 @@ class ImportMixin:
         if res.image and res.image != picked.filename:  # splat works on a flat image made from the program
             rom = (workdir / res.image).read_bytes()
 
+        analysis_sha1 = hashlib.sha1(rom).hexdigest()
+        if reimport is not None and console.recompiler is not None:
+            recompile_review.keep_reviewed_on_reimport(self, reimport, res, rom, analysis_sha1, log)
+
         chosen = bool(toolchain or flags or reimport is not None)  # a reimport keeps the project's compiler
         toolchain = toolchain or console.default_compiler(info, res.compiler)
         if info.get("compiler_why") and not chosen:
@@ -180,7 +190,7 @@ class ImportMixin:
         cfg = {
             "kind": "rom", "platform": console.id, "big_endian": picked.big_endian, "gp": res.gp,
             "rom": {**info, "file": res.image or picked.filename, "program": picked.filename,
-                    "analysis_sha1": hashlib.sha1(rom).hexdigest()},
+                    "analysis_sha1": analysis_sha1},
             "segments": [vars(s) for s in res.segments],
             "coverage_notes": getattr(res, 'coverage_notes', []),
             "compiler": {"toolchain": toolchain, "flags": flags, "timeout": 20},
@@ -189,11 +199,14 @@ class ImportMixin:
                       "confirmed_at": time.time()},
             "context": {"file": None},
         }
+        if res.analysis_banks:
+            cfg['donor_overlays'] = res.analysis_banks
+            cfg['rom']['donor_analysis_base'] = res.analysis_base
         cfg["compiler"]["flags"] = flags or console.default_flags(toolchain, consoles.small_gp(cfg))  # (its rom facts)
         if reimport is not None:
             old_cfg = json.loads(reimport["config"])
             for key, value in old_cfg.items():
-                if key not in {"kind", "platform", "big_endian", "gp", "rom", "segments", "legal", "coverage_notes"}:
+                if key not in {"kind", "platform", "big_endian", "gp", "rom", "segments", "legal", "coverage_notes", "donor_overlays"}:
                     cfg[key] = value
             cfg["compiler"] = old_cfg.get("compiler", cfg["compiler"])
             cfg.pop("export", None)
@@ -202,23 +215,35 @@ class ImportMixin:
             cfg.pop("system_calls_named", None)
         header = BASE_HEADER.format(title=info["title"]) + (GP_NOTE if consoles.small_gp(cfg) else "")
         header += self._debug_types(debug, cfg, workdir, log)
-        # A fresh import has no caller C to protect. Name unique exact SDK entries
-        # before symbols/assembly are generated; reimports preserve existing source names.
-        sdk_original_names={}
-        if reimport is None and console.sdk_assembly_sizes:
+        # Name unique assembly signatures before building symbols. A reimport
+        # preserves existing names because saved caller C can reference them.
+        assembly_original_names = {}
+        from ..sdk_assembly import known_identity, known_proof
+        sdk_sizes = set(console.sdk_assembly_sizes) | set(console.sdk_linked_sizes)
+        assembly_sizes = set(console.known_assembly_sizes) | sdk_sizes
+        if reimport is None and assembly_sizes:
             from ..function_names import generated
-            leads=[]
+            leads = []
+            byte_order = 'big' if picked.big_endian else 'little'
             for fn in res.functions:
-                if fn.size not in console.sdk_assembly_sizes:continue
-                code=b''.join(line.word.to_bytes(4,'big' if picked.big_endian else 'little') for line in fn.lines)
-                hint=console.sdk_assembly_identity(code,picked.big_endian)
-                if hint:leads.append((fn,hint['name']))
-            counts=Counter(name for _,name in leads)
-            taken=set(res.named) | {fn.name for fn in res.functions}
-            for fn,name in leads:
-                if generated(fn.name) and counts[name]==1 and name not in taken:
-                    sdk_original_names[name]=fn.name
-                    fn.name=name; taken.add(name)
+                check_cancel()
+                if fn.size not in assembly_sizes:
+                    continue
+                code = b''.join(line.word.to_bytes(4, byte_order) for line in fn.lines)
+                name = console.known_assembly_name(code)
+                if name:
+                    leads.append((fn, name, 'assembly_exact_digest'))
+                elif fn.size in sdk_sizes:
+                    hint = known_identity(console, cfg, code)
+                    if hint:
+                        leads.append((fn, hint['name'], 'sdk_exact_digest'))
+            counts = Counter(name for _, name, _ in leads)
+            taken = set(res.named) | {fn.name for fn in res.functions} | {data.name for data in res.data}
+            for fn, name, method in leads:
+                if generated(fn.name) and counts[name] == 1 and name not in taken:
+                    assembly_original_names[name] = (fn.name, method)
+                    fn.name = name
+                    taken.add(name)
         symbols = SymbolTable()
         for name, addr in res.named.items():
             symbols.add(Symbol(name, addr, 0, "func"), reindex=False)
@@ -247,12 +272,19 @@ class ImportMixin:
 
         root = Path(reimport["root"]) if reimport is not None else workdir
         backup = None
+        retained = []
         if reimport is not None:
             check_cancel()
-            saved_progress = root / "progress"
-            if saved_progress.is_dir():
-                log("Copying saved progress into the replacement project.")
-                shutil.copytree(saved_progress, workdir / "progress", dirs_exist_ok=True)
+            names = {"progress", "source"}
+            for key in ("progress_folder", "save_folder", "repository_sync_folder", "auto_commit_folder"):
+                if folder := cfg.get(key):
+                    path = Path(folder).expanduser().absolute()
+                    if path.is_relative_to(root):
+                        names.update(path.relative_to(root).parts[:1])
+            keep = [name for name in sorted(names) if (root / name).exists() or (root / name).is_symlink()]
+            for name in keep:
+                if (workdir / name).exists() or (workdir / name).is_symlink():
+                    raise NetworkError(f"Reimport would overwrite {root / name}. Move it to a separate folder and try again.")
             log("Replacing project files and updating the function analysis.")
             backup = root.with_name(f".{root.name}-reimport-backup-{time.time_ns()}")
             root.replace(backup)
@@ -263,6 +295,12 @@ class ImportMixin:
                 raise
             workdir = root
         try:
+            if backup is not None:
+                # Move whole folders on the same filesystem so Git metadata, ignored files,
+                # and local edits all survive. Put them back if registration rolls back.
+                for name in keep:
+                    (backup / name).rename(root / name)
+                    retained.append(name)
             now = time.time()
             with self.project_registration(slug=slug,name=info["title"],
                     description=f"{info['game_code']} · {info['region']} · {len(res.functions)} functions",
@@ -321,13 +359,23 @@ class ImportMixin:
                     known = debug.functions.get(fn.vram) if debug is not None else None
                     unit = debug.units.get(fn.vram, fn.segment) if debug is not None else fn.segment
                     old = old_functions.get(fn.name)
-                    same_target = (old is not None and old["target"] == target.code
+                    target_meta = console.function_target_meta(fn)
+                    previous_meta = json.loads(old['meta'] or '{}') if old is not None else {}
+                    same_target = (old is not None
+                                   and all(previous_meta.get(key) == value for key, value in target_meta.items()) and old["target"] == target.code
                                    and json.loads(old["relocs"] or "[]") == target.to_json())
                     asm = console.function_asm(fn)
                     # Identical targets keep operator decisions and naming provenance too.
                     # Re-analysis facts may refresh, but must not erase unrelated saved metadata.
-                    meta_data = json.loads(old['meta'] or '{}') if same_target else {}
+                    meta_data = previous_meta if same_target else {}
+                    if reviewed := previous_meta.get(recompile_review.PROVENANCE):
+                        if (reviewed["image_sha1"] == analysis_sha1 and old["rom_offset"] == fn.rom
+                                and old["vram"] == fn.vram and old["target"] == target.code):
+                            meta_data[recompile_review.PROVENANCE] = reviewed
+                        else:
+                            meta_data.pop(recompile_review.PROVENANCE, None)
                     meta_data.update(console.function_meta(fn))
+                    meta_data.update(target_meta)
                     if known:
                         meta_data["debug"] = known
                     status = old["status"] if same_target else console.function_status(fn)
@@ -336,8 +384,7 @@ class ImportMixin:
                         # Classify before the target reaches the claim queue; keep its bytes and symbols.
                         meta_data["asm_code"] = why
                         status = "asm"
-                    if status in ('open','asm') and fn.size in console.sdk_assembly_sizes and not meta_data.get('reopened'):
-                        from ..sdk_assembly import known_proof
+                    if status in ('open','asm') and fn.size in sdk_sizes and not meta_data.get('reopened'):
                         proof=known_proof(console,{'config':json.dumps(cfg)},
                             {'name':fn.name,'vram':fn.vram,'rom_offset':fn.rom,'size':fn.size,
                              'target':target.code,'relocs':relocs})
@@ -346,13 +393,16 @@ class ImportMixin:
                             status='asm'
                             meta_data['verified_assembly']=proof
                             meta_data['sdk_display']={'name':proof['name'],'names':proof['names'],'corpora':[proof['corpus']]}
-                            meta_data['asm_code']='Verified handwritten SDK assembly; no C matching required.'
-                            if fn.name in sdk_original_names:
-                                meta_data['naming']={'original_name':sdk_original_names[fn.name],'name':fn.name,
-                                    'method':'sdk_exact_digest','at':now}
+                            meta_data['asm_code'] = (proof['evidence'] if proof.get('from_c') else
+                                                     'Verified handwritten SDK assembly; no C matching required.')
+                    if status == 'asm' and fn.name in assembly_original_names:
+                        original_name, method = assembly_original_names[fn.name]
+                        meta_data['naming'] = {'original_name': original_name, 'name': fn.name,
+                                               'method': method, 'at': now}
                     from ..boundary_repairs import reason as boundary_reason
-                    warning = boundary_reason(console, {'target': target.code, 'status': status})
+                    warning = boundary_reason(console, {'target': target.code, 'status': status, 'meta': json.dumps(meta_data)})
                     if warning:meta_data['boundary_review'] = warning
+                    else:meta_data.pop('boundary_review', None)
                     meta = json.dumps(meta_data) if meta_data else None
                     n_insns = console.function_insns(fn)
                     if old is None:
@@ -435,8 +485,10 @@ class ImportMixin:
                 else:
                     event_kind = "reimport"
                 self._event(db, pid, None, event_kind, f"{len(res.functions)} functions from {info['title']}")
-        except Exception:
+        except BaseException:
             if backup is not None:
+                for name in reversed(retained):
+                    (root / name).rename(backup / name)
                 failed_root = root.with_name(f".{root.name}-reimport-failed-{time.time_ns()}")
                 root.replace(failed_root)
                 backup.replace(root)
@@ -459,10 +511,12 @@ class ImportMixin:
             except OSError as e:
                 log(f"the old project files could not be removed; they remain at {backup}: {e}")
             log(f"reimport kept {preserved} matched functions whose targets were unchanged")
-        if sdk_classified:log(f"Identified {sdk_classified} known SDK assembly functions; excluded from C agents.")
+        if sdk_classified:log(f"Identified {sdk_classified} known SDK library functions; excluded from C agents.")
         log(f"ready: {len(res.functions)} functions to decompile")
         if reimport is not None and rejudge:
             self._reimport_rejudge = rejudge
+        if reimport is None and on_new_rom is not None:
+            on_new_rom(slug)
         return slug
 
     def reimport_rom(self, slug: str, data: bytes | Path, *, confirmed: bool = False, name: str = "",
@@ -558,9 +612,10 @@ class ImportMixin:
         drafts = []
         for fn in rows:
             data_asm = "\n".join(self._jtbl_asm(proj, fn)) if "jtbl_" in (fn["asm"] or "") else None
-            draft = seeds.generate_from_asm(self._asm_text(fn, proj), fn["name"], current, header, data_asm, valid=True)
+            draft = seeds.generate_from_asm(self._asm_text(fn, proj), fn["name"], current, header, data_asm, valid=True,
+                                            resolve=lambda symbol: self.symbols(proj['id']).resolve(symbol))
             if draft:
-                drafts.append((fn, f"{seeds.M2C_MACROS}\n{draft}\n"))
+                drafts.append((fn, seeds.with_m2c_macros(draft) + "\n"))
         log(f"testing {len(tcs)} compilers on {len(drafts)} small functions")
 
         def matches(job) -> bool:

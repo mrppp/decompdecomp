@@ -442,7 +442,7 @@ function notSupported(head, file) {
   return null;
 }
 // 1.0.3 rewrote most of the app: every platform is being tested again, and reports are how a platform moves up
-const TRY_AND_TELL = `This version is new, so <a href="https://github.com/n-delic/decompdecomp/issues" target="_blank" rel="noopener">tell us how it goes</a> on your game.`;
+const TRY_AND_TELL = `This version is new, so <a href="https://github.com/RetroReversing/decompdecomp/issues" target="_blank" rel="noopener">tell us how it goes</a> on your game.`;
 const NOT_A_GAME = "That isn't a game file decompdecomp can start from scratch (yet). For other platforms, continue a public decomp.";
 
 /* A 32-bit DOS program bound to DOS/4GW: an MZ program with an LE module behind the extender (DOS/4GW itself comes
@@ -609,7 +609,14 @@ async function runImport(query, file, title, name = "") {
   $("dropBusy").hidden = false;
   $("busyTitle").textContent = title;
   $("busyStep").textContent = "starting";
-  $("jobLog").textContent = "";
+  const logEl = $("jobLog");
+  const workBar = $("impWork");
+  logEl.textContent = "";
+  logEl._workBar = workBar;
+  logEl._workStatus = $("busyStep");
+  workBar.className = "workbar";
+  workBar.setAttribute("aria-label", "Importing project");
+  for (const attr of ["aria-valuemin", "aria-valuemax", "aria-valuenow"]) workBar.removeAttribute(attr);
   $("impUp").hidden = !(file instanceof Blob);
   $("impWork").hidden = file instanceof Blob;
   const t0 = Date.now();
@@ -627,15 +634,27 @@ async function runImport(query, file, title, name = "") {
     }
     $("impUp").hidden = true;
     $("impWork").hidden = false;
-    const res = await followJob(started.job, $("jobLog"), (log) => {
+    const res = await followJob(started.job, logEl, (log, job) => {
+      if (job?.progress?.steps) {
+        updateWorkProgress(logEl, job.progress);
+        return;
+      }
       const last = log.filter((l) => l.trim()).pop();
       if (last) $("busyStep").textContent = last.trim().replace(/\s+/g, " ").slice(0, 120);
     });
     loadNav();
     location.hash = `#/p/${res.slug}`;
+    if (res.repository_warning) toast(esc(res.repository_warning), "err");
   } catch (e) {
     importFailed(name || title.replace(/^\w+ |…$/g, ""), e, $("jobLog").textContent, () => runImport(query, file, title, name));
-  } finally { importRunning = false; clearInterval(tick); $("busyTime").textContent = ""; $("impWork").hidden = true; }
+  } finally {
+    importRunning = false;
+    clearInterval(tick);
+    $("busyTime").textContent = "";
+    workBar.hidden = true;
+    delete logEl._workBar;
+    delete logEl._workStatus;
+  }
 }
 
 /* A failed import stays on screen with what happened, ready to report: a toast is gone before it's read. */

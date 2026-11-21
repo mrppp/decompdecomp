@@ -204,6 +204,7 @@ class GuiMixin:
         return done
 
     def overview(self, slug: str, *, room_members=True, quick=False) -> dict:
+        from ... import routing_experiment
         from .. import auto_push, match_commits, score_commits
         proj = self._project(slug)
         missing = self.project_missing(proj)
@@ -246,6 +247,8 @@ class GuiMixin:
                        "progress_sync": self.progress.status(slug),
                        "spend": cfg.get("spend"), "instructions": cfg.get("instructions") or "",
                        "claim_order": cfg.get("claim_order") if cfg.get("claim_order") in CLAIM_ORDERS else "",
+                       "routing_experiment": routing_experiment.report(self.project_store(proj['id']), proj,
+                                                                       cfg.get('routing_experiment')),
                        "priority": cfg.get("priority", []), "save_folder": str(saves.save_folder(self, slug)),
                        "missing": missing,
                        # (a suggestion its own check disproved isn't one: older ones were filed)
@@ -445,6 +448,7 @@ class GuiMixin:
         return {
             "slug": proj["slug"], "title": console.display_title(proj["name"], cfg.get("rom", {})), "description": proj["description"],
             "code_audit": self.is_rom(proj) and proj["arch"]=="mips",
+            "donor_layout": self.is_rom(proj) and console.donor_layout,
             "missed_functions": self.is_rom(proj) and type(console).missed_functions is not consoles.Console.missed_functions,
             **console.project_facts(),
             "compilers": [c.id for c in console.compilers],
@@ -674,6 +678,8 @@ class GuiMixin:
                     d = scoring.DiffResult(0 if verdict else max(1, d.score), d.max_score, d.rows, verdict)
                 from ...diff_summary import text as summary_text
                 from ...source_lines import mismatches as source_mismatches
+                from ..allocation_priority import hints as allocation_hints
+                from ..callee_frame_evidence import messages as callee_writes
                 from ..source_diagnostics import hints as source_hints
                 from ..stack_layout import text as stack_text
                 out = {"rows": [list(r) for r in d.rows], "score": d.score,
@@ -681,7 +687,8 @@ class GuiMixin:
                                                        filename="func.cpp" if result.language == "c++" else "func.c"),
                        "stack_diagnostic": stack_text(proj['arch'],d.rows),
                        "mismatch_summary": summary_text(d.rows),
-                       "source_diagnostics": source_hints(source, fn["name"], fn["asm"], proj["arch"], d.rows),
+                       "source_diagnostics": callee_writes(self, proj, fn, d.rows) + source_hints(source, fn["name"], fn["asm"], proj["arch"], d.rows)
+                                       + allocation_hints(self, proj, fn, ctx["header"], source, d.rows),
                        "percent": 100.0 if d.bytes_match else min(99.9, int(d.percent * 10) / 10),
                        "problems": problems, "source": source,
                        "checks": self._candidate_checks(fn, proj, result.obj),
@@ -738,6 +745,7 @@ class GuiMixin:
             fn = self._function(fn["name"], slug)
         from ..source_assembly import detail as assembly_detail
         initial_report = draft_report(self,fn['id'],project_id=fn['project_id'])
+        from ..return_contract_evidence import matched_review
         # #254: the latest/best switch is offered only when the best attempt isn't also the newest one
         best_differs = False
         if fn["status"] != "matched" and fn["best_source"] is not None:
@@ -756,6 +764,7 @@ class GuiMixin:
             "boundary_override": bool(json.loads(fn["meta"] or "{}").get("boundary_override")),
             "deep_pass": deep_pass, "verification": bundle_status(self,fn), "baseline_status": baseline_status(self,proj,fn),
             "compiler_test": self.compiler_test_result(proj, fn),
+            "signature_review": matched_review(self, proj, fn),
             "compiler_profile": compiler_for(self.cfg(proj), fn["vram"], fn),
             "default_compiler": self.cfg(proj)["compiler"],
             "compiler_profile_usage": self.compiler_profile_usage(proj),
@@ -867,7 +876,7 @@ class GuiMixin:
                 f"WHERE project_id=? AND id>? AND COALESCE(agent_id,0) NOT IN (SELECT value FROM json_each(?)) "
                 f"ORDER BY id DESC LIMIT {LIVE_EVENTS}", proj['id'], since_event, hidden), {'agent':'agent_id'})
             attempts = label(self, store.all(
-                "SELECT t.id,t.score,t.score_before,t.score_improved,t.compiled,t.created_at,"
+                "SELECT t.id,t.score,t.score_before,t.score_improved,t.compiled,t.created_at,t.via,"
                 "f.name AS function,f.n_insns,t.agent_id FROM attempts t JOIN functions f ON f.id=t.function_id "
                 "WHERE f.project_id=? AND t.id>? AND COALESCE(t.agent_id,0) NOT IN (SELECT value FROM json_each(?)) "
                 f"ORDER BY t.id DESC LIMIT {LIVE_ATTEMPTS}", proj['id'], since_attempt, hidden), {'agent':'agent_id'})

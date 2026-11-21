@@ -56,6 +56,20 @@ def test_branches_clobbers_and_partial_stack_stores_drop_unsafe_arguments():
     assert mips_assets.read(0x80000000,code)['events'][-1]['args'][4] is None
 
 
+@pytest.mark.parametrize('known',[True,False])
+def test_mips_dma_size_may_be_the_difference_of_two_constants(known):
+    base=0x80000000
+    subu=8<<21 | 4<<16 | 6<<11 | 0x23
+    code=words(lui(4,0xb0000000) if known else 0, addiu(4,4,0x2000),
+               lui(8,0xb0000000),addiu(8,8,0x2340),jal(base+0x100),subu)
+    argument=mips_assets.read(base,code)['events'][-1]['args'][2]
+    if known:
+        assert argument['value']==0x340
+        assert argument['evidence']==[base+8,base+12,base,base+4,base+20]
+    else:
+        assert argument is None
+
+
 def test_ee_register_arguments_are_not_read_from_o32_stack_slots():
     code=words(addiu(8,0,80),addiu(9,0,96),jal(0x1000),0,big=False)
     call=mips_assets.read(0x100000,code,big_endian=False,argument_count=8)['events'][-1]
@@ -243,7 +257,7 @@ def test_current_maps_use_cache_and_changed_roles_force_new_analysis(project,mon
     net,pid,root=project
     rom_explorer.run(net,'game',Log())
     def no_analysis(*args,**kwargs):pytest.fail('unchanged map was rescanned')
-    monkeypatch.setattr(rom_explorer,'analyse',no_analysis)
+    monkeypatch.setattr(rom_explorer.rom_scan,'run',no_analysis)
     assert rom_explorer.run(net,'game',Log())['cached']
 
 

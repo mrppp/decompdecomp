@@ -6,13 +6,13 @@ repair_policy repair_policy_coverage repair_sequences repair_sequence_outcomes r
 agent_tool_usage agent_tool_task_usage room_membership_effects activity_events
 variant_games game_variants logical_functions variant_bindings variant_sources variant_edit_locks variant_jobs'''.split())
 SCOPED = set('''functions agent_family_targets agent_selection agent_variant_runs attempt_hints attempts
-claims auto_match_commits candidate_rechecks compiler_tests compiler_trial_evidence context_history
+claims claim_routing_experiments claim_routing_samples claim_routing_focus matching_focus matching_milestones auto_match_commits candidate_rechecks compiler_tests compiler_trial_evidence context_history
 context_versions cross_game_attempts cross_game_index deep_permutation_improvements
  deep_permutation_measurements deep_permutation_passes deep_permutation_recipe_wins
  deep_permutation_recipes events free_match_attempts helper_sessions history_revisions history_rewrites
 iterative_runs knowledge knowledge_evidence knowledge_support library_transfers map_changes near_pass_visits
 notes polish_failures polish_patterns progress_dirty progress_dirty_file progress_files progress_manifests progress_state project_totals reconcile_visits
-repair_analysis_queue repair_attempt_provenance repair_attempt_settings repair_cursors repair_examples
+repair_analysis_queue repair_coverage_verdicts repair_attempt_provenance repair_attempt_settings repair_attempt_mismatches repair_cursors repair_examples repair_example_votes
 repair_frontiers repair_input_effects repair_origins repair_outcome_analysis repair_profile_evidence
 repair_proposal_progress repaired_pairs reuse_cursors reuse_runs reuse_trials reviewed_search_seeds
 saved_progress score_commit_baselines symbols twin_misses verification_regressions verified_matches waits'''.split())
@@ -21,7 +21,7 @@ COUNTERS = {'read_revisions','layout_revision','map_clock','repair_capture_group
 DERIVED = {'read_snapshots','payload_links','payload_sizes'}
 BLOBS = {'text_payloads','header_blobs'}
 KNOWN = SHARED | SCOPED | TRANSCRIPTS | COUNTERS | DERIVED | BLOBS | {'projects','settings'}
-FUNCTION_KEYS = set('''agent-stall agent-review agent-experiment candidate-quality machine-draft
+FUNCTION_KEYS = set('''agent-stall agent-review agent-experiment agent-output-history candidate-quality machine-draft
 machine-draft-generation permuter-checkpoint permuter-inputs-v1 dependency-pivot repair-first'''.split())
 PROJECT_KEYS = set('''boundary-repair code-audit data-region deep-metrics-reset deep-sweep
  draft-repair-cursor free-candidate-cursor named-donor-cursor source-recovery-queue source-preparation
@@ -94,7 +94,7 @@ class Settings:
                 try:owner = self.projects.get(json.loads(value).get('slug'),0)
                 except (ValueError,AttributeError):pass
             return owner
-        if key=='abandons_recounted':return 'each'
+        if key in {'abandons_recounted','repair-baseline-category-v1'}:return 'each'
         if prefix in {'payload-links','payload-sizes-cursor','project-id-namespace','stable-row-identifiers'}:return 0
         # A source-only cursor had one shared offset before the split. Seed each
         # destination independently; these contain no source text or identities.

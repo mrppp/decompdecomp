@@ -3,7 +3,10 @@ const romViews=new Map();
 let romEpoch=0, romDetailEpoch=0;
 // One palette for both maps: the byte strip and the grid below it show the same
 // regions (grouped or not) in the same colours, under one legend.
-const ROM_TYPES=[['code','Function','--cc-1'],['data','Data','--cc-0'],['unknown','Unknown','--line'],['repeated bytes','Repeated bytes','--muted'],['image','Image','--cc-2'],['audio','Audio','--cc-3'],['3d model','3D model','--cc-4'],['compressed','Compressed','--cc-5'],['strings','Strings','--cc-6'],['animation','Animation','--cc-2'],['collision','Collision','--cc-4'],['object placements','Placements','--cc-0'],['world grid','World grid','--cc-1'],['music sequence','Music sequence','--cc-3'],['demo','Demo','--cc-6'],['other','Other data','--cc-7']];
+const ROM_TYPES=[['code','Function','--cc-1'],['data','Data','--faint'],['unknown','Unknown','--line'],['repeated bytes','Repeated bytes','--muted'],['image','Image','--cc-2'],['audio','Audio','--cc-3'],['3d model','3D model','--cc-4'],['compressed','Compressed','--cc-5'],['strings','Strings','--cc-6'],['animation','Animation','--cc-2'],['collision','Collision','--cc-4'],['object placements','Placements','--faint'],['world grid','World grid','--cc-1'],['music sequence','Music sequence','--cc-3'],['demo','Demo','--cc-6'],['other','Other data','--cc-7']];
+const ROM_COLORS=[...new Set(ROM_TYPES.map(([, , color])=>color).filter(color=>color.startsWith('--cc-'))),
+  '--rom-color-coral','--rom-color-pink','--rom-color-lavender',
+  '--rom-color-sky','--rom-color-mint','--rom-color-olive'];
 function romView(slug=S.slug) {
   if(!romViews.has(slug))romViews.set(slug,{sort:'start',direction:1,limit:100,query:'',function:'',report:null,job:null,busy:false});
   return romViews.get(slug);
@@ -20,12 +23,8 @@ function romControls(view) {
 }
 async function loadRomExplorer() {
   const slug=S.slug, epoch=++romEpoch, view=romView(slug), log=romWorkLog();
-  if(typeof stopRomAudioBrowser==='function')stopRomAudioBrowser();
-  if(typeof stopRomModelBrowser==='function')stopRomModelBrowser();
-  $('romModelPanel').hidden=true;view._modelReport=null;
-  $('romAudioPanel').hidden=true;view._audioReport=null;
-  if(typeof stopRomTextureGallery==='function')stopRomTextureGallery();
-  $('romTexturePanel').hidden=true;view._textureReport=null;
+  if(typeof stopRomAssetBrowser==='function')stopRomAssetBrowser();
+  $('romAssetBrowser').hidden=true;view._assetReport=null;
   view.busy=true;romControls(view);
   $('romTypeMapPanel').hidden=true;$('romTypeStatus').textContent='';$('romResult').replaceChildren();$('romSummary').textContent='';$('romMap').hidden=true;$('romMapKey').hidden=true;$('romMapRange').textContent='';$('romStale').hidden=true;$('romNotes').textContent='';$('romRuntime').hidden=true;$('romRuntimeItems').replaceChildren();$('romLoaderGroups').hidden=true;$('romLoaderItems').replaceChildren();
   $('assetAgentPanel').hidden=true;
@@ -133,9 +132,10 @@ function renderRomExplorer(view=romView()) {
   host.querySelectorAll('[data-rom-region]').forEach(b=>b.onclick=()=>openRomRegion(b.dataset.romRegion));
   const more=host.querySelector('[data-rom-more]');if(more)more.onclick=()=>{view.limit+=100;renderRomExplorer(view);};
   drawRomMap(view);drawRomTypeMap(view);
-  if(typeof renderRomModelBrowser==='function' && view._modelReport!==report){view._modelReport=report;renderRomModelBrowser(view);}
-  if(typeof renderRomAudioBrowser==='function' && view._audioReport!==report){view._audioReport=report;renderRomAudioBrowser(view);}
-  if(typeof renderRomTextureGallery==='function' && view._textureReport!==report){view._textureReport=report;renderRomTextureGallery(view);}
+  if(typeof renderRomAssetBrowser==='function' && view._assetReport!==report){
+    view._assetReport=report;
+    renderRomAssetBrowser(view);
+  }
 }
 function drawRomMap(view=romView()) {
   const canvas=$('romMap'),report=view.report;if(!report?.available)return;
@@ -144,39 +144,68 @@ function drawRomMap(view=romView()) {
   const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);
   const lo=view.zoom?.[0] || 0,hi=view.zoom?.[1] || report.size,span=hi-lo || 1;
   const style=getComputedStyle(document.documentElement);
-  const rows=romTypeRows(view);
+  const rows=romTypeRows(view),types=romMapTypes(rows);
   for(const row of rows){if(row.end<=lo || row.start>=hi)continue;
-    ctx.fillStyle=style.getPropertyValue(romRegionType(row)[2]).trim() || style.getPropertyValue('--muted').trim();
+    ctx.fillStyle=style.getPropertyValue(types.get(romRegionType(row)[0]).color).trim() || style.getPropertyValue('--muted').trim();
     ctx.fillRect(Math.max(0,(row.start-lo)/span*width),0,Math.max(1,(Math.min(row.end,hi)-Math.max(row.start,lo))/span*width),52);
   }
   $('romMapRange').textContent=`ROM ${hex8(lo)}–${hex8(hi)} (exclusive) · click the map to inspect a region`;
   canvas.onclick=event=>{const at=lo+(event.clientX-canvas.getBoundingClientRect().left)/width*span;
     const row=rows.find(r=>r.start<=at && r.end>at);if(row && !report.stale)openRomRegion(row.id);};
-  drawRomLegend(view,rows);
+  drawRomLegend(view,types);
 }
-function drawRomLegend(view,rows) {
-  const counts=new Map();for(const row of rows){const key=romRegionType(row)[0];counts.set(key,(counts.get(key)||0)+1);}
+function romMapTypes(rows) {
+  const counts=new Map();
+  for(const row of rows){
+    const [key]=romRegionType(row);
+    counts.set(key,(counts.get(key)||0)+1);
+  }
+  const types=new Map(),used=new Set();
+  // Reserve preferred colours before assigning spares, so an alternate never
+  // takes another visible type's colour.
+  for(const [key,label,preferred] of ROM_TYPES){
+    if(!counts.has(key))continue;
+    const color=used.has(preferred) ? null : preferred;
+    if(color)used.add(color);
+    types.set(key,{label,count:counts.get(key),color});
+  }
+  const spare=ROM_COLORS.filter(color=>!used.has(color));
+  for(const type of types.values()){
+    if(!type.color)type.color=spare.shift();
+  }
+  return types;
+}
+function drawRomLegend(view,types) {
   $('romGroupAssets').checked=view.groupAssets!==false;$('romGroupCount').textContent=`(${(view.report.asset_groups || []).length} groups)`;
-  $('romTypeLegend').innerHTML=ROM_TYPES.map(([key,label,color])=>`<span><i class="sw" data-rom-color="${color}"></i>${label} (${counts.get(key)||0})</span>`).join('');
+  $('romTypeLegend').innerHTML=[...types.values()].map(({label,count,color})=>`<span><i class="sw" data-rom-color="${color}"></i>${label} (${count})</span>`).join('');
   $('romTypeLegend').querySelectorAll('[data-rom-color]').forEach(node=>{node.style.background=`var(${node.dataset.romColor})`;});
   $('romMapKey').hidden=false;
 }
-async function openRomRegion(id,inspect=false) {
+function romRegionTitle(region) {
+  return region?.annotation?.name || region?.detected_asset?.label || region?.detected_asset?.resource_path
+    || region?.archive_path || region?.symbols?.[0]?.name || 'ROM region';
+}
+
+async function openRomRegion(id,assetView) {
   const slug=S.slug,report=romView(slug).report,epoch=++romDetailEpoch;if(!report || report.stale)return;
-  const body=dialog('ROM region','<pre data-rom-detail-work></pre>','rom-region');
+  const body=dialog(romRegionTitle(report.regions?.find(region=>region.id===id)),'<pre data-rom-detail-work></pre>','rom-region');
   const log=body.querySelector('[data-rom-detail-work]'),finish=beginWork(log,'Reading region',[]);
   const active=()=>S.slug===slug && epoch===romDetailEpoch && S.dialogKind==='rom-region';
   try {
     const r=await api(`/api/rom-explorer?slug=${encodeURIComponent(slug)}&region=${id}&image_hash=${report.image_hash}`);if(!active())return;
+    if(assetView)r.detected_asset=romAssetForView(r,assetView) || r.detected_asset;
     finish();body.classList.add('rom-region-body');
-    body.innerHTML=`<p><b>${hex8(r.start)}–${hex8(r.end)}</b> · ${r.size.toLocaleString()} bytes · ${esc(r.kind)} (${esc(r.confidence)})</p><p class="small muted">${esc(r.mappings.map(m=>m.segment+' at '+hex8(m.address)).join(' · ') || 'No known runtime address')}</p><button type="button" class="ghost small-btn" data-rom-zoom>Zoom map to this region</button><h3>Evidence</h3>${r.evidence.map(e=>`<p><b>${esc(e.label)}</b> · ${esc(e.confidence)}<br>${esc(e.reason)}${e.expanded_size!=null ? ' Expanded size: '+e.expanded_size.toLocaleString()+' bytes.' : ''}</p>`).join('') || '<p>No format evidence found.</p>'}<p class="small muted">Sample entropy: ${r.entropy} bits per byte over ${r.sampled_bytes} bytes. Region boundaries may be display pages.</p><h3>Functions referencing this region</h3><p class="small muted">Imported address references; runtime execution and access length are not established.</p>${r.references.map(ref=>`<p><button type="button" class="link-btn" data-rom-function="${esc(ref.function)}">${esc(ref.function)}</button> at <code>${hex8(ref.instruction)}</code> → <code>${hex8(ref.target)}</code> · ${esc(ref.segment)} · ${esc(ref.confidence)}<br><span class="small muted">${esc(ref.reason)}</span></p>`).join('') || '<p>No references found. This does not establish that the bytes are unused.</p>'}<details><summary>Pointer chains (${r.pointers.length} sampled words)</summary><p class="small muted">Referencing function → this region → pointer word → possible destination. These are leads; a load or decompressor data flow has not been proven. At most 32 pointer words are shown.</p>${r.pointers.map(p=>`<p><code>${hex8(p.at)}</code> → ${hex8(p.target)} ${p.destinations.map(d=>`<button type="button" class="link-btn" data-rom-destination="${d.region}">${esc(d.segment)} ROM ${hex8(d.rom)}</button>`).join(' · ')}</p>`).join('') || '<p>No sampled pointers into known mappings.</p>'}</details>${romUsageHTML(r)}${romGroupHTML(r)}${romFlowHTML(r.loader_flow)}${romAssetHTML(r)}<details open><summary>Hex and text preview (first 256 bytes)</summary><pre>${esc(r.preview)}</pre>${r.strings.map(s=>`<p class="mono">${esc(s)}</p>`).join('')}</details><h3>Your interpretation</h3><p class="small muted">Labels and notes are local annotations; they do not change symbols, bytes or matching status.</p><label class="field"><span>Label</span><input data-rom-label maxlength="120" value="${esc(r.annotation.name || '')}"></label><label class="field"><span>Your classification (optional)</span><select data-rom-kind>${['','unknown','code','data','strings','pointer table','compressed','image','3d model','animation','collision','object placements','world grid','music sequence','demo','palette','audio','font','container','repeated bytes'].map(kind=>`<option value="${kind}"${kind===(r.annotation.kind || '') ? ' selected' : ''}>${kind || 'Keep automatic label'}</option>`).join('')}</select></label><label class="field"><span>Evidence / next steps</span><textarea data-rom-notes maxlength="4000" rows="4">${esc(r.annotation.notes || '')}</textarea></label><button type="button" class="primary small-btn" data-rom-save>Save notes</button><pre data-rom-save-work></pre>`;
+    $('dialogTitle').textContent=romRegionTitle(r);
+    const subtitle=$('dialogSubtitle');
+    subtitle.textContent=`${hex8(r.start)}–${hex8(r.end)} · ${r.size.toLocaleString()} bytes`;
+    subtitle.hidden=false;
+    body.innerHTML=`${romAssetHTML(r)}<p class="small muted">${esc(r.kind)} (${esc(r.confidence)}) · ${esc(r.mappings.map(m=>m.segment+' at '+hex8(m.address)).join(' · ') || 'No known runtime address')}</p><h3>Evidence</h3>${r.evidence.map(e=>`<p><b>${esc(e.label)}</b> · ${esc(e.confidence)}<br>${esc(e.reason)}${e.expanded_size!=null ? ' Expanded size: '+e.expanded_size.toLocaleString()+' bytes.' : ''}</p>`).join('') || '<p>No format evidence found.</p>'}<p class="small muted">Sample entropy: ${r.entropy} bits per byte over ${r.sampled_bytes} bytes. Region boundaries may be display pages.</p><h3>Functions referencing this region</h3><p class="small muted">Imported address references; runtime execution and access length are not established.</p>${r.references.map(ref=>`<p><button type="button" class="link-btn" data-rom-function="${esc(ref.function)}">${esc(ref.function)}</button> at <code>${hex8(ref.instruction)}</code> → <code>${hex8(ref.target)}</code> · ${esc(ref.segment)} · ${esc(ref.confidence)}<br><span class="small muted">${esc(ref.reason)}</span></p>`).join('') || '<p>No references found. This does not establish that the bytes are unused.</p>'}<details><summary>Pointer chains (${r.pointers.length} sampled words)</summary><p class="small muted">Referencing function → this region → pointer word → possible destination. These are leads; a load or decompressor data flow has not been proven. At most 32 pointer words are shown.</p>${r.pointers.map(p=>`<p><code>${hex8(p.at)}</code> → ${hex8(p.target)} ${p.destinations.map(d=>`<button type="button" class="link-btn" data-rom-destination="${d.region}">${esc(d.segment)} ROM ${hex8(d.rom)}</button>`).join(' · ')}</p>`).join('') || '<p>No sampled pointers into known mappings.</p>'}</details>${romUsageHTML(r)}${romGroupHTML(r)}${romFlowHTML(r.loader_flow)}<details open><summary>Hex and text preview (first 256 bytes)</summary><pre>${esc(r.preview)}</pre>${r.strings.map(s=>`<p class="mono">${esc(s)}</p>`).join('')}</details><h3>Your interpretation</h3><p class="small muted">Labels and notes are local annotations; they do not change symbols, bytes or matching status.</p><label class="field"><span>Label</span><input data-rom-label maxlength="120" value="${esc(r.annotation.name || '')}"></label><label class="field"><span>Your classification (optional)</span><select data-rom-kind>${['','unknown','code','data','strings','pointer table','compressed','image','3d model','animation','collision','object placements','world grid','music sequence','demo','palette','audio','font','container','repeated bytes'].map(kind=>`<option value="${kind}"${kind===(r.annotation.kind || '') ? ' selected' : ''}>${kind || 'Keep automatic label'}</option>`).join('')}</select></label><label class="field"><span>Evidence / next steps</span><textarea data-rom-notes maxlength="4000" rows="4">${esc(r.annotation.notes || '')}</textarea></label><button type="button" class="primary small-btn" data-rom-save>Save notes</button><pre data-rom-save-work></pre>`;
     body._romRecordPage=0;body._romResourceSort=null;
-    setupRomAsset(body,r,slug,report.image_hash,active,inspect);
+    setupRomAsset(body,r,slug,report.image_hash,active,romCanPreloadAsset(r),assetView);
     setupRomDiscovery(body,r,slug,report.image_hash,active);
     setupRomGroup(body,r);
     body.querySelectorAll('[data-rom-function]').forEach(b=>b.onclick=()=>{closeDialog();openFn(b.dataset.romFunction);});
     body.querySelectorAll('[data-rom-destination]').forEach(b=>b.onclick=()=>openRomRegion(b.dataset.romDestination));
-    body.querySelector('[data-rom-zoom]').onclick=()=>{romView(slug).zoom=[r.start,r.end];closeDialog();drawRomMap(romView(slug));};
     const button=body.querySelector('[data-rom-save]');let saving=false;
     button.onclick=async()=>{
       if(saving || body._romAssetBusy || !active())return;saving=true;body._romAssetBusy=true;
@@ -184,7 +213,8 @@ async function openRomRegion(id,inspect=false) {
       const done=beginWork(work,'Saving region notes',[...new Set([button,label,notes,kind,...body.querySelectorAll('input,select,button')])],'Region notes saved.');showJobError(work,'');
       try {const result=await api('/api/rom-explorer/annotation',{method:'POST',body:{slug,region:id,image_hash:report.image_hash,name:label.value,notes:notes.value,kind:kind.value,preview_settings:romAssetOptions(body),model_settings:romModelOptions(body)}});
         const row=report.regions.find(row=>row.id===id);if(row)row.annotation=result.annotation;
-        if(S.slug===slug && S.tab==='rom'){romView(slug)._textureReport=null;renderRomExplorer(romView(slug));}
+        if(active())$('dialogTitle').textContent=romRegionTitle({...r,annotation:result.annotation});
+        if(S.slug===slug && S.tab==='rom'){romView(slug)._assetReport=null;renderRomExplorer(romView(slug));}
       }catch(error){showJobError(work,error.message);}finally{saving=false;if(active())body._romAssetBusy=false;done();}
     };
   } catch(error){if(active())showJobError(log,error.message);}finally{finish();}
@@ -212,13 +242,13 @@ function drawRomTypeMap(view=romView()) {
   panel.hidden=!report?.available;if(panel.hidden)return;
   const canvas=$('romTypeMap'),rows=romTypeRows(view),width=canvas.clientWidth || 800;
   if(!rows.length){panel.hidden=true;return;}
-  const layout=squareMapLayout(width,rows.length),ratio=window.devicePixelRatio || 1,style=getComputedStyle(document.documentElement);
+  const types=romMapTypes(rows),layout=squareMapLayout(width,rows.length),ratio=window.devicePixelRatio || 1,style=getComputedStyle(document.documentElement);
   view.typeSelection=Math.max(0,Math.min(rows.length-1,view.typeSelection || 0));
   const describe=i=>{const row=rows[i];return `${row.asset_group ? 'Asset group · ' : ''}${romRegionType(row)[1]} · ${hex8(row.start)}–${hex8(row.end)} · ${row.size.toLocaleString()} bytes · ${row.annotation?.name || row.functions?.[0] || row.symbols?.[0]?.name || row.detected_asset?.resource_path || row.confidence}${row.annotation?.kind ? ' · Your annotation' : ''}`;};
   const paint=()=>{
     canvas.width=Math.round(width*ratio);canvas.height=Math.round(layout.h*ratio);canvas.style.height=layout.h+'px';
     const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);
-    rows.forEach((row,i)=>{ctx.fillStyle=style.getPropertyValue(romRegionType(row)[2]).trim();squareMapCell(ctx,layout,i);});
+    rows.forEach((row,i)=>{ctx.fillStyle=style.getPropertyValue(types.get(romRegionType(row)[0]).color).trim();squareMapCell(ctx,layout,i);});
     const i=view.typeSelection,x=i%layout.cols*(layout.size+layout.gap),y=Math.floor(i/layout.cols)*(layout.size+layout.gap);
     ctx.strokeStyle=style.getPropertyValue('--ink').trim();ctx.lineWidth=1.5;ctx.strokeRect(x-.5,y-.5,layout.size+1,layout.size+1);
     $('romTypeStatus').textContent=describe(i)+(report.stale ? ' · Refresh to inspect this changed image.' : '');

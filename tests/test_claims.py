@@ -207,19 +207,26 @@ def test_functions_given_up_on_go_to_the_strongest_model_at_work(tmp_path):
     on 3 times to it, and the strong one takes those first; with nothing else left the weak one still gets them."""
     import time
 
+    from decompnet.claim_routing import build_profiles
+
     net = RomNetwork(tmp_path / "app.db", tmp_path)
     strong, _ = net.local_agent("claude-sonnet-1")
     weak, _ = net.local_agent("opencode-beam-free-1")
     with net.store.tx() as db:
         pid = db.execute("INSERT INTO projects(slug,name,description,arch,big_endian,root,config) VALUES(?,?,?,?,?,?,?)",
-                         ("game", "Game", "", "mips", 1, str(tmp_path), json.dumps({"kind": "rom"}))).lastrowid
+                         ("game", "Game", "", "mips", 1, str(tmp_path), json.dumps({"kind": "rom", "compiler": {"toolchain": "test"}}))).lastrowid
         for name, n, abandons in [("hard", 4, 3), ("tried", 40, 2), ("fresh", 60, 0)]:
             db.execute("INSERT INTO functions(project_id,name,size,n_insns,status,unit,abandons) VALUES(?,?,?,?,?,?,?)",
                        (pid, name, n * 4, n, "open", "a", abandons))
+        proj = db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        fn = db.execute("SELECT * FROM functions WHERE project_id=? LIMIT 1", (pid,)).fetchone()
+        profile = build_profiles(proj)(fn)
         for agent, won in ((strong, 15), (weak, 2)):  # 20 claims each, this many matched
             for i in range(20):
                 db.execute("INSERT INTO events(project_id,agent_id,kind,detail,created_at) VALUES(?,?,?,?,?)",
                            (pid, agent.id, "claim", f"old_{agent.id}_{i}", time.time()))
+                db.execute("INSERT INTO claim_routing_samples VALUES(?,?,?,?,?,?,1,?)",
+                           (pid, -agent.id * 100 - i, agent.id, time.time(), profile, "small:unscored", i < won))
             for i in range(won):
                 db.execute("INSERT INTO functions(project_id,name,size,n_insns,status,unit,matched_agent_id) "
                            "VALUES(?,?,?,?,?,?,?)", (pid, f"won_{agent.id}_{i}", 40, 10, "matched", "a", agent.id))
@@ -240,20 +247,27 @@ def test_once_every_function_was_given_up_on_a_weak_model_keeps_the_less_tried_h
     back to the whole queue: 3,183 claims for 10 matches in a night. The line moves to the median instead."""
     import time
 
+    from decompnet.claim_routing import build_profiles
+
     net = RomNetwork(tmp_path / "app.db", tmp_path)
     strong, _ = net.local_agent("claude-opus-1")
     weak, _ = net.local_agent("claude-haiku-1")
     with net.store.tx() as db:
         pid = db.execute("INSERT INTO projects(slug,name,description,arch,big_endian,root,config) VALUES(?,?,?,?,?,?,?)",
-                         ("game", "Game", "", "x86", 0, str(tmp_path), json.dumps({"kind": "rom"}))).lastrowid
+                         ("game", "Game", "", "x86", 0, str(tmp_path), json.dumps({"kind": "rom", "compiler": {"toolchain": "test"}}))).lastrowid
         # the smallest is the most given up on: "easiest" would hand it to the weak model first
-        for name, n, abandons in [("worst", 4, 25), ("bad", 10, 13), ("less", 40, 6), ("least", 60, 5)]:
+        for name, n, abandons in [("worst", 4, 25), ("bad", 10, 13), ("less", 20, 6), ("least", 25, 5)]:
             db.execute("INSERT INTO functions(project_id,name,size,n_insns,status,unit,abandons) VALUES(?,?,?,?,?,?,?)",
                        (pid, name, n * 4, n, "open", "a", abandons))
+        proj = db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        fn = db.execute("SELECT * FROM functions WHERE project_id=? LIMIT 1", (pid,)).fetchone()
+        profile = build_profiles(proj)(fn)
         for agent, won in ((strong, 15), (weak, 1)):
             for i in range(20):
                 db.execute("INSERT INTO events(project_id,agent_id,kind,detail,created_at) VALUES(?,?,?,?,?)",
                            (pid, agent.id, "claim", f"old_{agent.id}_{i}", time.time()))
+                db.execute("INSERT INTO claim_routing_samples VALUES(?,?,?,?,?,?,1,?)",
+                           (pid, -agent.id * 100 - i, agent.id, time.time(), profile, "small:unscored", i < won))
             for i in range(won):
                 db.execute("INSERT INTO functions(project_id,name,size,n_insns,status,unit,matched_agent_id) "
                            "VALUES(?,?,?,?,?,?,?)", (pid, f"won_{agent.id}_{i}", 40, 10, "matched", "a", agent.id))
@@ -482,10 +496,10 @@ def test_helpers_reused_by_name_claim_again_after_the_app_restarts(tmp_path):
     assert net.claim_row(haiku2, "game", "f3")["name"] == "f3"  # then the app stopped with haiku-2 on f3
     assert net.claim_row(chat, "game", "f2")["name"] == "f2"  # the user's own agent, which runs on its own
 
-    assert net.release_local_claims("the app restarted") == ["f3"]  # the app starting again
+    assert net.release_local_claims() == ["f3"]  # the app starting again
     assert _held(net, haiku2) is None and _held(net, chat) == "f2"  # an agent elsewhere keeps its lease
     note = net.store.one("SELECT text FROM notes WHERE function_id=(SELECT id FROM functions WHERE name='f3')")
-    assert "its agent stopped (the app restarted)" in note["text"]
+    assert note is None
     assert net.store.one("SELECT abandons FROM functions WHERE name='f3'")["abandons"] == 0  # nobody gave up on it
 
     assert net.claim_row(haiku1, "game", None)["name"] == "f3"  # the function it hasn't tried first
@@ -501,7 +515,7 @@ def test_an_agent_doesnt_get_back_what_it_just_released_until_its_run_ends(tmp_p
     assert net.claim_row(a, "game", None)["name"] == "x"
     net.release(a, "x", "", "game")
     assert net.claim_row(a, "game", None) is None
-    net.release_stopped([a.id], "it was stopped")  # its helper stopped: the next run starts afresh
+    net.release_stopped([a.id])  # its helper stopped: the next run starts afresh
     assert net.claim_row(a, "game", None)["name"] == "x"
 
 

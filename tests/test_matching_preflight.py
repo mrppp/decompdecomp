@@ -83,7 +83,16 @@ def test_missing_compilers_are_not_installed_and_current_exact_profiles_are_pres
     assert preflight.run(net,proj,fn)['tested'] == 0 and not state['calls']
     monkeypatch.setattr(preflight.toolchains, 'installed', lambda tid:{'fingerprint':'pinned'})
     net._judge_with = lambda *a:(True,SimpleNamespace(score=0),'')
-    assert preflight.run(net,proj,fn)['tested'] == 1
+    recovered = []
+
+    def save(agent, project, candidate, source, **kwargs):
+        recovered.append((source, kwargs))
+        candidate['status'] = 'matched'
+
+    net.try_quietly = save
+    result = preflight.run(net, proj, fn)
+    assert result['tested'] == 1 and result['applied']
+    assert recovered == [(fn['best_source'], {'synchronize':False, 'exact_only':True})]
     assert not state['applied'] and not state['suggested']
 
 
@@ -115,6 +124,14 @@ def test_unexpected_suggestion_failure_is_not_swallowed():
     def fail(*args,**kwargs):raise NetworkError('project was removed')
     net.suggest=fail
     with pytest.raises(NetworkError,match='project was removed'):preflight.run(net,proj,fn)
+
+
+def test_grouped_word_transfer_prioritizes_existing_copy_repairs():
+    from decompnet.app.repair_ranking import matching_topics, order
+    rows = [(' ', f'lw $t{i}, {i*4}($a0)', f'lw $t{i}, {i*4}($a0)') for i in range(3)]
+    rows += [('o', f'sw $t{i}, {i*4}($a1)', f'sw $t{i}, {i*4}($a1)') for i in range(3)]
+    assert matching_topics(rows) == ['Grouped copies']
+    assert order(['local_width', 'global_record_copy'], rows) == ['global_record_copy', 'local_width']
 
 
 def test_one_profile_rounds_resume_durably_instead_of_retesting_first_choices():
@@ -172,4 +189,252 @@ def test_captured_profiles_are_ranked_but_rejudged_with_current_inputs():
     assert captured(net,proj,net.cfg(proj)['compiler'])==[['-O3'],['-O1']]
     assert preflight.run(net,proj,fn,max_profiles=2)['best']['exact']
     assert state['calls']==[['-O2'],['-O3']]
+    assert not state['applied']
+
+
+def test_kmc_scheduler_orders_single_and_paired_passes_by_evidence(monkeypatch):
+    from decompnet.app import allocation_evidence
+    from decompnet.app.profile_hypotheses import kmc_priorities
+
+    own = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O1']}
+    rows = [('o', 'sw $ra, 24($sp)', 'sw $ra, 24($sp)')]
+    diagnosis = {'scheduling': True, 'delay_slot': False}
+    monkeypatch.setattr(allocation_evidence, 'diagnose', lambda rows: diagnosis)
+    single = ('-O1', '-fschedule-insns2')
+    combined = ('-O1', '-fschedule-insns', '-fschedule-insns2')
+    assert kmc_priorities(own, '', rows) == [single, combined]
+    diagnosis['delay_slot'] = True
+    assert kmc_priorities(own, '', rows) == [combined, single]
+
+
+def test_kmc_sqrt_trial_stays_review_only_even_with_auto_adjust(monkeypatch):
+    from decompnet.app import repair_ranking
+
+    net, proj, fn, state = setup()
+    net.cfg(proj)['compiler']['toolchain'] = 'gcc-2.7.2-kmc'
+    fn['asm'] = 'sqrt.s $f0, $f12'
+    state['auto'] = True
+    monkeypatch.setattr(repair_ranking, 'evidence', lambda *a: [
+        ('>', '', 'c.eq.s $f0, $f0'), ('>', '', 'jal sqrtf'),
+    ])
+    net._judge_with = lambda p,f,t,flags,s: (
+        '-ffast-math' in flags, SimpleNamespace(score=1120), '',
+    )
+    assert preflight.run(net, proj, fn)['best']['exact']
+    assert not state['applied']
+    assert state['suggested'][0]['review_only']
+    assert state['suggested'][0]['flags'] == '-O2 -ffast-math'
+
+
+def test_four_word_copy_ranking_requires_contiguous_transfers():
+    from decompnet.app.repair_ranking import matching_topics, order
+
+    rows = [(' ', f'lw $t{i}, {i*4}($a0)', f'lw $t{i}, {i*4}($a0)') for i in range(4)]
+    rows += [('o', f'sw $t{i}, {i*4}($a1)', f'sw $t{i}, {i*4}($a1)') for i in range(4)]
+    assert order(['local_width', 'word_block_copy'], rows)[0] == 'word_block_copy'
+    rows[-1] = ('o', 'sw $t3, 20($a1)', '')
+    assert 'Grouped copies' not in matching_topics(rows)
+
+
+@pytest.mark.parametrize("case", ["sqrt", "prologue", "delay-slot"])
+def test_kmc_fresh_baseline_prioritizes_targeted_profiles_on_resume(case):
+    net, proj, fn, state = setup()
+    base, trial, assembly, rows, problem = {
+        "sqrt": (
+            ["-O2"], ["-O2", "-ffast-math"], "sqrt.s $f0, $f12",
+            [('>', '', 'c.eq.s $f0, $f0'), ('>', '', 'jal sqrtf')],
+            "`sqrtf` is not a known symbol.",
+        ),
+        "prologue": (
+            ["-O1"], ["-O1", "-fschedule-insns2"], "",
+            [('o', 'sw $ra, 20($sp)', 'sw $ra, 20($sp)')], "",
+        ),
+        "delay-slot": (
+            ["-O2", "-g3"], ["-O2"], "",
+            [(' ', 'jr $ra', 'jr $ra'), ('|', 'addiu $sp, $sp, 16', 'nop')], "",
+        ),
+    }[case]
+    net.cfg(proj)['compiler'] = {'toolchain': 'gcc-2.7.2-kmc', 'flags': base}
+    fn['asm'] = assembly
+    state['auto'] = True
+
+    def judge(project, function, toolchain, flags, source):
+        assert source == fn['best_source']
+        state['calls'].append(flags)
+        if flags == base:
+            return False, SimpleNamespace(score=1120, rows=rows), problem
+        assert flags == trial
+        return True, SimpleNamespace(score=0), ''
+
+    net._judge_with = judge
+    assert preflight.run(net, proj, fn, max_profiles=1)['pending']
+    result = preflight.run(net, proj, fn, max_profiles=1)
+    assert result['best']['exact'] and 'link' not in result
+    assert state['calls'] == [base, trial]
+    if case == 'sqrt':
+        assert state['suggested'][0]['review_only'] and not state['applied']
+    else:
+        assert result['applied']
+
+
+def test_kmc_float_sqrt_repairs_source_and_flags_together(monkeypatch):
+    from decompnet.app import repair_ranking
+
+    net, proj, fn, state = setup()
+    net.cfg(proj)['compiler']['toolchain'] = 'gcc-2.7.2-kmc'
+    fn.update(asm='sqrt.s $f0, $f0', best_source='extern float sqrt(float);\nfloat f(float x) { return sqrt(x); }')
+    state['auto'] = True
+    monkeypatch.setattr(repair_ranking, 'evidence', lambda *a: [])
+
+    def judge(proj, fn, toolchain, flags, source):
+        state['calls'].append((flags, source))
+        if 'sqrtf(' in source and '-ffast-math' in flags:
+            return True, SimpleNamespace(score=0), ''
+        return False, SimpleNamespace(score=1120), '`sqrtf` is not a known symbol.' if 'sqrtf(' in source else ''
+
+    net._judge_with = judge
+    result = preflight.run(net, proj, fn)
+    assert result['best']['exact'] and result['review_only']
+    assert len(state['calls']) == 3
+    assert state['calls'][1][0] == ['-O2']
+    assert not state['applied']
+    assert state['suggested'][0]['review_only'] and 'sqrtf(' in state['suggested'][0]['source']
+
+
+def test_signed_halfword_word_store_pair_runs_before_isolated_flags(monkeypatch):
+    from decompnet.app import profile_hypotheses
+
+    net, proj, fn, state = setup()
+    proj['arch'] = 'mips'
+    net.cfg(proj)['compiler']['toolchain'] = 'gcc-2.7.2-kmc'
+    fn.update(best_source='void f(void) { v = *(volatile s32 *)(in + i); *(s32 *)(out + j) = v; }',
+              asm='lh $v0, %lo(in)($v1)\nsw $v0, %lo(out)($at)')
+    monkeypatch.setattr(profile_hypotheses, 'kmc_priorities', lambda *args: [['-O1']])
+
+    def judge(proj, fn, toolchain, flags, source):
+        state['calls'].append((flags, source))
+        exact = ('-fno-schedule-insns' in flags and '*(s16 *)' in source and '*(volatile s32 *)(out' in source)
+        return exact, SimpleNamespace(score=0 if exact else 200, rows=[]), ''
+
+    net._judge_with = judge
+    result = preflight.run(net, proj, fn, max_profiles=2)
+    assert result['tested'] == 2 and result['best']['exact']
+    assert [flags for flags, _ in state['calls']] == [['-O2'], ['-O2', '-fno-schedule-insns']]
+    assert state['suggested'][0]['source'] == result['best']['source']
+    assert not state['applied']
+
+
+def test_relocation_recovery_resumes_and_rejudges_the_source_before_clearing_the_link_blocker():
+    net, proj, fn, state = setup()
+    proj['arch'] = 'mips'
+    fn['best_source'] = 'extern int stale; int f(void){return stale;}'
+    rows = [('i', 'lui $v0, %hi(current)', 'lui $v0, %hi(?stale)'),
+            ('i', 'lw $v0, %lo(current)($v0)', 'lw $v0, %lo(?stale)($v0)')]
+
+    def judge(project, function, toolchain, flags, source):
+        state['calls'].append((flags, source))
+        if 'stale' in source:
+            return False, SimpleNamespace(score=70, rows=rows), '`stale` is not a known symbol.'
+        return False, SimpleNamespace(score=50), ''
+
+    net._judge_with = judge
+    first = preflight.run(net, proj, fn, max_profiles=1)
+    assert first['tested'] == 1 and first['link']['symbols'] == ['stale']
+    result = preflight.run(net, proj, fn, max_profiles=1)
+    assert result['tested'] == 1 and 'link' not in result
+    assert result['relinked']['source'] == 'extern int current; int f(void){return current;}'
+    assert result['relinked']['baseline'] == fn['best_source']
+    assert [flags for flags, _ in state['calls']] == [['-O2'], ['-O2']]
+    assert not state['suggested']
+
+
+def test_displaced_jump_table_keeps_a_clean_compiler_profile_as_a_search_lead(monkeypatch):
+    from decompnet.app import switch_tables
+
+    net, proj, fn, state = setup()
+    proj['arch'] = 'mips'
+    net.cfg(proj)['compiler']['toolchain'] = 'gcc-2.7.2-kmc'
+    monkeypatch.setattr(switch_tables, 'read', lambda *args: [(0, [4100, 4104])])
+    logs = []
+
+    def judge(project, function, toolchain, flags, source):
+        state['calls'].append(flags)
+        if '-fno-schedule-insns' in flags:
+            return False, SimpleNamespace(score=90), ''
+        return False, SimpleNamespace(score=50), "your code refers to .rodata+0x0 where the ROM's code has no address"
+
+    net._judge_with = judge
+    assert not preflight.run(net, proj, fn, log=logs.append, max_profiles=1).get('jump_table_profile')
+    result = preflight.run(net, proj, fn, log=logs.append, max_profiles=2)
+    assert state['calls'][:3] == [['-O2'], ['-O2', '-fno-schedule-insns'], ['-O2', '-fno-schedule-insns2']]
+    assert result['jump_table_profile']['score'] == 90
+    assert result['jump_table_profile']['flags'] == ['-O2', '-fno-schedule-insns']
+    assert 'Jump-table relocation cleared' in '\n'.join(logs)
+    assert not state['applied'] and not state['suggested']
+    assert fn['best_score'] == 50
+
+
+def test_jump_table_search_scores_only_clean_candidates():
+    from decompnet.app import profile_climb
+
+    net, proj, fn, _ = setup()
+    search = SimpleNamespace(net=net, tested=0, report=lambda: None)
+    profile = net.cfg(proj)['compiler']
+    source = fn['best_source']
+    net._judge_with = lambda *args: (False, SimpleNamespace(score=20), 'unplaced table')
+    assert profile_climb._judge(search, proj, fn, profile, source, require_clean=True) is None
+    net._judge_with = lambda *args: (False, SimpleNamespace(score=30), '')
+    assert profile_climb._judge(search, proj, fn, profile, source, require_clean=True) == 30
+    assert search.tested == 2
+
+
+def test_displaced_jump_table_can_recover_with_delay_slot_scheduling_disabled(monkeypatch):
+    from decompnet.app import switch_tables
+
+    net, proj, fn, state = setup()
+    proj['arch'] = 'mips'
+    net.cfg(proj)['compiler']['toolchain'] = 'gcc-2.7.2-kmc'
+    monkeypatch.setattr(switch_tables, 'read', lambda *args: [(0, [4100, 4104])])
+    logs = []
+
+    def judge(project, function, toolchain, flags, source):
+        state['calls'].append(flags)
+        if '-fno-delayed-branch' in flags:
+            return False, SimpleNamespace(score=90), ''
+        return False, SimpleNamespace(score=50), "your code refers to .rodata+0x0 where the ROM's code has no address"
+
+    net._judge_with = judge
+    assert not preflight.run(net, proj, fn, log=logs.append, max_profiles=1).get('jump_table_profile')
+    result = preflight.run(net, proj, fn, log=logs.append, max_profiles=3)
+    assert state['calls'][:4] == [
+        ['-O2'], ['-O2', '-fno-schedule-insns'], ['-O2', '-fno-schedule-insns2'], ['-O2', '-fno-delayed-branch'],
+    ]
+    assert result['jump_table_profile']['score'] == 90
+    assert result['jump_table_profile']['flags'] == ['-O2', '-fno-delayed-branch']
+    assert 'Jump-table relocation cleared' in '\n'.join(logs)
+    assert not state['applied'] and not state['suggested']
+    assert fn['best_score'] == 50
+
+
+def test_jump_table_preflight_combines_case_order_with_scheduling(monkeypatch):
+    from decompnet.app import switch_tables
+
+    net, proj, fn, state = setup()
+    proj['arch'] = 'mips'
+    net.cfg(proj)['compiler']['toolchain'] = 'gcc-2.7.2-kmc'
+    child = 'int f(void) { return 2; }'
+    monkeypatch.setattr(switch_tables, 'read', lambda *args: [(0, [4100, 4104])])
+    monkeypatch.setattr(switch_tables, 'variants', lambda *args: [('target_switch_order', child)])
+    calls = []
+
+    def judge(project, function, compiler, flags, source):
+        calls.append((flags, source))
+        if source == child and '-fno-schedule-insns' in flags:
+            return False, SimpleNamespace(score=90), ''
+        return False, SimpleNamespace(score=50), "your code refers to .rodata+0x0 where the ROM's code has no address"
+
+    net._judge_with = judge
+    assert not preflight.run(net, proj, fn).get('jump_table_profile')
+    assert preflight.run(net, proj, fn)['jump_table_profile']['source'] == child
+    assert (['-O2', '-fno-schedule-insns'], child) in calls
     assert not state['applied']

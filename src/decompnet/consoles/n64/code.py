@@ -80,15 +80,18 @@ def find_segments(rom: bytes, taken: list[tuple[int, int, int]], ends: tuple[int
             floor = max([floor] + [e for e in ends if e < hi])  # (data has no code: one ending in it is before)
             stretches.append((lo, hi, floor))
             seg = place(rom, lo, hi, floor, calls, known_vram, REGIONS)
-            if seg:
+            if seg and seg[0] < seg[1]:
                 candidates.append(seg)
                 floor = seg[1]
     found = []
     used_vram = [(v, v + (e - s)) for s, e, v in taken]
 
     def accept(start: int, end: int, vram: int) -> bool:
-        if any(a < vram + (end - start) and vram < b for a, b in used_vram) or \
-                any(a < end and start < b for a, b, _ in found):
+        # The last return can precede the first plausible entry in a stretch.
+        # An empty range claims no bytes and cannot become a splat segment.
+        if (not 0 <= start < end <= size
+                or any(a < vram + (end - start) and vram < b for a, b in used_vram)
+                or any(a < end and start < b for a, b, _ in found)):
             return False
         found.append((start, end, vram))
         used_vram.append((vram, vram + end - start))
@@ -126,10 +129,56 @@ def find_segments(rom: bytes, taken: list[tuple[int, int, int]], ends: tuple[int
     from .loader_mapping import refine, verified
 
     found=complete(rom,sorted(found),taken)
+    found=reconcile_adjacent(rom,found,taken,log)
     from .code_references import complete as referenced_gaps
 
     found=refine(rom,found+referenced_gaps(rom,sorted(taken+found),declared),taken,log)
     return close_gaps(rom, loaded_code(rom,found,verified(rom,taken),taken,log), taken)
+
+
+def reconcile_adjacent(rom, found, taken=(), log=print):
+    """Keep one mapping across adjacent inferred text when calls corroborate it."""
+    ordered = sorted(found)
+    if len(ordered) < 2:
+        return ordered
+    callers = sorted((*taken, *ordered))
+    result = [ordered[0]]
+    for lo, hi, vram in ordered[1:]:
+        before, left_end, left_vram = result[-1]
+        expected = left_vram+lo-before
+        # Test the preceding mapping only when the two ranges already meet in
+        # ROM and the inferred address jumps forward by a small amount.
+        if lo != left_end or not 0 < vram-expected <= BLOCK:
+            result.append((lo, hi, vram))
+            continue
+        if any(start < hi and lo < end or ram < expected+hi-lo and expected < ram+end-start
+               for start, end, ram in callers if (start, end, ram) != (lo, hi, vram)):
+            result.append((lo, hi, vram))
+            continue
+        sites = [set(), set()]
+        end_vram = expected+hi-lo
+        for start, end, entry in callers:
+            targets = jal_targets(struct.unpack_from(f'>{(end-start)//4}I', rom, start), entry)
+            inside = start == lo and end == hi
+            sites[inside].update(t for t in targets if vram <= t < end_vram)
+
+        if all(_supports_mapping(rom, lo, expected, vram, targets) for targets in sites):
+            result[-1] = before, hi, left_vram
+            log('Recovered a continuous N64 code mapping from calls inside and outside the range.')
+        else:
+            result.append((lo, hi, vram))
+    return result
+
+
+def _supports_mapping(rom, lo, expected, current, targets):
+    def fits(target, base):
+        pos = lo+target-base
+        word = struct.unpack_from('>I', rom, pos)[0]
+        return is_frame(word) or pos >= lo+8 and struct.unpack_from('>I', rom, pos-8)[0] == JR_RA
+
+    matched = sum(fits(t, expected) for t in targets)
+    old = sum(fits(t, current) for t in targets)
+    return len(targets) >= 8 and matched*4 >= len(targets)*3 and (matched-old)*4 >= len(targets)
 
 
 GAP_LIMIT = 0x10000  # the longest function a gap between two pieces of one segment can be
@@ -205,6 +254,47 @@ def mapped_data(spans,declared,size):
     return ranges
 
 
+# IPL3 reads the cartridge header entry, masks it to a physical RAM
+# address, then writes the PI destination, cartridge offset and length.
+_BOOT_DMA = bytes.fromhex(
+    '3c0bb000 8d690008 3c0a1fff 354affff 3c01a460 012a4824 ac290000 '
+    '3c08a460 8d080010 31080002 5500fffd 3c08a460 '
+    '24081000 010b4020 010a4024 3c01a460 ac280004 '
+    '3c0a0010 254affff 3c01a460 ac2a000c'
+)
+
+
+def boot_switch_range(image, segments):
+    """Expose the IPL3 cartridge mirror only when its DMA is identified."""
+    start, end = 0x1000, 0x101000
+    if len(image) < end or _BOOT_DMA not in image[0x40:start]:
+        return []
+    entry = int.from_bytes(image[8:12], 'big')
+    if not 0x80000400 <= entry < 0x80800000 or entry % 4:
+        return []
+    if not any(s.rom_start == start and s.vram == entry for s in segments):
+        return []
+    return [dict(rom_start=start, rom_end=end, vram=entry, target_prefix=0x80000000, boot_copy=True)]
+
+
+def relocated_switch_ranges(image, segments):
+    """Track the immediate data tail of code ranges that share an overlay load mapping."""
+    ranges = boot_switch_range(image, segments)
+    ordered = sorted(segments,key=lambda segment:segment.rom_start)
+    for i,(previous,segment) in enumerate(zip(ordered,ordered[1:]), 1):
+        delta = segment.vram-segment.rom_start
+        if (previous.rom_end!=segment.rom_start or previous.vram-previous.rom_start!=delta
+                or segment.vram&0xe0000000!=0x80000000 or segment.vram<0x80200000):
+            continue
+        start = segment.rom_end
+        limit = ordered[i+1].rom_start if i+1<len(ordered) else len(image)
+        end = min(limit,start+0x10000)&~3
+        if end>start:
+            ranges.append(dict(rom_start=start,rom_end=end,vram=(start+delta)&0x1fffffff,
+                               target_prefix=0x80000000,code_delta=delta))
+    return ranges
+
+
 # ---------------------------------------------------------------------------------------------- compressed code
 
 def _looks_like_code(data: bytes) -> bool:
@@ -212,20 +302,24 @@ def _looks_like_code(data: bytes) -> bool:
     return sum(w == JR_RA for w in words) >= 16 and sum(is_frame(w) for w in words) >= 16
 
 
-def _rare(rom: bytes, at: int) -> tuple[bytes, int] | None:
-    """Rare's packing at `at`: 0x1172/0x1173, maybe the unpacked size (3 bytes), then a raw deflate stream.
+def _rare(rom: bytes, at: int, *, headers=(6,5,2), minimum=0x1000) -> tuple[bytes, int] | None:
+    """Rare's packing at `at`: 0x1172/0x1173, an optional three- or four-byte size, and raw deflate.
     Returns (unpacked, packed length)."""
-    for skip in (5, 2):
+    for skip in headers:
+        expected = int.from_bytes(rom[at+2:at+skip], "big") if skip > 2 else None
+        if expected is not None and not minimum <= expected <= 0x1000000:
+            continue
         d = zlib.decompressobj(-15)
+        view = memoryview(rom)[at+skip:at+skip+0x800000]
         try:
-            out = d.decompress(rom[at + skip:at + skip + 0x800000], 0x1000000)
+            out = d.decompress(view, (expected+1) if expected is not None else 0x1000000)
         except zlib.error:
             continue
-        if not d.eof or len(out) < 0x1000:
+        if not d.eof or len(out) < minimum:
             continue
-        if skip == 5 and int.from_bytes(rom[at + 2:at + 5], "big") != len(out):
+        if expected is not None and expected != len(out):
             continue
-        return out, skip + len(rom[at + skip:at + skip + 0x800000]) - len(d.unused_data)
+        return out, skip+len(view)-len(d.unused_data)
     return None
 
 
@@ -326,29 +420,69 @@ def add_segments(config: Path, workdir: Path, image: str, log=print) -> str:
 
     import yaml
 
-    from . import overlays
+    from . import (
+        boot_gzip,
+        copied_overlays,
+        dma_overlays,
+        indexed_overlays,
+        named_dma,
+        overlays,
+        raw_slots,
+        resident_deflate,
+        shared_dma,
+    )
 
     if result := overlays.add(config, workdir, image, log):
         return result
 
     original = image
     rom = (workdir / image).read_bytes()
+    original_rom = rom
+    taken = split.code_ranges(config)
+    if taken and (result := resident_deflate.add(config,workdir,image,rom,taken,log)):
+        return result
+    if taken and (result := boot_gzip.add(config, workdir, image, rom, taken, log)):
+        return result
+    if taken and (slots := raw_slots.registered(rom, taken)):
+        recovered = raw_slots.recover_registered(rom, slots, taken, log)
+        if raw_slots.add(config, rom, recovered, slots, log):
+            return original
     packed = unpack_code(rom)
+    locations = []
     if packed:
         work = bytearray(rom)
         for _, data in packed:  # each after a gap, so pieces of different blocks never run together
             work += bytes(-len(work) % 0x10 + 0x2000)
+            locations.append(len(work))
             work += data
         work += bytes(-len(work) % 0x10)
         image = f"{Path(image).stem}.unpacked{Path(image).suffix}"
-        (workdir / image).write_bytes(work)
         rom = bytes(work)
         kib = sum(len(d) for _, d in packed) // 1024
         log(f"unpacked {len(packed)} compressed code block{'s' if len(packed) != 1 else ''} ({kib} KiB)")
-    taken = split.code_ranges(config)
     known = split.segments_from_config(config)
     found = find_segments(rom, taken, tuple(s.rom_end for s in known), log=log,
                           declared=tuple((s.rom_start, s.rom_end, s.vram) for s in known)) if taken else []
+    if not packed and taken and (banks := copied_overlays.read(original_rom, taken)):
+        copied_overlays.add(config, original_rom, found, banks, log)
+        return original
+    if not packed and taken and (banks := indexed_overlays.read(original_rom, taken)):
+        resident = indexed_overlays.resident_banks(original_rom, taken, before=banks[0].start)
+        copied_overlays.add(config, original_rom, found, resident + banks, log)
+        return original
+    if not packed and taken and (slots := named_dma.read(original_rom, taken)):
+        if shared_dma.add(config, original_rom, taken, found, slots, log):
+            return original
+    if not packed and taken and (slots := shared_dma.read(original_rom, taken, found, include_inline=False)):
+        if shared_dma.add(config, original_rom, taken, found, slots, log):
+            return original
+    if not packed and taken and (banks := dma_overlays.banks(original_rom)):
+        dma_overlays.add(config,workdir,original_rom,found,banks,log)
+        return original
+    if packed and found:
+        from . import rare_overlays
+        if result := rare_overlays.add(config,workdir,original,original_rom,packed,found,locations,log):
+            return result
     if taken:  # what the game loads that the search couldn't place: found by running it (when the emulator's here)
         from .loaded_code import find as run_and_find
 
@@ -356,19 +490,68 @@ def add_segments(config: Path, workdir: Path, image: str, log=print) -> str:
         found = sorted(found + loaded["segments"])
         found = sorted(complete_gaps(rom, taken, found, tuple((s.rom_start, s.rom_end, s.vram) for s in known),
                                      runtime_entries(workdir), log=log))
-    from .boot_mapping import recover
+    from .boot_mapping import extend_startup_data, extend_startup_trap, mark_boot_version, recover
+    from .rsp_prefix import trim
 
+    found = trim(rom, found, taken, log)
+    found = recover_scheduled_mapping_entries(rom, found, taken, log)
     recover(config, rom, found, log)
+    extend_startup_trap(config, rom, log)
+    extend_startup_data(config, rom, log)
+    mark_boot_version(config, rom, log)
+    if not packed and taken and (slots := shared_dma.read(original_rom, taken, found)):
+        if shared_dma.add(config, original_rom, taken, found, slots, log):
+            return original
+    if not packed and taken and (slots := raw_slots.read(original_rom,taken)):
+        if raw_slots.add(config,original_rom,found,slots,log):
+            return original
     if not found:
         return original
     cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
     if packed:
+        (workdir/image).write_bytes(rom)
         cfg.setdefault("options", {})["target_path"] = image
         cfg["sha1"] = hashlib.sha1(rom).hexdigest()
     insert_segments(config, cfg, found, len(rom))
     kib = sum(en - st for st, en, _ in found) // 1024
     log(f"found {len(found)} more code segment{'s' if len(found) != 1 else ''} the game loads later ({kib} KiB)")
     return image
+
+
+def recover_scheduled_mapping_entries(image, found, taken, log=print):
+    """Move an inferred split from a stack allocation to its independently called prologue."""
+    from ...arch.mips_code_recovery import _lead
+
+    original = sorted(found)
+    result = list(original)
+    for index, (left, right) in enumerate(zip(original, original[1:])):
+        start, end, first_address = left
+        seam, stop, address = right
+        if end != seam or seam-start < 16 or address != first_address+seam-start:
+            continue
+        if not is_frame(int.from_bytes(image[seam:seam+4], 'big')):
+            continue
+        for lead in (4, 8):
+            entry = seam-lead
+            if (image[entry-8:entry] != JR_RA.to_bytes(4, 'big') + bytes(4)
+                    or _lead(image, entry, stop, 'big', 'vr4300') != lead):
+                continue
+            candidates = range(address-lead, address+4, 4)
+            targets = {0x0c000000 | ((target>>2)&0x03ffffff):target for target in candidates}
+            called = set()
+            for lo, hi, vram in (*taken, *original):
+                if lo%4 or hi%4 or not 0 <= lo < hi <= len(image) or (vram>>28) != address>>28:
+                    continue
+                words = (word for word, in struct.iter_unpack('>I', memoryview(image)[lo:hi]))
+                called.update(targets[word] for word in words if word in targets)
+            if (called != {address-lead}
+                    or any(target.to_bytes(4,'big') in image for target in range(address-lead+4,address+4,4))):
+                continue
+            result[index] = (result[index][0], entry, result[index][2])
+            result[index+1] = (entry, stop, address-lead)
+            log('Kept a directly called scheduled prologue with its recovered code range.')
+            break
+    return result
 
 
 def insert_segments(config: Path, cfg: dict, found, size: int) -> None:
@@ -426,3 +609,35 @@ def missed_functions(config: Path, rom: bytes, log=print) -> list[tuple[int, int
         cfg = yaml.safe_load(config.read_text(encoding="utf-8"))
         insert_segments(config, cfg, new, len(rom))
     return new
+
+
+def recover_terminal_display_lists(result, image, log=print):
+    """Classify a display-list call and its neighboring asset name as data."""
+    from ...arch.mips_references import references
+
+    candidates = []
+    for fn in result.functions:
+        if fn.size != 8 or fn.lines[0].word != 0xde000000:
+            continue
+        end = fn.rom+8
+        pointer = fn.lines[1].word
+        tail = image[end:end+32]
+        if (0x80000400 <= pointer < 0x80800000 and not pointer%8 and fn.rom >= 12
+                and any(s.rom_end == end and s.rom_start <= fn.rom-12
+                        and s.vram-s.rom_start == fn.vram-fn.rom for s in result.segments)
+                and struct.unpack_from('>3I',image,fn.rom-12) == (JR_RA,0,0)
+                and re.fullmatch(rb'\0{4}[A-Z][A-Z0-9_ ]{5,19}\0{4,}',tail)):
+            candidates.append(fn)
+    if not candidates:
+        return
+    targets = set(result.named.values())
+    for segment in result.segments:
+        targets.update(target for target,_,_ in references(image,segment.rom_start,segment.rom_end,segment.vram))
+    removed = set()
+    for fn in candidates:
+        if any(address in targets or address.to_bytes(4,'big') in image for address in (fn.vram,fn.vram+4)):
+            continue
+        removed.add((fn.rom,fn.vram))
+        result.data.append(split.DataSymbol(fn.name,fn.vram,fn.rom,8,'data'))
+        log('Recovered a display-list command at the end of a code range.')
+    result.functions = [fn for fn in result.functions if (fn.rom,fn.vram) not in removed]
