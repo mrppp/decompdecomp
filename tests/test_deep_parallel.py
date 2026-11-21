@@ -313,6 +313,26 @@ def test_packed_word_store_scope_runs_with_mixed_operand_evidence(monkeypatch):
     assert 'do { entry->color.word = (((0xff000000 | (shade << 16)) | (shade << 8)) | shade); }' in tried[0]
 
 
+def test_loop_register_rewrites_run_first_when_registers_dominate_the_diff(monkeypatch):
+    # An N64 function with four loops: 40 register rows and two moved ones (1175 -> 280 with these rewrites).
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    source = ('extern s16 Table;\nvoid f(void) {\n    s16 *table;\n    s32 i;\n\n    table = &Table;\n    i = 0;\n'
+              '    do {\n        table[i] = 0;\n        i += 1;\n    } while (i < 4);\n}\n')
+    fn = {**net.function(), 'name': 'f', 'asm': 'addu $a0, $a0, $a1', 'best_source': source}
+    search = deep_permuter.Search(net, 1, 20, Log())
+    rows = [('r', f'addu $s{n}, $v0, $a1', f'addu $s{n + 1}, $v0, $a1') for n in range(5)] + [('o', 'move $s4, $zero', '')]
+    search.winner_diff = (rows, None)
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, project, function, child, best, fork: tried.append(child) or 30)
+
+    assert search.operand_order_pass(AGENT, proj, fn, 95, None) == 30
+    assert '(&Table)[i] = 0;' in tried[0] and 'table' not in tried[0]
+    assert not deep_permuter.permuter_focus.register_dominant([('r', 'a', 'b'), ('o', 'c', 'd'), ('o', 'e', 'f')])
+
+
 def test_float_stack_call_reuse_runs_when_the_diff_has_extra_loads(monkeypatch):
     from tests.test_permute import AGENT
 
@@ -531,6 +551,62 @@ def test_word_byte_loop_carrier_runs_before_random_rewrites(monkeypatch):
     assert 'items[i] == (u8)key' in tried[0]
 
 
+def test_join_initializer_sink_runs_in_the_local_pass(monkeypatch):
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    fn = {**net.function(), 'name': 'f', 'asm': '',
+          'best_source': ('void f(void *a, u16 *p) {\n  s32 v;\n  v = 255;\n  if (p[0] & 2)\n  {\n'
+                          '    if (!(p[1] & 16))\n    {\n      v = 191;\n      goto L;\n    }\n'
+                          '    *((u8 *) (((char *) a) + 0x7F)) = 255;\n  }\n  else\n  {\n    L:\n'
+                          '    *((u8 *) (((char *) a) + 0x81)) = v;\n  }\n}\n')}
+    search = deep_permuter.Search(net, 1, 6, Log())
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or 0)
+
+    assert search.operand_order_pass(AGENT, proj, fn, 60, None) == 0
+    assert '    v = 255;\n    L:' in tried[0] and '  v = 255;\n  if' not in tried[0]
+
+
+def test_a_pair_of_rewrites_is_tried_when_neither_improves_alone(monkeypatch):
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    fn = {**net.function(), 'name': 'f', 'asm': '', 'best_source': 'void f(void) { first; }'}
+    search = deep_permuter.Search(net, 1, 6, Log())
+    offered = {'void f(void) { first; }': ([('sink', 'A'), ('polarity', 'B')], []), 'A': ([('literal', 'AC')], [])}
+    monkeypatch.setattr(search, '_local_proposals', lambda source, proj, fn, rows: offered.get(source, ([], [])))
+    scores = {'A': 90, 'B': 500, 'AC': 40}
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or scores[child])
+
+    # A alone is worse than the best (60) but within reach; B is too far to build on; A + the literal wins.
+    assert search.operand_order_pass(AGENT, proj, fn, 60, None) == 40
+    assert tried == ['A', 'B', 'AC']
+
+
+def test_the_second_step_is_bounded_and_skips_far_children(monkeypatch):
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    fn = {**net.function(), 'name': 'f', 'asm': '', 'best_source': 'void f(void) { first; }'}
+    search = deep_permuter.Search(net, 1, 6, Log())
+    many = [('x', f'C{i}') for i in range(40)]
+    offered = {'void f(void) { first; }': ([('sink', 'A')], []), 'A': (many, [])}
+    monkeypatch.setattr(search, '_local_proposals', lambda source, proj, fn, rows: offered.get(source, ([], [])))
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or 90)
+
+    assert search.operand_order_pass(AGENT, proj, fn, 60, None) == 60
+    assert len(tried) <= 1 + search.COMBINED_BUDGET
+    tried.clear()
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or 500)
+    assert search.operand_order_pass(AGENT, proj, fn, 60, None) == 60 and tried == ['A']
+
+
 def test_scoped_byte_global_update_uses_current_relocation_names(monkeypatch):
     from tests.test_permute import AGENT
 
@@ -618,6 +694,60 @@ def test_masked_byte_stride_runs_in_the_bounded_local_lane(monkeypatch):
 
     assert search.operand_order_pass(AGENT, proj, fn, 1175, None) == 1120
     assert tried == [child]
+
+
+def test_guarded_offset_index_runs_in_the_bounded_local_lane(monkeypatch):
+    from decomprepair import guarded_offset_index
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    fn = {**net.function(), 'asm': ''}
+    child = fn['best_source'] + '\n/* shared indexed counter */'
+    monkeypatch.setattr(guarded_offset_index, 'variants',
+                        lambda *args: [('guarded_offset_index_shared_counter', child)])
+    search = deep_permuter.Search(net, 1, 6, Log())
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, child, best, fork: tried.append(child) or 20)
+
+    assert search.operand_order_pass(AGENT, proj, fn, 180, None) == 20
+    assert tried == [child]
+
+
+def test_guarded_offset_index_reaches_the_shared_counter_on_an_m2c_draft():
+    """A 3-loop GCC 2.7.2 function's saved best (m2c's guarded do-whiles with byte offsets): the family's last
+    child is the one that judged 180 -> 20 there, before the frame trim finished it."""
+    from decomprepair import guarded_offset_index
+
+    draft = """void f(void *a) {
+    s32 var_s1;
+    s32 var_s1_2;
+    s32 var_s2;
+    s32 var_v1;
+    var_s1 = 0;
+    if ((*(s16 *)((char *)(a) + 0xC)) > 0) {
+        var_s2 = 0;
+        do {
+            g(var_s2 + (*(s32 *)((char *)(a) + 0)));
+            var_s1 += 1;
+            var_s2 += 0x18;
+        } while (var_s1 < (*(s16 *)((char *)(a) + 0xC)));
+    }
+    var_s1_2 = 0;
+    if ((*(s16 *)((char *)(a) + 0xC)) > 0) {
+        var_v1 = 0;
+        do {
+            h(var_v1 + (*(s32 *)((char *)(a) + 0)));
+            var_s1_2 += 1;
+            var_v1 += 0x18;
+        } while (var_s1_2 < (*(s16 *)((char *)(a) + 0xC)));
+    }
+}
+"""
+    families = dict(guarded_offset_index.variants(draft, 'f', 'mips', ''))
+    shared = families['guarded_offset_index_shared_counter']
+    assert shared.count('if (i < (*(s16 *)((char *)(a) + 0xC))) {') == 2
+    assert 'g((i * 0x18) + (*(s32 *)((char *)(a) + 0)));' in shared
 
 
 def test_component_before_resets_uses_relocated_target_names(monkeypatch):

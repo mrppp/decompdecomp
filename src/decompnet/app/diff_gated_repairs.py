@@ -8,24 +8,37 @@ from decomprepair import (
     byte_cursor_postincrements,
     direct_mapped_address,
     field_snapshot_copies,
+    float_intermediate_repairs,
     float_matrix_identity,
     global_pointer_local_repairs,
     guard_inversion_repairs,
+    guard_reset_scheduling,
     indexed_field_cursor,
     kmc_cast_repairs,
     likely_branch_cursor,
+    loop_counter_roles_repairs,
     loop_sentinel_repairs,
     loop_storage_shapes,
+    masked_slot_dispatch,
     measured_address_repairs,
     measured_callback_loop,
     measured_callback_repairs,
     measured_control_flow,
+    measured_cursor_loop_tail,
+    measured_cursor_publish,
+    measured_cursor_schedule,
     measured_expression_repairs,
+    measured_float_grid_stores,
+    measured_global_rebase,
     measured_immediate_repairs,
+    measured_kmc_addresses,
     measured_lifetime_shapes,
     measured_memory_order,
     measured_mmio_polling,
+    measured_narrow_use,
+    measured_null_iteration_store,
     measured_pointer_scale,
+    measured_scalar_updates,
     measured_storage_shapes,
     measured_temporary_repairs,
     ordered_halfword_updates,
@@ -33,6 +46,7 @@ from decomprepair import (
     passthrough_argument_repairs,
     relocated_byte_table,
     relocated_global_update,
+    search_exit_loop_repairs,
     shared_return_repairs,
     short_leaf_drafts,
     split_dispatch_zero_case,
@@ -40,6 +54,8 @@ from decomprepair import (
     stack_fill_drafts,
     stack_header_buffer,
     stack_read_retry,
+    switch_pointer_calls,
+    symbol_width_repairs,
     target_string_repairs,
     targeted_switch_labels,
     uncached_read_repairs,
@@ -186,6 +202,10 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
     if not any(marker != ' ' for marker,_,_ in rows):
         return result
     result += measured_lifetime_shapes.variants(source, name, header, toolchain, rows)
+    result += measured_scalar_updates.variants(source, name, header, toolchain, rows, asm)
+    if toolchain == 'gcc-2.7.2-kmc':
+        result += measured_cursor_schedule.variants(source, name, header, rows, asm or '')
+        result += measured_kmc_addresses.variants(source, name, header, rows, flags)
     if toolchain.startswith('ido-7.1'):
         return result
     target, candidate = (_instructions(rows, side) for side in (1,2))
@@ -198,6 +218,10 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
                                                              big_endian=big_endian,flags=flags)
     if toolchain.startswith('gcc-2.7.2-kmc'):
         result += measured_storage_shapes.variants(source, name, header, rows, asm, big_endian=big_endian)
+        result += masked_slot_dispatch.variants(source, name, asm or '', header,
+                                                read_data=read_data, big_endian=big_endian)
+        result += switch_pointer_calls.variants(source, name, asm or '', header,
+                                                read_data=read_data, big_endian=big_endian)
         result += short_leaf_drafts.variants(source, name, asm, header)
         result += target_inline_storage_diff_repairs.proposals(source,name,header,rows,target,candidate,asm,
                                                              read_data=read_data,big_endian=big_endian)
@@ -205,7 +229,18 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
         if candidate_source := uncached_read_repairs.rewrite(source, name, asm or '', resolve):
             result.append(('measured_uncached_word_read', candidate_source))
         result += measured_control_flow.variants(source,name,rows)
+        result += measured_cursor_loop_tail.variants(source, name, rows)
+        result += measured_cursor_publish.variants(source, name, rows)
+        result += shared_return_repairs.result_copy_variants(source, name, rows)
+        result += guard_reset_scheduling.variants(source, name, header, rows)
+        result += global_pointer_local_repairs.scoped_field_reads(source, name, rows)
+        result += measured_global_rebase.variants(source, name, header, rows, resolve=resolve)
         result += measured_memory_order.variants(source,name,rows,resolve=resolve,header=header)
+        result += measured_memory_order.staged_field_masks(source, name, rows, header)
+        result += search_exit_loop_repairs.sentinel_byte_guard_variants(source, name, rows)
+        result += loop_counter_roles_repairs.guarded_reuse_variants(source, name, rows)
+        result += measured_float_grid_stores.variants(source, name, rows)
+        result += float_intermediate_repairs.repeated_products(source, name, rows)
         result += measured_expression_repairs.variants(source,name,header,rows)
         result += stack_byte_init_repairs.variants(source, name, header, rows)
         result += measured_temporary_repairs.variants(source,name,rows)
@@ -219,6 +254,9 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
             result.append(('relocated_byte_table', candidate_source))
         if candidate_source := relocated_global_update.rewrite(source, name, asm or '', header, resolve):
             result.append(('relocated_global_update', candidate_source))
+        if any(marker != ' ' and op.startswith(('lbu ', 'sb ')) for marker, op, _ in rows):
+            if candidate_source := relocated_global_update.rewrite_branch_byte(source, name, asm or '', header, resolve):
+                result.append(('relocated_branch_byte', candidate_source))
         if candidate_source := relocated_global_update.rewrite_countdown(source, name, asm or '', header, resolve):
             result.append(('relocated_countdown', candidate_source))
         if candidate_source := stack_fill_drafts.rewrite(source, name, asm or '', header):
@@ -265,7 +303,8 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
             result.append(('guarded_global_return', candidate_source))
         if candidate_source := passthrough_argument_repairs.missing_entry_argument(source, name, asm or '', header):
             result.append(('entry_wrapper_argument', candidate_source))
-        result += passthrough_argument_repairs.shifted_call_variants(source, name, header, asm or '', rows)
+        result += passthrough_argument_repairs.shifted_call_variants(
+            source, name, header, asm or '', rows, resolve=resolve, read_data=read_data, big_endian=big_endian)
         if candidate_source := loop_storage_shapes.measured_copy_setup(source, name, asm or '', header):
             result.append(('measured_copy_loop_setup', candidate_source))
         result += measured_callback_repairs.variants(source,name,rows)
@@ -275,7 +314,13 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
         result += measured_pointer_scale.variants(source,name,header,rows)
         result += target_string_repairs.verified_variants(source, name, header, rows, read_data)
         result += measured_immediate_repairs.variants(source,name,rows)
+        result += measured_narrow_use.variants(source, name, rows)
+        result += symbol_width_repairs.signed_halfword_load_variants(source, name, rows)
+        result += measured_narrow_use.boolean_byte_carriers(source, name, rows)
+        result += measured_narrow_use.byte_backedge_variants(source, name, rows)
+        result += measured_narrow_use.shared_halfword_index_variants(source, name, rows)
         result += kmc_cast_repairs.variants(source,name,header,rows,flags)
+        result += measured_null_iteration_store.variants(source, name, rows)
         result += target_guard_width_diff_repairs.proposals(source,name,header,rows,target,candidate,asm,
                                                           resolve=resolve)
         result += target_edge_diff_repairs.proposals(source,name,header,rows,target,candidate,asm,

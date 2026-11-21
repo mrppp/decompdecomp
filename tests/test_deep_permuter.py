@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from decompnet.app import deep_permuter, draft_repairs, permuter_local
@@ -1092,6 +1094,29 @@ def test_loop_vector_shape_pass_composes_shapes_that_only_help_together(monkeypa
     assert any('const Bone *bone' in c and 'bones[k]' in c for c in seen) and len(seen) <= 15
 
 
+def test_loop_vector_shape_pass_reaches_the_scheduling_boundary_that_matched_a_display_list_function(monkeypatch):
+    """Every source order stayed at 60; splitting the tail with a do { } while (0), its call's global read first, was 0."""
+    net = setup(monkeypatch)
+    source = ('extern int D_8010A4D8;\nextern void *cursor;\nextern void *list;\nint g();\n'
+              'void f(int arg0) {\n    void *t;\n    g(arg0, 2);\n    ((S *)list)->a = 1;\n    ((S *)cursor)->a = 2;\n'
+              '    list += 8;\n    t = cursor + 8;\n    cursor = t;\n    g(arg0, D_8010A4D8, t);\n}\n')
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=60,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        # wrapping alone or hoisting alone stays at 60; the pair is exact
+        return 0 if 'do {' in candidate and 'repair_scope_1 = D_8010A4D8;' in candidate else 60
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source, name='f'), 60, None) == 0
+    assert any('do {' in c and 'repair_scope_1' not in c for c in seen) or len(seen) < 64
+
+
 def test_a_stub_baseline_is_named_before_the_tuning_passes(monkeypatch):
     net = setup(monkeypatch)
     fn = net.function()
@@ -1101,3 +1126,39 @@ def test_a_stub_baseline_is_named_before_the_tuning_passes(monkeypatch):
     assert 'it is a stub' in search.stub_note() and '40 of the target' in search.stub_note()
     search.winner_diff = ([('r', 'addu $v0, $a0, $a1', 'addu $v0, $a1, $a0')] * 240, '')
     assert search.stub_note() == ''
+
+
+# The ROM's entry point: N64 boot code that clears BSS with `addi` and sets $sp in the delay slot of its jump to main.
+BOOT_STUB = bytes.fromhex('3C08800D25087050' '3C090004252906F0' 'AD000000AD000004' '21080008' '2129FFF8' '1520FFFB' '00000000'
+                          '3C0A8000254A0460' '3C1D8010' '01400008' '27BD2CA0')
+
+
+def _boot_stub_net(monkeypatch, code):
+    from decompnet.app.twins import Twins
+    from decompnet.consoles import get as console
+    net = setup(monkeypatch)
+    net.console = lambda proj: console('n64')
+    net.is_rom = lambda proj: True
+    net.twins = Twins(net)
+    net.forks = None
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET target=?, size=?, meta=NULL", (code, len(code)))
+    return net
+
+
+def test_deep_search_sets_aside_hand_written_assembly_instead_of_searching_it(monkeypatch):
+    net = _boot_stub_net(monkeypatch, BOOT_STUB)
+    monkeypatch.setattr(deep_permuter, '_run', lambda *a, **k: pytest.fail('searched hand-written assembly'))
+    log = Log()
+    result = deep_permuter.run(net, 'game', 'f', 30, 10, log)
+    assert not result['matched'] and result['tested'] == 0 and 'addi' in result['reason']
+    row = net.function()
+    assert row['status'] == 'asm' and 'addi' in json.loads(row['meta'])['asm_code']
+
+
+def test_deep_search_leaves_a_function_the_user_gave_back_to_the_agents(monkeypatch):
+    net = _boot_stub_net(monkeypatch, BOOT_STUB)
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET meta='{\"reopened\": true}'")
+    assert net.twins.set_aside_function_asm(net.project_row('game'), net.function()) is None
+    assert net.function()['status'] == 'open'

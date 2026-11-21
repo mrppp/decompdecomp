@@ -138,6 +138,40 @@ class BriefMixin:
         bindings = [(name,self.symbols(proj['id']).resolve(name)) for name in sorted(roots)]
         from ..draft_reports import generation
         inputs = [DRAFT_REVISION, self.cfg(proj).get("draft_generation", 0), hashlib.sha256((fn["asm"] or "").encode()).hexdigest(), fn["name"], target, own["toolchain"], own.get("flags", []), sorted(roots), bindings, context]
+        if target.startswith('mips-') and re.search(r'\bjr\s+\$(?!(?:ra|31)\b)\w+', fn['asm'] or ''):
+            inputs.append('draft jump-table aliases')
+        if own["toolchain"] == 'ido-7.1':
+            from decomprepair import (
+                ido_buffer_drafts,
+                ido_indirect_event,
+                ido_mapped_poll,
+                ido_matrix_copy,
+                ido_packed_stack_word,
+                ido_stack_iterators,
+                ido_strided_cursor,
+                ido_switch_reply,
+                ido_typed_loops,
+            )
+
+            if ido_indirect_event.applies(fn['asm'] or ''):
+                inputs.append('IDO callback event frame')
+            if ido_strided_cursor.applies(fn['asm'] or ''):
+                inputs.append('IDO strided cursor')
+            if ido_switch_reply.applies(fn['asm'] or ''):
+                inputs.append('IDO switch reply frame')
+            if ido_stack_iterators.applies(fn['asm'] or ''):
+                inputs.append('IDO stack iterator records')
+            if ido_matrix_copy.applies(fn['asm'] or ''):
+                inputs.append('IDO unrolled matrix copy')
+            if ido_packed_stack_word.applies(fn['asm'] or ''):
+                inputs.append('IDO packed stack word')
+            if ido_typed_loops.applies(fn['asm'] or ''):
+                inputs.append('IDO typed loop cursors')
+            if ido_buffer_drafts.applies(fn['asm'] or ''):
+                inputs.append('IDO typed buffer access')
+            if ido_mapped_poll.applies(fn['asm'] or ''):
+                base = self.symbols(proj['id']).resolve(ido_mapped_poll.ZERO_WORD)
+                inputs.append(('IDO mapped poll read', base))
         if own["toolchain"] == 'gcc-2.7.2-kmc' and 'swl' in (fn['asm'] or ''):
             from decomprepair.unaligned_stack_drafts import stack_copy
 
@@ -154,16 +188,21 @@ class BriefMixin:
                 float_matrix_identity,
                 global_pointer_local_repairs,
                 guard_inversion_repairs,
+                heap_span_drafts,
                 indexed_field_cursor,
                 indirect_call_drafts,
+                kmc_buffer_drafts,
+                kmc_cartridge_io,
                 kmc_cast_repairs,
                 large_stack_drafts,
                 likely_branch_cursor,
                 loop_storage_shapes,
+                masked_slot_dispatch,
                 measured_address_repairs,
                 measured_callback_loop,
                 measured_mmio_polling,
                 measured_stack_drafts,
+                mips_entry_loops,
                 ordered_halfword_updates,
                 packed_matrix_conversion,
                 passthrough_argument_repairs,
@@ -177,9 +216,18 @@ class BriefMixin:
                 stack_header_buffer,
                 stack_read_retry,
                 stack_word_index_drafts,
+                switch_pointer_calls,
                 uncached_read_repairs,
             )
 
+            if heap_span_drafts.applies(fn['asm'] or ''):
+                inputs.append('linked heap spans')
+            if kmc_cartridge_io.applies(fn['asm'] or ''):
+                inputs.append('KMC cartridge I/O with diagnostic symbols')
+            if kmc_buffer_drafts.applies(fn['asm'] or ''):
+                inputs.append('KMC typed buffer access')
+            if mips_entry_loops.applies(fn['asm'] or ''):
+                inputs.append('MIPS entry loop')
             if short_leaf_drafts.applies(fn['asm'] or ''):
                 inputs.append('short leaf functions')
             if measured_stack_drafts.applies(fn['asm'] or ''):
@@ -194,6 +242,12 @@ class BriefMixin:
                 inputs.append('relocated byte table')
             if relocated_global_update.applies(fn['asm'] or ''):
                 inputs.append('relocated global update')
+            if relocated_global_update.branch_byte_applies(fn['asm'] or ''):
+                inputs.append('separately relocated test and clear')
+            if masked_slot_dispatch.applies(fn['asm'] or ''):
+                inputs.append('masked slot dispatch')
+            if switch_pointer_calls.applies(fn['asm'] or ''):
+                inputs.append('masked switch pointer calls')
             if relocated_global_update.countdown_applies(fn['asm'] or ''):
                 inputs.append('relocated countdown')
             if stack_fill_drafts.applies(fn['asm'] or ''):
@@ -300,7 +354,7 @@ class BriefMixin:
                         draft_reports.failure(report, 'generation', 'without_context', fallback_error)
             if report['failures']:
                 draft_reports.save(self, fn['id'], report, project_id=proj['id'])
-            text = f"{DRAFT_NOTE}\n{seeds.M2C_MACROS}\n{draft}" if draft else ""
+            text = f"{DRAFT_NOTE}\n{seeds.with_m2c_macros(draft)}" if draft else ""
             with self.project_store(proj['id']).tx() as db:
                 db.execute("UPDATE functions SET seed=?, seed_key=? WHERE id=?", (text, key, fn["id"]))
         return text

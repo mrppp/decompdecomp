@@ -7,7 +7,7 @@ symbols, data, independent references, image gaps or competing mappings.
 import heapq
 import re
 import struct
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import replace
 
@@ -38,6 +38,7 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
     pointers={w for i,(w,) in enumerate(struct.iter_unpack(fmt,image[:len(image)//4*4]))
               if w in starts and not any(s.contains(w,4) for s in slots)
               and (w not in zero_entries or not console.import_pointer_is_data(image,4*i))}
+    named_or_pointed = explicit | pointers
     references=defaultdict(set)
     direct_calls=set()
     transfer_targets=set()
@@ -68,11 +69,13 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
         if not references[dest]:del references[dest]
     functions = recover_inline_tables(functions, data, image, order, explicit | pointers, references, segments, log)
     buffer_written = buffer_write_evidence(functions, image, console, check=getattr(log,'check_cancel',lambda:None))
+    data_entry_targets = explicit|pointers|transfer_targets
     data_only = {
-        fn.vram for fn in functions if fn.size==4
-        and image[fn.rom:fn.rom+4]==fn.lines[0].word.to_bytes(4,order)
-        and fn.vram not in explicit|pointers|transfer_targets
-        and not any(d.rom is not None and d.rom<fn.rom+4 and fn.rom<d.rom+d.size for d in data)
+        fn.vram for fn in functions
+        if (fn.size==4 or fn.size==8 and all(line.word==0xbf800000 for line in fn.lines))
+        and image[fn.rom:fn.rom+fn.size]==b''.join(line.word.to_bytes(4,order) for line in fn.lines)
+        and not any(address in data_entry_targets for address in range(fn.vram,fn.vram+fn.size,4))
+        and not any(d.rom is not None and d.rom<fn.rom+fn.size and fn.rom<d.rom+d.size for d in data)
         and (address_word_references(fn, references, lines_by_rom)
              or not fn.lines[0].word and buffer_written(fn, references, reference_bodies))
     }
@@ -178,6 +181,7 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
         # The group's first entry is known as well: a leaf there ends at its own return, not at a call's cut.
         for cut in sorted(cuts & returns|{lo}):
             if (at:=seed(cut)) is not None:candidates.append(at)
+        called_cuts = sorted(cut for cut in cuts if cut+mapping in direct_calls)
         pending=list(set(candidates)|leaves);heapq.heapify(pending);seen=set()
         while pending:
             at=heapq.heappop(pending)
@@ -199,7 +203,11 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
                     continue
             else:
                 filler,target=None,None
-                size=size or called_extent(image,at,hi,at+mapping,**framed,table_ranges=tables)
+                independently_entered = (at+mapping in named_or_pointed or
+                                         any(source < at or source >= hi
+                                             for source,_ in references.get(at+mapping, ())))
+                size=size or called_extent(image,at,hi,at+mapping,**framed,table_ranges=tables,
+                                           allow_loop_epilogue=independently_entered)
                 if not size and at+mapping in direct_calls and at in cuts:
                     size=assembly_extent(image,at,hi,at+mapping,console,order)
                     if size and at+size not in cuts:
@@ -222,11 +230,17 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
             if any(address<a<finish for a in explicit|pointers):continue
             if any(address<=a<finish for a in data_only):continue
             if any(d.rom is not None and d.rom<end and at<d.rom+d.size for d in data):continue
+            # Alignment between a return and the next called entry may
+            # decode as a backward branch into the return's delay slot.
+            index = bisect_left(called_cuts, end)
+            following = called_cuts[index] if index < len(called_cuts) else None
+            tail = _return_delay_alignment(end, following, mapping, lines, references, named_or_pointed, data)
             # A branch within another occupant targets its own copy of the shared address.
             independent=any(not at<=offset<end
                             for dest in destinations[bisect_right(destinations,address):bisect_right(destinations,finish-1)]
                             for offset,_ in references[dest]
                             if (offset!=filler or dest!=ignored_edge)
+                            and not (offset==tail and dest==finish-4)
                             and not any(other.rom_start <= offset < other.rom_end and other.contains(dest, 4)
                                         for other in siblings))
             if independent:continue
@@ -239,6 +253,9 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
                 padding.add(proposed_padding[at])
                 cuts.update(proposed_padding[at])
             accepted.append((at,end));cuts={c for c in cuts if not at<c<end}|{at,end}
+            if tail is not None:
+                cuts = {c for c in cuts if not end<c<following}
+                padding.add((end, following))
             if end-8 in lines and lines[end-8].word==JR_RA:
                 if (following:=seed(end)) is not None:heapq.heappush(pending,following)
         if not accepted:result.extend(group);continue
@@ -321,7 +338,15 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
                 adjacent = following.vram == target and not following.vram%16 and is_frame(following.lines[0].word)
                 scheduler = (not following.vram%8 and any(is_frame(line.word) for line in following.lines[:3])
                              and calls_current_thread_dispatch(image, target, previous.vram, segments, order))
-                if not (adjacent or scheduler):
+                # A separate SDK leaf can follow the exception fallback when
+                # the thread destroyer lives elsewhere in the same mapping.
+                interrupt_leaf = (fn.rom == before and after-before == 4
+                                  and following.vram in direct_calls and not following.vram%16
+                                  and tuple(line.word for line in following.lines)
+                                  == (0x40086000, 0x2401fffe, 0x01014824, 0x40896000,
+                                      0x31020001, 0, JR_RA, 0)
+                                  and calls_current_thread_dispatch(image, target, previous.vram, segments, order))
+                if not (adjacent or scheduler or interrupt_leaf):
                     continue
             if looped and (following is None or following.vram not in direct_calls
                            or after-before != 4 and (after-before > HOLE or following.vram % 16)):
@@ -333,7 +358,7 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
                 next_is_entry = (following is not None and not following.vram%8 and following.vram in direct_calls
                                  and (is_frame(following.lines[0].word)
                                       or assembly_extent(image,following.rom,following.rom+following.size,
-                                                         following.vram,console,order)==following.size))
+                                                         following.vram,console,order,allow_cache=True)==following.size))
                 if after-before > LONG_ALIGNMENT or not (next_is_data or next_is_entry):
                     return False
                 candidates = b'|'.join(re.escape(addr.to_bytes(4,order))
@@ -374,8 +399,20 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
         if (leading_repeated_double(fn, following, image, order, segments, direct_calls)
                 and not referenced(fn)):
             dropped+=1;continue
+        if (fn.vram in data_only and predecessor is not None and owner(fn)==owner(predecessor)
+                and predecessor.lines[-2].word==JR_RA
+                and (not fn.lines[0].word or fn.size==8)):
+            recovered_data.append(DataSymbol(fn.name, fn.vram, fn.rom, fn.size, 'data'))
+            continue
+        if (fn.vram not in data_entry_targets and owner(fn)[0]>=0
+                and predecessor is not None and owner(fn)==owner(predecessor)
+                and default_color_word(fn, predecessor, following, image, order, references, direct_calls)):
+            recovered_data.append(DataSymbol(fn.name, fn.vram, fn.rom, 4, 'data'))
+            continue
         if ((terminal_data_alignment(fn, predecessor, image, order, segments)
-             or terminal_memory_ranges(fn, predecessor, image, order, segments)) and not referenced(fn)):
+             or terminal_halfword_data_alignment(fn, predecessor, image, order, segments)
+             or terminal_memory_ranges(fn, predecessor, image, order, segments)
+             or terminal_display_modes(fn, predecessor, image, order, segments)) and not referenced(fn)):
             dropped+=1;continue
         if zero_alignment(fn, previous):
             if fn.vram in data_only:
@@ -574,15 +611,56 @@ def split_alignment_after_leaf(functions, data, image, order, console, owner, se
     return result
 
 
+def _return_delay_alignment(end, following, mapping, lines, references, named, data):
+    """A branch from unentered alignment can imitate an entry into a stack pop."""
+    if (following is None or not 8 <= following-end <= 28 or (following+mapping)%32
+            or end-8 not in lines or lines[end-8].word != JR_RA
+            or lines[end-4].word >> 16 != 0x27bd or not 0 < lines[end-4].word & 0xffff < 0x8000
+            or any(symbol.rom is not None and symbol.rom < following and end < symbol.rom+symbol.size
+                   for symbol in data)):
+        return None
+    branch = None
+    for offset in range(end, following, 4):
+        if (offset+mapping in named or any(not end <= source < following
+                                          for source, _ in references.get(offset+mapping, ()))):
+            return None
+        word = lines[offset].word
+        if word & 0xfc1fffff == 8:
+            return None
+        if word>>26 not in (4, 5, 6, 7, 20, 21, 22, 23):
+            continue
+        delta = (word & 0xffff) - 0x10000
+        if branch is not None or not word & 0x8000 or offset+4+4*delta != end-4 or offset+8 > following:
+            return None
+        if lines[offset+4].word:
+            return None
+        branch = offset
+    return branch
+
+
 def multiword_alignment(functions, image, order, owner, named, references, direct_calls, data, segments, console):
-    """Find short unreachable tails left by 16-byte alignment of code."""
+    """Find short unreachable tails before aligned code entries."""
     gaps = set()
     entries = {(fn.rom, fn.vram): fn for fn in functions}
     for following in functions:
         if following.vram % 16 or owner(following)[0] < 0:
             continue
         segment = segments[owner(following)[0]]
-        for size in (4, 8, 12):
+        sizes = (4, 8, 12)
+        # Some objects align directly called entries to 32 bytes. Their
+        # unreachable suffix can look like a standalone loop to the splitter.
+        if following.vram % 32 == 0 and following.vram in direct_calls:
+            sizes += (16, 20, 24, 28)
+            # A reserved zero-filled area can follow a few leftover alignment
+            # words. The same return and incoming-reference checks still apply.
+            zero_start = following.rom
+            floor = max(segment.rom_start, zero_start-128)
+            while zero_start > floor and image[zero_start-4:zero_start] == bytes(4):
+                zero_start -= 4
+            zero_bytes = following.rom-zero_start
+            if zero_bytes >= 64:
+                sizes += tuple(range(zero_bytes, zero_bytes+29, 4))
+        for size in sizes:
             start = following.rom - size
             address = following.vram - size
             if start - 8 < segment.rom_start or int.from_bytes(image[start-8:start-4], order) != JR_RA:
@@ -647,7 +725,7 @@ def multiword_alignment(functions, image, order, owner, named, references, direc
     return gaps
 
 
-def assembly_extent(image, start, end, vram, console, order):
+def assembly_extent(image, start, end, vram, console, order, *, allow_cache=False):
     """A closed assembly body can span generated fragments even without a C-compatible frame."""
     from ..arch.mips_gaps import extent
 
@@ -660,9 +738,13 @@ def assembly_extent(image, start, end, vram, console, order):
     body = image[start:start+size]
     # ERET resumes the saved exception context; the following bytes can be
     # a separate cleanup entry even when a simple direct-flow walk continues.
-    if any(word==0x42000018 for word, in struct.iter_unpack('>I' if order=='big' else '<I',body)):
+    words = [word for word, in struct.iter_unpack('>I' if order=='big' else '<I',body)]
+    if 0x42000018 in words:
         return None
-    return size if console.asm_reason(body) else None
+    # The SDK cache routines have multiple closed exits and use the cache
+    # instruction even where the console's whole-function classification is unset.
+    cache = allow_cache and any(word>>26==47 for word in words)
+    return size if cache or console.asm_reason(body) else None
 
 
 def recover_segment_switch_data(functions, data, image, order, tables, protected, references, log):
@@ -794,22 +876,75 @@ def buffer_write_evidence(functions, image, console, *, check):
 
 
 def address_word_references(fn, references, lines):
-    """Every symbolic use must be a matching LUI or a direct word load/store."""
-    high = ((fn.vram+0x8000)>>16)&0xffff
-    low = fn.vram&0xffff
+    """Every symbolic use must be a matching LUI or a typed memory access."""
     has_high = has_access = False
+    pattern = re.compile(r'%((?:hi|lo))\(' + re.escape(fn.name) + r'(?: \+ (0x[0-9a-fA-F]+))?\)')
     for offset,_ in references.get(fn.vram,()):
         line = lines.get(offset)
-        if line is None:
+        symbol = line and pattern.search(line.operands)
+        if not symbol:
             return False
-        word = line.word
-        if word>>26==15 and word&0xffff==high and f'%hi({fn.name})' in line.operands:
-            has_high = True
-        elif word>>26 in (35,43) and word&0xffff==low and f'%lo({fn.name})' in line.operands:
-            has_access = True
+        part, addend = symbol.groups()
+        shift = int(addend, 16) if addend else 0
+        # A zero base can label an array of globals. Keep the proof tied to
+        # an exact access to the base even when other references use a member.
+        if shift and (fn.lines[0].word or shift >= 64):
+            return False
+        address = fn.vram + shift
+        opcode = line.word>>26
+        immediate = line.word&0xffff
+        if part=='hi' and opcode==15 and immediate==((address+0x8000)>>16)&0xffff:
+            has_high |= not shift
+        elif part=='lo' and opcode in (32,33,35,36,37,40,41,43,49,57) and immediate==address&0xffff:
+            has_access |= not shift
         else:
             return False
     return has_high and has_access
+
+
+def default_color_word(fn, previous, following, image, order, references, direct_calls):
+    """A default RGBA word stored in a record before the next callable body."""
+    if (fn.size!=4 or fn.lines[0].word!=0xff or (fn.vram+4)%16
+            or previous.lines[-2].word!=JR_RA or following is None
+            or following.vram not in direct_calls or following.rom!=fn.rom+4
+            or following.vram!=fn.vram+4):
+        return False
+    uses = {at for at,_ in references.get(fn.vram, ())}
+    if len(uses)!=2:
+        return False
+    start, low = sorted(uses)
+    if low!=start+4 or start+28>len(image):
+        return False
+    hi, lo, first, second, third, fourth, assignment = struct.unpack_from(
+        '>7I' if order=='big' else '<7I',image,start)
+    if hi>>21!=0x1e0:
+        return False
+    value = hi>>16&31
+    base = first>>21&31
+    upper = ((fn.vram+0x8000)>>16)&0xffff
+    return (value!=0 and base!=0 and hi&0xffff==upper
+            and lo==(0x24000000|value<<21|value<<16|fn.vram&0xffff)
+            and (first,second,third,fourth,assignment)
+            == tuple(op|base<<21 for op in (0xa400000c,0xac000008,0xa4000014,0xa4000016,
+                                            0xac000004|value<<16)))
+
+
+def terminal_display_modes(fn, previous, image, order, segments):
+    """An all-ones marker and a zero before a table of display modes."""
+    end = fn.rom+8
+    if (fn.size!=4 or fn.lines[0].word!=0xffffffff or (fn.vram+8)%16
+            or previous is None or previous.size<8 or previous.lines[-2].word!=JR_RA
+            or previous.rom+previous.size!=fn.rom or previous.vram+previous.size!=fn.vram
+            or not 8<=fn.rom<end+48<=len(image) or any(image[fn.rom+4:end])):
+        return False
+    owners = [s for s in segments if s.rom_start<=fn.rom-8 and s.rom_end==end
+              and s.vram-s.rom_start==fn.vram-fn.rom]
+    if len(owners)!=1 or any(s.rom_start<end+48 and end<s.rom_end for s in segments):
+        return False
+    rows = tuple(struct.iter_unpack('>4H' if order=='big' else '<4H',image[end:end+48]))
+    return (len({height for _,height,_,_ in rows})>=3
+            and all(width==640 and height in (240,480,720) and field==511 and not reserved
+                    for width,height,field,reserved in rows))
 
 
 def leading_repeated_double(fn, following, image, order, segments, calls):
@@ -873,22 +1008,51 @@ def terminal_data_alignment(fn, previous, image, order, segments):
 
 def calls_current_thread_dispatch(image, target, dispatcher, segments, order):
     """Verify the self-destroy path from the running-thread load to its dispatch."""
-    owners = [segment for segment in segments if segment.contains(target, 0xd8)]
+    owners = [segment for segment in segments if segment.contains(target, 51*4)]
     if len(owners) != 1:
         return False
-    start = target-owners[0].vram+owners[0].rom_start
-    if not 0 <= start <= len(image)-0xd8:
-        return False
-    words = struct.unpack_from('>54I' if order == 'big' else '<54I', image, start)
+    owner = owners[0]
+    start = target-owner.vram+owner.rom_start
     # On a null argument it loads the current thread into s0. The matching
-    # global is loaded again just before the only conditional dispatch call.
-    if (words[0] != 0x27bdffe0 or words[2] != 0x00808021 or words[6] != 0x16000004
-            or words[8]>>16 != 0x3c10 or words[10]>>16 != 0x8e10 or words[8]&0xffff != words[41]&0xffff
-            or words[41]>>16 != 0x3c02 or words[42]>>16 != 0x8c42 or words[10]&0xffff != words[42]&0xffff
-            or words[43:45] != (0x16020003,0) or words[46] != 0 or words[-2:] != (JR_RA,0x27bd0020)):
+    # global is loaded again before the conditional dispatch call.
+    for index, length in ((38, 51), (41, 54)):
+        if not 0<=start<=len(image)-length*4 or not owner.contains(target,length*4):
+            continue
+        words = struct.unpack_from(f'{">" if order=="big" else "<"}{length}I',image,start)
+        high, load, branch, delay, call, call_delay, next_word = words[index:index+7]
+        if (words[0]!=0x27bdffe0 or words[2]!=0x00808021 or words[6]!=0x16000004
+                or words[8]>>16!=0x3c10 or words[10]>>16!=0x8e10
+                or high>>16!=0x3c02 or load>>16!=0x8c42 or high&0xffff!=words[8]&0xffff
+                or load&0xffff!=words[10]&0xffff or (branch,delay,call_delay)!=(0x16020003,0,0)
+                or words[-2:]!=(JR_RA,0x27bd0020) or call>>26!=3):
+            continue
+        if index==38 and (words[9]>>26!=2 or words[11]>>16!=0x9603
+                          or next_word>>26!=3 or words[index+7]!=0x02202021):
+            continue
+        if index==41 and next_word!=0:
+            continue
+        if (((target+(index+5)*4)&0xf0000000)|((call&0x3ffffff)<<2))==dispatcher:
+            return True
+    return False
+
+
+def terminal_halfword_data_alignment(fn, previous, image, order, segments):
+    """Keep an unentered final scalar word ahead of an aligned halfword table in data."""
+    end = fn.rom+4
+    if (fn.size != 4 or fn.lines[0].word>>26 != 11 or (fn.vram+4)%16
+            or previous is None or previous.size<8 or previous.lines[-2].word != JR_RA
+            or previous.rom+previous.size != fn.rom or previous.vram+previous.size != fn.vram
+            or not 8<=fn.rom<end+80<=len(image)):
         return False
-    call = words[45]
-    return call>>26 == 3 and (((target+184)&0xf0000000)|((call&0x3ffffff)<<2)) == dispatcher
+    owner = [s for s in segments if s.rom_start<=fn.rom-8 and s.rom_end==end
+             and s.vram-s.rom_start==fn.vram-fn.rom]
+    if len(owner)!=1 or any(s.rom_start<end+80 and end<s.rom_end for s in segments):
+        return False
+    record = struct.unpack_from('>12I' if order=='big' else '<12I', image, end)
+    indices = struct.unpack_from('>8I' if order=='big' else '<8I', image, end+48)
+    return (record[:7]==(0,0,0x8000,0x8000,0x4000,0x4000,0)
+            and record[9:]==(0,0,0) and indices[:2]==(1,2)
+            and all(1<=b-a<=2 for a,b in zip(indices,indices[1:])))
 
 
 def terminal_memory_ranges(fn, previous, image, order, segments):

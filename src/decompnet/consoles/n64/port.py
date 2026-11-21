@@ -8,7 +8,9 @@ to read the microcode a game loads.
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from pathlib import Path
 
 from .. import PortKit, PortRuntime
@@ -225,6 +227,20 @@ def _quote(text: str) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+
+def rt64_adapter() -> Path | None:
+    """The explicitly configured development adapter for Apple desktop Play."""
+    if sys.platform != "darwin":
+        return None
+    from ... import toolchains
+
+    local = toolchains.root() / "rt64-adapter/libdecompnet-rt64.dylib"
+    bundled = Path(sys.executable).parent.parent.parent / "Frameworks/rt64/libdecompnet-rt64.dylib"
+    override = os.environ.get("DECOMPNET_RT64_ADAPTER")
+    candidates = (Path(override).expanduser(),) if override else (bundled, local)
+    return next((library for library in candidates if library.is_absolute() and library.is_file()), None)
+
+
 KIT = PortKit(
     name="libultraship and Torch",
     summary="libultra's API, a renderer for the game's display lists, input and saves (libultraship); the assets "
@@ -241,13 +257,15 @@ KIT = PortKit(
     wasm=Path(__file__).parent / "port_wasm",
     runtimes=(
         PortRuntime("wasm", "WebAssembly",
-                    "The game's C as the N64's, compiled to WebAssembly and run by decompdecomp's own stand-in for "
-                    "the console: plays before the native port's steps are done.", built=True),
+                    "decompdecomp’s built-in graphics, audio, input, and N64 services.",
+                    modes=("compatibility",), built_for=("compatibility",)),
         PortRuntime("libultraship", "libultraship",
-                    "A native port: libultra's API and a renderer on Metal, OpenGL or DirectX (Fast3D), with the "
-                    "game's assets extracted from your ROM by Torch.", needs=("code", "compiles", "links", "assets")),
+                    "libultra APIs and Fast3D graphics, with the game’s assets extracted by Torch.",
+                    needs=("code", "compiles", "links", "assets"), modes=("compatibility", "direct")),
         PortRuntime("n64modernruntime", "N64ModernRuntime",
-                    "A native port: real libultra threads and timers, the RT64 renderer, the ROM read as it runs "
-                    "(on macOS RT64 needs Xcode's Metal compiler).", needs=("code", "compiles", "links")),
+                    "libultra threads and timers, RT64 graphics, and ROM access at runtime.",
+                    needs=("code", "compiles", "links"), modes=("compatibility", "direct"), native_adapter=rt64_adapter,
+                    compatibility_summary="RT64 graphics in a Metal window, with decompdecomp’s game execution, "
+                                          "input, audio, and saves."),
     ),
 )

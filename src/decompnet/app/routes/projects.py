@@ -65,7 +65,7 @@ def register(app: App) -> None:
                         return fn(slug, request, data)  # Metadata is published by autosave, without another recheck here.
                     if request.method == "POST" and request.url.path in (
                         '/api/try', '/api/cross-game/run', '/api/reconcile-matches', '/api/reimport',
-                        '/api/permuter/function', '/api/deep-permuter', '/api/play-export', '/api/port-export-options', '/api/recompile',
+                        '/api/permuter/function', '/api/deep-permuter', '/api/play', '/api/play-export', '/api/port-export-options', '/api/recompile',
                     ):
                         return fn(slug, request, data)  # The worker synchronizes; return its job without waiting.
                     if request.method == "GET" or request.url.path == "/api/permuter/pass":
@@ -325,20 +325,30 @@ def register(app: App) -> None:
         from ...port import call_fixes
         return {"job": jobs.start("fix-calls", lambda log: call_fixes.fix(net, slug, log), project=slug)}
 
+    def require_port_build(data):
+        if data.get("build_mode", "compatibility") != "compatibility" or data.get("runtime", "wasm") != "wasm":
+            raise NetworkError("Choose N64 compatibility and the decompdecomp runtime to play or export today.")
+
     def p_play(slug, request, data):
         """Build the game for the PC and run it with its live view in the browser (port/wasm/play.py), in the
         background; Stop ends it."""
         from ...port.wasm import play
         if data.get("stop"):
             return {"stopped": play.stop(slug)}
-        if data.get("runtime", "wasm") != "wasm":
-            raise NetworkError(f"Play runs the WebAssembly build only for now; {data['runtime']} is planned "
-                               "(ROADMAP.md, Ports): choose WebAssembly")
-        if (url := play.running(slug)):
-            return {"url": url}
+        runtime = data.get("runtime", "wasm")
+        if data.get("build_mode", "compatibility") != "compatibility":
+            require_port_build(data)
+        adapter = play.native_adapter(net, slug, runtime) if runtime != "wasm" else None
+        if (view := play.running_result(slug)):
+            if bool(adapter) == view.get("native", False):
+                return view
+            raise NetworkError("Stop the running game before switching runtimes.")
         if (building := jobs.active(("play",), project=slug)):  # a second click, or another window: the same build
             return {"job": building["id"]}
-        return {"job": jobs.start("play", lambda log: play.play(net, slug, log), project=slug)}
+        def launch(log):
+            return play.play(net, slug, log, adapter=adapter) if adapter else play.play(net, slug, log)
+
+        return {"job": jobs.start("play", launch, project=slug)}
 
     def port_export_options(slug, request, data):
         """Save export targets in the project database and discover an active export before port readiness scans."""
@@ -374,6 +384,7 @@ def register(app: App) -> None:
             why = hostenv.open_folder(folder)
             return {"ok": why is None, "message": why}
 
+        require_port_build(data)
         if "targets" in data:
             targets = export.target_selection(data["targets"])
             if not any(target in export.KINDS for target in targets):
@@ -710,7 +721,7 @@ def register(app: App) -> None:
             name = str(data.get('name', ''))
             observer = watch(name, log.progress) if log is not None else nullcontext()
             with observer, net.progress.foreground():
-                agent, _ = net.local_agent("you")
+                agent, _ = net.local_agent(_holder(data))
                 res = net.attempt(agent, name, str(data.get("source", "")), slug, publish=False)
                 return {"score": res["score"], "matched": res["matched"], "exact": res.get('exact',False),
                         "new_match": res.get('new_match',False), "adopted": res.get('adopted',False),
@@ -737,8 +748,28 @@ def register(app: App) -> None:
                 if snapshot['state']!='running':raise NetworkError(snapshot.get('error') or 'Attempt ended without a result.')
             time.sleep(.05)
 
+    def _holder(data):
+        """Who a CLI judges as: "you" (the window), or a named holder such as one match-function session
+        ("claude-<id>"), so two sessions working at once each hold their own claim instead of sharing yours."""
+        holder = str(data.get("holder") or "")
+        if not holder:
+            return "you"
+        if len(holder) > 40 or not all(c.isalnum() or c in "-_." for c in holder):
+            raise NetworkError("A holder is up to 40 letters, digits, '-', '_' or '.'.")
+        return holder
+
+    def p_claim(slug, request, data):
+        """A CLI claims a function, as "you" or a named holder (_holder): the named one, or with no name an open
+        function nobody holds, picked by `strategy` (random by default), so parallel sessions never share one."""
+        agent, _ = net.local_agent(_holder(data))
+        name = str(data.get("name") or "") or None
+        fn = net.claim_row(agent, slug, name, str(data.get("strategy") or "random"))
+        if fn is None:
+            raise NetworkError("No open function is left to claim in this project.")
+        return {"name": fn["name"], "holder": agent.name}
+
     def p_release(slug, request, data):
-        agent, _ = net.local_agent("you")
+        agent, _ = net.local_agent(_holder(data))
         try:
             net.release(agent, str(data.get("name", "")), "", slug)
         except NetworkError:
@@ -1039,7 +1070,11 @@ def register(app: App) -> None:
             with jobs._lock:
                 last = jobs.jobs.get(function_searches.get((slug, name)))
             return {'job': last['id'] if last and last['state'] == 'running' else None, 'last': last}
-        return {'job': start_search(slug, str(data.get('name', '')), data.get('minutes', 10), data.get('variants', 500))}
+        # The older /api/permuter/function route spells these `function` and `max_variants`. Sending those here used to
+        # start a search on function '' or silently cap it at 500 variants, so both spellings mean the same thing.
+        name = data.get('name') or data.get('function') or ''
+        variants = data.get('variants', data.get('max_variants', 500))
+        return {'job': start_search(slug, str(name), data.get('minutes', 10), variants)}
 
     def p_finish_near(slug, request, data):
         from .. import finish_near
@@ -1380,7 +1415,7 @@ def register(app: App) -> None:
         "/api/code-audit-results": (g_code_audit, ["GET"]), "/api/code-audit-review": (p_code_audit_review, ["POST"]),
         "/api/delete": (p_delete, ["POST"]),
         "/api/try/status": (g_try_status, ["GET"]),
-        "/api/try": (p_try, ["POST"]), "/api/release": (p_release, ["POST"]), "/api/claim/handover": (p_claim_handover, ["POST"]), "/api/reopen": (p_reopen, ["POST"]), "/api/setaside": (p_set_aside, ["POST"]),
+        "/api/try": (p_try, ["POST"]), "/api/release": (p_release, ["POST"]), "/api/claim": (p_claim, ["POST"]), "/api/claim/handover": (p_claim_handover, ["POST"]), "/api/reopen": (p_reopen, ["POST"]), "/api/setaside": (p_set_aside, ["POST"]),
         "/api/recheck": (p_recheck, ["POST"]),
         "/api/finish-near": (p_finish_near, ["POST"]),
         "/api/reconcile-matches": (p_reconcile_matches, ["POST"]),

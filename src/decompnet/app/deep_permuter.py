@@ -338,12 +338,10 @@ class Search(Permuter):
             self.improvements += int(bool(result.get('applied')))
         return result
 
-    def operand_order_pass(self, agent, proj, fn, best, fork):
-        """Spend a few of the ordinary trials on a measured operand/register near miss."""
-        rows = self.winner_diff[0] if self.winner_diff else repair_ranking.evidence(self.net, fn['id'], agent.id)
+    def _local_proposals(self, source, proj, fn, rows):
+        """(proposals, loop_shapes): every local rewrite the library offers for `source`, most promising first."""
         from . import generation_calls
 
-        source = _candidate_source(fn, best)
         header = self.net._context(proj['id'], fn['unit'])['header']
         asm = dict(fn).get('asm') or ''
         arch, name = proj['arch'], fn['name']
@@ -359,8 +357,13 @@ class Search(Permuter):
                  (L + 'word_byte_loop_carrier.variants', (source, name, arch, asm)),
                  (L + 'counter_derived_loop_offset.masked_byte_stride_variants', (source, name, arch, asm)),
                  (L + 'counter_derived_loop_offset.variants', (source, name, arch, asm)),
+                 # m2c's byte offsets beside guarded counters, indexed by the counter again (and one shared
+                 # counter, guarded on itself), the pseudo layout GCC 2.x's strength reduction gives
+                 (L + 'guarded_offset_index.variants', (source, name, arch, asm)),
                  (L + 'stack_byte_loop_base.variants', (source, name, arch, asm, header)),
-                 (L + 'unsigned_rate_division_scope.variants', (source, name, arch, asm, header))]
+                 (L + 'unsigned_rate_division_scope.variants', (source, name, arch, asm, header)),
+                 (L + 'join_initializer_sink_repairs.variants', (source, name)),
+                 (L + 'branch_polarity_repairs.variants', (source, name))]
         zero_bound = None
         if arch == 'mips' and '%lo(' in asm:
             rename = getattr(self.net, 'rename_tokens', None)
@@ -382,7 +385,13 @@ class Search(Permuter):
                       (L + 'near_match_repairs.float_update_order', (source, name, header)),
                       (L + 'near_match_repairs.variants', (source, name)),
                       (L + 'target_local_repairs.value_lifetimes', (source, name))]
+        # Which values a function's loops keep in saved registers: local pointers to globals, one temporary shared
+        # by every loop, a do-while counter loop (decomp-repair 0.5.162). Offered first when registers dominate.
+        shapes = register or permuter_focus.register_dominant(rows)
+        if shapes:
+            calls.insert(0, (L + 'block_register_repairs.variants', (source, name)))
         results = [generation_calls.pairs(result) for result in generation_calls.library(calls)]
+        loop_shapes = results.pop(0) if shapes else []
         if register:
             results[-2] = [(family, child) for family, child in results[-2] if family == 'arithmetic_operand_order']
         proposals = []
@@ -391,8 +400,17 @@ class Search(Permuter):
                 proposals = result + proposals  # linked-case zero-bound labels go before the rest
             else:
                 proposals += result
+        proposals = loop_shapes + proposals
+        return proposals, loop_shapes
+
+    def operand_order_pass(self, agent, proj, fn, best, fork):
+        """Spend a few of the ordinary trials on a measured operand/register near miss."""
+        rows = self.winner_diff[0] if self.winner_diff else repair_ranking.evidence(self.net, fn['id'], agent.id)
+        source = _candidate_source(fn, best)
+        proposals, loop_shapes = self._local_proposals(source, proj, fn, rows)
         seen = {source}
-        limit = min(6, (self.limit - self.tested) // 2)
+        limit = min(6 + min(len(loop_shapes), 12), (self.limit - self.tested) // 2)
+        frontier = []
         for family, child in proposals:
             if limit <= 0:
                 break
@@ -405,6 +423,40 @@ class Search(Permuter):
             limit -= 1
             if score is not None and score < best:
                 return score
+            if score is not None:
+                frontier.append((score, child, family))
+        return self._combined_step(agent, proj, fn, best, fork, rows, frontier, seen)
+
+    COMBINED_TOLERANCE = 2.0   # a first step may score up to this times the best and still be half of a pair
+    COMBINED_PARENTS = 3       # nearest non-improving children to build on
+    COMBINED_BUDGET = 12       # compiles for the whole second step
+
+    def _combined_step(self, agent, proj, fn, best, fork, rows, frontier, seen):
+        """Rewrites that are each no better alone but win together.
+
+        A hand match needed three changes at once (a constant sunk to its join, written as its literal, its stores
+        typed `u8`); one at a time every step scored the same or worse, so a search that keeps only improvements
+        never reaches the pair. Take the few children that compiled nearest the best and run the same rewrites on them."""
+        if not best or not frontier:
+            return best
+        budget = min(self.COMBINED_BUDGET, (self.limit - self.tested) // 2)
+        near = sorted((item for item in frontier if item[0] <= best * self.COMBINED_TOLERANCE), key=lambda item: item[0])
+        for _, parent, first in near[:self.COMBINED_PARENTS]:
+            if budget <= 0:
+                break
+            proposals, _ = self._local_proposals(parent, proj, fn, rows)
+            for family, child in proposals:
+                if budget <= 0:
+                    break
+                if child in seen:
+                    continue
+                seen.add(child)
+                self.check()
+                with repair_trial({'kind': 'deep local repair', 'family': f'{first}+{family}'}):
+                    score = self._score(agent, proj, fn, child, best, fork)
+                budget -= 1
+                if score is not None and score < best:
+                    return score
         return best
 
     def stub_note(self):
@@ -417,7 +469,7 @@ class Search(Permuter):
         return stub_message(found) if found else ''
 
     def loop_vector_shape_pass(self, agent, proj, fn, best, fork):
-        """Climb through the loop and vector-update shapes that only help together (decomp-repair 0.5.130).
+        """Climb through the loop, vector-update and scheduling-boundary shapes that only help together (0.5.130, 0.5.187).
 
         Indexed element access, `const` on read-only locals and sums-then-stores for a vector's components each
         left a 2,122-instruction function's score nearly unchanged alone and gained a hundred instructions in
@@ -435,7 +487,11 @@ class Search(Permuter):
             for _, parent in frontier:
                 proposals = [pair for result in generation_calls.library([
                     ('decomprepair.loop_vector_shapes.variants', (parent, fn['name'], proj['arch'])),
-                    ('decomprepair.statement_interleave.variants', (parent, fn['name'], proj['arch']))])
+                    ('decomprepair.statement_interleave.variants', (parent, fn['name'], proj['arch'])),
+                    # a do { } while (0) boundary in the last straight-line run (decomp-repair 0.5.187): a display
+                    # list function stuck at 60 under every source order matched once split, only with its call's
+                    # global hoisted first, so the proposals are the pair, not two steps a beam would drop
+                    ('decomprepair.scheduling_scope.variants', (parent, fn['name'], proj['arch']))])
                     for pair in generation_calls.pairs(result)]
                 for family, child in proposals:
                     if child in seen or budget <= 0:
@@ -597,14 +653,25 @@ class Search(Permuter):
 
             store = self.net.project_store(proj['id'])
             header = self.net._context(proj['id'], fn['unit'])['header']
-            prototypes = ((candidate, 'Repaired a conflicting return type in the candidate.')
+            prototypes = ((candidate, 'Repaired a conflicting return type in the candidate.', None)
                           for candidate in variants(fn['best_source'], fn['name'], header))
-            saved = ((canonical_source(fn, source), 'Recovered a baseline from a saved attempt.')
+            saved = ((canonical_source(fn, source), 'Recovered a baseline from a saved attempt.', None)
                      for source in deep_source_recovery.saved_sources(
                          store, deep_source_recovery.saved_attempts(store, fn['id'])))
             seen = {fn['best_source']}
             attempts = measured[1]
-            for candidate, message in chain(prototypes, saved):
+            targeted = []
+            if proj['arch'] == 'mips':
+                from decomprepair import draft_call_recovery
+
+                toolchain = compiler_for(self.net.cfg(proj), fn['vram'], fn).get('toolchain')
+                def resolve(symbol):
+                    return self.net.symbols(proj['id']).resolve(symbol)
+
+                targeted = [(candidate, 'Recovered a source shape in the saved MIPS draft.', family)
+                            for family, candidate in draft_call_recovery.baseline_variants(
+                                fn['best_source'], fn['name'], fn['asm'], header, toolchain, resolve=resolve)]
+            for candidate, message, family in chain(targeted, prototypes, saved):
                 if candidate in seen or candidate_quality.reported_source(self.net, fn, candidate):
                     continue
                 if self.tested >= self.limit:
@@ -613,7 +680,9 @@ class Search(Permuter):
                 seen.add(candidate)
                 state.add(variants=1, repairs=1)
                 attempts += 1
-                score = self._score(agent, proj, fn, candidate, float('inf'), fork)
+                scope = repair_trial({'kind': 'deep local repair', 'family': family}) if family else nullcontext()
+                with scope:
+                    score = self._score(agent, proj, fn, candidate, float('inf'), fork)
                 fresh = self.net._function(fn['name'], proj['slug'])
                 if score is not None and fresh['status'] == 'open' and fresh['best_source'] == fn['best_source']:
                     # The old percentage described C which no longer compiles. Retain that source in
@@ -709,6 +778,54 @@ class Search(Permuter):
                 return score
         if tried >= 4:
             self.register_focus = True
+        return best
+
+    PAIRED_ROUNDS = 3
+
+    def paired_move_pass(self, agent, proj, fn, state, best, fork):
+        """Two statement moves at once, judged exactly in parallel (paired_moves).
+
+        A near-match whose registers and order need two relocations together sits at a local minimum for a search
+        that tries one move at a time. This judges every single move, expands the least-bad ones by a second move,
+        and re-judges the best through the ordinary path so it is saved and verified. Judgments through the pool are
+        a cheap prefilter: a batch of 50 counts as one trial against the variant limit."""
+        from . import judge_pool, paired_moves
+        for _ in range(self.PAIRED_ROUNDS):
+            rows = self.winner_diff[0] if self.winner_diff else ()
+            if fork or not best or not rows or not paired_moves.worth(rows):
+                return best
+            if self.limit - self.tested < 4 or self.deadline - time.monotonic() < 90:
+                return best
+            fn = self.net._function(fn['name'], proj['slug'])
+            source = _candidate_source(fn, best)
+            header = self.net._context(proj['id'], fn['unit'])['header']
+            own = compiler_for(self.net.cfg(proj), fn['vram'], fn)
+            flags = own['flags'].split() if isinstance(own['flags'], str) else own['flags']
+            self.phase = 'two-move search'
+            self.log('Searching two statement moves at once: every single move is judged, then a second move on '
+                     'the least-different results.')
+            with judge_pool.JudgePool(proj['slug'], fn, own['toolchain'], flags) as pool:
+                score, candidate, judged = paired_moves.search(
+                    pool.judge_many, source, fn['name'], header, best, seen=self.local_seen, check=self.check,
+                    log=self.log)
+                if pool.errors:
+                    self.log('Two-move search could not judge here: ' + pool.errors[0][:200])
+            self.tested += max(1, judged // 50)
+            self.report()
+            if candidate is None:
+                self.log(f'Two-move search: {judged} candidates judged, none better than {best}.')
+                return best
+            self.local_seen.add(candidate)
+            with repair_trial({'kind': 'deep local repair', 'family': 'paired_statement_moves'}):
+                measured = self._score(agent, proj, fn, candidate, best, fork)
+            if measured is None or measured >= best:
+                self.log(f'Two-move search found {score} in the pool but the ordinary judge gave {measured}; '
+                         'keeping the saved source.')
+                return best
+            self.log(f'Two-move search improved {best} to {measured} ({judged} candidates judged).')
+            best = measured
+            if best == 0:
+                return 0
         return best
 
     def allocation_choices(self, proj, fn, source, rows, choices, labels, header, fork):
@@ -826,6 +943,7 @@ class Search(Permuter):
         layout_probes=0
         expanded = set()
         residual_bursts = 0
+        residual_frame_followups = 0
         counters = {'compile_failed': 0, 'frontier_pruned': 0, 'depth_limit': 0}
         self.local_status = {'reason': 'searching', **counters}
         while best > 0:
@@ -890,6 +1008,11 @@ class Search(Permuter):
                     resolve=resolve_symbol, symbols=symbol_table,
                     read_data=read_data if hasattr(self.net,'reader') and resolve_symbol else None)
                     if child not in self.local_seen]
+            from . import residual_trials
+            if not fork and proj['arch'] == 'mips' and self.measured_winner(fn, source):
+                targeted = residual_trials.proposals(source,fn['name'],header,rows,net=self.net,proj=proj,fn=fn)
+                observed_choices = [(family,child) for family,child in targeted
+                                    if child not in self.local_seen] + observed_choices
             observed_order = {child:index for index,(_,child) in enumerate(observed_choices)}
             focused_choices = observed_choices + buffer_choices + store_choices + frame_choices
             focused_pass = bool(focused_choices)
@@ -1011,7 +1134,8 @@ class Search(Permuter):
                 frame_prefix=[c for _,c in progressed if c in frame_sources]
                 dispatch_prefix=[c for family,c in progressed if family in {'effectful_dispatch_specialization','narrow_snapshot_branches'}][:4]
                 cross_prefix = [c for family,c in progressed if family in cross_function_repairs.FAMILIES]
-                queue = list(dict.fromkeys(cross_prefix+frame_prefix+complete+dispatch_prefix+[c for _,c in progressed]))
+                residual_prefix = [c for family,c in progressed if family in residual_trials.FAMILIES]
+                queue = list(dict.fromkeys(residual_prefix+cross_prefix+frame_prefix+complete+dispatch_prefix+[c for _,c in progressed]))
                 if loan:queue=feedback.continuation(source,queue,labels,self.local_seen)
                 lane = getattr(self, "parallel_lane", None)
                 if lane is not None:
@@ -1127,6 +1251,17 @@ class Search(Permuter):
                                          else repair_ranking.evidence(self.net, fn['id'], agent.id))
                         if getattr(self, '_trial_reused', False) and not measured_rows:
                             continue
+                        if (labels.get(candidate) == residual_trials.residual_source_repairs.FRAME
+                                and residual_frame_followups < 2 and score <= best*2):
+                            for family,child in residual_trials.followups(candidate,fn['name'],header,parent_rows,measured_rows):
+                                if child in self.local_seen or child in queue:
+                                    continue
+                                labels[child] = family
+                                parents[child] = (candidate,measured_rows,parent_path+[labels[candidate]])
+                                queue.insert(0,child)
+                                residual_frame_followups += 1
+                                if residual_frame_followups == 2:
+                                    break
                         alternatives.offer(candidate, score, measured_rows, arch=proj['arch'], baseline=parent_rows, baseline_score=best)
                         if not any(n['source'] == candidate for n in alternatives.nodes):
                             counters['frontier_pruned'] += 1
@@ -1554,6 +1689,15 @@ def _full_run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, 
             reason = 'Identified and set aside as SDK library code'
             log(reason)
             return {'matched': False, 'tested': 0, 'reason': reason}
+    twins = getattr(net, 'twins', None) if slug not in net.links else None
+    if fn['status'] == 'open' and twins is not None:
+        log.check_cancel()
+        with looking(net):
+            why = twins.set_aside_function_asm(net.project_row(slug), fn)
+        if why:
+            reason = f'Set aside as assembly, no compiler makes this code: {why}'
+            log(reason)
+            return {'matched': False, 'tested': 0, 'reason': reason}
     lock = net.__dict__.setdefault('_deep_run_locks', {}).setdefault(fn['id'], threading.Lock())
     if not lock.acquire(blocking=False):
         raise NetworkError('A deep search is already running for this function.')
@@ -1666,6 +1810,14 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
     source = _candidate_source(fn, fn['best_score'])
     for hint in hints(source, name, fn['asm'], proj['arch'], repair_ranking.evidence(net, fn['id'], agent.id)):
         log('Source check (advisory): '+hint)
+    if lane is None or lane.index == 0:
+        try:  # the saved best's register swaps, explained by the compiler's own allocation priorities
+            from .allocation_priority import hints as allocation_hints
+            best_diff = net.function_diff(slug, name, 'best')
+            for hint in allocation_hints(net, proj, fn, net._context(proj['id'], fn['unit'])['header'], source, best_diff.get('rows')):
+                log('Allocation check (advisory): '+hint)
+        except Exception:  # (advice only: a search never fails for want of it)
+            pass
     try:
         # Explicitly configured local source carries real records/macros and original line breaks.
         # Try it before mutating an accumulated machine draft; never fetch a reference automatically.
@@ -1720,6 +1872,9 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
                 relabel = baseline and not fork and search.can_relabel_switch(fn)
                 if baseline and not relabel and (lane is None or lane.index == 0):
                     baseline = search.near_register_pass(agent, proj, fn, state, baseline, fork)
+                    fn = net._function(name, slug)
+                if baseline and not fork and not relabel and (lane is None or lane.index == 0):
+                    baseline = search.paired_move_pass(agent, proj, fn, state, baseline, fork)
                     fn = net._function(name, slug)
                 if baseline and not fork and not relabel and (lane is None or lane.index == 0):
                     if profile := deep_profiles.tail_dispatch(net, proj, fn):
@@ -1831,6 +1986,9 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
         from . import deep_handoff
         current = net._function(name, slug)
         if search.measured_winner(current, current['best_source']):
+            if proj['arch'] == 'mips' and not fork:
+                from . import targeted_retry
+                result['targeted_retry'] = targeted_retry.snapshot(search.winner_source, search.winner_diff[0])
             if deep_handoff.save(net, proj, current, search.winner_source, search.winner_diff[0]):
                 log('Saved the measured residual for the next agent claim.')
     result['compiler_profiles'] = compiler_profiles

@@ -1,5 +1,164 @@
 # Compiler matching learning log
 
+### IDO 7.1 rejects byte arithmetic on void pointers
+
+An isolated N64 replay used `ido-7.1 -O2 -mips2 -G 0 -non_shared -Xcpluscomm
+-Wab,-r4300_mul -woff 649,838,712`. Four machine drafts failed to compile
+because m2c added literal byte offsets to `void *` parameters and cursors.
+Casting each base to `unsigned char *` made simple assignments and stores
+through pointers compile. One draft also needed to expand `p += n` to
+`p = (unsigned char *) p + n`. Fixing only the simple assignments left that
+draft blocked. All four passed compilation and received linked scores
+(14059, 4109, 3915 and 7149) through deep-permuter source recovery.
+These were scored starting points for search.
+
+### KMC GCC 2.7.2: branch directly to shared floating-point returns
+
+An isolated N64 replay used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`.
+The saved draft was one opcode off at score 200. The target used `bne` while
+the compiler emitted `bnel` with the same operands and zero-return delay slot.
+An instrumented scheduler showed that a temporary liveness marker for the
+later floating-point return's value of one kept the return register live on
+the integer branch's fallthrough path.
+
+Replacing every assignment into the shared Boolean return with a direct
+branch to the same two constant return labels preserved all predicates,
+including their behavior on NaNs. The unchanged compiler and linked judge
+verified score zero. Rewriting only the integer guard or separating one
+floating-point path did not produce an exact match.
+
+### KMC GCC 2.7.2: publish the advanced command cursor
+
+An isolated N64 replay used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`.
+The target advanced a cursor before its relocated global store. The C
+published the old cursor and advanced only its local copy. Publishing the
+advanced pointer improved the linked score from 715 to 675. Swapping which
+zero-valued local was initialized outside a guarded assignment reduced
+the score to 665. The false path returns or overwrites both locals before
+using them. The zero-initializer change on its own scored 705. Reusing an
+existing local to capture the relocated state pointer in a one-shot scope
+improved 665 to 510. The later reload remained in place. The linked result
+is a partial match.
+
+### KMC GCC 2.7.2: narrow a word where the byte or halfword is used
+
+An isolated N64 replay used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`.
+An inline helper narrowed a temporary on assignment, while the target
+retained the word and narrowed it separately for a table index and an
+equality test. Moving the cast to those reads improved the linked score
+from 650 to 405. Moving a separate random-result mask down to its
+immediately following remainder operand improved 405 to 385. That
+second change alone scored 630. The saved result is partial.
+
+### KMC GCC 2.7.2: share a byte-store constant with a signed divide
+
+An isolated N64 replay used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`.
+The target used one positive 255 register for byte stores and a signed
+division. The draft stored through signed byte pointers, so GCC hoisted
+minus one for the stores and loaded 255 again for division. Writing the
+same three byte values through unsigned pointers brought the linked score
+from 385 to 230. The target incremented the loop counter in the delay slot
+of the null-result branch and stored the halfword initializer in the
+successful path's call delay slot. An explicit null-result increment and
+continue, a one-shot scope around the successful iteration's increment,
+and moving the halfword initializer before the call brought the linked
+score to zero. Reordering the initializer alone did not improve the draft.
+
+### KMC GCC 2.7.2: shorten expression lifetimes in a 3-by-3 float grid
+
+An isolated N64 replay used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`.
+Writing the grid in row-major source order, inlining its single-use
+addition and subtraction temporaries, and removing an unused double
+array moved the linked score from 432 to 110. The compiler then saved
+all five floating-point register pairs observed in the target. Swapping
+the operands of one remaining shared multiply brought the score to zero.
+Each of the three normalization changes scored worse on its own. The
+normalized draft with the unused array still present scored 140.
+
+### KMC GCC 2.7.2: a local pointer for a repeated `&global` argument, scoped to the outer loop
+
+Compiler and flags: `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. One N64 function (about 490 instructions, a bit
+reader called with the same buffer address in every call), a 99% near miss of 465 in the judge. Source change:
+inside the outer loop, the repeated `&D_800E1310` argument became one local pointer assigned right before the loop;
+the nested goto loop and the call before the loop kept the constant. The judge's score went from 465 to 405 (the
+first loop's registers and the order of its setup matched; the remaining differences are elsewhere). Evidence level:
+one real function, measured in the judge. Not a controlled regression test.
+
+Why it matters: GCC 2.7's global allocation ranks pseudos by `floor_log2(n) * n / live length` (`-dl -dg` print each
+pseudo's use count, live length and register, and the order they were allocated in), where `n` counts each reference
+once more for every loop around it. A local pointer is a pseudo of its own, so where it sits in that order against
+the loop counters decides which counter gets which saved register. Written out again in a nested goto loop (which
+carries no loop notes, so it weighs less) the address is a constant the compiler rebuilds: using the local there too
+moved the counters the wrong way. Where the assignment sits matters too: two statements above the loop gave the
+matching order of the setup; right before the loop did not.
+
+Failed on the same function, so they needn't be tried again: naming the loop counters differently, giving each loop
+its own counter, `u16` counters without masks, declaring locals in another order, inlining the index and stride
+temporaries, spelling the address sums in other orders, structured loops in place of the goto loops, other compiler
+flags. None changed the registers.
+
+Library family: `loop_address_hoist` in decomp-repair 0.5.157 proposes it (every use; the uses outside the nested
+loops; one outer loop with and without its nested loops), with the assignment before the loop or up to two
+statements above it, for a global declared as a plain `extern T g;`.
+### KMC GCC 2.7.2: which loops share a counter variable (no match yet)
+
+Profile: `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. Evidence level: measured on one real near-miss function with a
+fast local compile against the target's words; **no match came of it yet**, and it is not a controlled regression.
+
+A counter variable is one pseudo for the whole function, so the loops that share `var_s1` give one saved register to
+all of them, and which counter outranks which depends on how many loops, weighted uses and instructions each spans
+(`floor_log2(uses) * uses / live length`, uses counted once more per loop around them). m2c names a few variables for
+the registers a binary used and shares them between loops; the game's own code had its own pairing. On a 493
+instruction function the role of each of the seven later-loop counters was searched over 62,500 combinations (the
+phase-one counters, the first later loop's, the nested loop's, the outer loop's and the four loops after it, each from
+a pool of five variables): most left the differing words at the starting 22, the rest moved them to 25, 38 or
+hundreds, and none went below 22. A bounded sample through the library family below, 24 variants of the same function,
+all compiled, 16 kept the instruction count, and the differing words ranged from 22 to 151. So pairing changes what
+the allocator sees; on this function it never changed it to the target's.
+
+A counter loop is a local integer set by a plain `v = <number>;` just before a `do`, `for`, `while` or goto loop and
+stepped and tested in it; every mention of the variable must lie in such a loop (set to read), or the variable is left
+alone, as is one whose address is taken. Operations, all renames: a later loop gets its own variable of the same type;
+one loop takes another same-typed counter whose loops don't overlap it; two such counters merge; two loops trade
+counters. (`block_temp_split` in decomp-repair 0.5.161 gives every loop its own variable at once.)
+
+Library family: `loop_counter_roles` in decomp-repair 0.5.163 (`loop_counter_fresh`, `_reassign`, `_merge`, `_swap`),
+singles before pairs, capped at 24, registered with the other local repairs. Proposals only; the byte judge decides.
+
+### KMC GCC 2.7.2: test a cursor loop at the bottom
+
+An isolated N64 replay used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`.
+The draft compared the bitwise AND of two ordering tests against one and
+advanced the cursor with an explicit continue. A byte-sized zero test in a
+bottom-tested loop let GCC use the target's branch-likely back edge, with
+the cursor update in its delay slot. The linked score moved from 350 to
+zero. The same byte test in the original infinite loop scored 410.
+
+### KMC GCC 2.7.2: preserve a call setup's allocation with an initialized guard
+
+An isolated N64 replay used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`.
+Duplicating the same straight-line call setup in two branches controlled by an
+initialized scalar parameter recovered eight saved-register differences and
+took the linked score from 40 to byte-exact. Both arms perform the same
+operations. Reordering declarations or adding `register` hints tied at 40.
+A randomized exact candidate used an uninitialized condition and was discarded.
+
+On another draft, using subtraction of a negated narrow scaled offset
+restored the order of the two `addu` operands and improved 205 to 200.
+The remaining difference was one `bne` versus `bnel` with the same delay
+slot. The focused zero-exit shapes did not recover it.
+
+### KMC GCC 2.7.2: retain a separately relocated record base
+
+An isolated N64 replay used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`.
+The draft based a group of writes on a nearby byte global. The target
+instead relocated the record's own address and loaded the byte at a
+negative displacement. Using the record symbol directly made GCC fold its
+address into each store and worsened the linked score from 290 to 1,480.
+Capturing the record's address with cancelling unsigned arithmetic around
+an initialized local kept the address in a register and scored zero.
+The exact result was verified with the linked ROM judge.
+
 ### KMC GCC 2.7.2: use fixed byte offsets within a record walk
 
 An isolated N64 replay used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`.
@@ -9,6 +168,33 @@ with base indices 1 and 2 improved the linked score from 14,888 to
 14,764. Correcting the matrix buffer and prototypes alone tied at
 14,888. The cursor rewrite reproduced the partial improvement on the
 original draft by itself.
+
+### KMC GCC 2.7.2: a float register swap that only an extra block insn fixes, and per-case temporaries
+
+A 2,426-instruction N64 cutscene interpreter (a 37-case switch with a 118-way sub-switch and a 56-entry update loop)
+matched byte for byte with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. This is a new match, judged exactly by the
+app, not a replay of an archived source. The earlier best was a two-case stub at score 240,235.
+
+- Which cases share a temporary decided most of the late progress. Giving each case its own copy of a length or
+  parameter local, and merging others into one shared local, took the diff from 275 differing instructions to 13.
+  Locals that every case assigns before it reads can be split or merged freely; the app now proposes both
+  (`case_temporary_split`, `case_temporary_merge`).
+- Four rows were left: in the three stacked cases that read a vector and add 180.0f to its second component,
+  the target held the constant in `$f0` and the reloaded component in `$f2`, and the compiler did the opposite. In
+  `local-alloc.c` the constant (4 refs over 6 insns) and the reload (4 refs over 8 insns) tie in
+  `floor_log2(refs) * refs / (death - birth)` terms once the sum is counted, so the quantity born first wins `$f0`.
+  Reordering statements, moving the `+= 180.0f`, a separate temporary, an offset local, a `const` byte pointer,
+  duplicate assignments and `__asm__("")` markers either changed nothing or moved the swap around. (Inline assembly is
+  refused by the app anyway.)
+- A zero-size marker that C can write fixed it: an unused `{ s64 wide = arg; }` at the top of that case. The
+  optimiser removes its move but the CLOBBER of the 64-bit pair stays through the first scheduling pass, which then
+  put the `arg >> 8` shift between the add and its store, lengthening the sum's life by one insn and giving the
+  constant `$f0`. A `s32`/`u32` local, an empty-struct initialiser and a union initialiser did not do this (the
+  latter two also changed the code size). `phantom_wide_local` proposes it at every block start.
+- Evidence level: exact match of the whole function, one function. Whether the original source had such a local is
+  unknown; the match proves only that the bytes agree. Removing the phantom local from the solved source and running
+  the new family finds the match among 294 proposals (2 of them, `long long` and `unsigned long long` at the same
+  site); all 294 and all 47 case-temporary proposals compile.
 
 ### KMC GCC 2.7.2: typed access at an inferred array stride
 
@@ -9871,3 +10057,1211 @@ Four previously uncompilable drafts matched all their bytes through fresh genera
 
 - With `ido-7.1 -O2 -mips2 -G 0 -non_shared -Xcpluscomm -Wab,-r4300_mul -woff 649,838,712`, making the pointers byte-sized compiled three drafts but left scores 640, 70, and 670. Two post-increment loads matched the 56-byte signed read. Restoring the wide result and staging the shift and mask of a variable-width read matched all 64 bytes. It scored 25 with neither unreachable staging statement, 10 or 15 with either one, and exact with both. Keeping the stored bytes and restoring the two incoming word-sized formals matched the 80-byte biased copy.
 - With `ido-7.1 -O2 -G 0 -mips2 -32 -non_shared -Xcpluscomm -Wab,-r4300_mul -DNON_MATCHING`, renaming an invalid local-label pointer declaration to the verified absolute function-symbol alias matched all 52 bytes. The C declaration remained a function pointer, and the two instruction words verified its slot address. Trying the data alias failed compilation.
+
+### A shifted loaded byte names IDO inside a GCC game, and a bit-packed unpacker needs index loops
+
+A 656-byte, 164-instruction N64 function (an audio header unpacker) matched exactly with `ido-7.1 -O2 -mips2 -G 0
+-non_shared -Xcpluscomm -Wab,-r4300_mul -woff 649,838,712` in a game whose other functions were built with
+`gcc-2.7.2-kmc`. Under the game's own compiler it sat at score 11,654 across 243 attempts; the near-match drafts all
+had GCC-shaped loops. Controlled evidence (a manual match, not a regression test; the game data stays private):
+
+- The target shifted every freshly loaded byte with `sra` (`lbu t6,1(a1); sra t7,t6,6; andi t8,t7,3`, 21 times).
+  KMC GCC 2.7.2, GCC 2.8.1, egcs 2.91 and SN64 2.7.2/2.8.1 all write `srl` and drop a redundant `andi` for the same
+  C: more than a thousand combinations of byte/halfword/word types, casts to `s8`/`u8`/`s16`/`u16`/`s32`/`u32`,
+  `volatile`, reused signed locals, inline helpers, and `-O0` to `-O3` never produced `lbu` then `sra`. IDO 5.3 and 7.1
+  write it for plain `(p[1] >> 6) & 3` on an `unsigned char *`. `move_fingerprints.profiles` now treats it as a
+  second compiler signal beside the `or`/`addu` move (it names IDO even where the function has no move to read).
+- The shape that matched: byte-pointer parameter `u8 *p`; stack arrays declared in the order of the target's frame
+  from the highest address down (`h[8]`, `a[4]`, `c[4]`, `b[4]`, `d[4]`, `e[52]`) so IDO lays them out low to high in
+  reverse; one `for (i = 0; i < 4; i++)` loop writing `a[i]`, `b[i]`, `c[i]`, `d[i]` and `e[i*13+k]` from
+  `p[i*7+5+k]`; the five arrays passed to the callee. Explicit induction pointers (`*pa++`) scored 0.14 of the
+  instructions equal and a walked source pointer `q += 7` 0.93, because IDO places the induction-variable updates
+  itself and only the all-index form put them where the target has them (1.00).
+- Failed experiments worth not repeating: bit-field structs (`unsigned f:6`, packed or not, `unsigned char` or `short`
+  base) give word or halfword loads and `srl`; `-fsigned-char`/`-funsigned-char` and every other -f flag KMC accepts
+  leave `srl`.
+
+### Preserve measured scalar lifetimes and byte-cursor updates
+
+The archived sources independently compiled as controls. Each installed rule reproduced its bytes from a reconstructed draft.
+
+- Four cases used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3`. Restoring the unchanged first argument before the reloaded byte matched all 84 bytes from score 20. Updating the local counter inside the first byte store matched all 120 bytes from score 20. Staging the masks and shifts into a single running sum matched a 40-byte pack from score 25. Using explicit post-increments for both byte reads preserved both halfword stores and matched all 64 bytes from score 25. Both halfword and word temporaries produced the same bytes in the last case.
+- With `ido-5.3 -O2 -mips2 -G 0 -non_shared -Xcpluscomm -Wab,-r4300_mul`, a compound byte decrement placed the address and value in different registers. Reading the byte into a word local, decrementing it, then writing it back moved score 25 to exact across all 24 bytes.
+
+The same function's unmodified m2c draft (score 11,654 under GCC) now reaches the match without a hand edit: the
+`stack_unpack_loop` family (decomprepair 0.5.151) rebuilds the pointer walks as the indexed loop over stack arrays
+(counts from the end test, array extents from the objects' offsets, the callee's stack arguments from the target's
+stores), and the `sra` signal above makes the deep pass probe IDO. Through `draft_repairs.variants` it produced two
+variants, one with the draft's `|` operand order (0.71 of the instructions) and one swapped (all 164, exact in the
+judge): IDO evaluates the operand written first first, so the swapped form is offered beside the plain one.
+
+### Preserve branch-local stores and the live divisor
+
+Three reconstructed near misses matched byte for byte with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3`. The archived sources compiled independently as controls.
+
+- The division target masked its third parameter in place after storing the previous value of a reused local. In-place masking alone moved the previous store and increased score 25 to 190. Preserving that store with a volatile word lvalue and masking the parameter together matched all 184 bytes.
+- A field update set or cleared a flag through a temporary also used in a sibling branch. Updating the field directly in either arm kept the sibling's earlier value intact and matched all 192 bytes from score 25.
+- An early-return mode case sits between selection of two defaults. Assigning the defaults in their own arms matched all 72 bytes from score 30.
+
+### Preserve narrow arguments and separately relocated pointers
+
+Three reconstructed N64 drafts matched byte for byte. The archived sources compiled independently as controls.
+
+- With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3`, forwarding the unchanged first parameter before a reloaded halfword moved the 112-byte draft from score 30 to exact. Using an explicit table symbol also matched. The linked bytes were identical with either relocation spelling.
+- At `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O1`, narrowing the index parameter and removing a spurious integer argument to the float call moved score 30 to 10. Casting the relocated base to a byte pointer before adding the record stride matched all 248 bytes.
+- With the first case's compiler and flags, keeping two separate loads of the global state pointer preserved the two callback stores and the intervening sentinel store. Staging the sentinel constant before the first load and preserving the final byte store matched all 152 bytes from score 30. An inline byte-address helper also matched, and the installed rule only needs separate locals.
+
+### Reading the compiler's own register ranking (GCC 2.x)
+
+A register-only difference ("the candidate keeps $s2 where the target has $s3") is decided by GCC 2.x's global
+allocation, not by anything in the C that names a register. `app/allocation_priority.py` compiles the candidate once
+with `-dl -dg` (gcc-2.7.2-kmc, gcc-2.8.1-pm, egcs) and reads back each pseudo's weighted uses, live length, priority
+`floor_log2(uses) * uses / length` and final register, then explains each saved-register swap of a diff by the two
+pseudos that are live together: which was placed first and what moves the order (a reference more or fewer inside its
+range, a longer or shorter live range). It shows in the diff panel's source diagnostics and in a deep search's log.
+Controlled observations on one near-match function (`-G0 -mips3 -mgp32 -mfp32 -O2`): extra references added to a
+stride temporary moved it up the order only after about eight, while renaming, retyping or reordering the loop
+variables, `register` hints, and rewriting a counter's masks left every priority unchanged; a nested loop written
+with `goto` has no loop depth (its references count once), and a real nested loop changes the code itself (invariants
+are hoisted), so that spelling is not a free choice. This is a diagnostic: it names the cause of a swap, it does not
+accept a match, and it is not a rewrite family. A priority-aware rewrite family would aim at these numbers.
+
+### KMC GCC 2.7.2: which values a function's loops keep in saved registers
+
+An N64 function with four loops (`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`) linked with the right
+instructions and 38 register-only differences. Measured on the running app's judge, each step from the
+previous best:
+
+- 1175 to 1130: the slot table declared as a struct array instead of a byte pointer plus a stride. gcc
+  stopped hoisting its address into a saved register for the first loop.
+- 1130 to 770: the probe-timer loop written as `for (i = 0; i < 2; i++)` with its volatile pointer declared
+  outside it, instead of `i = 0; do { ... } while (i < 2);`. The test is then made at the head, with no copy
+  before the loop.
+- 750 to 470: two local pointers to globals (`s16 *totals = &A; s16 *scores = &B;`, set after the memsets)
+  replaced by `(&A)[i]` and `(&B)[i]` at each use. The draft's pointers were pseudos of their own; the game's
+  code kept the globals' addresses in the registers the memset arguments used and copied them at the loop
+  (`move $s2, $s0`). The whole first loop matched.
+- 470 to 280: the slot-index temporary and a text-buffer temporary, shared by all four loops, renamed per
+  loop. A name shared across loops is one multi-block pseudo and gets one saved register; the target's
+  loops have the index in a scratch register.
+- 280 to 260 to 80: two more steps by the deep search (`temp_s1` as `unsigned short` among them).
+- 80 to 20: the probe-timer loop's counter init left as its own statement before the loop's pointer declaration
+  (`i = 0; { volatile u8 *m = ...; for (; (u16)i < 2; i++) ... }`), not in the `for` header.
+- 20 to 0 (byte-identical): every `if (v != 0)` written as `if (inline_fn(v))` with
+  `static inline int inline_fn(s32 a) { return a != 0; }`. After `beqz v` gcc's CSE knows `v == 0` on the else
+  path and replaced `v` in `else if (v < n)` by the counter register that also held zero (`slt $v0, $s4, $v0`);
+  through the helper the byte kept its own register (`slt $v0, $v1, $v0`). The deep permuter's random
+  `perm_inline` found it after 1,704 candidates.
+
+No difference: moving each local declaration to the front or back, `bonusTable` as a local pointer, a
+`while` or `for` form of the first loop (918, worse), the totals update spelled three ways. Evidence level: a
+real game, byte-identical in the end; decomp-repair 0.5.185's `block_register_repairs` has the rewrites for
+steps one to three, the split of the temporaries, the init left in place and the inline test (two of its
+variants took the score-20 source to exact), and the deep permuter offers them first when register rows
+dominate the diff.
+
+### Keep a conditional halfword update in the guarded arm
+
+Three fresh N64 drafts from `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` lost the first argument at a call
+following a guarded unsigned halfword increment or decrement. The target loaded the field into the second argument
+register, compared the original value, then updated that register in the branch delay slot. On fallthrough it stored
+the halfword back and prepared the second argument for the call. The first argument kept its entry value.
+
+Restoring the first argument alone left register allocation differences. Computing the updated halfword inside the
+guard and passing it as the second argument matched all 56, 60, and 64 bytes from fresh draft scores 35, 330, and 335.
+The last case subtracts one more after masking to 16 bits. The rule checks the target branch destination, that the
+load and store address the same halfword, and that the original first argument reaches the call. The independently
+archived sources matched as controls.
+
+The rules behind that table, from GCC's own global.c (2.95.3 reads the same here; 2.7.2's source could not be fetched):
+allocation units are ranked by `floor_log2(n_refs) * n_refs / live_length * size`, ties to the lower number; `n_refs`
+is weighted by loop depth and `live_length` is the longest of the pseudos merged into the unit. `find_reg` makes two
+passes: the first only reuses registers that are already used (a saved register nobody took yet is not offered), the
+second may take a new one; both scan the registers in order and skip any a lower-ranked overlapping unit prefers
+(preferences come from copies and from moves to or from hard registers, and the dump prints them as `N preferences:`).
+For saved registers the preferences were all caller-saved ones in the function studied, so only the ranking and the
+conflicts decided its saved-register swaps. A swap that no single priority change explains usually means two pseudos
+were merged by a copy: look at the copies the compiler made (`-dl` shows them) rather than at one variable's uses.
+
+### Reuse a call register across pointer lifetimes and stage a scaled call argument
+
+Both cases used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3`. The independently archived sources matched.
+
+- A guarded call keeps the context in the first argument register. It loads a pointer into the second argument
+  register, then moves its return value into that same register before testing and dereferencing it. Forwarding the
+  context alone left score 20 on the near draft. Reusing the original pointer local moved score 30 to an exact 148
+  bytes. On the fresh draft it moved 40 to 10, and the existing unsigned byte-store repair resolved the last difference.
+- For a byte-indexed 12-byte stride, one call computes the first shift in the guard's delay slot and keeps the scaled
+  index in the first argument register across the float store. Caching the index or grouping both shifts into one
+  expression left score 30. Computing shift/add and the final shift in separate statements before that call matched
+  all 184 bytes from the fresh draft. The second call keeps its original expression.
+
+### Schedule indexed bytes, a masked list index, and a recursive count
+
+Three fresh N64 drafts matched byte for byte with the original compiler. Their independently archived sources
+also matched as controls.
+
+- With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, moving a constant subtraction to the indexed unsigned byte
+  and spelling the power-of-two scale as a shift restored the byte load order and matched all 68 bytes from score 45.
+  Introducing a separate address local gave the same result.
+- Adding `-g3`, computing the incoming index mask once in the non-null list arm and making the back edge an explicit
+  non-null test matched all 76 bytes from score 60. Simplifying the loop tail without staging the mask left score 60.
+- With the same `-g3` command, forwarding the entry argument to a count helper moved the 112-byte recursive draft
+  from score 280 to 245. Updating the original count after recursion and returning it on every path matched exactly.
+
+### Stage the first indexed base, preserve byte strides, and load a stack halfword
+
+All four N64 controls compiled to their archived target bytes with the original compiler.
+
+- With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3`, writing the comparison with the stream position first
+  and capturing the counter address only for the final guarded copy matched 128 bytes from score 50. The target
+  retained the counter address through the conditional clamp.
+- With the same flags, staging the base before calculating the index for the first byte store matched all 200 bytes
+  from score 60. The later stores continued to reference the global directly.
+- Also with those flags, the 52-byte generated draft initially failed to compile because its first store dereferenced
+  an integer. Typing the store compiled at score 60. An unsigned halfword index and an explicit load from byte two
+  of the fifth, word-sized argument matched exactly during draft generation.
+- At `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O1`, passing the entry argument to the final call brought the
+  168-byte draft from score 55 to 10. Casting each relocated word address to a byte pointer before adding the
+  already-scaled index removed the remaining two-bit shift error and matched exactly.
+
+### Verified match: a 490-instruction N64 function reached by four small edits (switch stores, guard, address sum, counter)
+
+Compiler and flags: `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. Evidence level: one real function, a "2,000-function
+N64 game" decoder routine of about 490 instructions, matched exactly by the app's judge (linked bytes exact, status
+matched); the intermediate word counts below come from a fast local compile of the same C against the target, not the
+judge. The function reads a bit stream into tables through eleven nested read loops after one switch.
+
+The chain, each step measured on its own and each an improvement: judge 465 (m2c draft reworked by agents) -> 405 (a
+local pointer for the repeated bit-reader address in the outer loop only, the nested goto loop keeping the literal:
+`loop_address_hoist`) -> 400 (operand order of an address sum inside the nested loop, from decomp-permuter's
+randomizer) -> then local differing words 21 -> 14 (a store in each switch arm instead of one store after the switch;
+`switch_arm_store`) -> 7 (the last loop's body duplicated into `if (v) {B} else {B}` on the nested loop's counter, a
+read of that counter after its loops; randomizer) -> 5 (one more reassociation of the nested loop's first call
+argument; randomizer) -> 0, judged 0 (the first read loop counting with the nested loop's counter instead of its own
+variable; `loop_counter_roles`). Without the guard the last step is worse (31 vs 2), so the steps are not
+interchangeable; each of guard, address sum and counter role is needed for the last 0 (all eight combinations
+measured: 15, 14, 7, 5, 31, 30, 2, 0 differing words).
+
+Why the switch edit matters: the target had the store to a hardware-pointer global first and the next call's argument
+setup after it, the candidate had them reversed (8 differing words, all instruction order). GCC 2.x merges identical
+store tails of switch arms late (cross-jumping, after the first scheduling pass). With the store after the merge it is
+in the same scheduling block as the next call's argument setup, which the first pass then schedules above it; with a
+store in each arm the cross-jumped store sits in a block of its own and stays first. The instructions are the same
+either way, only their order differs, so no instruction-level search could see the cause. A two-statement test
+reproduces it with the real compiler (tests/test_switch_arm_store.py).
+
+Why the counter and guard matter: GCC 2.7 gives saved registers by `floor_log2(uses) * uses / live length` (`-dl -dg`
+print the table; see the allocation-priority report), uses weighted by loop depth. A goto loop has no loop depth. A
+counter read again after its loops (the guard) is live over more code, which lowers its priority; and a loop that
+counts with another loop's counter variable adds uses and live range to that one pseudo. The two together moved two
+counters between saved registers without changing a single instruction.
+
+Failed on the same function, so they need not be tried again: renaming, retyping (`s32`/`u32`/`u16`/`s16`) or
+reordering declarations of the loop variables and temporaries (16,384 type combinations, 135 declaration orders);
+`register` on the locals; dead assignments inserted at every statement boundary (1,260 variants, no effect: GCC deletes
+them before allocation); `-mcpu` and optimisation flag changes (`-mcpu=r4600` was worse); inline helpers around the
+reader or the index arithmetic; writing the nested goto loops as real loops (the compiler then hoists and strength
+reduces, 490 differing words); statement order inside the loops; spelling variants of the index, stride, comparison and
+increment (1,080 combinations: one cleared a single row); a role assignment of seven later counters over five variable
+names (62,500 combinations, none below the starting count until the switch stores were in place).
+
+What the permuter now has for this: `switch_arm_store` (decomp-repair 0.5.170), `loop_counter_roles` taking a loop onto
+a counter that is read after its last loop, and recognising goto loops (0.5.170), `loop_address_hoist` (0.5.157); the
+guard and the address reassociation come from decomp-permuter's randomizer. Starting from the m2c form of the switch,
+`switch_arm_store` reproduces the edit exactly; starting from the guarded source, `loop_counter_roles` proposes the final
+counter edit (variant 8 of 23, among the reassignments that rank first).
+
+
+### Preserve relocated byte arithmetic and reload a stored context slot
+
+Three fresh N64 drafts matched with the original compilers and independent archived controls.
+
+- With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O1`, intermediate shifts were two bits too large at one relocated
+  word load and three word stores. Applying their already-scaled expressions to byte pointers reproduced all
+  280 bytes from score 40. Narrowing the formal parameters as well produced the same result.
+- With the same flags, swapping the grouping of two shifted unsigned bytes repaired their load order, leaving
+  score 20. Casting the relocated base to a byte pointer before either add matched all 248 bytes from score 60.
+- At `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, moving the slot read after the flag assignment still left
+  score 330. Retaining the context for both stores and taking the address of the updated pointer slot matched all
+  76 bytes from score 335. The target reloads that pointer for the word read and final call.
+
+### KMC loop-entry bound read before an unconditional reset
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a draft for an
+unmatched N64 function cleared a volatile global before reading the
+volatile loop bound. The target's relocations show the entry read before
+the clear, followed by a branch using the saved value. In a scratch
+project, splitting the one-shot initialization block and capturing the
+entry bound before the reset lowered the linked diff score from 350 to
+230. Wrapping only the local counter's zero initialization in a one-shot
+`do { ... } while (0)` then let KMC place the zero in the branch delay
+slot and lowered the score to 0. The loop's back edge still reads the
+bound directly. The deep permuter reproduced the linked byte match
+starting from the original scratch draft.
+
+### Preserve a record scan, stage layout fields, and recover a formatted stack buffer
+
+All three N64 drafts were verified with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3`; independently
+archived sources compiled as controls.
+
+- A counted record scan matched all 108 bytes from score 670 when its cursors moved in bytes, the successful
+  store had its own return path, and the key was assigned to a local before entering the loop. Keeping the
+  key in the parameter still left score 55.
+- Staging one literal for four layout updates and capturing the field value before a global reset matched the
+  schedule. Restoring the forwarded context argument at the final call matched all 236 bytes from score 65.
+  Staging the literal and restoring the argument alone left score 60.
+- The 256-byte formatter draft initially failed compilation because two stack-byte names had no declarations.
+  Recovering a four-byte buffer compiled at score 60; staging the signed clamp before the call matched exactly
+  during draft generation. The target passes the buffer address and later loads three consecutive bytes from it.
+
+### KMC register allocation for a shared result copy
+
+Two related N64 functions compiled with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` had a linked diff
+score of 15 each. In both, a nested pointer guard skipped the loop with a zero folded into the delay slot.
+The target copied the initialized flag register at that site and copied the same register again before the
+final branch. Moving the existing labeled copy from the outer guard's else arm to its common exit
+reproduced both linked functions exactly. Removing the guard's early copy while flattening the exit
+scored 320 on each function. Wrapping the assignments or changing their scalar widths left residual
+differences. The deep permuter can now try the shared exit from those measured register differences.
+
+### Recover stack objects for queued messages and relocated packets
+
+Five earlier N64 drafts had undeclared stack-slot names. Independent archived sources matched their controls.
+
+- With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, the 132-byte request uses a 24-byte queue, a one-word
+  message buffer and a request whose result is written by the receiver. Reconstructing the objects compiled
+  at score 560. Returning early on the disabled path matched all bytes.
+- With the same flags, three request wrappers (132, 168 and 168 bytes) use a longer request before the queue.
+  An ordinary aggregate compiled but left scores 1185, 1245 and 1245. Passing the command as a parameter to a
+  small inline helper put the command in the expected saved register and reproduced the stack frames exactly.
+- With the same compiler options plus `-g3`, a relocated packet passes twelve bytes through unaligned word
+  copies. A twelve-byte aggregate compiled at score 10. Storing the terminator through an unsigned byte pointer
+  matched all 136 bytes.
+
+### Stage a masked field load before zero argument setup
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a scratch N64 function scored 180 because
+several instructions were scheduled out of order. The target loads a word before preparing a zero
+argument and masks that word afterward. The draft put the zero first. Reading the field into the same
+32-bit local and then applying the mask lowered the linked score to 120. The deep permuter reproduced
+and saved the improvement. Staging the later call's byte and halfword arguments did not reduce the
+original score. The function still has four reordered instructions.
+
+### Recover payload packets, channel status words and relocated reply bounds
+
+Five N64 drafts failed on undeclared stack slots. Independently compiled archive controls matched all five targets.
+
+- With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3`, copying eight payload bytes into a twelve-byte
+  aggregate, then copying the aggregate and writing an unsigned terminator, matched the 168-byte packet.
+- Two status routines read the same location as both a byte and a halfword. Two word-aligned stack buffers
+  and separate return tests matched all 224 bytes at the same flags without `-g3`. The 236-byte `-g3` draft
+  additionally needed its relocated pointer expressed in bytes and its positive timeout value staged before
+  assignment to a signed byte. Direct assignment compiled with `-6` in place of the target's 250.
+- At the `-g3` flags, the typed reply aggregate alone left scores 245 and 365 in two 180-byte routines.
+  Using a symbol at the loop-bound byte's resolved address let KMC reload it within each iteration and matched
+  both targets. The input byte cursor retained the separately evidenced relocation and offset.
+
+### Copy the search result at the join and simplify its truncated byte test
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a scratch N64 draft scored 220. The
+target writes the no-hit sentinel before copying the index into the key at the shared exit. Its
+later byte comparison has no left shift. Moving the copy to the exit and rewriting the
+truncated byte test from a left shift compared to 4 to a low-seven-bit test compared to 2
+reduced the linked score to 10. Either edit alone scored worse than the starting draft.
+Comparing the whole byte directly dropped the target's mask instruction. The combined
+rewrite retains the original high-bit semantics and leaves one mask operand difference.
+
+## Byte table read through a word cast (N64 PS-style KMC gcc 2.7.2, `-O2`; one function, partial)
+
+A hand match of a ~0x35c-byte actor-update function (score 2225 -> 450, not yet exact; evidence level: one function).
+- A refined draft declared `extern s32 gTrackMarkerDone;` and read it as `u8 v = *(s32 *)((s8 *)&gTrackMarkerDone + i)`.
+  The word read compiled to a byte load at `%lo(gTrackMarkerDone+0x3)` (the low byte of a big-endian word) where the
+  target has `lbu %lo(gTrackMarkerDone)`. Casting the read `u8` fixed the relocation; the declaration's type did not
+  matter (`s32` and `u8` scored the same).
+- A callee called `f(x + k, y)` whose target left `$a0` alone is `f(arg0, x + k, y)`; the existing
+  `passthrough_argument` family already produces it (checked on the saved best).
+- Not matched: the target's `if (!(t & 0x10)) {0xBF stores} else {0xFF stores}` ends in an out-of-line
+  `li $v0,0xff; j tail` block. `goto` into a shared tail, a shared color variable and duplicated blocks all left that
+  block out (450); the branchless `col = 0xFF; if (...) col = 0xBF;` form was worse (1675).
+- decomp-repair v0.5.181: `symbol_width_repairs` retypes `*(T *)((s8 *)&D + i)` casts on a symbol of known type (and the
+  printed dialect with extra parentheses) when the target's loads never use T's width.
+
+## KMC gcc 2.7.2: base-relative stores, and a two-move search that did not help (N64, one 352-instruction startup function)
+
+Compiler and flags: `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. Evidence level: one real function, searched with the
+app's own judge (`decomp judge-worker`, which returns exactly the app's score); not a controlled regression test.
+
+- **Stores that stay `off($sN)`.** A run of stores written as `*(s8 *)((char *)&sym + off) = v` compiled to absolute
+  `lui/sb` pairs, where the target addressed all of them from one saved register. Wrapping the first use of the
+  symbol's address in `do { call(&sym + k); } while (0);` kept every later store base-relative (linked score 4955 to
+  1760). Without the wrapper the compiler folds `(plus (reg) off)` back to a constant address. The library already
+  has the wrapper (`call_one_shot_scope`); it did not pair it with base-form accesses.
+- **Recompute, don't cache.** The target recomputed `n & 1` at the use site; a `temp = n & 1` local cost 45 points.
+  Recomputing the loop index from its counter at the top of the loop body (`i = n & 0xFFFF`) took 1715 to 1430.
+- **Loop constants.** Holding the loop's constants (`2`, `0x64`, `1`) in explicit locals took 1430 to 1330. Moving or
+  reordering their assignments changed nothing: the scheduler's priorities, not the source position, place them.
+- **Random search plateaus.** From 1090, six seeds of statement swaps, call-wrapper toggles and local type changes
+  reached 785 in one round; two more rounds (one with token-level rewrites) found nothing lower. Simulated annealing
+  at temperatures 8 to 40 did not either.
+- **Exhaustive single moves.** Every plain statement moved to every other position (870 single moves, one 64-statement
+  run): none scored below 785. 785 is a local minimum for one move at a time.
+- **Two moves (`paired_statement_moves`, decomp-repair 0.5.182) did not help here.** Judging every single move, taking
+  the 60 least-different results and trying every second move from each (27,400 exact judgments, 6 minutes) found
+  nothing below 785; neither did 9,000 randomly sampled pairs. The remaining difference is about 29 register
+  choices that follow from the loop counter taking `$s2` where the target has `$s5`, which is allocation priority
+  (use count over live range), not statement order. The search stays in the Deep Permuter for near-matches whose
+  difference is order; it is not a fix for this one.
+
+## KMC gcc 2.7.2: a status copied into `$v0` is the function's return value (N64, one 65-instruction function, exact)
+
+Compiler and flags: `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. Evidence level: one real function, judged by the
+app (score 15 to 0). Not a controlled regression test; the rewrite has a unit test on the m2c shape.
+
+- **The signature was the blocker.** m2c wrote `void f(void)` ending `if (var_v0 == 0) { g(); }`. The target did
+  `move $v0,$a2` in the delay slot of the guard's second null check and again at the join, then `bnez $v0`. Three
+  register rows differed (the draft used `$v1`) and about 25 source shapes under the project's earlier agents, plus
+  ~20 hand-built ones (copy position, declaration order, narrower types, `register`, pointer-typed flag, inline
+  helper) never moved them: with a `void` function gcc folds `v = a; if (v == 0)` into `bnez $a2` and the early
+  copy into `move $v1,$zero`. Returning the value is what keeps the copy: the status and the callee's result share
+  one pseudo, which the allocator puts in the return register `$v0`, and the steal-from-target delay slot then
+  duplicates the join's copy.
+- **The shape that matched:** `s32 f(void)`; the flag copies `var_v0 = var_a2;` removed from every path and written
+  once at the final test; `var_v0 = g(); return var_v0;` as the tail. m2c's `goto block_9` stays as it was (the
+  label needs a `;`). Applying only the signature and tail change (copies left where m2c put them) scored 420: the
+  copy position matters as much as the return.
+- **Failed:** `if (a == 0) return g(); return a;` (the copy lands in the `bnez` delay slot, `bnez $a2`); a `void`
+  function with the copy at the join in any of 6 positions, with or without gotos (all fold to `bnez $a2`).
+- The `return_contract` family now also handles this shape (`flag_variants`).
+
+### Reuse the next guarded loop's counter after earlier reads
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a scratch N64 texture conversion
+function scored 419. Reusing the next guarded loop's counter in the preceding guarded loop
+lowered the linked score to 399. The first loop's zero, increment and bound comparison
+moved from an argument register to the target's saved register. The original value of
+the reused local dies before the first loop starts, and the second loop always resets
+it. Reuse across the next pair instead scored 649. Changing only the spelling of the
+zero as a one-shot block also failed to improve the baseline.
+
+
+## KMC gcc 2.7.2, `-O2`: single-row register leftovers that source shape alone did not move (N64, a game with about 1,900 functions)
+
+Ten unmatched functions sat at a judged score of 5 to 15, five of them with exactly one differing row. All were
+compiled locally with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` and compared register-exactly with the target
+(relocations, `addu rd,rs,$zero` as `move` and FP register names normalised). Controlled compile-only results, one
+function each; nothing here matched, so none of it is a recipe, only a list of dead ends.
+
+- **Commutative `and` with a mask that does not fit `andi`** (a 23-instruction function that clears nine bits of a
+  flags word, target `lw $v1; addiu $v0,$zero,-0x1c1; and $v0,$v0,$v1`). Two allocation clusters exist and nothing
+  tried leaves them: either `lw $v1 / li $v0 / and $v0,$v1,$v0` (the load first) or `lw $v0 / li $v1 / and $v0,$v0,$v1`.
+  The target is the first cluster's registers with the second cluster's operand order. 32 source shapes (compound
+  assignment, mask-first, mask in a local before or after the load, signed and unsigned, `(s16)` and `-449` spellings,
+  xor and De Morgan forms, a mask local assigned after the load) and 23 flag sets (`-O1`, `-O3`, `-fno-` scheduling,
+  cse, gcse, strength-reduce and friends, `-mcpu=r4000`) all stayed in one cluster or the other. The reading that fits:
+  cse knows the mask register equals a constant and canonicalises the constant to the second operand, so the first
+  operand can never be the constant while cse sees it as one; the target's order needs the mask not to look constant at
+  cse time.
+- **`f + product` where the product comes from a call** (a function adding `angleDelta12(f) * scale` to a float field;
+  target `add.s $f2,$f2,$f0` with the reload in `$f2`). Writing the sum as `field + product` gives the target's operand
+  order but swaps the product and the reload (`$f2`/`$f0`). Reusing one named local for the argument read and the reload
+  (`x = a->f; ...call(x)...; x = a->f; x = x + p;`) gives the target's whole second half, then moves the first load
+  and the `trunc.w.s` to the other register pair. 53 expression shapes, none exact; the best has 3 differing rows.
+- **A subtraction that reads a saved register while its copy is in the argument register** (target `subu $a1,$s0,$a1`
+  after `move $a0,$s0`; ours reads `$a0`). cse prefers the hard register that holds the copy, so any source where the
+  copy exists in RTL before the subtraction reads `$a0`. 144 combinations of subtraction spelling, argument spelling
+  and statement order (including the subtraction first) did not make the subtraction read `$s0`.
+- **A return value that must keep `$v0` busy** (target `lbu $v1,0x1e; bnez; move $v0,$zero`, ours `lbu $v0`). Initialising
+  a shared result local at the top moved every temporary one register up (`$t0`/`$t1`) instead.
+- The stock Deep Permuter, 500 candidates each (`perm_inline`, `perm_add_sub`, `perm_randomize_function_type` were the
+  families that ran last), found nothing better than the saved best on the first three.
+
+Tooling note: a hand harness that normalises relocations and FP register names before counting differing rows is what
+made single-row leftovers visible; the app's own diff already does this, but `compile_snippet.py` reports
+`addu ...,$zero` against `move` as a difference.
+
+### KMC request packets and inode halfword scans
+
+- Replayed two N64 examples with no saved failed attempt using their archived context, original flags,
+  and linked-byte judge. A command request built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3`
+  matched all 164 bytes after rebuilding the eight stack bytes as one byte-aligned aggregate, copying
+  it once per channel, resolving the distinct global fields, and omitting the unused m2c preamble.
+  The preamble alone caused parse errors because this header lacked the short type aliases it uses.
+- An inode scan built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` matched all 272 bytes after
+  restoring the 128-halfword array passed at stack offset 16, correcting the callee declaration,
+  and reconstructing the index loop with the target's first-bank rule and error exits. Declaring
+  the buffer and fixing the pointer step alone compiled with difference scores of 1465 and 1455.
+- The isolated replay of 38 drafts with missing stack-byte declarations went from 10 to 12 exact
+  matches. The other 26 still failed to compile.
+
+### KMC inode cache page and byte map
+
+- Three N64 examples built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, one also with
+  `-g3`, each matched 344 linked bytes from a fresh draft. The stack argument is a page of 128
+  halfwords used as both words and byte pairs. The output is a cache with its bank at offset 256
+  and the 256-byte map at offset 257. The typed map and the unsigned byte bank modulo expressions
+  preserve the original address computation and allocation.
+- Restoring the stack array alone compiled but scored 3112 on all three. A flat byte map with shifts
+  and masks scored 941. The 38-example draft replay rose from 12 to 15 exact matches, with 23 drafts
+  still failing compilation.
+
+### KMC display-list tail: a `do { } while (0)` boundary for the second scheduler
+
+- One N64 function (`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, 79 instructions) sat at score 60 with a single
+  misplaced `addiu`: the target has `add p; store p; add q; store q` at its end (two global pointer bumps, then
+  the call), every source order gave `add p; add q; store p; store q`. The first scheduler (before register
+  allocation, `-dS`) already produced the target's order; the second (after allocation, `-dR`) hoisted the second
+  add above the first store, because its chain to the store was longer.
+- A `do { } while (0)` leaves loop notes that are scheduling boundaries and no code. Wrapping the second half of the
+  run, through the final call, matched (60 -> 0, exact) **only** with the global the call reads
+  (`temp = D_8010A4D8;`) copied into a local before the boundary: left inside, its load moved after the boundary and
+  the target loads it with the first group. Hoisting alone and wrapping alone stayed at 60.
+- Failed first, so not repeated: every order of the seven tail statements (70), 300 spellings of the two increments
+  and the call's arguments, 108 pointer-type choices (`void *` .. `s16 *`), post-increment through a struct pointer
+  (changes the register the cursor lands in), `goto` and empty `while (0)` / `for (; 0;)` / `if (0)` / `switch (0)`
+  (all folded away before scheduling, no boundary), and inline `asm("")` (the judge refuses inline assembly).
+- The wrapper has a side effect: it moved arg0 and the constant 2 to swapped saved registers when the final call
+  stayed outside it (the loop depth changes the allocation priority of the pseudo that is live through it). Putting the
+  call inside the wrapper restored `$s0`/`$s1`. One function, one compiler: a measured result, not a controlled one.
+- decomp-repair 0.5.187 `scheduling_scope` proposes the pair; the deep permuter's local beam runs it
+  (`loop_vector_shape_pass`).
+
+
+## A constant assigned early, shared through a `goto` join: sink it to the label (N64, KMC gcc 2.7.2 `-O2`)
+
+One hand match of an actor-update function (score 2225 -> 0, exact in the app's judge; one function, so one result, not a
+controlled one). The colour block sets three bytes to 0xFF or 0xBF, with the target storing 0xFF/0xBF in `$v0`.
+- m2c's form `v = 0xFF; if (c) { ...; if (!(t & 0x10)) { v = 0xBF; goto L; } stores of 0xFF } else { L: stores of v }`
+  put `v` in `$a0` (780). With the assignment moved to just before `L:` it lives in `$v0`, `li $v0,0xff` fills the
+  `bnez` delay slot and the `j tail` + `li $v0,0xbf` delay slot appear, as in the target.
+- A constant above 0x7F stored through `s8 *` is `li -1` (`addiu $v0,$zero,-1`); typed `u8` it is `li 0xff`.
+- A constant held in a local (`int c = 0xFF;`, the search's own `__repair_constant`) keeps a register and adds an extra
+  saved register (228 instructions against the target's 224): write its literal.
+- Failed: five hand spellings of the same branches (`goto` into a shared tail, a shared colour variable, duplicated
+  store blocks, the branchless `col = 0xFF; if (...) col = 0xBF;`) all ended at 450 or worse: `jump.c` inverts
+  `if (x) goto A; goto B;` and moves the fall-through block, so the *polarity* of the `if` and where the
+  assignment sits, not the spelling of the stores, decide the layout. Reading the target's raw assembly (delay slots
+  included) gave the polarity; the RTL dumps (`cc1 -dj -dr`) show where the pass moved the blocks.
+- decomp-repair v0.5.188 `join_initializer_sink` produces the sunk, literal and `u8` forms; on the function's saved best
+  the last child scores exactly like the hand-matched source locally, and it runs in the deep local pass.
+### Share a halfword index across two guarded score loops
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a scratch N64 function
+scored 50. The target narrows the same callee's result into one register in
+both loops, while the draft uses two different registers. Reusing the same
+index local, declaring the score separately after its original declaration
+group, and inlining the second loop's halfword load as the left operand of the
+equality brought the linked score to 0. Leaving the score in its declaration
+group left score 40. The deep permuter reproduced and saved the byte match.
+
+### Reuse the entry byte carrier at a dispatch loop's back edge
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a scratch N64 bytecode dispatch
+draft scored 140. Reusing the existing entry temporary for the back-edge byte load,
+sentinel comparison and opcode mask lowered the linked score to 125. The target
+and candidate then use the same register for all three operations. Using the
+narrowed opcode as both the sentinel and switch value did not improve the score.
+The deep permuter reproduced and saved the partial improvement.
+
+## Search shape: pairs of rewrites, branch polarity and the join sink's limits (N64, KMC gcc 2.7.2)
+
+From the same hand match as the join sink (one function; the numbers are that function's, not a controlled study).
+- Three changes (sink, literal, `u8` stores) each scored the same or worse alone. The deep local pass kept only
+  improvements and tried about six children, so it could never reach a pair. It now keeps the children that compiled
+  within 2x the best and runs the same rewrites on the nearest three (12 compiles in all): `<first>+<second>` families in
+  the repair log.
+- `branch_orientation` swaps `if/else` arms only where `negate` inverts a bare comparison; a bit test (`x & 0x10`), a `!`,
+  `&&`/`||` never flipped. decomp-repair 0.5.193 `branch_polarity` negates any side-effect-free condition and also writes
+  m2c's `if (c) { T; goto L; } R` as `if (!c) { R } else { T; goto L; }`. On this function the flipped variants compile to
+  the same length but score below the sunk form locally (0.68-0.74 against 0.75 exact): offered, not a fix by themselves.
+- `join_initializer_sink` now handles several constants, an assignment separated from its `if`, a join label after the
+  statement (no `else`) or in the then arm, and refuses a `goto` path that doesn't assign the value first or a second jump
+  to the label (both would read an unset register: the first version did not check).
+### KMC fixed Huffman lengths and controller-write stack objects
+
+- A fixed Huffman draft compiled with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` matched
+  all 452 bytes once both builders shared the 288-word table and the same variable held the fill
+  index and each builder result. Restoring the array alone scored 1368. Using ordinary indexed loops
+  without the shared result variable scored 993.
+- A controller write compiled with the same flags matched all 360 bytes after restoring a separate
+  four-byte status buffer and a 12-byte unaligned reply aggregate. The draft reads a halfword from
+  the status buffer, polls a byte in that buffer, and extracts a byte from the copied reply. Restoring
+  both objects without reshaping the control flow scored 1135. Reversing their declarations in the
+  otherwise exact candidate scored 11 and changed the stack layout.
+- The 38-example isolated stack-slot replay rose from 15 to 17 byte-exact drafts, with 21 compilation
+  failures remaining.
+- Across the same 226 inputs as the earlier v0.5.148 replay, fresh byte-exact drafts increased from
+  8 to 25. The 17 changes were all prior compilation failures. There were still 161 compilation
+  failures and 40 generation failures.
+
+### KMC GCC 2.7.2: a once-only byte-cursor walk and the join's copy (`pointer_walk_index`, `join_copy_sink`)
+
+One N64 function (`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`), reached two ways. In a fresh scratch app the
+untouched m2c draft scored 255 and had two byte cursors (`char *`, stepping 4) and `while (counter == 0)`; the
+dev project's autopilot draft already had the indexed `for` and scored 15. Both ended with the same two register
+names differing (`$v1` for `$v0`, on the skipped-loop path and before the final `bnez`), plus, on the raw draft,
+the order of three hoisted loop constants.
+
+- The indexed loop, `for (i = 0; i < 1U; i++)` over `((s32 *)&D_800C4470)[i]`, is the exact order of the hoisted
+  constants (195 -> 15). The bound must be unsigned: `< 1` scored 200, `< 1U` and a `u32` counter scored 0.
+  `pointer_walk_index` now writes the byte-cursor walk this way (library 0.5.189).
+- The copy: m2c wrote `v = x;` before the inner guard and again at the `goto` label. The early one is a real
+  instruction before the inner test, so `$v0` (live as the loaded field) is taken and the copy gets `$v1`. Merging
+  the guards and putting `v = x;` at the end of each arm gives `$v0` (15 -> 0; 195 -> 180 on the raw draft).
+  `join_copy_sink` (0.5.189) does it, and treats an early `v = 0;` as the label's `v = x;` after `x = 0;`.
+
+Controlled result, one function: stock Deep Permuter, fresh import, the draft untouched, one compiler profile:
+255 -> 195 (m2c_refinement) -> 180 (join_copy_sink) -> 0 (pointer_walk_index), 169 candidates, matched.
+Before the app wired `join_copy_sink` into `draft_repairs.py` the same run stopped at 15 with the exact variant one
+call away: a library family the app never calls is not offered, whatever the library ships.
+
+Failed forms (compiled locally, 0.779 = the draft's own ratio): one copy of any shape (`r = s; if (!r)`, `&&` with
+one copy, a goto join with one copy) folds the move into `s`; `s`/copy as `u8`, `s16`, `u32` add extension
+instructions; one copy per arm without merging the guards leaves a `j` to a shared tail.
+
+A second route to the same bytes is the measured `shared_result_copy` family (0.5.178, the entry above): it keeps
+the early copy and moves the label. It needs the diff rows, and the app that held this function had library 0.5.166
+installed, so it had never been offered either. First thing to check on a stuck near-match: the app's library
+version.
+
+### Stage repeated interpolation products in one single-precision temporary
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a scratch N64 function
+had a linked score of 95. Staging a recurring interpolation and its products
+in one unused single-precision local lowered the score to 60. Reusing a
+different, dead single-precision result for the final interpolation lowered
+it to 40. Both preparations retain the original grouping and literal types.
+Using the same staging temporary for the final conversion did not reach 40.
+The deep permuter reproduced the 95 to 40 improvement from the starting draft.
+
+### KMC dispatch bounds and explicit default cases
+
+- A renamed jump-table reference can use its numeric address alias even though the table data keeps the original
+  `jtbl_` label. Giving m2c one spelling for the paired relocations and table removed 27 generation failures
+  in the same isolated 226-example replay. Six of those drafts failed compilation, 18 compiled without a match,
+  two matched from fresh generation, and one matched through the existing goto-leaf permutation. The other
+  199 outcomes were identical.
+- For the two fresh matches, `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` built identical 80-byte and
+  100-byte functions. The source needed explicit leading cases whose table entries point to the dispatch guard's
+  default destination, and a signed local for the masked selector. With the alias fixed alone, omitting the
+  leading cases left scores of 2525 and 200. The compiler used a comparison chain for the first and rebased the
+  jump table to the first explicit case for the second.
+
+### Store a comparison result in a byte local
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a scratch N64 draft
+scored 200. The target copies a comparison result into a saved register,
+while assigning an explicitly cast byte to a word local emitted an extra
+mask. Declaring the flag as a byte and assigning the result directly
+matched the linked bytes. Removing only the cast scored 235 because KMC
+coalesced the two locals. The deep permuter reproduced the exact match.
+
+### Stage a relocated signed halfword read at its original load site
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a scratch N64 draft replaced
+the target's signed halfword read with a volatile word read and scored 200.
+Changing only the volatile access width emitted an unsigned halfword load
+followed by sign-extension shifts and scored 400. A plain signed halfword read
+in a one-shot block retained the original load position and scored 95.
+Declaring the source offset before the other independent loop initializers
+lowered that to 30, leaving four register and prologue differences.
+
+
+## KMC gcc 2.7.2, `-O2`: an `and` whose mask register comes first (N64, a game with about 1,900 functions)
+
+A 23-instruction function that clears nine flag bits (`*flags &= ~0x1c0` after a call) sat at score 5 for hundreds of
+attempts. The one differing row was `and $v0,$v0,$v1` in the target (mask first, loaded word second) against
+`and $v0,$v1,$v0` in ours, with the load and the `addiu $v0,$zero,-0x1c1` in the same registers. **Exact match,
+controlled** (compile only, then the app's judge: byte-identical).
+
+- The cause is in cse, found by dumping the compiler's own passes (`cc1 -dr -dj -dc`): the expanded RTL has the mask
+  first (`(and (reg mask) (reg old))`, the order the source was written in), and cse's `fold_rtx` swaps a register it
+  knows to be a constant into the second operand. So `and rd, mask, x` with the mask first cannot come from
+  `x & mask` however it is spelled. 32 spellings (compound assignment, mask first, mask in a local before or after the
+  load, signed/unsigned, xor and De Morgan forms) and 23 flag sets stayed in one of two register clusters.
+- The source that matches: `u32 updated = (old & ~0x1c0U) | ~0x1c0U; updated &= old; *flags = updated;`. Cse cannot
+  see through `(x & K) | K`, so the mask is no longer a known constant and keeps its place; combine then folds the
+  expression back to the constant (`x & K` is a subset of `K`), so nothing extra is emitted. Several other identities
+  that hide the constant work the same way (`K & (old | K)`, `((u32)obj & K) | K`); `if (obj) u = K; else u = K;` also
+  works but jump.c turns it into a store-flag sequence and leaves two dead pseudos that grow the frame by 16 bytes
+  (`vars= 16`), so it does not match. A mask that fits `andi` (up to 0xFFFF) never takes a register, so none of this
+  applies to it.
+- The rule, not the spelling: **a known constant is always the second operand of a commutative instruction; to get it
+  first, make it unknown to cse and let combine recover it.**
+
+What the permuter has for this: `mask_operand_order` in decomp-repair 0.5.201 (`kmc_operand_repairs`), proposed when the
+diff has an `and` whose source registers are reversed, or the target's own `and` has a negative mask register first
+(0.5.201: every register in the diff may differ), and the mask needs a register. It reads m2c's `M2C_FIELD` as a pure
+read, so it applies to the untouched draft: on a fresh import the draft (score 10, the other allocation cluster, only
+the load and mask registers differing) gets exactly one proposal, `(s32) (((R & -0x1C1) | -0x1C1) & R)`, which compiles
+byte-identical. The first version (0.5.196) needed the swapped `and` row and never fired in a real run from the
+draft: a reminder that a rewrite proven on a hand-picked source is not proven. The same reasoning probably applies
+to other commutative instructions with a constant (`or`, `xor`, `add`), not yet seen.
+
+
+## KMC gcc 2.7.2, `-O2`: a `s16` local whose sign extension steals the argument register (N64, a game with about 1,900 functions)
+
+A 104-instruction function sat at score 5: the target's `subu $a1,$s0,$a1` read the switch result's saved register,
+ours read `$a0`. Dumping the passes (`cc1 -dr -dc`) showed why: the expanded RTL gives the `s16` local's sign extension
+(`sll`/`sra`) a pseudo of its own, cse reuses that pseudo for every later reader (the subtraction and the call
+argument), and local-alloc puts it in `$a0`. Declaring the local `s32` removes the extension: the subtraction then reads
+`$s0`. **Controlled, one function, not a match:** the only row that remains is a move's schedule position (the target's
+`move $a0,$s0` comes before the constant load; ours after the subtraction); 144 spellings of the subtraction, the call
+argument and statement order did not move it, and the `s32` step scores no better than the `s16` source in the app's
+judge, so a pure hill-climb never keeps it.
+The family is `kmc_widen_sign_local` in decomp-repair 0.5.203 (`kmc_type_repairs`): proposed when one changed row
+differs only by a saved register in the target against an argument register in ours, for a local assigned only
+literals that fit its type. A synthetic two-call reduction did not reproduce the effect (the reduction kept `$s0`
+either way), so the test here covers the proposal, not the byte effect.
+
+### KMC separately relocated flag and shared switch call
+
+- Both N64 functions were compiled with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` and checked
+  with the linked-byte judge. The first matched all 424 bytes after naming the flag independently of its
+  base object. A base-relative field access had scored 225 because KMC shared an address calculation that
+  the original split between the load and the guarded store. The new rule requires both raw relocations to
+  resolve to the same byte.
+- The second matched all 244 bytes after restoring four narrowed byte inputs and using a typed pointer with
+  the byte argument at the call shared by the switch arms. The original draft scored 970 and the bounded
+  search brought it to 865 without matching. The rewrite checks all 27 jump-table destinations and the
+  branch delay slots that supply the call's arguments before changing the source.
+- Both repairs also reproduced their matches from compiled drafts through the Deep Permuter proposal path.
+  The same 226-example replay rose from 28 to 30 exact matches, with 29 from fresh drafts and one after search.
+
+## KMC gcc 2.7.2: shared counters, scheduling regions and integer bases (N64, the same 352-instruction function: 785 to 120)
+
+Compiler and flags: `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. Evidence level: one real function, hand work with the
+app's exact judge and the compiler's own RTL dumps (`cc1 -dS -dR -dL -dg`); not a controlled regression test.
+
+- **Reuse the counters across loops (785 to 550).** The target used one counter for loop 1 and loop 3's outer loop
+  (`$s5`) and another for loop 2 and loop 3's inner loop (`$s2`). m2c's drafts give every loop its own variable; two
+  shared `u16`-style counters changed use counts and live ranges enough to give the allocator the target's order.
+- **Keep bases in registers the target does, by declaring them (550 to 325).** `b1 = D_80117428; b3 = b1 + 0x150;
+  b2 = D_800BFC38;` before the nested loop reproduced the three hoisted bases (`$s6`, `$s7`, `$fp`). Typing the first
+  two `unsigned int` made the address adds put the integer operand first, as the target does (`addu a0,s0,s6`):
+  a pointer-typed base is sorted first by the compiler.
+- **A `do { call } while (0);` is a scheduling barrier (325 to 120).** The scheduler places a loop-invariant constant
+  as late as it can inside its region, and loop notes bound regions. A wrapper around `func_8000A18C` put all three loop
+  constants before that call; assigning `c2` before the wrapper and `c64`, `c1` after it split them the way the target
+  has them (325 to 120). Which call is wrapped decides where constants land, and wrapping is the only source-level
+  lever found for it. Position and declaration order of the assignments did not matter.
+- **Delay slots come from the nearest single-word instruction before the call** (reorg), so a constant that is
+  scheduled earlier than a macro-expanded store or load can still end up in a call's delay slot.
+- **What did not work:** `int` for a loop constant (it merges with an earlier word constant of the same value);
+  assigning the constants after the stores; wrapping any single non-call statement in the region; a second wrapper
+  ending at `func_80007160` (it reproduced the constants' order and scrambled the stores).
+- **Left at 120:** two instructions out of place: the counter's `move` (the target has it after the `lbu` that
+  loads the call's argument) and the `0x64` constant (the target has it right after the `lhu`). Both are scheduler
+  ordering; no source position or wrapper tried changes them.
+
+### Recover byte displacements in small table readers and call wrappers
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, three machine drafts in a scratch
+N64 project reached exact linked matches. A halfword reader applied a byte stride
+through a word pointer. Preserving the odd factor of the stride in byte arithmetic
+and using a halfword load brought its score from 30 to 0. A floating-point reader
+cast and masked its input before indexing a float table. Typing the table and using
+its element index brought the score from 170 to 0. A call wrapper passed the address
+four bytes into a halfword record and the initial halfword separately. Applying the
+displacement as bytes brought its score from 10 to 0. The deep permuter reproduced
+all three matches using the measured shift, relocation and call-delay-slot evidence.
+
+### Full-byte mask after a sentinel repair
+
+On an isolated N64 ROM project, KMC GCC 2.7.2 with
+`-G0 -mips3 -mgp32 -mfp32 -O2` left one differing operand after a sentinel
+repair. The target used `lbu`, loaded the comparison constant, then applied
+`andi ..., 0xff` before the branch. The draft used `0x7f`. Using `0xff`
+directly removed the redundant mask and raised the linked score from 10 to
+240. The automatic follow-up tried full-byte casts and staged unsigned
+locals, including a volatile local and an instruction-free register
+constraint. The isolated replay retained score 10 after the five focused trials.
+
+### Narrow zero stores and preserve the bias in float table indexes
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, two machine drafts
+in an isolated N64 ROM project reached exact linked matches. Changing only
+the cast on an indexed zero store from word to byte brought its score from
+200 to 0. The target and draft used the same address instructions, with
+`sb` in the target and `sw` in the draft. In a float table reader, typing
+the table as an array and preserving the constant subtraction between the
+float-to-integer cast and index mask brought the score from 170 to 0.
+The deep permuter independently reproduced and saved both byte matches.
+
+### KMC masked slot dispatch and signed table offsets
+
+- Two N64 functions built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` matched all 412 and 424
+  linked bytes. The rewrite uses a typed slot-list header, a signed halfword offset table, and four-byte
+  mask entries. It checks the nine original table destinations and the two observed call layouts.
+- Fresh drafts scored 3353 and 3673. The bounded search reduced both scores to 1145. In the first case,
+  a typed reconstruction that loaded the signed offset before forming the 36-byte stride still scored
+  40 and exchanged the registers for the two loop advances. Computing the stride first matched.
+- The original drafts also matched through the new Deep Permuter proposal. The 226-example replay
+  increased from 30 to 32 exact matches.
+
+## KMC gcc 2.7.2: what the scheduler does around a one-shot loop (same function, 120 and two instructions short)
+
+Same compiler, flags and function as the previous entry; hand work with `cc1 -dS -dR` dumps.
+
+- **The first instruction after a loop note is pinned.** The dump gives it a dependence on every earlier set and use; the
+  rest of the region then depends on it. In `do { ci = 0; ... call(x); } while (0);` the counter's `move` is that
+  pinned first instruction, so it is scheduled before the argument `lbu`; the target has the `lbu` first.
+- **A load that feeds a call is forwarded into it** by combine, so it never becomes the region's first instruction
+  even when it is the first statement. Declaring the global `volatile` stops that without changing the code (the
+  load stays `lui` + `lbu $a0`): `targ = D_801002F1; ci = 0; c2 = 2; call(targ);` inside the wrapper then schedules
+  `[lbu, move, call, li2]` exactly as the target does. A `*(volatile u8 *)&sym` cast does not: it costs an address
+  register and an extra instruction.
+- **A call's delay slot is filled from before it or after it**: reorg takes the nearest single-word instruction, and
+  for a call it may take the one that follows. A constant scheduled just after a call can therefore end up in its
+  delay slot.
+- **After a load, the stall is filled by the first ready instruction**: stores of zero win it over a held constant,
+  whatever the source order, so `li c64` could not be placed right after the `lhu` as the target has it. Moving the
+  `lhu` statement to be first after the wrapper (so it is that region's pinned instruction) puts the `lhu` first but
+  sends the constant to the end of the region.
+- **Result:** the `volatile` form fixes the counter's `move` but costs the `$s6`/`$s7` order of the two constants
+  (120 became 275); no source shape reproduced both. The remaining target feature is a held constant scheduled
+  between a load and the stores that follow it.
+
+### Preserve halfword table strides across call slots and nested indexes
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, five machine drafts
+on an isolated N64 ROM project scored 30 because an indexed halfword load
+had a second word-scale multiplication and an extra two-byte relocation
+addend. A typed halfword array matched the contiguous reads. A byte array
+with an explicit halfword load preserved the original stride for records.
+The deep permuter recovered both forms, including a load in a call delay
+slot and an address calculation interrupted by a return-address spill. All
+five linked scores fell from 30 to 0.
+
+### Forward an entry argument alongside a float call's stack output
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, machine drafts
+in an isolated N64 ROM project put a stack output pointer in the first
+argument register. The target put it in the second and carried the entry
+argument unchanged into the first. Restoring the forward fixed one
+register difference. Recovering the halfword table and, where present,
+the separate word table eliminated the remaining scaled-address
+differences. The normal deep permuter measured the combined improvements
+from scores 35 and 45 to exact linked matches. Two further wrappers at score 45
+matched after reusing the caller's typed first parameter alongside its
+existing signature, including when another parameter was already present.
+
+### IDO adjusted indirect callback and address-taken event word
+
+- Four N64 functions built with `ido-7.1 -O2 -mips2 -G 0 -non_shared -Xcpluscomm -Wab,-r4300_mul -woff 649,838,712`
+  matched all 80 bytes each. The generated draft had an integer dereference where the receiver was loaded.
+  The repair restores the typed record access, the signed 16-bit receiver adjustment, and the event
+  initialized at stack offset 44 and passed by address.
+- Introducing pointer types alone compiled but scored 29. Staging the adjustment before the indirect
+  call scored 4. The stack padding around the event recovered the original frame and call schedule.
+  This repair requires the full target instruction pattern and a matching source event value.
+
+### Preserve float record strides and shared word offsets
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a machine draft
+in an isolated N64 ROM project loaded a float field through a default
+word declaration. This duplicated the byte scale and inserted an
+integer-to-float conversion after the load. A byte array plus a typed
+float load preserved the original record stride and reduced the linked
+score from 120 to 0. In another draft, one offset served several word
+reads in a guarded block. Dividing its shared constant by the word size
+reduced the score from 10 to 0. The deep permuter independently found and
+saved both exact matches.
+
+### Recover byte displacements and selected halfword tables
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, two machine
+drafts in an isolated N64 ROM project reached exact linked matches.
+A call delay slot applied a negative byte displacement to a saved
+global address. Casting that one address to a byte pointer corrected
+the displacement from -32 to -8 and reduced the linked score from 10
+to 0. Another draft selected a table through a shared cursor. Typing
+that cursor as a halfword pointer corrected the shift and load offset.
+The existing word-table repair then handled a separate access, taking
+the score from 30 to 10 to 0.
+
+### Preserve loops that branch to their own entry
+
+Two isolated N64 examples built with
+`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` matched all 36 and 24
+linked bytes respectively. The byte scan also used `-g3`. Giving m2c a
+local entry label let it emit drafts, but the scan omitted the pointer
+advance in the taken branch's delay slot (score 400). A bitwise `&`
+between the byte and end-pointer checks preserved both evaluations, and
+the compiler placed the advance in that delay slot. The entry-label
+draft for the word poll scored 10 until a volatile declaration kept
+the load inside the loop.
+
+### Preserve IDO strided cursor initialization and scheduling
+
+- Two isolated N64 examples used
+  `ido-7.1 -O2 -mips2 -G 0 -non_shared -Xcpluscomm -Wab,-r4300_mul -woff 649,838,712`.
+  The halfword clear matched all 48 linked bytes with comma initialization
+  and a typed cursor. Correcting void-pointer arithmetic alone scored
+  240. An indexed loop scored 290.
+- A three-by-three float copy with four-float row strides matched all 76
+  linked bytes after ordering the destination initializer before the
+  source and initializing both loop counters. The byte-cursor draft
+  scored 75 and the typed step alone scored 65.
+- A four-word clearing loop used
+  `ido-7.1 -O2 -G 0 -mips2 -32 -non_shared -Xcpluscomm -Wab,-r4300_mul -DNON_MATCHING`.
+  A typed cast with the counter assignment, cursor assignment and
+  `do` on one source line matched all 64 linked bytes. The split-line
+  form scored 20.
+
+### Recover pointer units independently at two calls
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, an isolated
+N64 machine draft scaled two call arguments twice. Casting the address
+of a global record table to a byte pointer preserved the indexed byte
+stride and brought the linked score from 20 to 10. Converting the byte
+displacement on a loaded halfword pointer to one element brought the
+score to 0. The deep permuter found each edit from its own relocation
+and argument-setup evidence and saved the linked match.
+
+### Preserve the masked byte offset while changing address operand order
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, an isolated N64
+machine draft differed only in the order of the two register operands
+of an address addition. The target and draft already used the same
+16-bit mask and four-byte scale. Performing the same offset addition
+in 32-bit integer units before casting back to a pointer brought the
+linked score from 5 to 0. Typed array indexing and byte-pointer
+addition retained the original operand order and the score of 5.
+The deep permuter reproduced and saved the exact match.
+
+### Rebuild an IDO reply record and move the shared switch tail
+
+An isolated N64 replay used
+`ido-7.1 -O1 -G 0 -mips2 -32 -non_shared -Xcpluscomm -Wab,-r4300_mul -DNON_MATCHING`.
+The draft passed one stack slot by address and read an undeclared word
+from inside the same record. The target exposed the byte count, a byte
+and halfword store, and a word load. Rebuilding an aligned 76-byte
+record and moving the shared reply block past its two switch cases
+matched all 328 linked bytes. The explicit early break, reply field
+assignment order, and compound update preserved IDO's schedule.
+An aligned byte buffer with casts at the field offsets compiled but
+scored 640.
+
+### Stage the subtracted product to match floating-point scheduling
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, one isolated N64
+machine draft emitted two load-and-multiply pairs in the reverse of
+the target order. Computing the right-hand product in a separate
+float local before evaluating the subtraction preserved the operand
+order of the subtraction and brought the linked score from 30 to 0.
+Moving the load statements alone retained score 30. Expressing the
+subtraction as addition of a negated product raised the score to 375.
+
+### Trim generated frame backing and recover a byte table load
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, an isolated N64
+draft's generated stack overlay had excess backing storage. Reducing
+the byte array by the eight-byte frame delta kept all typed view slots
+fixed and reduced the linked score from 8 to 0. Reducing it by twelve
+bytes instead retained a score of 8. A second draft used a word
+declaration for a byte table, which changed the load width and scaled
+the record offset twice. Restoring a byte array reduced its score
+from 270 to 60. The existing parameter-width repair then matched the
+remaining scheduling difference and brought the score to 0.
+
+### Rebuild IDO iterator records and preserve the typed cursor stride
+
+Two isolated N64 replays used
+`ido-7.1 -O2 -G 0 -mips2 -32 -non_shared -Xcpluscomm -Wab,-r4300_mul -DNON_MATCHING`.
+Both drafts dereferenced integer cursors and read undeclared stack
+words. Recovered record types and structured loops compiled, leaving
+scores of 4 and 10 from stack offsets alone. Restoring the scan's full
+scratch span and declaration order matched all 236 bytes. In the name
+lookup, reusing the loaded byte and the copy index, keeping the cache
+reload inside the loop, and ordering the addressed locals matched all
+300 bytes. Both exact drafts used local record declarations derived
+from the target's stack offsets and request increment.
+
+### Recover preloaded table strides and stage a comparison load
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, three isolated
+N64 drafts reached byte-exact matches. A loop shared a word-table
+offset with a pointer based on a previously loaded relocation.
+Removing the redundant source multiplication brought the score
+from 10 to 0. A second loop passed a global record address to a
+call. Treating its stride as bytes also brought the score from 10
+to 0. In the third case, the compiler reversed two float loads
+before a comparison. Staging the left-hand field in a local
+preserved the comparison and reduced the score from 20 to 0.
+
+### Recover a halfword guard and a table pointer in a call delay slot
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, one isolated N64
+draft applied word scaling to two byte strides. For a zero test,
+reading the original halfword from the byte-indexed table reduced
+the linked score from 220 to 10. The other address was formed in
+a call's delay slot from a previously loaded relocation. Recovering
+that byte stride reduced the score from 10 to 0. The deep permuter
+measured and saved both edits independently.
+
+### Keep heap byte distances and the IDO mapped poll
+
+- Two isolated N64 examples used
+  `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3`. Their drafts
+  mixed byte offsets, pointer subtraction and integer subtraction.
+  Typed byte pointers and explicit integer distances compiled but
+  scored 270 in both examples. Reusing the original argument for the
+  adjusted pointer and keeping one entry alias matched all 104 bytes
+  for the maximum and 96 bytes for the sum.
+- A mapped read used
+  `ido-7.1 -O1 -G 0 -mips2 -32 -non_shared -Xcpluscomm -Wab,-r4300_mul -DNON_MATCHING`.
+  A volatile status poll and typed destination store recovered the
+  source steps. Expressing the base word as a null-pointer dereference
+  scored 165. Naming the resolved word at address zero matched all
+  84 bytes.
+
+### Recover adjacent halfword fields and local setup around calls
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, one isolated N64
+draft read two adjacent signed halfwords from the low halves of word
+objects. Typing the fields as halfwords and retaining the byte stride
+reduced the linked score from 220 to 180. Moving two local zero
+initializations after the first call reduced it to 60. Moving a
+byte field read and its dependent index after a separate call
+reproduced the remaining instruction order and brought the score to
+0. Each step was independently measured in the deep permuter.
+
+### Restore cartridge I/O and IDO's unrolled matrix copy
+
+- With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, seven isolated
+  N64 examples had an invalid void dereference in the status poll.
+  Two examples also used `-g3`. The two word readers matched all
+  148 bytes each with a volatile poll, staged copies of the incoming
+  arguments, a typed uncached load and an empty loop before return.
+  Five DMA routines matched all 208 bytes each with explicit volatile
+  pointers for the DMA address registers and a shared length write
+  after the direction switch. Keeping the generated DRAM symbol
+  assignment in the tested draft scored 255.
+- With `ido-7.1 -O2 -mips2 -G 0 -non_shared -Xcpluscomm -Wab,-r4300_mul -woff 649,838,712`,
+  a float matrix copy had arithmetic on void pointers. Typed nested
+  loops with both headers on the same line matched all 96 linked
+  bytes. Splitting those headers across lines scored 20 by changing
+  the order of the cursor advances.
+
+### Recover a forwarded middle argument before a float literal
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, an isolated N64
+draft put the bits of a float literal in the second argument register.
+The target left the incoming second argument in place and loaded the
+literal into the third register. The callee read both registers.
+Inserting the forwarded formal into the call and its generated
+prototype reduced the linked score from 5 to 0. The deep permuter
+reproduced and saved the exact match.
+
+### Swap float declarations for a measured register exchange
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, an isolated
+N64 draft exchanged two float registers across six instructions.
+The instruction order, input fields and arithmetic already matched.
+Swapping the positions of the two affected local declarations
+changed the register allocation and brought the linked score from
+30 to 0. The deep permuter reproduced and saved the exact match.
+
+### Preserve IDO typed traversal, record stores and packed bytes
+
+- Three isolated N64 examples used
+  `ido-7.1 -O2 -mips2 -G 0 -non_shared -Xcpluscomm -Wab,-r4300_mul -woff 649,838,712`.
+  All failed on arithmetic with void pointers. The reciprocal matrix
+  copy matched all 96 bytes with the counter, destination and source
+  initialized in that order in the loop header. The indirect visitor
+  matched all 112 bytes with a typed word cursor and signed halfword
+  receiver adjustment. The mixed record copy matched all 128 bytes
+  with separate byte and word cursors, preserving the order of the
+  tag, byte loop, word copies and final stores.
+- Two command writers used
+  `ido-7.1 -O1 -G 0 -mips2 -32 -non_shared -Xcpluscomm -Wab,-r4300_mul -DNON_MATCHING`.
+  Their drafts read undeclared stack bytes. A union with bitfields at
+  the witnessed offsets matched all 132 and 148 bytes. Declaring the
+  assigned third field unsigned scored 200 on the longer writer.
+
+### Follow an indirect loop cursor and an aliased call label
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, two isolated
+N64 drafts reached exact linked matches. A cursor loaded record
+pointers and cleared two fields through them. Changing the cursor
+step from four pointer elements to one matched the target's
+four-byte advance and reduced the score from 10 to 0. In a
+guarded wrapper, resolving the source callee name to the assembly
+label let the deep permuter prove that the first argument was
+forwarded unchanged. Restoring that argument reduced the score
+from 15 to 0.
+
+### Recover halfword copy address order and return a list count directly
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, two isolated N64
+drafts each had one register-operand difference. Computing a halfword
+copy destination in 32-bit integer units preserved the byte stride
+and matched the target's address addition. Swapping the source pointer
+expression without the cast retained the score of 5. In a list walk,
+returning the already initialized count removed a redundant zero
+result path and used the target's source register in the delay slot.
+The deep permuter saved both linked matches, each from score 5 to 0.
+
+### Recover typed queue and buffer accesses
+
+- Four isolated N64 examples used
+  `ido-7.1 -O2 -mips2 -G 0 -non_shared -Xcpluscomm -Wab,-r4300_mul -woff 649,838,712`.
+  The drafts failed on void-pointer arithmetic. Word indexing and
+  early exits restored the queue submission (108 linked bytes).
+  Four staged copies per iteration restored the linear float
+  copy (128 bytes). A typed word loop restored the tagged record
+  copy (148 bytes), and a signed byte-count division with a staged
+  word load restored the checksum routine (184 bytes).
+- With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O1`, recovering the
+  nested pointer table and keeping the destination stride in bytes
+  matched all 124 bytes of a halfword copy. Under the same flags
+  with `-O2` in place of `-O1`, using a typed tag, count and table of
+  32-bit offsets matched all 148 bytes of a relocation walk.
+- A cartridge read with the same `-O2` flags matched all 148 bytes
+  after restoring the diagnostic symbol addresses from the call's
+  relocations. The draft had emitted inline string literals.
+
+### Recover a byte stride when the argument register already holds the base
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, an isolated
+N64 draft applied word scaling to a byte stride. The compiler put
+the scaled index in a temporary and loaded the global base into
+the argument register. Casting the table's address to a byte
+pointer preserved the stride and reduced the linked score from 10
+to 0. The deep permuter found and saved the match.
+
+### Prove a forwarded argument through a guarded jump table
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, one isolated N64
+draft placed a byte load in the first argument register. The target
+loaded that byte into the second register and forwarded the entry
+argument unchanged in the first. The deep permuter read every entry
+of the original jump table, confirmed the incoming first argument
+on every route that reached the call, and widened the generated
+prototype. The linked score fell from 5 to 0.
+
+### Use KMC's measured cursor and call schedules
+
+Four isolated N64 near-matches used
+`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. The first three also
+used `-g3`.
+
+- Staging the return-value clamp before passing a stack buffer to
+  the formatter moved its address setup after the arithmetic.
+  Score 60 fell to an exact 256-byte match.
+- Masking the input key once after the non-null check separated it
+  from the masked loop index. Removing the candidate's inert loop
+  wrapper alone scored 60. The combined repair reduced score 50
+  to an exact 76-byte match.
+- Keeping separate byte cursors for the record and its value slot
+  preserved both branch delay-slot increments. Indexing alone
+  scored 200. The complete repair reduced score 45 to an exact
+  108-byte match.
+- Reloading the context slot after both source writes preserved the
+  store-before-load order and the forwarded value. Reloading between
+  the two writes scored 265. The complete repair reduced score 60
+  to an exact 76-byte match.
+
+### Collapse split byte-flag updates in a switch case
+
+One N64 four-case switch function (752 bytes),
+`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, matched by hand from a
+clean rewrite. Each step measured with the app's judge; one function,
+not a controlled test.
+
+- One pointer local shared by three cases (a table pointer in one case,
+  `&global` in two others) put the cursor and the pointer in swapped
+  saved registers. A local per case fixed the swap (1465 to 895). The
+  library's `case_temporary_split` already proposes this.
+- Byte temporaries shared by two cases: splitting them per case gave
+  1060 to 610.
+- Struct-field stores (`cur->pos = -1`) let the scheduler sink a
+  scalar global's byte store below them: gcc 2.7.2 treats an in-struct
+  memory reference and a fixed-address scalar as non-conflicting
+  (`MEM_IN_STRUCT_P`). Writing the cursor's fields as
+  `*(s16 *)((u8 *)cur + 0x12)` kept the target's store order (420 to
+  340). Rewriting the object's fields the same way made it worse (1070).
+- `a = *m; b = G; a = (a | 4) & ~1; b &= ~1; *m = a; G = b;` left the
+  two byte values in swapped `$v0`/`$v1`; folding the load
+  (`a = (*m | 4) & ~1;`) fixed it (340 to 240).
+- In the other case, the same split spelling put the `lui/addiu` of
+  `&m` before the `&global` set-up of `$s0`; `*m |= 1; G |= 1;` was
+  exact (240 to 0). Statement order in that case changed nothing (all
+  12 orders scored the same); sched1 dumps showed the extra local's
+  pseudo was what moved the address.
+- Permuter: `split_read_modify_write` (decomp-repair 0.5.237) offers
+  these folded and collapsed, per site, per interleaved group and all
+  together. From the 340 source its all-sites child is exact in one
+  step; the stock families' best single step there was 100.
+
+### Advance a halfword cursor on sentinel loop entry
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, an isolated N64
+draft advanced a cast halfword cursor twice as far before the first
+iteration. Correcting the initial pointer arithmetic alone reduced
+the linked score from 200 to 60. Moving the advance to the beginning
+of the loop reproduced the target's ordering around the sentinel
+guard and call, bringing the score to 0. The deep permuter recognized
+and saved the combined repair from score 200.
+
+### Index guarded counter loops by the counter, and share one counter
+
+`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, an N64 function with three
+loops over 0x18-byte records (one with calls, one without, one with three
+calls), from m2c's guarded `i = 0; if (n > 0) { off = 0; do { ... off + base
+...; i += 1; off += 0x18; } while (i < n); }` loops. One function, judged by
+the app; evidence level: exact match.
+
+- The target's offset zero (`move $s2,$zero`) comes after the hoisted loop
+  invariants (`addiu $s3,$sp,0x20; lui/mtc1 50.0f`): it is a giv made by
+  loop.c's strength reduction, so the source indexed `base + i * 0x18`. An
+  offset variable puts its zero before them. Indexing loops 1 and 2: 180 to
+  60; all three (the early `i += 1` of loop 3 moved last): 60.
+- Register order (`$s1` counter, `$s2` offsets in every loop) is global.c's
+  priority `floor_log2(uses) * uses / live_length`. One counter shared by
+  the three loops had 21 weighted uses over 102 insns (0.82); the givs 0.93,
+  so they took `$s1`. A guard written on the counter (`if (i < n)`, what a
+  `for` expands to) adds a use per loop: 24 uses, 0.94, counter first.
+  Guards alone: 193; shared counter alone (with m2c's reuse of the counter
+  name for a call result split off): 115 to 135; the three together: 20.
+- The last 20 was frame size only (0xb8 for 0xa0): the guards' compare
+  pseudos left dead ST_REGS pseudos that took stack. Shrinking m2c's frame
+  union (`bytes[68]` to 44) or declaring the three vectors as separate
+  locals was exact (0). `measured_trim_frame_view` already does the former.
+- Failed: 120 declaration orders of the five counters/offsets (all 180);
+  every partition of shared counters/offsets without indexing (best 180);
+  `i = 0` moved inside the guard (385).
+- Permuter: `guarded_offset_index` (decomp-repair 0.5.238): indexed,
+  counter-guarded, and shared-counter children; the shared one is 180 to
+  20 on the saved best, then the frame trim finishes it.
+
+### Restore entry save order and stage a halfword mask
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, two isolated N64
+drafts reached exact linked matches. Restoring a forwarded first
+argument alone reduced the first score from 35 to 30. Reordering
+the two entry-parameter copies to match the target saves brought
+it to 0. For the other draft, staging a halfword mask before
+merging in the remaining bits reproduced the OR operand order
+and brought the score from 5 to 0. Swapping the written operands
+without staging preserved the original score of 5.
+
+### Preserve KMC's measured address and call preparation
+
+Five isolated N64 examples used `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`.
+
+- With `-ffast-math`, staging the squared length, square root and
+  divisor recovered the float register order and retained the two
+  source reloads. The linked score fell from 75 to zero across
+  116 bytes.
+- With `-g3`, taking the flag snapshot before publishing the pointer
+  reduced the score from 70 to 10. Restoring the empty loop's
+  initializer and final increment matched all 84 bytes.
+- Also with `-g3`, staging a byte pointer and a 24-byte record
+  displacement matched all 44 bytes of a word comparison (score 70).
+- Separating a call's biased offset from its loaded base with a
+  static inline sum matched all 80 bytes (score 90). The helper was
+  fully inlined.
+- Forwarding the untouched third entry argument through a record
+  update matched all 88 bytes (score 70).

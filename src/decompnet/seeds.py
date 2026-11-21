@@ -39,6 +39,11 @@ _BRANCH = re.compile(r"^(b|beq|bne|beqz|bnez|bgtz|blez|bltz|bgez|bltzal|bgezal|b
                      r"bltzl|bgezl|bc1t|bc1f|bc1tl|bc1fl|j)$")
 
 
+def with_m2c_macros(source: str) -> str:
+    """Add the compatibility preamble when a draft needs its names."""
+    return M2C_MACROS + '\n' + source if re.search(r'\bM2C_\w+', source) else source
+
+
 def m2c_target(toolchain_id: str) -> str | None:
     """m2c's target for C that `toolchain_id` built ("mips-ido-c"): the console that lists the compiler says m2c's
     dialect (consoles/). None when m2c can't read its code."""
@@ -370,8 +375,13 @@ def generate_from_asm(asm_text: str, name: str, toolchain_id: str | None, contex
         if not valid:
             return source
         if target.startswith('mips'):
-            return _compilable(source, name, asm_text, context_header, toolchain_id)
+            return _compilable(source, name, asm_text, context_header, toolchain_id, resolve=resolve)
         return _compilable(source)
+
+    from decomprepair import mips_entry_loops
+
+    if entry_loop := mips_entry_loops.candidate(asm_text, name, context_header):
+        return entry_loop
 
     from decomprepair import (
         aligned_allocator_request,
@@ -388,6 +398,7 @@ def generate_from_asm(asm_text: str, name: str, toolchain_id: str | None, contex
         large_stack_drafts,
         likely_branch_cursor,
         loop_storage_shapes,
+        masked_slot_dispatch,
         measured_address_repairs,
         measured_callback_loop,
         measured_mmio_polling,
@@ -406,13 +417,14 @@ def generate_from_asm(asm_text: str, name: str, toolchain_id: str | None, contex
         stack_header_buffer,
         stack_read_retry,
         stack_word_index_drafts,
+        switch_pointer_calls,
         unaligned_stack_drafts,
         uncached_read_repairs,
     )
 
     draft_asm = likely_branch_cursor.draft_asm(asm_text)
     source = _compilable(run_m2c(draft_asm, name, target, context_header, data_asm, timeout, valid, strict, options),
-                         name, asm_text, context_header, toolchain_id)
+                         name, asm_text, context_header, toolchain_id, resolve=resolve)
     if not source:
         return None
     if 'M2C_UNALIGNED32' in source and (draft := unaligned_stack_drafts.rewrite(
@@ -422,9 +434,13 @@ def generate_from_asm(asm_text: str, name: str, toolchain_id: str | None, contex
         return words[0][1]
     if leaves := short_leaf_drafts.variants(source, name, asm_text, context_header):
         return leaves[0][1]
-    return (measured_stack_drafts.rewrite(source, name, asm_text, context_header)
+    switch_asm = _mips_table_aliases(asm_text, data_asm) if data_asm and 'switch (' in source else asm_text
+    return (measured_stack_drafts.rewrite(source, name, asm_text, context_header, resolve=resolve)
             or large_stack_drafts.rewrite(source, name, asm_text, context_header)
-            or shared_default_drafts.rewrite(source, name, asm_text, data_asm, context_header)
+            or masked_slot_dispatch.rewrite(source, name, switch_asm, data_asm, context_header)
+            or switch_pointer_calls.rewrite(source, name, switch_asm, data_asm, context_header)
+            or shared_default_drafts.explicit_default_labels(source, name, switch_asm, data_asm)
+            or shared_default_drafts.rewrite(source, name, switch_asm, data_asm, context_header)
             or uncached_read_repairs.rewrite(source, name, asm_text, resolve)
             or measured_callback_loop.rewrite(source, name, asm_text, context_header, resolve)
             or indirect_call_drafts.rewrite(source, name, asm_text, context_header, resolve)
@@ -433,6 +449,7 @@ def generate_from_asm(asm_text: str, name: str, toolchain_id: str | None, contex
             or relocated_byte_table.rewrite(source, name, asm_text, context_header, resolve)
             or relocated_global_update.rewrite(source, name, asm_text, context_header, resolve)
             or relocated_global_update.rewrite_reload_wrapper(source, name, asm_text, context_header, resolve)
+            or relocated_global_update.rewrite_branch_byte(source, name, asm_text, context_header, resolve)
             or relocated_global_update.rewrite_countdown(source, name, asm_text, context_header, resolve)
             or stack_fill_drafts.rewrite(source, name, asm_text, context_header)
             or stack_fill_drafts.rewrite_ascending(source, name, asm_text, context_header)
@@ -462,7 +479,7 @@ def generate_from_asm(asm_text: str, name: str, toolchain_id: str | None, contex
             or source)
 
 
-def _compilable(source: str | None, name='', asm='', header='', toolchain=None) -> str | None:
+def _compilable(source: str | None, name='', asm='', header='', toolchain=None, *, resolve=None) -> str | None:
     """Repair generated C before the first compiler trial, using the target when available."""
     if not source:
         return source
@@ -471,7 +488,7 @@ def _compilable(source: str | None, name='', asm='', header='', toolchain=None) 
     if asm:
         from decomprepair import draft_call_recovery
 
-        if repaired := draft_call_recovery.variants(source, name, asm, header, toolchain):
+        if repaired := draft_call_recovery.variants(source, name, asm, header, toolchain, resolve=resolve):
             return repaired[0][1]
     return source
 
@@ -508,6 +525,27 @@ def _execute_m2c(argv, timeout):
         timeout=timeout,encoding="utf-8",errors="replace",creationflags=NO_WINDOW)
 
 
+_MIPS_TABLE_LABEL = re.compile(r"^[ \t]*dlabel[ \t]+((jtbl_|D_)([0-9A-Fa-f]{8}))[ \t]*$", re.M)
+_MIPS_DATA_RELOC = re.compile(r"(%(?:hi|lo)\()D_([0-9A-Fa-f]{8})(\))")
+
+
+def _mips_table_aliases(asm: str, data: str) -> str:
+    """Use the supplied table's name when the draft's relocation uses its address alias."""
+    aliases = {}
+    for match in _MIPS_TABLE_LABEL.finditer(data):
+        name, prefix, address = match[1], match[2], match[3].lower()
+        # A table with two spellings for the same address needs its original relocation.
+        aliases[address] = name if prefix == "jtbl_" and aliases.get(address, name) == name else None
+    if not aliases:
+        return asm
+
+    def replace(match):
+        table = aliases.get(match[2].lower())
+        return match[1] + table + match[3] if table else match[0]
+
+    return _MIPS_DATA_RELOC.sub(replace, asm)
+
+
 @compile_timing.timed('generation')
 def run_m2c(asm_text: str, name: str, target: str, context_header: str = "", data_asm: str | None = None,
             timeout: float = 20, valid: bool = False, strict: bool = False, options: tuple[str, ...] = ()) -> str | None:
@@ -522,7 +560,7 @@ def run_m2c(asm_text: str, name: str, target: str, context_header: str = "", dat
 
         asm_text = abi_register_names(asm_text)
         if data_asm:
-            asm_text = draft_asm(asm_text, name, data_asm=data_asm)
+            asm_text = draft_asm(_mips_table_aliases(asm_text, data_asm), name, data_asm=data_asm)
     if target.startswith("gba"):  # a public GBA decomp (pret style): function macros, pre-UAL load mnemonics
         asm_text = re.sub(r"^\s*(?:non_word_aligned_)?thumb_func_start\s+(\w+)", r"glabel \1", asm_text, flags=re.M)
         asm_text = re.sub(r"^\s*arm_func_start\s+(\w+)", r"glabel \1", asm_text, flags=re.M)

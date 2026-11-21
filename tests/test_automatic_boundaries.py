@@ -525,6 +525,19 @@ def test_multiword_alignment_between_a_return_and_an_aligned_frame(protect, fill
     assert [fn.rom for fn in result] == ([0,8,16] if protect else [0,16])
 
 
+@pytest.mark.parametrize('protect', [False, True])
+def test_long_alignment_before_a_directly_called_entry(protect):
+    call = 0x0c000000 | ((BASE+32) >> 2) & 0x3ffffff
+    words = [0x8c820000, 0x03e00008, 0, 0,
+             0xa0a60004, 0x24e7ffff, 0x04e1fffd, 0x24a5fffe,
+             *BODY, call, 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0,16,32,32+len(BODY)*4,len(words)*4))
+    symbols = [f'entry = 0x{BASE+16:08X};'] if protect else ()
+    result = repair(functions, [], image, consoles.get('n64'), segments, symbols=symbols)
+    assert any(fn.rom == 16 for fn in result) == protect
+    assert any(fn.rom == 32 for fn in result)
+
+
 @pytest.mark.parametrize('called', [False, True])
 def test_alignment_call_folded_into_the_next_frame(called):
     apparent_call = 0x0c000000 | (BASE >> 2)&0x3ffffff
@@ -708,3 +721,111 @@ def test_five_scheduled_entry_instructions_are_kept_with_their_frame():
     image, functions, segments = fixture(lead + BODY, cuts=(0, 32, 52))
     result = repair(functions, [], image, consoles.get('n64'), segments)
     assert [(fn.rom, fn.size) for fn in result] == [(0, 52)]
+
+
+@pytest.mark.parametrize('protected', [False, True])
+def test_branch_from_wide_padding_does_not_split_the_preceding_frame(protected):
+    calls = [0x0c000000 | ((address >> 2) & 0x3ffffff) for address in (BASE, BASE+64)]
+    body = [*BODY[:-2], 0, *BODY[-2:]]
+    fill = [0, 0, 0, 0, 0x1440fffa, 0, 0]
+    words = [*body, *fill, *BODY, calls[0], 0, calls[1], 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0,16,64,96,len(words)*4))
+    symbols = [f'entry = 0x{BASE+52:08X};'] if protected else ()
+    result = repair(functions, [], image, consoles.get('n64'), segments, symbols=symbols)
+    assert [(fn.rom, fn.size) for fn in result[:2]] == ([(0,16),(16,48)] if protected else [(0,36),(64,32)])
+
+
+@pytest.mark.parametrize('protect', [False, True])
+def test_zero_reservation_corroborates_alignment_after_a_return(protect):
+    call = 0x0c000000 | (((BASE+128)>>2)&0x3ffffff)
+    words = [*BODY, 0x24040002, 0x00851821, 0xac830030, 0x24460008,
+             *([0]*20), *BODY, call, 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0,32,48,128,160,len(words)*4))
+    symbols = [f'entry = 0x{BASE+40:08X};'] if protect else ()
+    result = repair(functions, [], image, consoles.get('n64'), segments, symbols=symbols)
+    assert any(fn.rom == 32 for fn in result) == protect
+    assert any(fn.rom == 128 for fn in result)
+    if not protect:
+        assert not any(32 <= fn.rom < 128 for fn in result)
+
+
+@pytest.mark.parametrize('case', ['worker', 'wrong restore', 'no incoming reference'])
+def test_closed_worker_keeps_its_compiler_epilogue(case):
+    entry = BASE+16
+    call = 0x0c000000 | ((entry>>2)&0x03ffffff) if case != 'no incoming reference' else 0
+    back = 0x08000000 | (((entry+12)>>2)&0x03ffffff)
+    restore = 0x8fb00010 if case != 'wrong restore' else 0x8fb10010
+    words = [call, 0, 0x03e00008, 0, 0x27bdffe8, 0xafbf0014, 0xafb00010, 0x26100001,
+             back, 0, restore, 0x8fbf0014, 0x03e00008, 0x27bd0018]
+    image, functions, segments = fixture(words, cuts=(0,16,32,56))
+    result = repair(functions, [], image, consoles.get('n64'), segments)
+    actual = [(fn.rom, fn.size) for fn in result]
+    assert ((16,40) in actual) == (case == 'worker')
+
+
+@pytest.mark.parametrize('protected', [False, True])
+def test_long_zero_alignment_before_called_cache_leaf(protected):
+    entry = BASE + 112
+    call = 0x0c000000 | ((entry >> 2) & 0x3ffffff)
+    tail = [0x10800003, 0, 0xbd190000, 0, 0x03e00008, 0]
+    words = [*BODY, *([0]*20), *tail, call, 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 32, 36, 112, 136, len(words)*4))
+    symbols = [f'entered = 0x{BASE+32:08X};'] if protected else []
+    result = repair([functions[i] for i in (0,1,3,4)], [], image, consoles.get('n64'), segments, symbols=symbols)
+    assert (32 in {fn.rom for fn in result}) == protected
+
+
+@pytest.mark.parametrize('case', ['directory', 'damaged directory', 'named entry'])
+def test_terminal_scalar_alignment_before_halfword_data(case):
+    data = [0, 0, 0x8000, 0x8000, 0x4000, 0x4000, 0, 27, 0xff800000, 0, 0, 0, *range(1,9)]
+    if case == 'damaged directory':
+        data[-1] += 4
+    image, functions, _ = fixture([0, *BODY, 0x2d6b1919, *data], cuts=(4, 36, 40))
+    segments = [Segment('code', 4, 40, BASE+12)]
+    functions = [replace(fn, vram=fn.vram+8, lines=[replace(line,vram=line.vram+8) for line in fn.lines])
+                 for fn in functions]
+    symbols = [f'entered = 0x{BASE+44:08X};'] if case == 'named entry' else []
+    result = repair(functions, [], image, consoles.get('n64'), segments, symbols=symbols)
+    assert (36 in {fn.rom for fn in result}) == (case != 'directory')
+
+
+@pytest.mark.parametrize('word,opcode', [(0, 36), (0xbf800000, 49)])
+def test_typed_memory_access_preserves_data_after_closed_function(word, opcode):
+    words = [*BODY, word, *([word] if word else []), 0x3c088000,
+             opcode << 26 | 8 << 21 | 3 << 16 | 0x1020, 0x03e00008, 0]
+    end = 40 if word else 36
+    image, functions, segments = fixture(words, cuts=(0, 32, end, len(words)*4))
+    carrier = functions[1]
+    caller = functions[2]
+    caller.lines[0] = replace(caller.lines[0], operands=f'$t0, %hi({carrier.name})')
+    caller.lines[1] = replace(caller.lines[1], operands=f'$t1, %lo({carrier.name})($t0)')
+    data = []
+    result = repair(functions, data, image, consoles.get('n64'), segments)
+    assert carrier.name not in {fn.name for fn in result}
+    assert [(d.rom, d.size) for d in data] == [(32, end-32)]
+
+
+@pytest.mark.parametrize('valid', [True, False])
+def test_terminal_all_ones_marker_before_display_modes(valid):
+    from decompnet.rom.automatic_boundaries import terminal_display_modes
+
+    words = [0, 0, *BODY, 0xffffffff, 0]
+    image, functions, segments = fixture(words, cuts=(8, 40, 44))
+    heights = [480,480,240,240,240,720] if valid else [480,480,240,240,240,900]
+    for height in heights:
+        image += (640 << 16 | height).to_bytes(4, 'big') + (511 << 16).to_bytes(4, 'big')
+    assert terminal_display_modes(functions[-1], functions[0], image, 'big', segments) == valid
+
+
+def test_default_color_pointer_assigned_to_initialized_record():
+    from decompnet.rom.automatic_boundaries import default_color_word
+
+    data_at = BASE+12
+    init = [0x3c028000, 0x2442100c, 0xa600000c, 0xae000008,
+            0xa6000014, 0xa6000016, 0xae020004]
+    words = [0x24820001, 0x03e00008, 0, 0xff, *BODY, *init]
+    image, functions, _ = fixture(words, cuts=(0, 12, 16, 48, len(words)*4))
+    previous, data, following, _ = functions
+    references = {data_at: {(48, 'code'), (52, 'code')}}
+    assert default_color_word(data, previous, following, image, 'big', references, {following.vram})
+    assert not default_color_word(data, previous, following, image, 'big', references, set())

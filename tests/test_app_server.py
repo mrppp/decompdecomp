@@ -115,6 +115,27 @@ def test_saved_match_recheck_pause_is_validated_saved_and_applied_live(app, monk
     assert not net.progress.matched_rechecks_paused
 
 
+def test_two_cli_sessions_claim_different_open_functions(app):
+    """match-function: a session with no function named claims an open one under its own holder, so two sessions
+    working at once never get the same function; release gives it back to the queue."""
+    from .test_loading import tiny_game
+    client,net,_=app
+    tiny_game(net,'parallel-claims',functions=3)
+    h={'X-Decomp':'1'}
+    first=client.post('/api/claim',headers=h,json={'slug':'parallel-claims','holder':'claude-a'})
+    second=client.post('/api/claim',headers=h,json={'slug':'parallel-claims','holder':'claude-b'})
+    assert first.status_code==200 and second.status_code==200,(first.text,second.text)
+    a,b=first.json()['name'],second.json()['name']
+    assert a!=b and {a,b}<={'func_0','func_1','func_2'}
+    # asking again while holding one is that same claim, renewed
+    assert client.post('/api/claim',headers=h,json={'slug':'parallel-claims','holder':'claude-a'}).json()['name']==a
+    assert client.post('/api/claim',headers=h,json={'slug':'parallel-claims','holder':'bad holder!'}).status_code==400
+    assert client.post('/api/release',headers=h,json={'slug':'parallel-claims','name':a,'holder':'claude-a'}).status_code==200
+    held={r['name'] for r in net.project_store(net._project('parallel-claims')['id']).all(
+        'SELECT f.name FROM claims c JOIN functions f ON f.id=c.function_id')}
+    assert held=={b}
+
+
 @pytest.fixture(scope="module")
 def app(tmp_path_factory):
     home = tmp_path_factory.mktemp("home")
@@ -3852,16 +3873,100 @@ def test_the_project_list_answers_same_for_an_unchanged_signature(app, monkeypat
     assert changed['sig'] != first['sig'] and changed['projects'][0]['matched'] == 2
 
 
-def test_play_refuses_a_runtime_it_cant_build_on_yet(app):
-    """The Play step's native runtimes are planned: asked for one, Play says so and starts nothing."""
+@pytest.mark.skipif(sys.platform != "darwin" or not os.getenv("DECOMPNET_RT64_ADAPTER"),
+                    reason="requires a local RT64 adapter and a macOS desktop")
+def test_rt64_play_runs_saved_c_and_both_fallbacks(app, tmp_path, monkeypatch):
+    """Exercise the Porting request with a real native renderer and three distinct code paths."""
+    import hashlib
+    import struct
+
+    from decompnet.port.wasm import play
+
+    if any(toolchains.installed(tool) is None for tool in ("sdl3", "zig", "wabt", "n64recomp")):
+        pytest.skip("requires the pinned compatibility and SDL3 tools")
+    client, net, _ = app
+    slug = "rt64-play-demo"
+    folder = tmp_path / "progress"
+    (folder / "src").mkdir(parents=True)
+    (folder / "include").mkdir()
+    rom = bytearray(0x3000)
+    for address, words in ((0, (0x80371240, 0, 0x80000400)), (0x1000, (0x08000108, 0)),
+                           (0x1020, (0x03E00008, 0)), (0x1080, (0x24020007, 0x03E00008, 0)),
+                           (0x1200, (0x24020008, 0x03E00008, 0))):
+        struct.pack_into(">" + "I" * len(words), rom, address, *words)
+    rom[0x3E] = ord("E")
+    (tmp_path / "demo.z64").write_bytes(rom)
+    image = {"sha1": hashlib.sha1(rom).hexdigest(), "file": "demo.z64", "title": "RT64 demo"}
+    code = """void entry(void) {
+        volatile unsigned short *frame = (unsigned short *)0x80010000;
+        unsigned short color = func_80000480() + func_80000600() == 15 ? 0x07C1 : 0xF801;
+        for (int i = 0; i < 320 * 240; i++) frame[i] = color;
+        osViSwapBuffer((void *)frame);
+    }"""
+    (folder / "src/entry.c").write_text(code)
+    (folder / "include/common.h").write_text(
+        "int func_80000480(void); int func_80000600(void); void osViSwapBuffer(void *);")
+    layout = [{"name": name, "vram": vram, "size": size, "rom_offset": offset}
+              for name, vram, size, offset in (("entry", 0x80000420, 8, 0x1020),
+                                               ("func_80000480", 0x80000480, 12, 0x1080),
+                                               ("func_80000600", 0x80000600, 12, 0x1200))]
+    (folder / "decompdecomp.json").write_text(json.dumps({"format": 2, "game": image, "platform": "n64", "layout": layout}))
+    config = {"kind": "rom", "platform": "n64", "big_endian": True, "rom": image,
+              "segments": [{"name": "demo", "rom_start": 0x1000, "rom_end": 0x1100, "vram": 0x80000400}]}
+    with net.project_registration(slug=slug, name=slug, description="", arch="mips", big_endian=True,
+                                  root=tmp_path, config=config) as (db, pid):
+        for function, source in zip(layout[:2], (code, None)):
+            offset, size = function["rom_offset"], function["size"]
+            db.execute("INSERT INTO functions(project_id,name,size,n_insns,target,vram,rom_offset,status,matched_source)"
+                       " VALUES(?,?,?,?,?,?,?,?,?)",
+                       (pid, function["name"], size, size // 4, bytes(rom[offset:offset + size]), function["vram"],
+                        offset, "matched" if source else "open", source))
+
+    dump = tmp_path / "frame.rdram"
+    monkeypatch.setenv("PORT_RAM_DUMPS", f"8:{dump}")
+    monkeypatch.setenv("PORT_RECOMP_CALLS", "80000480")
+    monkeypatch.setenv("PORT_INTERP_TRACE", "1")
+    selection = {"slug": slug, "build_mode": "compatibility", "runtime": "n64modernruntime"}
+    headers = {"X-Decomp": "1"}
+    try:
+        response = client.post("/api/play", headers=headers, json=selection)
+        assert response.status_code == 200, response.json()
+        job = response.json()["job"]
+        for _ in range(600):
+            result = client.get("/api/job", params={"id": job}).json()
+            if result["state"] != "running":
+                break
+            time.sleep(.2)
+        assert result["state"] == "done", result
+        assert result["result"]["native"]
+        for _ in range(40):
+            if dump.exists() and dump.stat().st_size >= 0x10002:
+                break
+            time.sleep(.05)
+        assert dump.read_bytes()[0x10000:0x10002] == bytes.fromhex("07C1")
+        log = (tmp_path / "port/wasm/build/play.log").read_text()
+        assert "RT64 compatibility frame submitted" in log
+        assert "recompiled 80000480" in log and "interpreter: 80000600" in log
+        assert client.post("/api/play", headers=headers, json={"slug": slug, "stop": True}).json()["stopped"]
+    finally:
+        play.stop(slug)
+
+
+def test_play_and_export_refuse_an_unavailable_build_or_runtime(app):
     from .test_loading import tiny_game
 
     client, net, _ = app
     slug = "play-runtime"
     tiny_game(net, slug)
-    response = client.post("/api/play", headers={"X-Decomp": "1"}, json={"slug": slug, "runtime": "libultraship"})
-    assert response.status_code == 400 and "WebAssembly build only" in response.json()["error"]
-    net.remove_project(slug)
+    try:
+        for route in ("/api/play", "/api/play-export"):
+            for unsupported in ({"runtime": "libultraship"}, {"build_mode": "direct", "runtime": "wasm"}):
+                response = client.post(route, headers={"X-Decomp": "1"},
+                                       json={"slug": slug, "targets": ["web"], **unsupported})
+                assert response.status_code == 400
+                assert "Choose N64 compatibility and the decompdecomp runtime" in response.json()["error"]
+    finally:
+        net.remove_project(slug)
 
 
 def test_startup_does_not_stop_at_one_projects_half_written_save(tmp_path, monkeypatch):
@@ -4063,3 +4168,25 @@ def test_community_directory_reports_matching_library_roms(app, tmp_path, monkey
     assert job["state"] == "done", job
     assert job["result"]["matches"] == [["n64", repo]]
     assert str(library) not in str(job)
+
+
+def test_deep_permuter_tab_accepts_the_older_routes_field_names(app, monkeypatch):
+    """`function` and `max_variants` (the older permuter route's names) mean `name` and `variants` here, not function
+    '' and the 500-variant default."""
+    from decompnet.app import deep_permuter
+
+    client, net, _ = app
+    calls, done = [], threading.Event()
+    monkeypatch.setattr(deep_permuter, "validate", lambda *args: None)
+
+    def run(net, slug, name, minutes, variants, log, **options):
+        calls.append((name, minutes, variants))
+        done.set()
+        return {"function": name}
+
+    monkeypatch.setattr(deep_permuter, "run", run)
+    response = client.post("/api/deep-permuter", headers={"X-Decomp": "1"},
+                           json={"slug": "tab-game", "function": "g", "minutes": 3, "max_variants": 3000})
+    assert response.status_code == 200, response.text
+    assert done.wait(2)
+    assert calls == [("g", 3, 3000)]

@@ -257,10 +257,7 @@ def _readiness(net, slug: str) -> dict:
     report["blockers"] = blockers(report)
     report["ready"] = not report["blockers"]
     report["runtimes"] = runtimes(kit, report)
-    if not rom_mode:
-        for runtime in report["runtimes"]:
-            runtime["playable"] = False
-            runtime["missing"].append("A port-build adapter for the project's source tree")
+    report["build_modes"] = build_modes(kit, report)
     return report
 
 
@@ -281,17 +278,38 @@ def steps_done(report: dict) -> set[str]:
     return {step for step, ok in done.items() if ok}
 
 
-def runtimes(kit, report: dict) -> list[dict]:
-    """The kit's runtimes for the Play step: each {"id", "name", "summary", "built", "missing" (the steps it still
-    waits for, by their names), "playable"}. A runtime decompdecomp can't build on yet is never playable, however
-    far the checklist is."""
+def runtimes(kit, report: dict, mode: str | None = None) -> list[dict]:
+    """Report readiness separately for each build mode. The flat report keeps the direct-port prerequisites."""
     done = steps_done(report)
     out = []
     for runtime in kit.runtimes if kit else ():
-        missing = [STEPS[step] for step in runtime.needs if step not in done]
-        out.append({"id": runtime.id, "name": runtime.name, "summary": runtime.summary, "built": runtime.built,
-                    "missing": missing, "playable": runtime.built and not missing})
+        if mode and mode not in runtime.modes:
+            continue
+        missing = [] if mode == "compatibility" else [STEPS[step] for step in runtime.needs if step not in done]
+        if report.get("mode") == "project":
+            missing.append("A port-build adapter for the project's source tree")
+        built = mode in runtime.built_for if mode else bool(runtime.built_for)
+        native_play = mode == "compatibility" and runtime.native_adapter is not None
+        if native_play and not runtime.native_adapter():
+            missing.append("A local macOS RT64 adapter (see docs/PORTING.md)")
+        name = "decompdecomp runtime" if mode == "compatibility" and runtime.id == "wasm" else runtime.name
+        summary = runtime.compatibility_summary if mode == "compatibility" and runtime.compatibility_summary else runtime.summary
+        out.append({"id": runtime.id, "name": name, "summary": summary, "built": built or native_play,
+                    "missing": missing, "playable": (built or native_play) and not missing,
+                    "exportable": built and not missing})
     return out
+
+
+def build_modes(kit, report: dict) -> list[dict]:
+    modes = (
+        ("compatibility", "N64 compatibility (32-bit game memory)",
+         "Keeps N64 pointers and data layouts. Uses WebAssembly in browsers and wasm2c for desktop builds. "
+         "N64Recomp or the interpreter can cover functions without decompiled C."),
+        ("direct", "Direct 64-bit C port",
+         "Compiles the game’s C directly for the host. The code needs to compile and link with 64-bit pointers."),
+    )
+    return [{"id": key, "name": name, "summary": summary, "runtimes": options}
+            for key, name, summary in modes if (options := runtimes(kit, report, key))]
 
 
 def blockers(report: dict) -> list[str]:

@@ -61,7 +61,7 @@ def read(image, taken):
     return []
 
 
-def add(config, image, found, records, log):
+def add(config, image, found, records, log, *, preserve_gaps=False):
     """Give each bank a distinct symbol scope and keep uncovered physical bytes opaque."""
     from .code import insert_segments
 
@@ -82,6 +82,9 @@ def add(config, image, found, records, log):
     first, last = records[0].start, records[-1].end
     outside = []
     for lo,hi,vram in found:
+        if preserve_gaps and all(hi <= bank.start or bank.end <= lo for bank in records):
+            outside.append((lo, hi, vram))
+            continue
         if lo < first:
             outside.append((lo,min(hi,first),vram))
         if hi > last:
@@ -195,7 +198,8 @@ def recover_registered(image, records, resident, log):
     found = []
     for record in records:
         scope = (record.start, record.end, record.vram)
-        bodies = complete(image, [], [scope], resident, Quiet(), table_ranges=[scope], entries=(record.vram,))
+        table = dict(rom_start=record.start, rom_end=record.end, vram=record.vram)
+        bodies = complete(image, [], [scope], resident, Quiet(), table_ranges=[table], entries=(record.vram,))
         for start, end, vram in bodies:
             if (found and record.start <= found[-1][0] and start-found[-1][1] <= 16
                     and not any(image[found[-1][1]:start])):

@@ -509,14 +509,18 @@ def test_copied_word_index_repair_runs_during_valid_kmc_draft_generation(monkeyp
     monkeypatch.setattr(seeds, 'm2c_target', lambda *args: 'mips-gcc-c')
     calls = []
 
-    def repair(*args):
-        calls.append(args)
+    def resolve(symbol):
+        assert symbol == 'table'
+        return 0x80010000
+
+    def repair(*args, resolve):
+        calls.append((*args, resolve('table')))
         return 's32 f(s32 arg) { return table[arg]; }'
 
     monkeypatch.setattr(measured_stack_drafts, 'rewrite', repair)
-    assert 'table[arg]' in seeds.generate_from_asm('asm', 'f', 'gcc-2.7.2-kmc', 'header', valid=True)
+    assert 'table[arg]' in seeds.generate_from_asm('asm', 'f', 'gcc-2.7.2-kmc', 'header', valid=True, resolve=resolve)
     assert seeds.generate_from_asm('asm', 'f', 'gcc-2.7.2-kmc', 'header') == raw
-    assert calls == [(raw, 'f', 'asm', 'header')]
+    assert calls == [(raw, 'f', 'asm', 'header', 0x80010000)]
 
 
 def test_larger_stack_recovery_is_used_by_valid_kmc_drafts(monkeypatch):
@@ -687,3 +691,45 @@ void f(int arg) {
     assert seeds.generate_from_asm(asm, 'f', 'ppc-compiler', valid=True) == raw
     recovery = dict(repairs.recovery_drafts(raw, 'f', asm, 'mips', 'ido-7.1', '', None, {}))
     assert recovery['initial_external_call_labels'] == fresh
+
+
+def test_ido_pointer_diagnostic_offers_recovery_in_rom_and_project_builds():
+    raw = """void *f(void *base) {
+    void *cursor;
+    cursor = base + 8;
+    cursor += 4;
+    return cursor;
+}
+"""
+    report = {'failures': [{'phase': 'compiler', 'reason': 'cfe: Error: Bad operand type for += or -='}]}
+    for toolchain in ('ido-7.1', ''):
+        choices = dict(repairs.recovery_drafts(raw, 'f', '', 'mips', toolchain, '', None, report))
+        assert 'cursor = (unsigned char *) base + 8;' in choices['initial_void_pointer_offsets']
+        assert 'cursor = (unsigned char *) cursor + 4;' in choices['initial_void_pointer_offsets']
+    assert not list(repairs.recovery_drafts(raw, 'f', '', 'mips', 'ido-7.1', '', None, {}))
+
+
+def test_kmc_keeps_volatile_entry_loop_when_m2c_cannot_find_the_entry(monkeypatch):
+    asm = '''
+glabel f
+/* 00 80003000 3C028001 */ lui $v0, %hi(flag)
+/* 04 80003004 8C424000 */ lw $v0, %lo(flag)($v0)
+/* 08 80003008 1440FFFD */ bnez $v0, f
+/* 0C 8000300C 00000000 */ nop
+/* 10 80003010 03E00008 */ jr $ra
+/* 14 80003014 00000000 */ nop
+'''
+    calls = []
+
+    def unsupported(*args, **kwargs):
+        calls.append(args)
+        raise seeds.DraftError('Cannot find branch target f')
+
+    monkeypatch.setattr(seeds, 'run_m2c', unsupported)
+    draft = seeds.generate_from_asm(asm, 'f', 'gcc-2.7.2-kmc', valid=True, strict=True)
+    assert 'extern volatile s32 flag;' in draft
+    assert 'while (flag != 0)' in draft
+    assert not calls
+    with pytest.raises(seeds.DraftError):
+        seeds.generate_from_asm(asm.replace('1440FFFD', '1440FFFE'), 'f', 'gcc-2.7.2-kmc', valid=True, strict=True)
+    assert len(calls) == 1

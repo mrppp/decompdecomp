@@ -777,7 +777,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Feature | N64 | PS1 | PS2 | PS3 | PS4 | PSP | GBA | GameCube · Wii | Windows PC | Xbox | DS | Public decomps |
 | :-- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
 | Loader/buffer tracing, named contracts and small wrappers | ✓ MIPS / named PI DMA | ✓ MIPS static | ✓ MIPS EE EABI | — | — | ✓ shared MIPS reader | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
-| Automatic texture banks (CI4/CI8, mixed CI8 palettes, RGBA32, RGBA16 mipmaps, RNC 1/2 and byte-sum RNC banks, named four-block banks, embedded ZIP packs, textures loaded by uncompressed display lists, I64 images in a chunked-RNC filesystem, model textures in a deflated asset table, UVTX files in a UV FORM filesystem, a texture table of back-reference-packed textures with inferred widths, display-list textures and sprites in a table of relocatable VPK0 files, image packs and model bitmaps in a party-game series' main filesystem, FLA2-packed texture banks, zlib RGBA members with stored dimensions; a fork's own splat image segments, JSON asset lists and sno texture sheets) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — image adapter | — image adapter | — | — image adapter | ✓ forks with the game file (N64 checked) |
+| Automatic texture banks (CI4/CI8, mixed CI8 palettes, RGBA32, RGBA16 mipmaps, RNC 1/2 and byte-sum RNC banks, named four-block banks, embedded ZIP packs, textures loaded by uncompressed display lists, I64 images in a chunked-RNC filesystem, model textures in a deflated asset table, UVTX files in a UV FORM filesystem, a texture table of back-reference-packed textures with inferred widths, display-list textures and sprites in a table of relocatable VPK0 files, image packs and model bitmaps in a party-game series' main filesystem, FLA2-packed texture banks, zlib RGBA members with stored dimensions, named textures in Iain block archives, RDP textures in paired ROM resource directories; a fork's own splat image segments, JSON asset lists and sno texture sheets) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — image adapter | — image adapter | — | — image adapter | ✓ forks with the game file (N64 checked) |
 | Audio browser, filters, sortable samples and explicit WAV preparation | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | Indexed dialogue scripts with scene and speaker browsing, verified voice playback and related cutscene scripts | ✓ ROM | — | — | — | — | — | — | — | — | — | — | — |
 | ELv9 sector extents, PATH keyframes and NCS command inspection | ✓ ROM | — | — | — | — | — | — | — | — | — | — | — |
@@ -785,11 +785,11 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Native directory roles: animation, collision, placements, grid, sequences and demos | ✓ validated schema / linked records | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | Native ADPCM animation, linked textures and source-family I4 fonts | ✓ bounded native previews | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | Text/pointer record inspectors and PSF2 glyph atlas | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
-| Model browser and automatic indexed geometry / local mesh wireframes (raw, RNC 1/2, EMsh in byte-sum RNC and RNX with linked effect textures, embedded ZIP, zlib packed vertex-cache commands) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
+| Model browser and automatic indexed geometry / local mesh wireframes (raw, RNC 1/2, EMsh in byte-sum RNC and RNX with linked effect textures, embedded ZIP, zlib packed vertex-cache commands, named Iain scene meshes, paired cartridge F3DEX2 lists) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | PD3V textures, static assemblies, linked scenery and glTF export | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
-| B1 (including relocated and bit-packed controls) / libmus PtrTablesV2 audio banks, table evidence and mono VADPCM/PCM16 previews | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
+| B1 (including relocated and bit-packed controls and parallel cartridge tables) / libmus PtrTablesV2 audio banks, table evidence and mono VADPCM/PCM16 previews | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | Native frame/palette/mip selection and explicit animation | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
-| Image, texture/palette and audio previews | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | ✓ forks with the game file (N64 checked) |
+| Image, texture/palette and audio previews (including split libmus songs and sequenced effects on N64) | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | ✓ forks with the game file (N64 checked) |
 | Agent asset discovery, automatic checks, independent review and similar regions | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | Indexed Eurocom EDL archives, texture and local-mesh previews, and companion resource tables | ✓ ROM | — | — | — | — | — | — | — | — | — | — | — |
 | ROM Explorer: whole analysis image, references, clues and notes | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — image adapter planned | — image adapter planned | — | — image adapter planned | ✓ forks with the game file (image and segments; no function references yet) |
@@ -895,6 +895,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | What stops the C linking for a PC (Porting, from Compile for PC's objects, docs/PORTING.md phase 3) | ✓ (undefined and twice-defined symbols, sorted by what fixes each; nothing linked yet) | — no port kit yet | — no port kit yet | — | — | — no port kit yet | — | — project mode not read yet | — project mode not read yet | — | — project mode not read yet | — |
 | Port fixes judged twice (Start agents → Fix C for the PC, `fix_for_pc`, docs/PORTING.md phase 4) | ✓ (console match by the function judge, PC build by the pinned Zig's clang) | — no port kit yet | — no port kit yet | — | — | — no port kit yet | — | — project mode not read yet | — project mode not read yet | — | — project mode not read yet | — |
 | Port: a native build of a finished game (docs/PORTING.md) | — planned: libultraship, Torch | — planned: PsyCross | — | — | — | — | — | — | — | — | — | — |
+| RT64 compatibility Play (Porting → N64ModernRuntime) | ✓ macOS preview, verified on a partial demo; — retail validation, exports and other systems | — | — | — | — | — | — | — | — | — | — | — |
 | iPhone/iPad Xcode export (Porting; offline browser port, touch controls; device playthrough pending) | ✓ wrapper compiles; packaging and input tested | — no browser port kit | — no browser port kit | — | — | — no browser port kit | — | — project mode not read yet | — project mode not read yet | — project mode not read yet | — project mode not read yet | — project mode not read yet |
 | Verified Git export sync (explicit Settings action) | build.json export | shared export adapter | shared export adapter | — | — | shared export adapter | — | source already in checkout | source already in checkout | — | source already in checkout | source already in checkout |
 | Commit and push bound portable progress | ✓ | ✓ | ✓ | — | — | ✓ | — | — own checkout UI planned | — own checkout UI planned | — | — own checkout UI planned | — own checkout UI planned |
@@ -1125,6 +1126,12 @@ matches trigger a bounded, configurable automatic cascade. Project-mode support 
 per-file compiler context, template readers and SDK source placement must be integrated with the object judge.
 Project-mode similar-transfer support is planned: align target-object relocations and adapt file-local declarations before trying
 similar C through objdiff. Other processors need an instruction reader for this search.
+
+The Deep Permuter's two-move pass (`app/paired_moves.py`, judged through `app/judge_pool.py`: a pool of `decomp
+judge-worker` processes) runs for ROM projects, whose functions carry target bytes the worker judges exactly. Project
+mode (GameCube/Wii/PC/DS) has no standalone exact judge yet: objdiff judges there, so the pass is skipped. Planned: a
+judge worker for project-mode units, then the same pass. It found nothing on the first function it was built for
+(docs/COMPILER_MATCHING_LEARNINGS.md); a register-allocation-priority search is the next step for that kind of diff.
 
 ## Recently done
 
@@ -1625,6 +1632,13 @@ No decoder scripts run. Object-build adapters and executing/reviewing proposed d
 planned; asset format descriptions are advisory text.
 
 ### ROM Explorer
+
+Indexed LZ banks expose named textures, including RDP textures drawn in separately paletted strips. Their object
+records expose local F3DEX2 meshes and levels of detail, and packed Standard MIDI banks offer stereo playback.
+
+BAM3 and counted big-endian TIM sprite banks expose individual textures and palettes after bounded decompression.
+Unnamed B1 relocators can establish a nearby sample-table address, including uncached cartridge addresses.
+Detached compact MIDI tables offer stereo previews when a unique validated wave bank matches the scores.
 
 Iguana resource archives now expose CI4 and CI8 bitmap banks with palette-backed previews
 and padded texture row support. Their QMesh resources also expose wireframe geometry from
@@ -2651,11 +2665,19 @@ Line Tools; queues that never wait, so decompdecomp's thread glue) or N64ModernR
 queues and timers; the RT64 renderer, complete S2DEX; reads the ROM at run time, so no extraction; RT64 needs full
 Xcode on macOS for its Metal shaders). The kit becomes a list per console (`Console.port_kits`), the readiness report
 and link check read the chosen one, and Port readiness shows the choice with what each needs on this computer.
-Started: the Porting tab's Play step lists the kit's runtimes (`PortKit.runtimes`), WebAssembly (playable now) and
-both native ones, each with the checklist steps it still waits for; the native ones can't be chosen until
-decompdecomp builds on them.
-Tried on a Mac: libultraship and its libraries built from source; N64ModernRuntime built; RT64 stopped for want of
-Xcode's `metal`.
+Porting separates the build mode from the runtime. The N64 compatibility build preserves the game's 32-bit
+memory layout. Play can use the local macOS RT64 adapter when configured. The adapter uses ModernRuntime's VI
+registers and presents in an SDL3 Metal window. It keeps the compatibility host's scheduler, input, audio, saves,
+and original RDRAM writes from the software RDP. The direct 64-bit C option and libultraship remain planned.
+
+An Apple Silicon end-to-end demo used saved C, N64Recomp and the interpreter in one run and submitted the expected
+framebuffer to RT64. A native graphics task captured in the reference emulator also reached RT64. Retail saves
+still need live playthroughs. Raw cartridge DMA can now fill RAM and compatibility stack buffers, and local buffers
+retain the eight-byte alignment required by original loader code. Two retail boot paths still need work: one
+loads a relocated copy of libultra whose scheduler calls need to reach the host, and another calls its game entry
+through a TLB mapping after a boot helper returns. Next: verify more microcodes and games, support RT64 export,
+replace the compatibility scheduler and device services where ModernRuntime can take them over, and add other
+desktop builds.
 
 ### Ports: a native build of a finished game
 
