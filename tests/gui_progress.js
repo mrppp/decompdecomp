@@ -149,6 +149,19 @@ async function main() {
     assert.equal(followed.length, failed ? 0 : 1);
     if (failed) assert.equal(test.get("deepSweepLoadingBar").hidden, true);
   }
+  // With helpers working, a deep pass asks first: declined, nothing starts and the button stays as it was.
+  for (const accept of [false, true]) {
+    const test = setup("steering", '$("deepSweepStart").onclick = async () => {', '\n};', "deepSweepLog", "deepSweepStart");
+    test.ctx.setDeepRunVisibility = () => {};
+    test.ctx.S.sessions = [{state: "working"}, {state: "waiting"}, {state: "stopped"}];
+    let asked = "", requests = 0;
+    test.ctx.confirm = (text) => { asked = text; return accept; };
+    test.ctx.api = async () => { requests++; return {}; };
+    await test.ctx.run();
+    assert.match(asked, /^2 helpers are working on this project/);
+    assert.equal(requests, accept ? 1 : 0);
+    assert.equal(test.button.disabled, false);
+  }
   // Run again explicitly repeats saved completed turns, even with Advanced unchecked.
   {
     const test = setup("steering", '$("deepSweepStart").onclick = async () => {', '\n};', "deepSweepLog", "deepSweepStart");
