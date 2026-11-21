@@ -225,6 +225,10 @@ def build(net: RomNetwork, home: Path, port: int, secret: str, *, headless: bool
         ('Archive verified matches', lambda slug, log: net.match_library.backfill(log, only_changed=True, slug=slug)),
     ])
     startup.start()
+    if getattr(net, 'forks', None) is not None and hasattr(net.forks, 'watch_stale_files'):
+        # files left not building (a process stopped mid-trial) put back from their last commit: ForkEngine
+        threading.Thread(target=net.forks.watch_stale_files, args=(startup.stop,), daemon=True,
+                         name='stale-file-watch').start()
     from .database_cleanup import Retention
     net.database_retention = Retention(net,jobs)
     from . import render_worker
