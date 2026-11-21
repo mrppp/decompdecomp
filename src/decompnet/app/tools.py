@@ -847,7 +847,12 @@ def _tool_foreground(net, agent, slug, name, args):
             with timed_lock(progress._project_lock(slug), 'progress_project_lock_wait') if notes and progress is not None else nullcontext():
                 if notes and name == 'release_function' and net._function(args['function'],slug)['id'] != fn['id']:
                     raise NetworkError('The function changed while this release waited. Read its current claim before releasing.')
-                yield
+                from .forkengine import _BEST_LEFT
+                left = _BEST_LEFT.set(bool(notes and name == 'release_function'))  # (no second leave_best under the lock)
+                try:
+                    yield
+                finally:
+                    _BEST_LEFT.reset(left)
                 if notes and progress is not None:progress.foreground_changed(slug)
 
 

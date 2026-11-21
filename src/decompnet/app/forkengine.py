@@ -10,6 +10,7 @@ single match.
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import hashlib
 import json
@@ -563,6 +564,13 @@ def _renamed_note(d) -> str:
     return (f"\n⚠️ Some references use other names than the original: {pairs}. objdiff counts the match, but the "
             "game links by name: use the original's names (or rename the symbol everywhere) so the code links.")
 
+
+
+# Set while the release tool holds the project lock, after it left the function's best state itself (tools.py): a
+# leave_best from under that lock compiles, which takes the source tree after the project lock, the opposite of every
+# compile's order. When the tool's own leave_best didn't finish (its compile failed, or another agent's attempt came
+# in between), the release's second one did that, and two of a game's helpers deadlocked for ten hours.
+_BEST_LEFT: contextvars.ContextVar[bool] = contextvars.ContextVar("best_left", default=False)
 
 class ForkEngine:
     def __init__(self, net):
@@ -4273,7 +4281,8 @@ class ForkEngine:
         fn = self._fn(slug, function)
         if (link := self.net.links.get(slug)) is not None:
             link.call("/collab/release", agent, function=fn["name"], notes=notes, not_c=not_c)
-        self.leave_best(agent, slug, function)
+        if not _BEST_LEFT.get():  # (the release tool did it already, before its project lock: never again under it)
+            self.leave_best(agent, slug, function)
         return Network.release(self.net, agent, function, notes, slug, not_c, claim_token=claim_token)
 
     def leave_best(self, agent: Agent, slug: str, function: str) -> None:
