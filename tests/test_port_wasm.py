@@ -54,6 +54,40 @@ def test_the_build_takes_matched_c_less_what_the_host_provides_plus_the_ports_ow
     assert not (out / "src" / "func_8001E640.c").exists()
 
 
+def test_the_build_uses_original_code_for_a_profiled_rom_address(tmp_path):
+    from decompnet.port.wasm.build import original_code
+
+    repo, manifest = save(tmp_path)
+    host = tmp_path / "host"
+    (host / "games").mkdir(parents=True)
+    sha1 = "a" * 40
+    (host / "games" / f"{sha1}.original").write_text("# compiler stack layout\n0x80001000\n0x80001008\n")
+    manifest["game"] = {"sha1": sha1.upper()}
+    fixed, _ = addresses(manifest)
+    original = original_code(host, manifest, fixed)
+    assert original == {"race_update.c", "tokenize.c"}
+    out = tmp_path / "build"
+    chosen = gather(repo, out, original)
+    assert "race_update.c" not in chosen
+    assert chosen["tokenize.c"].parent.name == "overrides"
+    manifest["game"]["sha1"] = "a" * 39 + "b"
+    assert original_code(host, manifest, fixed) == set()
+
+
+def test_the_profiled_menu_quad_allocator_keeps_its_implicit_result():
+    from pathlib import Path
+
+    from decompnet.port.wasm.build import original_code
+
+    host = Path(get("n64").port_kit.wasm)
+    manifest = {"game": {"sha1": "da3f262dfb86cff1376c9a1aa081212e5a7aad64"}, "layout": [
+        {"name": "new_panel", "vram": 0x8004C4D0},
+        {"name": "draw_panel", "vram": 0x8004C370},
+    ]}
+    fixed, _ = addresses(manifest)
+    assert original_code(host, manifest, fixed) == {"new_panel.c"}
+
+
 def test_a_save_written_before_saves_named_headers_takes_the_projects_own(tmp_path):
     """An N64 game's save from before saves named each function's header had per-part headers but no
     function_headers: every function got the shared header and 268 files stopped at `unknown type name`. The
@@ -726,3 +760,17 @@ def test_compatibility_stack_buffers_keep_eight_byte_alignment_for_rom_calls():
   %word = load i32, ptr %hdr, align 4
 """
     assert align_stack_objects(ir) == ir.replace("}, align 4", "}, align 8").replace("align 1,", "align 8,")
+
+
+@pytest.mark.parametrize("body", [
+    "do { work(); } while (1);",
+    "do { work(); } /* keep this */ while (1);",
+    "do work(); while (1);",
+    "do do work(); while (1); while (1);",
+])
+def test_idle_rewrite_leaves_do_while_trailers_alone(body):
+    from decompnet.port.wasm.build import ido_c
+
+    assert ido_c(f"void f(void) {{ {body} }}") == f"void f(void) {{ {body} }}"
+    mixed = ido_c(f"void f(void) {{ {body} while (1); }}")
+    assert f"{body} for (;;) port_idle_forever();" in mixed

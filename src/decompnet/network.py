@@ -48,6 +48,12 @@ MODEL_FAMILIES = {"opus": "claude", "sonnet": "claude", "haiku": "claude", "fabl
 STALL_BUDGET = ((32, 3), (64, 4), (128, 6), (256, 8))
 STALL_BUDGET_BIGGEST = 10
 LARGE_PLATEAU_BUDGET = 4
+# A near-match (its best score at most NEAR_MATCH_SCORE: a few register or order rows left) gets at least
+# NEAR_MATCH_BUDGET compiles. Functions a person matched by hand in under 22 compiles had sat with helpers for 300-440
+# attempts at scores 10-15, each helper told to move on after 3-6 compiles and handing over the same dead ends:
+# the last rows need several individually neutral edits combined, which a short budget never lets anyone reach.
+NEAR_MATCH_SCORE = 50
+NEAR_MATCH_BUDGET = 20
 STALL_LOOKBACK = 16  # compiles stall_note reads back: more than the biggest budget
 # The game's own code (an SQL condition on `functions`): not what the project sets aside as library code, middleware
 # or the C runtime (config/<version>/set_aside.json, objdiff.game_measures; while its scope is the game's own code).
@@ -65,6 +71,7 @@ PROGRESS_COLUMNS = (
 # The functions still in the game's build: not one a measure found gone (a piece joined to its function, kept for its
 # attempts and notes; ForkEngine.sync marks it), which the map and every count leave out (meta's gone, copied too)
 IN_BUILD = "gone_mark IS NULL"
+TRIED_ROWS = 8  # rows of the brief's "already tried at this best" table (tried_at_best)
 BRIEF_NOTES = 8  # the newest notes on a function its brief shows
 REPEATS_KEPT = 4096  # compile results kept in memory for repeat_of
 # events after which earlier compile results don't stand for a repeat (bump_generation): a header, a source file, a
@@ -199,15 +206,31 @@ class NetworkError(Exception):
 
 
 
-def _no_better(scores: list[int | None], baseline: int | None = None) -> int:
-    """How many of the last compiles in a row (oldest first in `scores`) didn't beat the best before them."""
-    best, since = baseline, 0
-    for s in scores:
+def _no_better(scores: list[int | None], baseline: int | None = None, digests: list[str | None] | None = None) -> int:
+    """How many of the last compiles in a row (oldest first in `scores`) didn't beat the best before them. With
+    `digests` (each compile's diff_digest), a compile that ties the best with a diff not seen at that best counts as
+    progress too: a different set of differing rows at the same score is a new place to stand, and near-matches are
+    finished by combining such individually neutral edits (guide "near-match")."""
+    best, since, seen = baseline, 0, set()
+    for i, s in enumerate(scores):
+        digest = digests[i] if digests is not None and i < len(digests) else None
         if s is not None and (best is None or s < best):
-            best, since = s, 0
+            best, since, seen = s, 0, {digest} if digest else set()
+        elif s is not None and s == best and digest and digest not in seen:
+            seen.add(digest)
+            since = 0
         else:
             since += 1
     return since
+
+
+def diff_digest(rows) -> str | None:
+    """A short digest of a compile's differing rows (marker and candidate text), so two compiles at one score can be
+    told apart: the same digest is the same diff."""
+    bad = [(m, c) for m, _t, c in rows or () if m and m.strip()]
+    if not bad:
+        return None
+    return hashlib.sha1(repr(bad).encode()).hexdigest()[:16]
 
 
 # A note that says the function matches (written while a function that later stopped matching counted as matched,
@@ -375,9 +398,16 @@ def model_family(agent_name: str) -> str:
     return MODEL_FAMILIES.get(word.group(0), re.sub(r"\d+$", "", word.group(0)))
 
 
-def stall_budget(n_insns: int) -> int:
-    """Compiles in a row without a better score before an agent is told to move on (STALL_BUDGET)."""
-    return next((after for under, after in STALL_BUDGET if n_insns < under), STALL_BUDGET_BIGGEST)
+def stall_budget(n_insns: int, best_score: int | None = None) -> int:
+    """Compiles in a row without a better score before an agent is told to move on (STALL_BUDGET), at least
+    NEAR_MATCH_BUDGET for a near-match (best score at most NEAR_MATCH_SCORE, above 0)."""
+    after = next((after for under, after in STALL_BUDGET if n_insns < under), STALL_BUDGET_BIGGEST)
+    return max(after, NEAR_MATCH_BUDGET) if near_match(best_score) else after
+
+
+def near_match(best_score) -> bool:
+    """Whether a function's best score is close enough to 0 for the near-match budget and guide."""
+    return best_score is not None and 0 < best_score <= NEAR_MATCH_SCORE
 
 
 def large_plateau(fn):
@@ -390,17 +420,24 @@ def stall_budget_text() -> str:
     names it, every compile_and_diff result shows where you stand against it, release_function goes by it): the
     prompt used to say "3 compiles ... up to 10", and agents guessed which applied."""
     return ("no better score in N compiles in a row, where N is the function's own number: its brief names it, and "
-            "every compile_and_diff result shows where you stand, as in \"no better in 2/6 compiles (move on at 6)\"")
+            "every compile_and_diff result shows where you stand, as in \"no better in 2/6 compiles (move on at 6)\"; "
+            f"a near-match (best score {NEAR_MATCH_SCORE} or less) gets at least {NEAR_MATCH_BUDGET}, and a new diff at the "
+            "best score counts as progress")
 
 
 def move_on_brief(fn, after=None) -> str:
     """The brief's line naming the function's own move-on number (the one compile_and_diff counts against)."""
     custom = after is not None
-    after = after if custom else stall_budget(fn["n_insns"] or 0)
-    basis = "your current claim policy" if custom else "this function’s size"
+    best = fn["best_score"] if "best_score" in fn.keys() else None
+    after = after if custom else stall_budget(fn["n_insns"] or 0, best)
+    basis = ("your current claim policy" if custom else "a near-match: combine neutral edits" if near_match(best)
+             else "this function’s size")
     return (f"move on after {after} compiles in a row without a better score ({basis}; "
             f"each compile_and_diff result shows the count). Recovery above the inherited best does not reset it. "
-            'To leave earlier with a reason, use release_function(move_on=true, claim_token="the current claim_token", notes="what you tried and why").')
+            'To leave earlier with a reason, use release_function(move_on=true, claim_token="the current claim_token", notes="what you tried and why").'
+            + (' Near-match: read guide("near-match") first; for register or order rows, compiler_passes shows the '
+               'allocation priorities and passes, and score_permutations grids statement orders and edit combinations.'
+               if near_match(best) else ''))
 
 
 def normalized_source(source: str) -> str:
@@ -923,6 +960,54 @@ class Network:
             while len(self._compiled) > REPEATS_KEPT:
                 self._compiled.popitem(last=False)
 
+    def tried_at_best(self, fn, limit: int = TRIED_ROWS) -> list[str]:
+        """The brief's deduplicated "already tried at this best" table: the function's attempts at its best score,
+        one row per distinct diff (attempts.diff_digest), with how often and by how many agents it was reached and
+        what the edit was (attempt_hints). Helpers on near-matches handed over the same dead ends hundreds of times
+        ("Threshold reached", "Reached 3/3") because each saw only the last few notes."""
+        best = fn["best_score"]
+        if best is None or best <= 0:
+            return []
+        store = self.project_store(fn["project_id"])
+        rows = store.all("SELECT a.agent_id, a.diff_digest, a.source_digest, h.summary FROM attempts a "
+                         "LEFT JOIN attempt_hints h ON h.attempt_id=a.id WHERE a.function_id=? AND a.score=? "
+                         "ORDER BY a.id DESC LIMIT 400", fn["id"], best)
+        groups: dict = {}
+        for r in rows:
+            key = r["diff_digest"] or r["source_digest"] or "?"
+            g = groups.setdefault(key, {"n": 0, "agents": set(), "what": None})
+            g["n"] += 1
+            g["agents"].add(r["agent_id"])
+            g["what"] = g["what"] or r["summary"]
+        if len(rows) < 2:
+            return []
+        out = ["", f"### Already tried at this best (score {best}): {len(rows)} compiles, {len(groups)} distinct diffs",
+               "Don't repeat these; combine neutral edits or change a different row (guide(\"near-match\")).",
+               "| diff | times | agents | edit |", "| :-- | --: | --: | :-- |"]
+        for key, g in sorted(groups.items(), key=lambda kv: -kv[1]["n"])[:limit]:
+            out.append(f"| {key[:8]} | {g['n']} | {len(g['agents'])} | {(g['what'] or 'not recorded')[:120]} |")
+        return out
+
+    def judged_at_best_note(self, fn_id: int, score: int | None, source: str, digest: str | None, *,
+                            project_id=None) -> str:
+        """Flags (never refuses) a compile at the function's best score whose source or diff was already judged
+        there before, by any agent: the brief's "already tried" table, at the moment it happens."""
+        store = self.project_store(project_id) if project_id is not None else self.store
+        fn = store.one("SELECT best_score FROM functions WHERE id=?", fn_id)
+        if score is None or fn is None or fn["best_score"] != score or score <= 0:
+            return ""
+        latest = store.one("SELECT MAX(id) AS id FROM attempts WHERE function_id=?", fn_id)["id"] or 0
+        same = hashlib.sha256(source.encode()).hexdigest()
+        row = store.one("SELECT COUNT(*) AS n, COUNT(DISTINCT agent_id) AS agents, "
+                        "SUM(COALESCE(source_digest,source_hash)=?) AS sources FROM attempts "
+                        "WHERE function_id=? AND score=? AND id<? AND (COALESCE(source_digest,source_hash)=? "
+                        "OR (diff_digest IS NOT NULL AND diff_digest=?))", same, fn_id, score, latest, same, digest)
+        if not row or not row["n"]:
+            return ""
+        what = "this exact source" if row["sources"] else "this same diff"
+        return (f"\n⚠ Already judged at this best: {what} was reached {row['n']} time(s) by {row['agents']} agent(s) "
+                "before. Change a different row, or combine it with another neutral edit.")
+
     def same_score_note(self, fn_id: int, agent_id: int, score: int | None, source: str, *, project_id=None) -> str:
         """When a new variant only reproduces a score an earlier, different source of this claim had: which compile
         it equals (in one project, 21 of 56 compiles in two long sessions did, 1001 seven times on one function)."""
@@ -938,6 +1023,14 @@ class Network:
                 return (f"\nSame score as your compile #{k} of this claim ({score}) with a different source: this "
                         "score alone does not prove identical assembly. Check the remaining differences before repeating this kind of change.")
         return ""
+
+    def same_score_and_seen_note(self, fn_id, agent_id, score, source, *, project_id=None) -> str:
+        """same_score_note, then judged_at_best_note for the compile just recorded (both modes' compile results)."""
+        store = self.project_store(project_id) if project_id is not None else self.store
+        last = store.one("SELECT diff_digest FROM attempts WHERE function_id=? ORDER BY id DESC LIMIT 1", fn_id)
+        return (self.same_score_note(fn_id, agent_id, score, source, project_id=project_id)
+                + self.judged_at_best_note(fn_id, score, source, last["diff_digest"] if last else None,
+                                           project_id=project_id))
 
     def _agent_name(self, agent_id) -> str:
         row = self.store.one("SELECT name FROM agents WHERE id=?", agent_id) if agent_id else None
@@ -1256,7 +1349,7 @@ class Network:
         configured = self.selection(project['slug'], name).get('stall_compiles')
         if configured is not None:
             return configured
-        if name not in NON_MODEL_AGENTS and large_plateau(fn):
+        if name not in NON_MODEL_AGENTS and large_plateau(fn) and not near_match(fn['best_score']):
             return LARGE_PLATEAU_BUDGET
         return None
 
@@ -1846,7 +1939,40 @@ class Network:
         ids = [r["id"] for r in self.store.all("SELECT id FROM agents WHERE origin='local' AND name NOT IN "
                                                f"({', '.join('?' * (1 + len(MACHINE_AGENTS)))})",
                                                "you", *MACHINE_AGENTS)]
-        return self.release_stopped(ids)
+        if not ids:
+            return []
+        identities = json.dumps(ids)
+        recent = time.time() - SELF_RELEASE_WINDOW
+        freed = []
+        for store, projects in self.project_stores():
+            # Recover only agents with a lease or a release that can still affect
+            # their next claim. Most local identities are historical.
+            with store.tx() as db:
+                claims = db.execute(
+                    "SELECT f.id,f.project_id,f.name,c.agent_id FROM claims c JOIN functions f ON f.id=c.function_id "
+                    "WHERE c.agent_id IN (SELECT value FROM json_each(?)) ORDER BY c.agent_id,f.id",
+                    (identities,)).fetchall()
+                boundaries = db.execute(
+                    "SELECT DISTINCT e.agent_id,e.project_id FROM events e INDEXED BY idx_events_time "
+                    "WHERE e.created_at>? AND e.kind='release' AND e.agent_id IN (SELECT value FROM json_each(?)) "
+                    "AND NOT EXISTS (SELECT 1 FROM events b WHERE b.agent_id=e.agent_id "
+                    "AND b.kind IN ('freed','stopped') AND b.created_at>=e.created_at)",
+                    (recent, identities)).fetchall()
+                owned = set(projects)
+                reset = set()
+                for row in claims:
+                    if store is not self.store and row["project_id"] not in owned:
+                        continue
+                    db.execute("DELETE FROM claims WHERE function_id=? AND agent_id=?", (row["id"], row["agent_id"]))
+                    self._event(db, row["project_id"], row["agent_id"], "freed", row["name"])
+                    freed.append(row["name"])
+                    reset.add(row["agent_id"])
+                for row in boundaries:
+                    if row["agent_id"] in reset or (store is not self.store and row["project_id"] not in owned):
+                        continue
+                    self._event(db, row["project_id"], row["agent_id"], "freed", "")
+                    reset.add(row["agent_id"])
+        return freed
 
     def get_function(self, function: str, project: str | None = None, agent: Agent | None = None) -> str:
         return self._brief(self._function(function, project), agent, header="VIEW")
@@ -1878,6 +2004,7 @@ class Network:
                          f"(each compile_and_diff renews it)")
         if fn["status"] != "matched":
             lines.append(move_on_brief(fn, self.agent_stall_budget(fn, agent)))
+            lines += self.tried_at_best(fn)
         if fn["status"] == "matched":
             lines += [f"MATCHED by {self._agent_name(fn['matched_agent_id'])} {_ago(fn['matched_at'])}:",
                       "```c", fn["matched_source"].strip(), "```"]
@@ -2133,7 +2260,7 @@ class Network:
         text = f"{head}\n{d.render()}{render_source_lines(mapped, source)}{warn}"
         if not scratch:
             self.remember_compile(key, agent, fn, text, d.score)
-            text += self.same_score_note(fn["id"], agent.id, d.score, source, project_id=fn["project_id"])
+            text += self.same_score_and_seen_note(fn["id"], agent.id, d.score, source, project_id=fn["project_id"])
         selected = store.one('SELECT best_source FROM functions WHERE id=?',fn['id'])
         return {"text": text + self.stall_note(fn["id"], agent.id, project_id=fn["project_id"]), "score": d.score,
                 "matched": False, "exact": d.bytes_match, "new_match": False,
@@ -2193,21 +2320,24 @@ class Network:
         store = self.project_store(project_id) if project_id is not None else self.store
         row = store.one("SELECT n_insns, project_id, abandons, best_score FROM functions WHERE id=?", function_id)
         custom = self.agent_stall_budget(row, agent_id=agent_id) if row else None
-        after = custom if custom is not None else stall_budget((row["n_insns"] if row else 0) or 0)
+        after = custom if custom is not None else stall_budget((row["n_insns"] if row else 0) or 0,
+                                                               row["best_score"] if row else None)
         claim = store.one("SELECT claimed_at FROM claims WHERE function_id=? AND agent_id=?", function_id, agent_id)
         baseline = None
         if claim is not None:
             start = claim["claimed_at"] or 0
-            rows = store.all("SELECT score,score_before FROM attempts WHERE function_id=? AND agent_id=? AND created_at >= ? "
+            rows = store.all("SELECT score,score_before,diff_digest FROM attempts WHERE function_id=? AND agent_id=? AND created_at >= ? "
                                   "ORDER BY id", function_id, agent_id, start)
             scores = [r["score"] for r in rows]
+            digests = [r["diff_digest"] for r in rows]
             baseline = rows[0]["score_before"] if rows else None
         else:
             start = None
-            rows = store.all(f"SELECT score FROM attempts WHERE function_id=? AND agent_id=? ORDER BY id DESC "
+            rows = store.all(f"SELECT score,diff_digest FROM attempts WHERE function_id=? AND agent_id=? ORDER BY id DESC "
                                   f"LIMIT {max(STALL_LOOKBACK, after + 1)}", function_id, agent_id)
             scores = [r["score"] for r in reversed(rows)]
-        return {"claimed_at": start, "compiles": len(scores), "no_better": _no_better(scores, baseline), "after": after, "inherited_best": baseline,
+            digests = [r["diff_digest"] for r in reversed(rows)]
+        return {"claimed_at": start, "compiles": len(scores), "no_better": _no_better(scores, baseline, digests), "after": after, "inherited_best": baseline,
                 "best": min((s for s in scores if s is not None), default=None)}
 
     def stall_note(self, function_id: int, agent_id: int, *, project_id: int | None = None) -> str:
@@ -2224,7 +2354,10 @@ class Network:
             return f"\n\nMove-on count: {stall_line(since, after)}."
         from .release_receipts import instruction
         action=instruction(self,function_id,agent_id,project_id=project_id)
-        return (f"\n\n⏭ Move on: {stall_line(since, after)}. {action}. "
+        st_best = st.get("best") if st.get("best") is not None else st.get("inherited_best")
+        combine = (" Before releasing a near-match, try compile_variants(combine=true) with your individually neutral "
+                   "edits, and read guide(\"near-match\")." if near_match(st_best) else "")
+        return (f"\n\n⏭ Move on: {stall_line(since, after)}. {action}.{combine} "
                 "Use this claim_token on the first release and on retries. Then claim the next function; "
                 "your best attempt stays saved for whoever comes next.")
 
@@ -2349,9 +2482,10 @@ class Network:
             if via == 'agent' and score is not None and config.get('kind') != 'fork':
                 tested = current if prepared_header is not None else fn
                 handoff_inputs = agent_notes.rom_inputs(store.one, proj, tested, ctx_version, used)
-            attempt = db.execute("INSERT INTO attempts(function_id,agent_id,score,compiled,context_version,source,created_at,via,handoff_inputs) "
-                       "VALUES(?,?,?,?,?,?,?,?,?)",
-                       (fn["id"], agent.id, score, compiled, ctx_version, source, now, via, handoff_inputs)).lastrowid
+            attempt = db.execute("INSERT INTO attempts(function_id,agent_id,score,compiled,context_version,source,created_at,via,handoff_inputs,diff_digest) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       (fn["id"], agent.id, score, compiled, ctx_version, source, now, via, handoff_inputs,
+                        diff_digest(mismatch_rows) if score else None)).lastrowid
             self.repair_feedback.attempt(db, current, attempt, ctx_version, effective_settings,
                                          mismatch_rows if score and score > 0 else ())
             if mismatch_rows or matched:

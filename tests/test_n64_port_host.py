@@ -625,3 +625,38 @@ int main(void) {
     binary = tmp_path / "pi"
     subprocess.run(["cc", "-o", str(binary), str(source)], check=True, capture_output=True, timeout=60)
     subprocess.run([str(binary)], check=True, capture_output=True, timeout=30)
+
+
+@pytest.mark.skipif(shutil.which("c++") is None, reason="needs a C++ compiler")
+def test_rt64_vi_fields_features_and_incomplete_framebuffers(tmp_path):
+    source = tmp_path / "present.cpp"
+    source.write_text(r"""
+#include "presentation.h"
+#include <cassert>
+
+int main() {
+    assert(port_rt64_vi_features(0x3202, 0x55) == 0x1321e);
+    assert(port_rt64_vi_features(0x1321e, 0xaa) == 0x3202);
+    assert(port_rt64_vi_features(0x321e, 0x03) == 0x3216);
+
+    assert(port_rt64_incomplete_framebuffer(320, 140, 2, 320, 240, 2));
+    assert(port_rt64_incomplete_framebuffer(640, 480, 2, 320, 240, 2));
+    assert(port_rt64_incomplete_framebuffer(320, 240, 3, 320, 240, 2));
+    assert(!port_rt64_incomplete_framebuffer(640, 480, 2, 640, 476, 2));
+
+    // A high-resolution interlaced mode advances by one more row for its second field.
+    const uint32_t mode[] = {0x324e, 640, 0, 0, 0, 0, 0, 0, 0,
+                             1280, 0x2000800, 0x5d0237, 0x9026b, 2,
+                             2560, 0x3000800, 0x5f0239, 0xd0269, 4};
+    const auto even = port_rt64_vi_field(mode, 0);
+    assert(even.origin == 1280 && even.y_scale == 0x2000800 && even.v_start == 0x5d0237);
+    assert(even.v_burst == 0x9026b && even.interrupt == 2);
+    const auto odd = port_rt64_vi_field(mode, 1);
+    assert(odd.origin == 2560 && odd.y_scale == 0x3000800 && odd.v_start == 0x5f0239);
+    assert(odd.v_burst == 0xd0269 && odd.interrupt == 4);
+}
+""")
+    program = tmp_path / "present"
+    subprocess.run(["c++", "-std=c++17", "-I", str(KIT / "rt64"), str(source), "-o", str(program)],
+                   check=True, capture_output=True, timeout=60)
+    subprocess.run([str(program)], check=True, capture_output=True, timeout=30)

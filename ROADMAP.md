@@ -103,7 +103,9 @@
 
 - Done: N64 imports recover shared overlay slots from indexed DMA tables and adjacent loaders'
   cache bounds. Branches in one occupant of a shared slot cannot cut a closed function in another
-  occupant. Rebuildable exports for overlapping overlay banks remain planned.
+  occupant. Rebuildable exports retain separate ROM placements and scoped symbols for overlapping banks.
+  Strong, unambiguous self-call evidence also corrects inferred code placed over a sibling bank.
+  Byte-matched emulator RAM ranges refine smaller inferred banks when their local calls corroborate the mapping.
 - Done: N64 imports map audited inline data spans separately from executable text when their
   full surrounding fingerprints match. This prevents constants and alignment words from cutting
   otherwise closed function bodies.
@@ -760,7 +762,7 @@ on Apple Silicon; physical Intel Mac and retail-game checks remain planned.
   module data rebuilds and functions without closed boundaries remain planned.
 - Startup-registered N64 overlay directories now supply scoped banks for imports, including
   a reserved index between populated records. The directory and its loader establish the ROM
-  bounds and shared RAM base. Rebuildable export for overlapping raw banks remains planned.
+  bounds and shared RAM base. Rebuildable exports preserve each bank's ROM placement.
 - Resident N64 directory copy loops now establish overlay ROM bounds and instruction-cache
   ranges. Banks that reuse a RAM range keep separate symbols and function boundaries.
 
@@ -789,7 +791,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | PD3V textures, static assemblies, linked scenery and glTF export | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | B1 (including relocated and bit-packed controls and parallel cartridge tables) / libmus PtrTablesV2 audio banks, table evidence and mono VADPCM/PCM16 previews | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | Native frame/palette/mip selection and explicit animation | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
-| Image, texture/palette and audio previews (including split libmus songs and sequenced effects on N64) | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | ✓ forks with the game file (N64 checked) |
+| Image, texture/palette and audio previews (including split libmus songs, sequenced effects and compressed multi-bank cartridge scores on N64) | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | ✓ forks with the game file (N64 checked) |
 | Agent asset discovery, automatic checks, independent review and similar regions | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | Indexed Eurocom EDL archives, texture and local-mesh previews, and companion resource tables | ✓ ROM | — | — | — | — | — | — | — | — | — | — | — |
 | ROM Explorer: whole analysis image, references, clues and notes | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — image adapter planned | — image adapter planned | — | — image adapter planned | ✓ forks with the game file (image and segments; no function references yet) |
@@ -834,6 +836,8 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Consumed-constant forward switch repair | ✓ proven C32 GCC ROM profiles | — real-profile validation planned | — invocation/validation planned | — | — | — invocation/validation planned | — | — external invocation proof planned | — external invocation proof planned | — | — external invocation proof planned | — external invocation proof planned |
 | Branch integer-one staging / measured loop combinations | ✓ proven C32 / known frame | — profile validation planned | — profile validation planned | — | — | — profile validation planned | — | — frame/invocation proof planned | — frame/invocation proof planned | — | — frame/invocation proof planned | MIPS known-frame lane; invocation/other frame proof planned |
 | Permuter on near misses | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Agents read compiler passes and allocation priorities (`compiler_passes`) | ✓ GCC (IDO —: no pass dumps) | — GCC unchecked | — GCC unchecked | — | — | — GCC unchecked | — | — Metrowerks prints none | — MSVC prints none | — | — | — own build |
+| Agents grid statement orders and edit combinations with the exact judge (`score_permutations`) | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — judge worker is ROM-only | — judge worker is ROM-only | — | — judge worker is ROM-only | — judge worker is ROM-only |
 | Hand-written assembly set aside | ✓ | ✓ | ✓ | ✓ (`sc` stubs) | — | ✓ | ✓ (`_call_via` helpers, `svc`/`swi` stubs) | ✓ | Visual C++'s exception-handling stubs (64-bit: the funclets its exception data names) | Visual C++'s exception-handling stubs | BIOS call stubs, pieces of functions | MIPS, PowerPC, ARM's BIOS stubs and pieces of functions |
 | Source splitting (`split_file`) | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | by project |
 | Pieces of functions joined to their function | — | — | — | — | — | — | — | — | ✓ (`scratch.merge_pieces`; 64-bit: .pdata's extents, none to join) | ✓ (`scratch.merge_pieces`) | ✓ (`recover.merge_pieces`) | — |
@@ -900,6 +904,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Verified Git export sync (explicit Settings action) | build.json export | shared export adapter | shared export adapter | — | — | shared export adapter | — | source already in checkout | source already in checkout | — | source already in checkout | source already in checkout |
 | Commit and push bound portable progress | ✓ | ✓ | ✓ | — | — | ✓ | — | — own checkout UI planned | — own checkout UI planned | — | — own checkout UI planned | — own checkout UI planned |
 | Create full verified rebuildable repository with nested app progress | ✓ | ✓ | ✓ | — | — | ✓ | — | — source checkout setup planned | — source checkout setup planned | — | — source checkout setup planned | — source checkout setup planned |
+| Merge independent rebuildable upgrades with a byte-identical rebuild | ✓ verified on an isolated game | ✓ shared build adapter | ✓ shared build adapter | — no full export | — no full export | ✓ shared build adapter | — no full export | — source checkout | — source checkout | — no full export | — source checkout | — source checkout |
 | Add missing origin remote in Settings | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓ |
 | Opt-in automatic push after a configurable commit threshold | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓ |
 | Review and push existing Git commits to origin | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓ |
@@ -2085,6 +2090,10 @@ reuse the saved map. See [ROM Explorer](docs/ROM_EXPLORER.md) for support and li
   gets the copy's secure area checksum (of the area encrypted, which a dump no longer is; dsd left it 0). The game
   that differed rebuilds identical, its 1,784 recovered functions included. Projects made before get their build
   fixed at start (`scratch.write_tools`, kept unless an identical rebuild stops being one).
+- **Near-match tools in project mode and on other GCC consoles.** `compiler_passes` runs only where the app's own
+  compiler adapter compiles a native GCC driver (checked on N64 KMC GCC); PS1/PS2/PSP GCC builds need a run each, and
+  project-mode units compile through their own build. `score_permutations` needs a standalone objdiff judge worker
+  for project mode (`app/score_permutations.py`, `app/compiler_passes.py`).
 - **The permuter's real rewrites in forks.** decomp-permuter got no header in a fork, so it refused every
   function ("Syntax error in base.c": `u16` was no type it knew) and only the six simple rewrites ran, in every
   fork and on DS. It now reads what the function's file includes and declares.
@@ -4447,6 +4456,10 @@ ABI analysis and automatic source/profile selection remain planned.
   match or the lower comparable score with its source and preserving both Git parents.
   Confirming a pull also checkpoints eligible uncommitted progress locally before the
   comparison. The checkpoint is recoverable if the merge needs manual review.
+  Independently generated rebuildable upgrades of a shared flat save can merge when
+  the local layout contains the incoming function boundaries. Rejudge C using the
+  local build inputs, then compare the complete rebuilt image with the original before
+  updating the branch. Repositories with edited build files still need structural review.
   Build-owned projects still need a source-unit adapter that judges competing functions
   and preserves their file and build context.
 
@@ -4614,8 +4627,12 @@ Similar-source ROM searches now have a separate bounded budget in both manual fu
 passes and automatic reuse waves. New verified matches can propagate to their own
 active project; busy projects defer their notification until the owning pass finishes.
 A bounded nearby-sibling reservation precedes the global donor shortlist cap. The
-MIPS arithmetic reader's supported reciprocal forms and the project-mode gaps above
-remain unchanged. Full discovery/adoption replay is available for self-contained
+manual MIPS ROM search covers the eligible queue in subprocesses and ranks more donors
+and repair variants per function, including donors built with different compilers. It tolerates
+wider differences in function length and instructions, and aligns shifted relocations.
+An exact result under an alternate installed compiler is shown as a compiler lead for
+review. Similarity-based transfer for imported projects still needs per-file source and
+relocation adaptation. Full discovery/adoption replay is available for self-contained
 private fixtures and a synthetic real-compiler regression.
 
 The model browser also recognizes self-contained PD3V models inside embedded ZIP

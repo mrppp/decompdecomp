@@ -12,6 +12,9 @@ import json
 import random
 import re
 import time
+from dataclasses import replace
+from difflib import SequenceMatcher
+from functools import lru_cache
 
 from .. import permuter, similarity, toolchains
 from ..metadata_rows import rows as metadata_rows
@@ -22,6 +25,12 @@ MIN_BYTES, MAX_BYTES = 32, 3200
 MIN_SIMILARITY = .9
 MAX_CANDIDATES = 3
 MAX_POOL = 400
+MANUAL_SIZE_RATIO = .75
+MANUAL_SIMILARITY = .76
+OTHER_COMPILER_POOL = 80
+MANUAL_CANDIDATES = 8
+MANUAL_OTHER_COMPILERS = 3
+MANUAL_REPAIRS = 16
 MAX_ATTEMPTS = 128
 MAX_SECONDS = 120
 MAX_REPAIRS = 8
@@ -139,6 +148,39 @@ def _mnemonics(net, proj, fn) -> list[str]:
     return similarity.mips_mnemonics(*args) if cpu is None else similarity.mips_mnemonics(*args, cpu)
 
 
+@lru_cache(maxsize=256)
+def _toolchain(profile: str) -> str | None:
+    return json.loads(profile).get('toolchain')
+
+
+def _aligned_prints(a, b, pa, pb, ops_a, ops_b):
+    """Pair same-kind relocations in contiguous runs of aligned MIPS instructions."""
+    other = {(offset, kind): address for offset, kind, address in relocations(b)}
+    left, right = [], []
+    source = relocations(a)
+    for block in SequenceMatcher(None, ops_a, ops_b, autojunk=False).get_matching_blocks():
+        # One coincidental load/call between changed instructions is weak evidence.
+        if block.size < 3:
+            continue
+        for offset, kind, address in source:
+            index, remainder = divmod(offset, 4)
+            if block.a <= index < block.a + block.size:
+                target = ((index + block.b - block.a) * 4 + remainder, kind)
+                if target in other:
+                    left.append(address)
+                    right.append(other[target])
+    return replace(pa, addrs=left), replace(pb, addrs=right)
+
+
+def _rank_donors(pool, ops, ops_cache, b, layout, big, floor):
+    from .parameter_transfers import scale_changes
+    by_id = {str(a['id']): a for a in pool}
+    ranked = similarity.rank(ops, {key: ops_cache[a['id']] for key, a in by_id.items()}, top=MAX_POOL, floor=floor)
+    ranked.sort(key=lambda item: (not scale_changes(by_id[item[0]], b, big),
+                                  [(o, t) for o, t, _ in relocations(by_id[item[0]])] != layout, -item[1]))
+    return ranked
+
+
 def repair_variants(source: str, feedback: dict | None = None) -> list[str]:
     """A reproducible small sample of the existing local permuter; never a new AI request."""
     rng = random.Random(hashlib.sha256(source.encode()).digest())
@@ -168,7 +210,7 @@ def repair_variants(source: str, feedback: dict | None = None) -> list[str]:
     return result
 
 
-def deeper_variants(source, header, settings, function, deadline):
+def deeper_variants(source, header, settings, function, deadline, count=MAX_REPAIRS // 2):
     """Use the already-installed full permuter for a small batch, inside this pass's time budget."""
     from .. import seeds
     from .permute import GENERATOR_SECONDS, Generator, available, weight_family
@@ -181,7 +223,7 @@ def deeper_variants(source, header, settings, function, deadline):
         return generator.batch({'header': seeds.c_only(header), 'source': source, 'function': function,
                                 'family': weight_family({'compiler': settings}, None, False),
                                 'seed': int(hashlib.sha256(source.encode()).hexdigest()[:7], 16),
-                                'count': MAX_REPAIRS // 2}) or []
+                                'count': count}) or []
     except OSError:
         return []  # the small built-in rewrites remain available when the optional tool cannot start
     finally:
@@ -240,7 +282,7 @@ def trial_key(source, header, compiler, fn, names) -> str:
 
 
 def compiler_trial(net, agent, proj, fn, candidate, settings):
-    """Test donor flags without changing build settings or misreporting them as accepted project progress."""
+    """Test a donor compiler profile without changing build settings or misreporting them as accepted project progress."""
     now = time.time()
     from .local_claims import expiry_ids
     store = net.project_store(proj['id'])
@@ -267,27 +309,37 @@ def compiler_trial(net, agent, proj, fn, candidate, settings):
             db.execute('DELETE FROM claims WHERE function_id=? AND agent_id=?', (fn['id'], agent.id))
 
 
-def run(twins, slug: str, job) -> int:
+def destination_supported(net, proj):
+    # Project mode still needs object-relocation alignment and per-file source adaptation.
+    slug = proj['slug']
+    return not net.fork_slug(slug) and net.is_rom(proj) and proj['arch'] == 'mips' and slug not in net.links
+
+
+def donor_projects(net, proj):
+    from .shared_reuse import compatible
+    return {p['id']: p for p in [*compatible(net, proj), proj] if net.is_rom(p)}
+
+
+def run(twins, slug: str, job, *, function_ids=None) -> int:
     """Try a few close candidates per function after exact transfers, with a pass-wide time/compile budget."""
     from .twins import _declared, apply, rom_renames
 
     net = twins.net
     proj = net.project_row(slug)
-    # Project mode needs alignment of object relocations and file-context adaptation, not ROM addresses.
-    # Other processors need their own instruction reader before mnemonic ranking is meaningful.
-    if net.fork_slug(slug) or not net.is_rom(proj) or proj['arch'] != 'mips' or slug in net.links:
+    if not destination_supported(net, proj):
         return 0
     cfg = net.cfg(proj)
-    from .shared_reuse import compatible
-    others = {p['id']:p for p in compatible(net, proj) if net.is_rom(p)}
-    others[proj['id']] = proj  # Matched siblings are donors too, without another imported region.
+    manual = getattr(job, 'cross_exhaustive', False)
+    supported_compilers = {c.id for c in net.console(proj).compilers} if manual else set()
+    others = donor_projects(net, proj)
     from . import free_candidates
     free_candidates.budget(job, MAX_SECONDS, MAX_ATTEMPTS)
     deadline = job.reuse_deadline
-    for other in others.values():
-        if job.stop.is_set() or time.monotonic() >= deadline:
-            return 0
-        twins.index_project(other)
+    if function_ids is None:  # The coordinator refreshes the indexes before launching separate lanes.
+        for other in others.values():
+            if job.stop.is_set() or time.monotonic() >= deadline:
+                return 0
+            twins.index_project(other)
     agent, _ = net.local_agent('autopilot')
     mine = twins.prints(proj)
     syms_b = net.symbols(proj['id'])
@@ -298,11 +350,15 @@ def run(twins, slug: str, job) -> int:
     donors = reuse_donors.Donors(net, proj, include_self=True)
     layouts = {pid: regional_layouts.learn(net, proj, other) for pid, other in others.items()}
     maps = {pid: regional_names(twins, proj, other) for pid, other in others.items()}
-    saved = net.project_store(proj['id']).one('SELECT function_id FROM reuse_cursors WHERE project_id=?', proj['id'])
-    cursor = saved['function_id'] if saved else 0
+    cursor = 0
+    if not manual:
+        saved = net.project_store(proj['id']).one('SELECT function_id FROM reuse_cursors WHERE project_id=?', proj['id'])
+        cursor = saved['function_id'] if saved else 0
+
     def resume(fid):
-        with net.project_store(proj['id']).tx() as db:
-            db.execute('INSERT OR REPLACE INTO reuse_cursors VALUES(?,?)', (proj['id'], fid))
+        if not manual:
+            with net.project_store(proj['id']).tx() as db:
+                db.execute('INSERT OR REPLACE INTO reuse_cursors VALUES(?,?)', (proj['id'], fid))
     attempted = matched = 0
     repairs = {}
 
@@ -357,7 +413,8 @@ def run(twins, slug: str, job) -> int:
     # Keep a quarter of the remaining budget for close misses. Previously a large transfer queue could
     # consume every pass, leaving hundreds of eligible cached misses with no repair attempts at all.
     transfer_deadline = time.monotonic() + max(0, deadline - time.monotonic()) * .75
-    transfer_limit = job.reuse_attempts + max(1, int((job.reuse_limit - job.reuse_attempts) * .75))
+    transfer_limit = (job.reuse_attempts + max(1, int((job.reuse_limit - job.reuse_attempts) * .75))
+                      if job.reuse_limit != float('inf') else job.reuse_limit)
     incomplete = False
 
     def transfers_exhausted():
@@ -366,13 +423,20 @@ def run(twins, slug: str, job) -> int:
     store = net.project_store(proj['id'])
     # Most open functions have no usable fingerprint or are already claimed.
     # Do not inflate all their source payloads before testing those cheap gates.
+    selected = ' AND id IN (SELECT value FROM json_each(?))' if function_ids is not None else ''
+    params = (json.dumps(function_ids),) if function_ids is not None else ()
     targets = metadata_rows(store, ('id', 'name'),
-                            "SELECT id,name FROM main.functions WHERE project_id=? AND status='open' ORDER BY id", proj['id'])
-    # Preserve the cheap aligned-transfer search before widening to learned mappings or different flags.
-    # A signed cursor encodes which phase to resume without storing any game source in the queue.
+                            "SELECT id,name FROM main.functions WHERE project_id=? AND status='open'" + selected
+                            + " ORDER BY id", proj['id'], *params)
+    # Manual searches widen each target before moving on. An entire project of
+    # cheap misses should not use up the budget before the wider search starts.
     work = [(phase, b) for phase in (0, 1) for b in targets]
-    position = (int(cursor < 0), abs(cursor))
-    work.sort(key=lambda item: ((item[0], item[1]['id']) < position, item[0], item[1]['id']))
+    position = (abs(cursor), int(cursor < 0)) if manual else (int(cursor < 0), abs(cursor))
+    def order(item):
+        phase, row = item
+        key = (row['id'], phase) if manual else (phase, row['id'])
+        return key < position, key
+    work.sort(key=order)
     from .cross_game_progress import report as publish_progress
     for index, (phase, b) in enumerate(work):
         publish_progress(job, 'Checking similar matched functions', function=b['name'], done=index, total=len(work))
@@ -390,26 +454,45 @@ def run(twins, slug: str, job) -> int:
         b = store.one("SELECT * FROM functions WHERE project_id=? AND id=? AND status='open'", proj['id'], b['id'])
         if b is None:
             continue  # matched/deleted since the metadata snapshot or the preceding phase
-        rows = donors.candidates(pb.size, max(MIN_BYTES, int(pb.size * .9)), min(MAX_BYTES, int(pb.size / .9)),
-                                 pb.key, twins._compiler_key(compiler_for(cfg, b['vram'], b)), MAX_POOL, near=b['vram'])
+        own = compiler_for(cfg, b['vram'], b)
+        own_key = twins._compiler_key(own)
+        own_toolchain = own.get('toolchain')
+        wide = manual and phase == 1
+        ratio = MANUAL_SIZE_RATIO if wide else .9
+        floor = MANUAL_SIMILARITY if wide else MIN_SIMILARITY
+        shortlist = (pb.size, max(MIN_BYTES, int(pb.size * ratio)), min(MAX_BYTES, int(pb.size / ratio)),
+                     pb.key, own_key)
+        rows = donors.candidates(*shortlist, MAX_POOL, near=b['vram'], eligible=lambda row, exact=phase == 0,
+                                 key=own_key, tc=own_toolchain: (
+            row['project_id'] in others and (row['compiler'] == key if exact else _toolchain(row['compiler']) == tc)))
+        # Keep an independent shortlist for other compiler builds. Rows from a
+        # large same-compiler library would otherwise fill the size-based cap.
+        alternate = donors.candidates(*shortlist, OTHER_COMPILER_POOL, eligible=lambda row, tc=own_toolchain: (
+            row['project_id'] in others and _toolchain(row['compiler']) != tc)) if wide else []
         layout = [(o, t) for o, t, _ in relocations(b)]
-        rows = [a for a in rows if a['project_id'] in others and a['has_matched']
-                and ([(o, t) for o, t, _ in relocations(a)] == layout or maps[a['project_id']])
-                and json.loads(a['compiler']).get('toolchain') == compiler_for(cfg, b['vram'], b).get('toolchain')]
-        own_key = twins._compiler_key(compiler_for(cfg, b['vram'], b))
-        rows = [a for a in rows if ([(o, t) for o, t, _ in relocations(a)] != layout or a['compiler'] != own_key) == bool(phase)]
-        if not rows:
+        def eligible(a, layout=layout, wide=wide, own_key=own_key, phase=phase):
+            if not a['has_matched']:
+                return False
+            if wide:
+                return True
+            same_layout = [(o, t) for o, t, _ in relocations(a)] == layout
+            return ((same_layout or maps[a['project_id']])
+                    and (not same_layout or a['compiler'] != own_key) == bool(phase))
+
+        rows = [a for a in rows if eligible(a)]
+        alternate = [a for a in alternate if eligible(a)]
+        if not rows and not alternate:
             continue
         ops = _mnemonics(net, proj, b)
-        for a in rows:
+        by_id = {str(a['id']): a for a in [*rows, *alternate]}
+        for a in by_id.values():
             if a['id'] not in ops_cache:
                 ops_cache[a['id']] = _mnemonics(net, others[a['project_id']], a)
-        by_id = {str(a['id']): a for a in rows}
-        ranked = similarity.rank(ops, {key: ops_cache[a['id']] for key, a in by_id.items()},
-                                 top=MAX_POOL, floor=MIN_SIMILARITY)
-        ranked.sort(key=lambda item: (not parameter_transfers.scale_changes(by_id[item[0]], b, bool(proj['big_endian'])),
-                                      [(o, t) for o, t, _ in relocations(by_id[item[0]])] != layout, -item[1]))
-        ranked = ranked[:MAX_CANDIDATES]
+
+        big = bool(proj['big_endian'])
+        ranked = _rank_donors(rows, ops, ops_cache, b, layout, big, floor)
+        extra = _rank_donors(alternate, ops, ops_cache, b, layout, big, floor)[:MANUAL_OTHER_COMPILERS] if alternate else []
+        ranked = extra + ranked[:(MANUAL_CANDIDATES if wide else MAX_CANDIDATES) - len(extra)]
         for key, score in ranked:
             a = by_id[key]
             # Re-read authoritative source after ranking: donors can be polished during a pass.
@@ -428,7 +511,14 @@ def run(twins, slug: str, job) -> int:
                 continue
             learned = maps[other['id']]
             aligned = [(o, t) for o, t, _ in relocations(a)] == layout
-            local = rom_renames(syms_a, a['matched_source'], pa, pb, a['name'], b['name'], syms_b) if aligned else {}
+            if wide and not aligned:
+                left, right = _aligned_prints(a, b, pa, pb, ops_cache[a['id']], ops)
+                local = rom_renames(syms_a, a['matched_source'], left, right, a['name'], b['name'], syms_b)
+                # Keep established mappings when a shifted instruction offers conflicting evidence.
+                if local is not None:
+                    local = {**local, **learned}
+            else:
+                local = rom_renames(syms_a, a['matched_source'], pa, pb, a['name'], b['name'], syms_b) if aligned else {}
             names = None if local is None else {**learned, **local, a['name']: b['name']}
             if names is None:
                 continue
@@ -441,16 +531,22 @@ def run(twins, slug: str, job) -> int:
             destination = b['best_source'] or b['seed'] or ''
             parameter_sources = list(dict.fromkeys([parameter_transfers.destination_signature(v, b['name'], destination)
                                                     for v in parameter_sources] + parameter_sources))
-            own = compiler_for(cfg, b['vram'], b)
             donor = json.loads(a['compiler'])
+            literals = literal_variants(source, a, b, big)
             variants = [(v, own, 'parameter transfer') for v in parameter_sources]
             variants += [(v, own, 'transfer') for v in
-                        [source, *literal_variants(source, a, b, bool(proj['big_endian'])),
-                         *regional_layouts.variants(source, a, b, layouts[other['id']], bool(proj['big_endian']))]]
-            # Only a compiler already installed and proven on the donor; no downloads or flag brute force.
-            if (donor.get('flags', []) != own.get('flags', []) and donor.get('toolchain')
-                    and not donor.get('cmd') and not own.get('cmd') and toolchains.installed(donor['toolchain'])):
+                        [source, *literals, *regional_layouts.variants(source, a, b, layouts[other['id']], big)]]
+            # The destination build gets first chance. An installed compiler of this console can
+            # supply a second opinion with the donor's measured flags, even when the flags match.
+            donor_toolchain = donor.get('toolchain')
+            flags_differ = donor.get('flags', []) != own.get('flags', [])
+            compiler_differs = donor_toolchain != own_toolchain
+            if (donor_toolchain and not donor.get('cmd') and not own.get('cmd')
+                    and ((not compiler_differs and flags_differ) or (wide and donor_toolchain in supported_compilers and compiler_differs))
+                    and toolchains.installed(donor_toolchain)):
                 variants.append((source, donor, 'compiler'))
+                if wide and compiler_differs:
+                    variants.extend((v, donor, 'compiler') for v in literals)
             for variant, settings, kind in variants:
                 if exhausted():
                     return matched
@@ -466,7 +562,7 @@ def run(twins, slug: str, job) -> int:
                     pair = (a['id'], b['id'])
                     if pair not in repairs or int(close[1]) < repairs[pair][0]:
                         repairs[pair] = (int(close[1]), a, b, other, score, prelude, variant, settings, names, header_b, dict(feedback))
-                if outcome == 'match':
+                if outcome in ('match', 'compiler'):
                     break
             if incomplete:
                 break
@@ -477,10 +573,15 @@ def run(twins, slug: str, job) -> int:
     # Cached trials regenerate this deterministic queue, so a later pass resumes even after an app restart.
     # Concrete address evidence goes before speculative cast/order mutations within the repair allowance.
     known = {name for name, _ in symbol_state}
-    prepared = [(address_repairs.variants(r[5] + r[6], r[10], r[2], bool(proj['big_endian']), known), r)
-                for r in repairs.values()]
+    prepared = []
+    for r in repairs.values():
+        if exhausted():
+            return matched
+        prepared.append((address_repairs.variants(r[5] + r[6], r[10], r[2], bool(proj['big_endian']), known), r))
     prepared.sort(key=lambda item: (not item[0], item[1][0]))
+    repair_limit = MANUAL_REPAIRS if manual else MAX_REPAIRS
     for address_variants, (_, a, b, other, score, prelude, source, settings, names, header, report) in prepared:
+        publish_progress(job, 'Repairing similar donor code', function=b['name'])
         if exhausted():
             if not incomplete:
                 resume(0)
@@ -492,10 +593,10 @@ def run(twins, slug: str, job) -> int:
             compiled = {'target': bytes.fromhex(report['candidate_target']), 'relocs': report.get('candidate_relocs', '[]')}
             guided.extend(literal_variants(prelude + source, compiled, b, bool(proj['big_endian'])))
         simple = repair_variants(source, report)
-        deep = deeper_variants(source, header + '\n' + prelude, settings, b['name'], deadline)
-        variants = [*guided, *(prelude + v for v in (simple[:MAX_REPAIRS // 2] if deep else simple)),
+        deep = deeper_variants(source, header + '\n' + prelude, settings, b['name'], deadline, repair_limit // 2)
+        variants = [*guided, *(prelude + v for v in (simple[:repair_limit // 2] if deep else simple)),
                     *(prelude + v for v in deep)]
-        for variant in list(dict.fromkeys(variants))[:MAX_REPAIRS]:
+        for variant in list(dict.fromkeys(variants))[:repair_limit]:
             if exhausted():
                 if not incomplete:
                     resume(0)
