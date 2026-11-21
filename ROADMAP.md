@@ -2142,6 +2142,10 @@ its column are features not yet run on it. Next, in order:
   helper's attempt, autopilot's or a deep pass's trial that writes a file and puts it back) overlapping on one
   file would do it: one truncating while the other writes at an offset. Write source files whole (a temporary
   file, then a rename), and take the unit's lock for every trial's write and restore;
+- a trial puts back the text it saved even when the file changed meanwhile: autopilot's and the background
+  drafter's trials (which keep running with a project's helpers stopped and its autopilot paused) twice undid a
+  repair made in between, restoring a file garbled by the NUL writes. A trial should put back its saved text only
+  where the file still holds what it wrote, and the background drafter should pause with autopilot;
 - a way to repair a file that doesn't build from inside the app: a file broken by drafts written into it (bodies
   that no longer agree with headers added since, `int f();` clashing with its definition) stays broken until a
   helper fixes it, and repairs made outside the app race autopilot's and the deep passes' trials, which put a
