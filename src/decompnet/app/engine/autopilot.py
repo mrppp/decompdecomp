@@ -420,6 +420,22 @@ class AutopilotMixin:
             def draft_candidates():
                 yield 'raw_m2c', f"{note}{seeds.with_m2c_macros(draft)}\n"
                 candidates = []
+                from .. import draft_return_type, twin_drafts
+                if twin_drafts.enabled(self.cfg(proj)):
+                    # a close matched look-alike's C with this function's names (app/twin_drafts.py)
+                    candidates += twin_drafts.candidates(self, proj, fn, ctx['header'])
+                if draft_return_type.enabled(self.cfg(proj)):
+                    from .. import call_evidence
+                    try:  # what the callers show (app/call_evidence.py); the function's own exits decide when they can
+                        callers = call_evidence.verdict(call_evidence.gather(self, proj, fn, ctx['header']))
+                    except Exception:  # noqa: BLE001 - a witness; the draft stage goes on without it
+                        callers = None
+                    candidates += draft_return_type.candidates(draft, fn['name'], proj['arch'], target_asm, context,
+                                                               lambda ctx_text: seeds.generate_from_asm(
+                                                                   target_asm, fn['name'], toolchain, ctx_text, data_asm,
+                                                                   valid=True, strict=False, timeout=20,
+                                                                   resolve=lambda symbol: self.symbols(proj['id']).resolve(symbol)),
+                                                               note, callers)
                 from ..loop_storage_shapes import variants as loop_shapes
                 for family,source in loop_shapes(draft,fn['name'],ctx['header'],proj['arch'])[:2]:
                     candidates.append((family,f"{note}{seeds.with_m2c_macros(source)}\n"))
@@ -477,12 +493,19 @@ class AutopilotMixin:
                         return
                     yield family, f"{note}{seeds.with_m2c_macros(source)}\n"
 
+            def error_driven_candidates():
+                if report['compiled']:
+                    return
+                from .. import compile_error_repair
+                yield from compile_error_repair.candidates(lambda text: self._compile(proj, ctx['header'], text, fn),
+                                                           f"{note}{seeds.with_m2c_macros(draft)}\n")
+
             from decomprepair.compiler_shape_repairs import machine_draft_copies
             from decomprepair.narrow_store_repairs import machine_drafts as narrow_drafts
 
             from ..carrier_sequence_repairs import machine_drafts as carrier_drafts
             outcomes, seen = [], set()
-            for family, source in chain(carrier_drafts(narrow_drafts(machine_draft_copies(chain(draft_candidates(), local_candidates()), fn['name'], ctx['header']),fn['name'],ctx['header'],proj['arch']),fn['name'],ctx['header'],proj['arch']), recovery_candidates()):
+            for family, source in chain(carrier_drafts(narrow_drafts(machine_draft_copies(chain(draft_candidates(), local_candidates()), fn['name'], ctx['header']),fn['name'],ctx['header'],proj['arch']),fn['name'],ctx['header'],proj['arch']), recovery_candidates(), error_driven_candidates()):
                 if source in seen:
                     continue
                 seen.add(source)
