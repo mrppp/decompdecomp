@@ -70,3 +70,122 @@ def test_rejected_partial_runtime_range_does_not_split_the_inferred_segment():
     image[0x3000:0x3000+4*48]=bytes(4*48)
     old=(0,0x5000,0x80040000)
     assert inferred_overlays.runtime_mappings(image,[old],[(0,0x4000,0x80100000)])==([old],set())
+
+
+def test_scopes_cannot_overlap_the_global_range_even_in_its_gaps():
+    found=[(0x2000,0x3000,0x80050000)]
+    taken=[(0,0x1000,0x80000400),(0x1000,0x2000,0x80100000)]
+    assert not inferred_overlays.scopes_fit(found,{0x2000},taken)
+    assert inferred_overlays.scopes_fit([(0x2000,0x3000,0x80200000)],{0x2000},taken)
+
+
+def test_scope_inferred_segments_below_banks_or_keep_original_for_known_conflict():
+    found=[(0x1000,0x2000,0x80000400),(0x2000,0x3000,0x80050000)]
+    taken=[(0,0x1000,0x80100000)]
+    assert inferred_overlays.safe_scopes(found,{0x2000},taken)=={0x1000,0x2000}
+    assert inferred_overlays.safe_scopes(found,{0x2000},[(0,0x100000,0x80000400)]) is None
+
+
+def test_shifted_overlay_needs_return_separated_entries_and_external_call():
+    lo, hi = 0x1000, 0x2400
+    correct = 0x80301000
+    image = bytearray(hi)
+    def jal(address):
+        return 0x0c000000 | ((address >> 2) & 0x3ffffff)
+    for i in range(16):
+        target = correct + ((i + 1) % 16) * 32 + 8
+        struct.pack_into('>8I', image, lo + i*32, 0x03e00008, 0, 0x3c038004, 0x24630010,
+                         0x8c620000, jal(target), 0, 0)
+    struct.pack_into('>I', image, 0, jal(correct + 8))
+    found = [(lo, hi, correct - 12)]
+    external = (0, 0x100, 0x80001000)
+    result, scoped = inferred_overlays.recover(bytes(image), found, [external])
+    assert result == [(lo, hi, correct)]
+    assert lo in scoped
+    image[:4] = bytes(4)
+    assert inferred_overlays.recover(bytes(image), found, [external])[0] == found
+    assert inferred_overlays.recover(bytes(image), [(lo, hi, correct)], [external])[0] == [(lo, hi, correct)]
+
+
+def test_terminated_pointer_words_do_not_become_independent_code_scopes():
+    image = bytearray(64)
+    struct.pack_into('>3I', image, 16, 0x80001004, 0x80001008, 0)
+    found = [(0, 16, 0x80001000), (16, 20, 0x80202000),
+             (20, 24, 0x80202004), (24, 28, 0x80202008), (28, 64, 0x8020200c)]
+    assert inferred_overlays.drop_pointer_fragments(bytes(image), found) == [found[0], found[4]]
+    struct.pack_into('>I', image, 0, 0x08000000 | ((0x80202004 >> 2) & 0x3ffffff))
+    assert inferred_overlays.drop_pointer_fragments(bytes(image), found) == found
+
+
+def test_nearby_mapping_requires_closed_entries_and_internal_and_external_calls():
+    image = bytearray(0x5000)
+    lo, hi, correct = 0x1000,0x4000,0x80301000
+    def jal(target):
+        return 0x0c000000 | ((target>>2)&0x3ffffff)
+    for i in range(12):
+        at = lo+i*64
+        # The complete framed body is not closed when entered eight bytes late.
+        struct.pack_into('>8I',image,at,0x27bdfff0,0xafbf000c,0x24020001,0,
+                         0x8fbf000c,0,0x03e00008,0x27bd0010)
+        struct.pack_into('>I',image,0x3000+4*i,jal(correct+i*64))
+        if i < 4:
+            struct.pack_into('>I',image,4*i,jal(correct+i*64))
+    found = [(lo,hi,correct-8)]
+    taken = [(0,0x100,0x80001000)]
+    result, scoped = inferred_overlays.recover(bytes(image),found,taken)
+    assert result == [(lo,hi,correct)] and lo in scoped
+    image[:16] = bytes(16)
+    assert inferred_overlays.recover(bytes(image),found,taken)[0] == found
+
+
+def test_concatenated_banks_require_distinct_self_calls_and_data_gap():
+    image = bytearray(0xb000)
+    lo, boundary, hi = 0x1000, 0x5000, 0xb000
+    old, alternate = 0x80100000, 0x80104000
+    # Closed functions in each bank, and calls to their own placements.
+    first = [lo + i*0x100 for i in range(8)]
+    second = [boundary + i*0x100 for i in range(8)]
+    for at in first + second:
+        struct.pack_into('>6I', image, at, 0x27bdffe0, 0xafbf001c, 0x8fbf001c,
+                         0x27bd0020, 0x03e00008, 0)
+    struct.pack_into('>2I', image, 0x3ff8, 0x03e00008, 0)
+    for i, at in enumerate(first + second):
+        target = at + (alternate-lo if at < boundary else old-lo)
+        call = 0x3000 + 4*i if i < 8 else 0x9000 + 4*(i-8)
+        struct.pack_into('>I', image, call, 0x0c000000 | ((target >> 2) & 0x3ffffff))
+    found = [(lo, hi, old)]
+    assert inferred_overlays.split_concatenated(image, found) == (
+        [(lo, 0x4000, alternate), (boundary, hi, alternate)], {lo, boundary})
+    # Without enough independent entries the original map remains untouched.
+    image[0x3000:0x3020] = bytes(0x20)
+    assert inferred_overlays.split_concatenated(image, found) == (found, set())
+
+
+def test_truncated_terminal_frame_extends_only_to_a_closed_next_boundary():
+    image = bytearray(0x400)
+    struct.pack_into('>2I', image, 0x1ec, 0x03e00008, 0)
+    struct.pack_into('>7I', image, 0x1f4, 0x27bdffe0, 0xafbf001c, 0, 0x8fbf001c,
+                     0x27bd0020, 0x03e00008, 0)
+    found = [(0x100, 0x200, 0x80100000), (0x210, 0x300, 0x80110000)]
+    assert inferred_overlays.extend_adjacent_frame(image, found) == [
+        (0x100, 0x210, 0x80100000), found[1]]
+    image[0x208:0x20c] = bytes(4)
+    assert inferred_overlays.extend_adjacent_frame(image, found) == found
+
+
+def test_same_address_banks_get_distinct_segment_names(tmp_path, monkeypatch):
+    import yaml
+
+    from decompnet.consoles.n64.code import insert_segments
+    from decompnet.rom import split
+
+    config = tmp_path / 'game.yaml'
+    config.write_text('segments: []\n')
+    monkeypatch.setattr(split, 'segments_from_config', lambda _: [])
+    cfg = {'segments': [[0x4000]]}
+    banks = [(0x1000, 0x1800, 0x80100000), (0x2000, 0x3000, 0x80100000)]
+    insert_segments(config, cfg, banks, 0x4000)
+    rows = [row for row in yaml.safe_load(config.read_text())['segments']
+            if isinstance(row, dict) and row.get('type') == 'code']
+    assert len(rows) == 2 and len({row['name'] for row in rows}) == 2
+    assert all(row['subsegments'][0][2] == row['name'] for row in rows)

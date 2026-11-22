@@ -48,7 +48,8 @@ def setup(monkeypatch, imported=False):
 
 
 @pytest.mark.parametrize('imported', [False, True])
-def test_one_function_deep_search_uses_normal_judge_and_keeps_improvements(monkeypatch, imported):
+@pytest.mark.parametrize('minutes, variants, options', [(30, 10, {}), (240, 1_200_000, {'expanded_budget': True})])
+def test_one_function_deep_search_uses_normal_judge_and_keeps_improvements(monkeypatch, imported, minutes, variants, options):
     net = setup(monkeypatch, imported)
     seen = []
     def judge(self, agent, proj, fn, source, best, fork):
@@ -63,7 +64,7 @@ def test_one_function_deep_search_uses_normal_judge_and_keeps_improvements(monke
     monkeypatch.setattr(Permuter, '_score', judge)
     batches(monkeypatch, ['local', 'random', 'never tested'])
     log = Log()
-    result = deep_permuter.run(net, 'game', 'f', 30, 10, log)
+    result = deep_permuter.run(net, 'game', 'f', minutes, variants, log, **options)
     assert not capture_suppressed()
     assert result['matched'] and result['tested'] == 2 and result['skipped'] == 1
     assert seen == [('local','fork' if imported else None), ('random','fork' if imported else None)]
@@ -1120,6 +1121,89 @@ def test_loop_vector_shape_pass_reaches_the_scheduling_boundary_that_matched_a_d
     assert any('do {' in c and 'repair_scope_1' not in c for c in seen) or len(seen) < 64
 
 
+def test_loop_vector_shape_pass_offers_comparison_scope_with_volatile_load(monkeypatch):
+    net = setup(monkeypatch)
+    source = ("int f(void) { volatile int *p; int zero, count, present; "
+              "do { zero = 0; count = *p; present = (short) (zero < count); } while (0); return present; }")
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=350,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        return 85 if 'do { present = (short) (zero < count); } while (0);' in candidate else 350
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source, name='f'), 350, None) == 85
+    assert any('do { present = (short) (zero < count); } while (0);' in c for c in seen)
+
+
+def test_loop_vector_shape_pass_offers_known_zero_conversion(monkeypatch):
+    net = setup(monkeypatch)
+    source = ("int f(void) { volatile int *p;\nlong value;\nint zero;\nint present;\n"
+              "do { value = *p; zero = 0; do { present = (short) (zero < value); } while (0); } while (0); "
+              "return present; }")
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=85,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        return 75 if '(unsigned short) value ^ ((unsigned int) value & 0xFFFF)' in candidate else 85
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source, name='f'), 85, None) == 75
+    assert any('(unsigned short) value ^ ((unsigned int) value & 0xFFFF)' in c for c in seen)
+
+
+def test_loop_vector_shape_pass_interleaves_increment_and_reset(monkeypatch):
+    net = setup(monkeypatch)
+    source = ("int f(void) { volatile int *p;\nint counter;\nint found;\n"
+              "next:\n    counter++;\n\n    found = 0;\n    if (*p) goto next;\n"
+              "return found + counter; }")
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=75,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        return 25 if 'found = 0;\n\n    counter++;' in candidate else 75
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source, name='f'), 75, None) == 25
+    assert any('found = 0;\n\n    counter++;' in c for c in seen)
+
+
+def test_loop_vector_shape_pass_offers_pointer_zero_identity(monkeypatch):
+    net = setup(monkeypatch)
+    source = ("int f(void) { volatile int *p;\nlong value;\nint zero;\nint present;\n"
+              "do { value = *p; zero = (unsigned short) value ^ ((unsigned int) value & 0xFFFF); "
+              "do { present = (short) (zero < value); } while (0); } while (0); return present; }")
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=25,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        return 0 if '(unsigned short) (unsigned int) p ^ ((unsigned int) p & 0xFFFF)' in candidate else 25
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source, name='f'), 25, None) == 0
+    assert any('(unsigned short) (unsigned int) p ^ ((unsigned int) p & 0xFFFF)' in c for c in seen)
+
+
 def test_loop_vector_shape_pass_reaches_the_guard_initializer_scope_that_matched_a_timer_loop(monkeypatch):
     """A guard's `i = 0;` hoisted before it in a one-shot scope, the copy before the guard sunk: 10 -> 0 in one child."""
     net = setup(monkeypatch)
@@ -1141,6 +1225,62 @@ def test_loop_vector_shape_pass_reaches_the_guard_initializer_scope_that_matched
 
     monkeypatch.setattr(search, '_score', score)
     assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source, name='f'), 10, None) == 0
+
+
+def test_loop_vector_shape_pass_reaches_the_chain_load_scope_that_matched_a_menu_function(monkeypatch):
+    """Identical arms written once plus the chain load behind the branch operand's load: 210 -> 0 in one child."""
+    net = setup(monkeypatch)
+    source = ('extern void *gState;\nextern int sink(int);\nvoid f(void) {\n  void *entry;\n  int value;\n  void *next;\n'
+              '  entry = *((void **) (((char *) gState) + 0x18));\n  if (entry)\n  {\n'
+              '    value = *(*((int **) (((char *) entry) + 0x10)));\n    next = entry + 0x28;\n  }\n  else\n  {\n'
+              '    value = *(*((int **) (((char *) entry) + 0x10)));\n    next = entry + 0x28;\n  }\n'
+              '  if (((*((unsigned char *) (((char *) gState) + 0x2D))) != 0) && (sink(1) == 0))\n  {\n    sink(value);\n  }\n'
+              '  sink(next);\n}\n')
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=210,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        # the arms alone are worse, the scope on the arms alone is no better; collapsed and scoped is exact
+        return 0 if 'do { value = *chain_ptr; } while (0);' in candidate and 'else' not in candidate else 220
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source, name='f'), 210, None) == 0
+    assert any('guard_load' in c for c in seen)
+
+
+def test_loop_vector_shape_pass_reaches_the_halfword_countdown_that_matched_a_menu_function(monkeypatch):
+    """The unsigned entry test, the u16 counter and the compound field decrement: 310 -> 0 in one child."""
+    net = setup(monkeypatch)
+    source = ('extern void *gMenu;\nextern void *gState;\nextern int sink(void *, int);\nvoid f(void) {\n  int i;\n  short t;\n'
+              '  unsigned short temp;\n  int next;\n  void *state;\n  void *menu;\n'
+              '  t = *((short *) (((char *) gMenu) + 0x7C));\n  if (t == 0)\n  {\n    i = 0;\n    state = gState;\n'
+              '    if ((((unsigned) t) + 1) <= ((unsigned char) (*((unsigned char *) (((char *) state) + 5)))))\n    {\n'
+              '      do\n      {\n        sink(state, i & 0xFFFF);\n        i += 1;\n      }\n'
+              '      while (((unsigned) (i & 0xFFFF)) < ((unsigned char) (*((unsigned char *) (((char *) state) + 5)))));\n    }\n  }\n'
+              '  menu = gMenu;\n  temp = *((short *) (((char *) menu) + 0x7C));\n  if (((short) temp) > 0)\n  {\n'
+              '    next = temp - 1;\n    *((short *) (((char *) menu) + 0x7C)) = next;\n    if ((next << 0x10) == 0)\n    {\n'
+              '      sink(state, 1);\n    }\n  }\n}\n')
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_score=310,best_source=? WHERE name='f'", (source,))
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        search.tested += 1
+        # each edit alone is no better (314, 310, 455); the three together are exact
+        whole = ('(unsigned) t) <' in candidate and 'u16 i;' in candidate and '-= 1;' in candidate)
+        return 0 if whole else 314
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source, name='f'), 310, None) == 0
+    assert len(seen) >= 3
 
 
 def test_a_stub_baseline_is_named_before_the_tuning_passes(monkeypatch):
@@ -1228,3 +1368,144 @@ def test_neutral_plateau_pass_reaches_a_step_that_pays_off_after_same_score_step
 def test_neutral_frontier_spreads_over_families_first():
     children = [('a', 1), ('a', 2), ('b', 3), ('a', 4), ('c', 5)]
     assert deep_permuter.Search.neutral_frontier(children, 4) == [('a', 1), ('b', 3), ('c', 5), ('a', 2)]
+
+
+def test_switch_temporary_restore_gets_an_early_local_trial(monkeypatch):
+    from decompnet.app import generation_calls
+    from decomprepair.reused_temp_split_repairs import RESTORE_FAMILY, variants
+
+    net = setup(monkeypatch)
+    fn, proj = net.function(), net.project_row('game')
+    source = '''int f(int which) {
+    int value;
+    int value_b1;
+    switch (which) {
+    case 0:
+        value = 0;
+        break;
+    default:
+        value_b1 = 1;
+        break;
+    }
+    return value;
+}'''
+    monkeypatch.setattr(generation_calls, 'library', lambda calls: [
+        variants(*arguments) if name == 'decomprepair.reused_temp_split_repairs.variants'
+        else [('other', 'another draft')]
+        for name, arguments, *_ in calls
+    ])
+    search = deep_permuter.Search(net, 1, 10, Log(), fn)
+    proposals, _ = search._local_proposals(source, proj, fn, [])
+    family, candidate = proposals[0]
+    assert family == RESTORE_FAMILY
+    assert 'value = 1;' in candidate
+    assert 'value_b1' not in candidate
+
+
+@pytest.mark.parametrize('header,expected', [('', 35), ('#define setup() use(counter)', 155)])
+def test_counter_reset_pass_uses_header_when_moving_across_setup(monkeypatch, header, expected):
+    net = setup(monkeypatch)
+    monkeypatch.setattr(net, '_context', lambda *args: {'header': header})
+    source = """int f(void) {
+    int counter;
+    counter = 0;
+    setup();
+    do {
+        observe(counter);
+        counter += 1;
+    } while (counter < 4);
+    return counter;
+}"""
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+
+    def score(agent, proj, fn, candidate, best, fork):
+        search.tested += 1
+        return 35 if 'setup();\n    counter = 0;' in candidate else 155
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, proj, dict(fn, best_source=source), 155, None) == expected
+
+
+def test_loop_vector_shape_pass_pairs_signed_entry_with_halfword_counter(monkeypatch, tmp_path):
+    from decompnet import toolchains
+    from decompnet.compiler import compile_source
+    from decompnet.elfobj import extract_function
+    from decompnet.project import compiler_config
+
+    toolchain = 'gcc-2.7.2-kmc'
+    if not toolchains.installed(toolchain):
+        pytest.skip('needs the local pinned compiler')
+    source = """
+typedef unsigned short u16;
+extern int count;
+extern int next(void);
+extern void tick(void), visit(int);
+void f(void) {
+    int timer;
+    int index;
+    int *bound;
+    if (timer) { tick(); } else { tick(); }
+    timer = next();
+    if (timer == 0) {
+        index = 0;
+        bound = &count;
+        if (((unsigned) timer) < ((unsigned) (*bound))) {
+            do {
+                visit(index & 0xff);
+                index++;
+            } while ((index & 0xffff) < *bound);
+        }
+    }
+}
+"""
+    expected = (source.replace('int index;', 'u16 index;')
+                .replace('((unsigned) timer) < ((unsigned) (*bound))', 'timer < *bound')
+                .replace('if (timer) { tick(); } else { tick(); }', 'tick();'))
+    cfg = compiler_config(tmp_path, {'compiler': {'toolchain': toolchain,
+                                                 'flags': ['-G0', '-mips3', '-mgp32', '-mfp32', '-O2']}})
+    original = compile_source(cfg, '', expected)
+    baseline = compile_source(cfg, '', source)
+    assert original.ok, original.log
+    assert baseline.ok, baseline.log
+    target = extract_function(original.obj, 'f').code
+    assert extract_function(baseline.obj, 'f').code != target
+    net = setup(monkeypatch)
+    fn = dict(net.function(), best_source=source)
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    seen = []
+
+    def score(agent, proj, fn, candidate, best, fork):
+        seen.append(candidate)
+        result = compile_source(cfg, '', candidate)
+        return 0 if result.ok and extract_function(result.obj, 'f').code == target else best
+
+    monkeypatch.setattr(search, '_score', score)
+    assert search.loop_vector_shape_pass(AGENT, net.project_row('game'), fn, 170, None) == 0
+    assert expected in seen
+
+
+def test_reused_temp_split_lane_rejects_a_branch_join_with_old_values(monkeypatch):
+    from decompnet.app import generation_calls
+    from decomprepair.reused_temp_split_repairs import variants
+
+    net = setup(monkeypatch)
+    fn, proj = net.function(), net.project_row('game')
+    source = '''int f(int mode, int input) {
+    int value;
+    value = 1;
+    if (mode) {
+        value = input;
+    } else {
+        value = 0;
+    }
+    return value;
+}'''
+    monkeypatch.setattr(generation_calls, 'library', lambda calls: [
+        variants(*arguments) if name == 'decomprepair.reused_temp_split_repairs.variants' else []
+        for name, arguments, *_ in calls
+    ])
+    search = deep_permuter.Search(net, 1, 10, Log(), fn)
+    proposals, _ = search._local_proposals(source, proj, fn, [])
+    assert not any(family == 'reused_temp_split' and 'value_b2 = 0;' in candidate
+                   for family, candidate in proposals)

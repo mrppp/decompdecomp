@@ -9,11 +9,13 @@ import re
 import threading
 
 from decomprepair import (
+    accumulator_chain_repairs,
     address_association_repairs,
     address_param_copy_repairs,
     affine_operand_repairs,
     allocation_repairs,
     allocator_shape_repairs,
+    arm_pointer_split_repairs,
     assignment_tree_switch_repairs,
     assignment_use_repairs,
     bit_predicate_repairs,
@@ -44,8 +46,11 @@ from decomprepair import (
     case_split_repairs,
     case_temporary_repairs,
     clamp_barrier_repairs,
+    clamp_default_scope_repairs,
     comma_flag_condition_repairs,
     comma_temporary_repairs,
+    compare_arm_split_repairs,
+    compare_operand_stage,
     compare_tree_switch_repairs,
     compared_load_inline_repairs,
     comparison_sides_repairs,
@@ -53,12 +58,15 @@ from decomprepair import (
     compiler_shape_repairs,
     component_index_repairs,
     compound_global_update_repairs,
+    condition_table_anchor,
     conditional_ternary_repairs,
     const_read_repairs,
     constant_exit_return_repairs,
     constant_pointer_repairs,
     conversion_scheduling_repairs,
+    copy_back_repairs,
     copy_lifetime_repairs,
+    copy_sink_after_call_repairs,
     count_lifetime_repairs,
     countdown_guard_repairs,
     counted_call_loop_repairs,
@@ -69,10 +77,16 @@ from decomprepair import (
     debug_initializer_repairs,
     decision_address_repairs,
     decoded_byte_repairs,
+    default_else_repairs,
     deferred_store_repairs,
     delay_slot_duplicate_repairs,
+    derived_pointer_fold_repairs,
+    disjoint_local_merge_repairs,
+    display_cursor_record_repairs,
     duplicate_return_node_repairs,
     entry_parameter_copy_repairs,
+    entry_pointer_capture,
+    epsilon_predicate_order,
     equal_value_flow,
     evidence_repairs,
     example_lifetime_repairs,
@@ -83,9 +97,12 @@ from decomprepair import (
     field_width_repairs,
     flag_returns_repairs,
     float_bit_argument_repairs,
+    float_forwarded_argument,
+    float_hold_reuse_repairs,
     float_intermediate_repairs,
     float_prototype_repairs,
     float_record_copy_repairs,
+    float_register_argument_repairs,
     float_zero_local_repairs,
     focused_lifetime_repairs,
     formatter_repairs,
@@ -98,10 +115,13 @@ from decomprepair import (
     global_store_repairs,
     goto_loop_repairs,
     goto_structure_repairs,
+    goto_tail_order_repairs,
     guard_inversion_repairs,
     guard_shape_repairs,
+    guard_temp_sink_repairs,
     guarded_call_repairs,
     guarded_do_for_repairs,
+    guarded_pointer_copy,
     halfword_sign_repairs,
     hardware_operation_repairs,
     identity_lifetime_repairs,
@@ -125,11 +145,15 @@ from decomprepair import (
     load_pair_repairs,
     load_store_order_repairs,
     loaded_byte_repairs,
+    loaded_search_fold,
     local_inline_repairs,
     local_widening_repairs,
     local_width_repairs,
     loop_address_inline_repairs,
+    loop_entry_reset_repairs,
+    loop_goto_form_repairs,
     loop_guard_storage_repairs,
+    loop_head_giv_repairs,
     loop_index_inline_repairs,
     loop_param_reuse_repairs,
     loop_sentinel_repairs,
@@ -139,14 +163,19 @@ from decomprepair import (
     loop_weight_repairs,
     macro_address_repairs,
     macro_repairs,
+    macro_scope_weight,
+    masked_byte_pair_repairs,
     masked_counter_repairs,
     masked_flag_test_repairs,
+    masked_range_equalities,
     masked_reuse_repairs,
     match_followup_repairs,
     match_shape_repairs,
     matched_prototype_repairs,
+    mips_float_local_reuse,
     mmio_repairs,
     narrow_call_repairs,
+    narrow_count_copy_repairs,
     narrow_expression_repairs,
     narrow_shift_repairs,
     narrow_store_repairs,
@@ -155,11 +184,17 @@ from decomprepair import (
     near_match_repairs,
     near_repairs,
     nested_guard_repairs,
+    nested_join_hoist_repairs,
     normalization_repairs,
     observed_repairs,
     offset_base_local_repairs,
     operand_order_repairs,
+    opposing_float_bounds_repairs,
+    or_chain_order_repairs,
+    or_constant_stage_repairs,
     out_of_line_guard_repairs,
+    paired_call_argument_inline_repairs,
+    param_address_local_repairs,
     param_mask_repairs,
     parameter_copy_drop_repairs,
     parameter_mask_drop_repairs,
@@ -177,8 +212,10 @@ from decomprepair import (
     pointer_walk_index_repairs,
     post_call_capture_repairs,
     preheader_order_repairs,
+    prelude_pointer_inline_repairs,
     prepared_call_repairs,
     product_operand_reuse_repairs,
+    product_shift_stage_repairs,
     product_temporary_repairs,
     queue_cursor_index_repairs,
     range_case_switch_repairs,
@@ -194,6 +231,7 @@ from decomprepair import (
     reloaded_global_repairs,
     result_debris_repairs,
     returned_flag_repairs,
+    reused_temp_split_repairs,
     row_subscript_repairs,
     saved_register_argument_repairs,
     scalar_storage_reuse,
@@ -208,8 +246,10 @@ from decomprepair import (
     shared_offset_repairs,
     shared_product_repairs,
     shared_return_repairs,
+    shifted_byte_lifetime,
     short_counter_loop_repairs,
     signed_division_repairs,
+    slot_helper_repairs,
     source_variable_reuse_repairs,
     stack_extent_repairs,
     stack_object_size_repairs,
@@ -217,17 +257,22 @@ from decomprepair import (
     stack_repairs,
     stack_run_array_repairs,
     stack_unpack_loop_repairs,
+    staged_narrow_store_repairs,
     storage_scope_repairs,
     store_address_repairs,
     store_expression_forms,
     store_result_repairs,
     store_value_first_repairs,
+    stored_compare_repairs,
+    stored_float_zero_repairs,
     stored_pointer_read_repairs,
     stored_return_value_repairs,
     structure_return_repairs,
     switch_case_order_repairs,
     switch_default_if_repairs,
+    switch_default_tail_repairs,
     switch_range_repairs,
+    switch_variable_split_repairs,
     symbol_base_repairs,
     symbol_width_repairs,
     tail_call_arm_repairs,
@@ -248,7 +293,14 @@ from decomprepair import (
     unsigned_switch_repairs,
     value_range_repairs,
     varargs_signature_repairs,
+    vector_accumulator_stage,
+    vector_component_order,
+    vector_output_capture,
+    volatile_global_plain_repairs,
+    volatile_local_drop_repairs,
     volatile_reload_repairs,
+    volatile_slot_demotion_repairs,
+    widened_field_read_repairs,
     width_promotion_repairs,
     word_block_copy_repairs,
     wrapped_counter_repairs,
@@ -289,11 +341,13 @@ from . import (
 )
 from .repair_generation import call as _generated
 
-AGENT_FAMILIES = (loop_sentinel_repairs.FAMILY, target_call_constant_repairs.FAMILY, out_of_line_guard_repairs.FAMILY, record_layout_search.FAMILY,) + (initial_draft_repairs.FRAME_FAMILY,) + unknown_symbol_offset_repairs.FAMILIES + masked_counter_repairs.FAMILIES + delay_slot_duplicate_repairs.FAMILIES + constant_exit_return_repairs.FAMILIES + target_constant_repairs.FAMILIES + const_read_repairs.FAMILIES + shared_return_repairs.FAMILIES + read_before_assign_repairs.FAMILIES + irregular_case_repairs.FAMILIES + unsigned_switch_repairs.FAMILIES + volatile_reload_repairs.FAMILIES + pointer_walk_index_repairs.FAMILIES + queue_cursor_index_repairs.FAMILIES + guarded_do_for_repairs.FAMILIES + parameter_copy_drop_repairs.FAMILIES + load_store_order_repairs.FAMILIES + passthrough_argument_repairs.FAMILIES + goto_loop_repairs.FAMILIES + carried_store_arms_repairs.FAMILIES + compared_load_inline_repairs.FAMILIES + if_tree_switch_repairs.FAMILIES + call_site_prototype_repairs.FAMILIES + masked_flag_test_repairs.FAMILIES + row_subscript_repairs.FAMILIES + shared_product_repairs.FAMILIES + store_expression_forms.FAMILIES + stack_run_array_repairs.FAMILIES + busy_wait_repairs.FAMILIES + global_record_copy_repairs.FAMILIES + assignment_tree_switch_repairs.FAMILIES + range_case_switch_repairs.FAMILIES + register_carrier_repairs.FAMILIES + shared_constant_store_repairs.FAMILIES + ternary_argument_repairs.FAMILIES + counted_call_loop_repairs.FAMILIES + leaf_frame_repairs.FAMILIES + nested_guard_repairs.FAMILIES + offset_base_local_repairs.FAMILIES + parameter_mask_drop_repairs.FAMILIES + parameter_shape_repairs.FAMILIES + search_exit_loop_repairs.FAMILIES + stored_pointer_read_repairs.FAMILIES + halfword_sign_repairs.FAMILIES + source_variable_reuse_repairs.FAMILIES + target_call_order_repairs.FAMILIES + wrapped_counter_repairs.FAMILIES + address_param_copy_repairs.FAMILIES + compare_tree_switch_repairs.FAMILIES + float_record_copy_repairs.FAMILIES + leading_parameter_repairs.FAMILIES + switch_case_order_repairs.FAMILIES + tail_shape_repairs.FAMILIES + varargs_signature_repairs.FAMILIES + call_index_split_repairs.FAMILIES + case_split_repairs.FAMILIES + comma_temporary_repairs.FAMILIES + deferred_store_repairs.FAMILIES + global_pointer_local_repairs.FAMILIES + loop_address_inline_repairs.FAMILIES + loop_shape_repairs.FAMILIES + result_debris_repairs.FAMILIES + saved_register_argument_repairs.FAMILIES + stack_record_repairs.FAMILIES + tail_call_arm_repairs.FAMILIES + unknown_table_index_repairs.FAMILIES + counter_loop_repairs.FAMILIES + float_prototype_repairs.FAMILIES + switch_default_if_repairs.FAMILIES + field_width_repairs.FAMILIES + goto_structure_repairs.FAMILIES + symbol_base_repairs.FAMILIES + target_call_arity_repairs.FAMILIES + unsigned_conversion_repairs.FAMILIES + guard_inversion_repairs.FAMILIES + integer_sum_repairs.FAMILIES + stored_return_value_repairs.FAMILIES + word_block_copy_repairs.FAMILIES + comma_flag_condition_repairs.FAMILIES + compound_global_update_repairs.FAMILIES + conditional_ternary_repairs.FAMILIES + duplicate_return_node_repairs.FAMILIES + join_copy_sink_repairs.FAMILIES + join_store_split_repairs.FAMILIES + field_load_hoist_repairs.FAMILIES + flag_returns_repairs.FAMILIES + float_zero_local_repairs.FAMILIES + narrow_widening_repairs.FAMILIES + narrowed_call_argument_repairs.FAMILIES + reloaded_global_repairs.FAMILIES + short_counter_loop_repairs.FAMILIES + unknown32_float_repairs.FAMILIES + assignment_use_repairs.FAMILIES + comparison_sides_repairs.FAMILIES + narrow_shift_repairs.FAMILIES + pointer_scale_repairs.FAMILIES + returned_flag_repairs.FAMILIES + search_loop_repairs.FAMILIES + signed_division_repairs.FAMILIES + stack_extent_repairs.FAMILIES + stack_unpack_loop_repairs.FAMILIES + stack_object_size_repairs.FAMILIES + switch_range_repairs.FAMILIES + target_string_repairs.FAMILIES + symbol_width_repairs.FAMILIES + call_index_staging_repairs.FAMILIES + guard_shape_repairs.FAMILIES + global_array_repairs.FAMILIES + local_inline_repairs.FAMILIES + product_temporary_repairs.FAMILIES + loop_param_reuse_repairs.FAMILIES + scaled_size_inline_repairs.FAMILIES + clamp_barrier_repairs.FAMILIES + loop_index_inline_repairs.FAMILIES + frame_padding_repairs.FAMILIES + field_struct_view_repairs.FAMILIES + entry_parameter_copy_repairs.FAMILIES + store_value_first_repairs.FAMILIES + init_placement_repairs.FAMILIES + param_mask_repairs.FAMILIES + width_promotion_repairs.FAMILIES + record_slot_repairs.FAMILIES + bit_predicate_repairs.FAMILIES + scope_topology_repairs.FAMILIES + (bit_role_repairs.FAMILY,) + (carrier_sequence_repairs.FAMILY,) + compiler_phase_repairs.FAMILIES + snapshot_branch_repairs.FAMILIES + branch_tail_distribution.FAMILIES + call_preparation_repairs.FAMILIES + repair_cleanup.FAMILIES + record_lifetime_recovery.FAMILIES + pointer_result_repairs.FAMILIES + record_store_bundles.FAMILIES + narrow_store_repairs.FAMILIES + scratch_role_repairs.FAMILIES + parameter_carriers.FAMILIES + narrow_load_subtraction.FAMILIES + integer_constant_repairs.FAMILIES + loop_storage_shapes.FAMILIES + scalar_storage_reuse.FAMILIES + (switch_constant_dispatch.FAMILY, guarded_call_repairs.FAMILY, decoded_byte_repairs.FAMILY, zero_chain_repairs.FAMILY, component_index_repairs.FAMILY, unsigned_shift_repairs.FAMILY, preheader_order_repairs.FAMILY, terminal_guard_repairs.FAMILY, promoted_entry_repairs.FAMILY,) + zero_argument_repairs.FAMILIES + (matched_prototype_repairs.FAMILY, countdown_guard_repairs.FAMILY,) + loaded_byte_repairs.FAMILIES + pointer_capture_repairs.FAMILIES + scan_load_repairs.FAMILIES + byte_address_inline_repairs.FAMILIES + byte_increment_repairs.FAMILIES + loop_tail_update_order_repairs.FAMILIES + loop_top_label_repairs.FAMILIES + product_operand_reuse_repairs.FAMILIES + dead_local_stage_repairs.FAMILIES + counter_companion_repairs.FAMILIES + global_pointer_run_repairs.FAMILIES + (known_bit_repairs.FAMILY, post_call_capture_repairs.FAMILY) + loop_guard_storage_repairs.FAMILIES + macro_address_repairs.FAMILIES + live_return_address_repairs.FAMILIES + copy_lifetime_repairs.FAMILIES + (debug_boundary_repairs.FAMILY,) + conversion_scheduling_repairs.FAMILIES + (hardware_operation_repairs.FAMILY,) + (return_contract_repairs.FAMILY, float_storage_repairs.FAMILY, narrow_expression_repairs.FAMILY) + narrow_call_repairs.FAMILIES + (branch_scalar_repairs.FAMILY, call_count_repairs.FAMILY, pointer_snapshot_repairs.FAMILY,) + call_assignment_repairs.FAMILIES + constant_pointer_repairs.FAMILIES + (shared_offset_repairs.FAMILY, 'branch_store_tail', 'common_scalar_tail',) + later_local_repairs.FAMILIES + call_scope_repairs.FAMILIES + prepared_call_repairs.FAMILIES + debug_initializer_repairs.FAMILIES + phase_union_repairs.FAMILIES + captured_index_repairs.FAMILIES + recent_capture_repairs.FAMILIES + (identity_lifetime_repairs.FAMILY, 'typed_global_identity', 'block_accumulator_lifetime', pointer_index_scope.FAMILY,) + copy_shape_repairs.FAMILIES + focused_lifetime_repairs.FAMILIES + (store_result_repairs.FAMILY,) + equal_value_flow.FAMILIES + example_lifetime_repairs.FAMILIES + affine_operand_repairs.FAMILIES + loop_weight_repairs.FAMILIES + branch_pointer_repairs.FAMILIES + capture_followup_repairs.FAMILIES + ('paired_load_order',) + allocation_repairs.FAMILIES + case_temporary_repairs.FAMILIES + phantom_local_repairs.FAMILIES + value_range_repairs.FAMILIES + count_lifetime_repairs.FAMILIES + helper_expansion.FAMILIES + record_lifetime_repairs.FAMILIES + raw_address_repairs.FAMILIES + zero_test_repairs.FAMILIES + pointer_pair_repairs.FAMILIES + field_order_repairs.FAMILIES + match_shape_repairs.FAMILIES + increment_expression_repairs.FAMILIES + allocator_shape_repairs.FAMILIES + buffer_address_repairs.FAMILIES + normalization_repairs.FAMILIES + call_lifetime_repairs.FAMILIES + sdk_io_repairs.FAMILIES + target_local_repairs.FAMILIES + formatter_repairs.FAMILIES + ('target_switch_order',) + inline_scheduling_repairs.FAMILIES + ('runtime_scalar_signature', 'shared_return_tail', 'direct_compound_store', 'redundant_loop_guard', 'float_argument_bits', 'arithmetic_operand_order', 'call_forwarded_arguments', 'small_copy', 'typed_record_address', 'one_shot_scope', 'one_shot_unwrap',
+AGENT_FAMILIES = nested_join_hoist_repairs.FAMILIES + paired_call_argument_inline_repairs.FAMILIES + widened_field_read_repairs.FAMILIES + float_register_argument_repairs.FAMILIES + derived_pointer_fold_repairs.FAMILIES + staged_narrow_store_repairs.FAMILIES + volatile_slot_demotion_repairs.FAMILIES + copy_sink_after_call_repairs.FAMILIES + compare_arm_split_repairs.FAMILIES + masked_byte_pair_repairs.FAMILIES + or_constant_stage_repairs.FAMILIES + display_cursor_record_repairs.FAMILIES + or_chain_order_repairs.FAMILIES + volatile_global_plain_repairs.FAMILIES + loop_head_giv_repairs.FAMILIES + default_else_repairs.FAMILIES + stored_compare_repairs.FAMILIES + loop_entry_reset_repairs.FAMILIES + guard_temp_sink_repairs.FAMILIES + product_shift_stage_repairs.FAMILIES + clamp_default_scope_repairs.FAMILIES + volatile_local_drop_repairs.FAMILIES + disjoint_local_merge_repairs.FAMILIES + reused_temp_split_repairs.FAMILIES + accumulator_chain_repairs.FAMILIES + narrow_count_copy_repairs.FAMILIES + mips_float_local_reuse.FAMILIES + (epsilon_predicate_order.FAMILY, vector_component_order.FAMILY, vector_accumulator_stage.FAMILY, entry_pointer_capture.FAMILY, float_forwarded_argument.FAMILY, vector_output_capture.FAMILY, opposing_float_bounds_repairs.FAMILY, stored_float_zero_repairs.FAMILY, loop_sentinel_repairs.FAMILY, target_call_constant_repairs.FAMILY, out_of_line_guard_repairs.FAMILY, record_layout_search.FAMILY,) + (initial_draft_repairs.FRAME_FAMILY,) + unknown_symbol_offset_repairs.FAMILIES + masked_counter_repairs.FAMILIES + delay_slot_duplicate_repairs.FAMILIES + constant_exit_return_repairs.FAMILIES + target_constant_repairs.FAMILIES + const_read_repairs.FAMILIES + shared_return_repairs.FAMILIES + read_before_assign_repairs.FAMILIES + irregular_case_repairs.FAMILIES + unsigned_switch_repairs.FAMILIES + volatile_reload_repairs.FAMILIES + pointer_walk_index_repairs.FAMILIES + queue_cursor_index_repairs.FAMILIES + guarded_do_for_repairs.FAMILIES + parameter_copy_drop_repairs.FAMILIES + load_store_order_repairs.FAMILIES + passthrough_argument_repairs.FAMILIES + goto_loop_repairs.FAMILIES + carried_store_arms_repairs.FAMILIES + compared_load_inline_repairs.FAMILIES + if_tree_switch_repairs.FAMILIES + call_site_prototype_repairs.FAMILIES + masked_flag_test_repairs.FAMILIES + masked_range_equalities.FAMILIES + row_subscript_repairs.FAMILIES + shared_product_repairs.FAMILIES + store_expression_forms.FAMILIES + stack_run_array_repairs.FAMILIES + busy_wait_repairs.FAMILIES + global_record_copy_repairs.FAMILIES + assignment_tree_switch_repairs.FAMILIES + range_case_switch_repairs.FAMILIES + register_carrier_repairs.FAMILIES + shared_constant_store_repairs.FAMILIES + ternary_argument_repairs.FAMILIES + counted_call_loop_repairs.FAMILIES + leaf_frame_repairs.FAMILIES + nested_guard_repairs.FAMILIES + offset_base_local_repairs.FAMILIES + parameter_mask_drop_repairs.FAMILIES + parameter_shape_repairs.FAMILIES + search_exit_loop_repairs.FAMILIES + stored_pointer_read_repairs.FAMILIES + halfword_sign_repairs.FAMILIES + source_variable_reuse_repairs.FAMILIES + goto_tail_order_repairs.FAMILIES + prelude_pointer_inline_repairs.FAMILIES + switch_variable_split_repairs.FAMILIES + target_call_order_repairs.FAMILIES + wrapped_counter_repairs.FAMILIES + address_param_copy_repairs.FAMILIES + compare_tree_switch_repairs.FAMILIES + float_record_copy_repairs.FAMILIES + leading_parameter_repairs.FAMILIES + switch_case_order_repairs.FAMILIES + tail_shape_repairs.FAMILIES + varargs_signature_repairs.FAMILIES + call_index_split_repairs.FAMILIES + case_split_repairs.FAMILIES + comma_temporary_repairs.FAMILIES + deferred_store_repairs.FAMILIES + global_pointer_local_repairs.FAMILIES + loop_address_inline_repairs.FAMILIES + loop_shape_repairs.FAMILIES + result_debris_repairs.FAMILIES + saved_register_argument_repairs.FAMILIES + stack_record_repairs.FAMILIES + tail_call_arm_repairs.FAMILIES + unknown_table_index_repairs.FAMILIES + counter_loop_repairs.FAMILIES + float_prototype_repairs.FAMILIES + switch_default_if_repairs.FAMILIES + switch_default_tail_repairs.FAMILIES + field_width_repairs.FAMILIES + goto_structure_repairs.FAMILIES + loop_goto_form_repairs.FAMILIES + symbol_base_repairs.FAMILIES + target_call_arity_repairs.FAMILIES + unsigned_conversion_repairs.FAMILIES + guard_inversion_repairs.FAMILIES + integer_sum_repairs.FAMILIES + stored_return_value_repairs.FAMILIES + word_block_copy_repairs.FAMILIES + comma_flag_condition_repairs.FAMILIES + compound_global_update_repairs.FAMILIES + conditional_ternary_repairs.FAMILIES + duplicate_return_node_repairs.FAMILIES + join_copy_sink_repairs.FAMILIES + join_store_split_repairs.FAMILIES + arm_pointer_split_repairs.FAMILIES + param_address_local_repairs.FAMILIES + slot_helper_repairs.FAMILIES + field_load_hoist_repairs.FAMILIES + flag_returns_repairs.FAMILIES + float_zero_local_repairs.FAMILIES + narrow_widening_repairs.FAMILIES + narrowed_call_argument_repairs.FAMILIES + reloaded_global_repairs.FAMILIES + short_counter_loop_repairs.FAMILIES + unknown32_float_repairs.FAMILIES + assignment_use_repairs.FAMILIES + comparison_sides_repairs.FAMILIES + narrow_shift_repairs.FAMILIES + pointer_scale_repairs.FAMILIES + returned_flag_repairs.FAMILIES + search_loop_repairs.FAMILIES + loaded_search_fold.FAMILIES + signed_division_repairs.FAMILIES + stack_extent_repairs.FAMILIES + stack_unpack_loop_repairs.FAMILIES + stack_object_size_repairs.FAMILIES + switch_range_repairs.FAMILIES + target_string_repairs.FAMILIES + symbol_width_repairs.FAMILIES + call_index_staging_repairs.FAMILIES + guard_shape_repairs.FAMILIES + global_array_repairs.FAMILIES + local_inline_repairs.FAMILIES + product_temporary_repairs.FAMILIES + loop_param_reuse_repairs.FAMILIES + scaled_size_inline_repairs.FAMILIES + clamp_barrier_repairs.FAMILIES + loop_index_inline_repairs.FAMILIES + frame_padding_repairs.FAMILIES + field_struct_view_repairs.FAMILIES + entry_parameter_copy_repairs.FAMILIES + store_value_first_repairs.FAMILIES + init_placement_repairs.FAMILIES + param_mask_repairs.FAMILIES + width_promotion_repairs.FAMILIES + record_slot_repairs.FAMILIES + bit_predicate_repairs.FAMILIES + scope_topology_repairs.FAMILIES + (bit_role_repairs.FAMILY,) + (carrier_sequence_repairs.FAMILY,) + compiler_phase_repairs.FAMILIES + snapshot_branch_repairs.FAMILIES + branch_tail_distribution.FAMILIES + call_preparation_repairs.FAMILIES + repair_cleanup.FAMILIES + record_lifetime_recovery.FAMILIES + pointer_result_repairs.FAMILIES + record_store_bundles.FAMILIES + narrow_store_repairs.FAMILIES + scratch_role_repairs.FAMILIES + parameter_carriers.FAMILIES + narrow_load_subtraction.FAMILIES + integer_constant_repairs.FAMILIES + loop_storage_shapes.FAMILIES + scalar_storage_reuse.FAMILIES + (switch_constant_dispatch.FAMILY, guarded_call_repairs.FAMILY, decoded_byte_repairs.FAMILY, zero_chain_repairs.FAMILY, component_index_repairs.FAMILY, unsigned_shift_repairs.FAMILY, preheader_order_repairs.FAMILY, terminal_guard_repairs.FAMILY, promoted_entry_repairs.FAMILY,) + zero_argument_repairs.FAMILIES + (matched_prototype_repairs.FAMILY, countdown_guard_repairs.FAMILY,) + loaded_byte_repairs.FAMILIES + pointer_capture_repairs.FAMILIES + scan_load_repairs.FAMILIES + byte_address_inline_repairs.FAMILIES + byte_increment_repairs.FAMILIES + loop_tail_update_order_repairs.FAMILIES + loop_top_label_repairs.FAMILIES + product_operand_reuse_repairs.FAMILIES + float_hold_reuse_repairs.FAMILIES + dead_local_stage_repairs.FAMILIES + copy_back_repairs.FAMILIES + counter_companion_repairs.FAMILIES + global_pointer_run_repairs.FAMILIES + (known_bit_repairs.FAMILY, post_call_capture_repairs.FAMILY) + loop_guard_storage_repairs.FAMILIES + macro_address_repairs.FAMILIES + live_return_address_repairs.FAMILIES + copy_lifetime_repairs.FAMILIES + (debug_boundary_repairs.FAMILY,) + conversion_scheduling_repairs.FAMILIES + (hardware_operation_repairs.FAMILY,) + (return_contract_repairs.FAMILY, float_storage_repairs.FAMILY, narrow_expression_repairs.FAMILY) + narrow_call_repairs.FAMILIES + (branch_scalar_repairs.FAMILY, call_count_repairs.FAMILY, pointer_snapshot_repairs.FAMILY,) + call_assignment_repairs.FAMILIES + constant_pointer_repairs.FAMILIES + (shared_offset_repairs.FAMILY, 'branch_store_tail', 'common_scalar_tail',) + later_local_repairs.FAMILIES + call_scope_repairs.FAMILIES + prepared_call_repairs.FAMILIES + debug_initializer_repairs.FAMILIES + phase_union_repairs.FAMILIES + captured_index_repairs.FAMILIES + recent_capture_repairs.FAMILIES + (identity_lifetime_repairs.FAMILY, 'typed_global_identity', 'block_accumulator_lifetime', pointer_index_scope.FAMILY,) + copy_shape_repairs.FAMILIES + focused_lifetime_repairs.FAMILIES + (store_result_repairs.FAMILY,) + equal_value_flow.FAMILIES + example_lifetime_repairs.FAMILIES + affine_operand_repairs.FAMILIES + loop_weight_repairs.FAMILIES + macro_scope_weight.FAMILIES + condition_table_anchor.FAMILIES + compare_operand_stage.FAMILIES + branch_pointer_repairs.FAMILIES + capture_followup_repairs.FAMILIES + ('paired_load_order',) + allocation_repairs.FAMILIES + case_temporary_repairs.FAMILIES + phantom_local_repairs.FAMILIES + value_range_repairs.FAMILIES + count_lifetime_repairs.FAMILIES + helper_expansion.FAMILIES + record_lifetime_repairs.FAMILIES + raw_address_repairs.FAMILIES + zero_test_repairs.FAMILIES + pointer_pair_repairs.FAMILIES + field_order_repairs.FAMILIES + match_shape_repairs.FAMILIES + increment_expression_repairs.FAMILIES + allocator_shape_repairs.FAMILIES + buffer_address_repairs.FAMILIES + normalization_repairs.FAMILIES + call_lifetime_repairs.FAMILIES + sdk_io_repairs.FAMILIES + target_local_repairs.FAMILIES + formatter_repairs.FAMILIES + ('target_switch_order',) + inline_scheduling_repairs.FAMILIES + ('runtime_scalar_signature', 'shared_return_tail', 'direct_compound_store', 'redundant_loop_guard', 'float_argument_bits', 'arithmetic_operand_order', 'call_forwarded_arguments', 'small_copy', 'typed_record_address', 'one_shot_scope', 'one_shot_unwrap',
                   'pointer_block_scope', 'array_address_share', 'combined_integer_lifetimes', 'inferred_record_layout',
                   'float_product_intermediate','pointer_chase_reuse','independent_assignment_order',
                   'terminal_early_return','member_store_replay','scalar_global_address','split_mask_stores',
                   'split_integer_phase','paired_integer_lifetimes','initialization_cluster')
+
+AGENT_FAMILIES += (guarded_pointer_copy.FAMILY,) + shifted_byte_lifetime.FAMILIES
 
 LIMIT = 20
 _IDENT = r'[A-Za-z_]\w*'
@@ -436,12 +490,36 @@ def _variants(source: str, name: str, arch: str, asm: str = '', flags=(), labels
     semantic=(_generated(snapshot_branch_repairs.variants,source,name,header,arch)
               + _generated(known_bit_repairs.variants,source,name,header,arch)
               + _generated(post_call_capture_repairs.variants,source,name,header,arch))
+    semantic += _generated(switch_default_tail_repairs.variants, source, name)
+    semantic += (_generated(compare_arm_split_repairs.variants, source, name)
+                 + _generated(masked_byte_pair_repairs.variants, source, name)
+                 + _generated(or_constant_stage_repairs.variants, source, name))
+    # What a 1,190-instruction m2c function needed, in the order it needed it (docs/COMPILER_MATCHING_LEARNINGS.md)
+    semantic += (_generated(nested_join_hoist_repairs.variants, source, name)
+                 + _generated(paired_call_argument_inline_repairs.variants, source, name)
+                 + _generated(widened_field_read_repairs.variants, source, name)
+                 + _generated(derived_pointer_fold_repairs.variants, source, name)
+                 + _generated(staged_narrow_store_repairs.variants, source, name)
+                 + _generated(volatile_slot_demotion_repairs.variants, source, name)
+                 + _generated(copy_sink_after_call_repairs.variants, source, name))
+    if arch == 'mips':
+        semantic += _generated(float_register_argument_repairs.variants, source, name, asm, flags)
     scoped = []
     if arch == 'mips':
         scoped = (_generated(loop_sentinel_repairs.variants, source, name, header, arch, asm)
                   + _generated(target_call_constant_repairs.variants, source, name, asm)
-                  + _generated(out_of_line_guard_repairs.variants, source, name, header))
-    early=scoped+_generated(switch_constant_dispatch.variants,source,name,header,**(entry_scope or {})) + _generated(guarded_call_repairs.variants,source,name,header,arch) + _generated(decoded_byte_repairs.variants,source,name,header,arch,**(entry_scope or {})) + _generated(zero_chain_repairs.variants,source,name,header,**(entry_scope or {})) + _generated(component_index_repairs.variants,source,name,header,**(entry_scope or {})) + _generated(unsigned_shift_repairs.variants,source,name,header,**(entry_scope or {})) + _generated(preheader_order_repairs.variants,source,name,header,**(entry_scope or {})) + _generated(terminal_guard_repairs.variants,source,name,header) + _generated(promoted_entry_repairs.variants,source,name,header,**(entry_scope or {})) + _generated(zero_argument_repairs.variants,source,name,header,callees) + _generated(float_bit_argument_repairs.variants,source,name,header,arch,flags) + _generated(unknown_symbol_offset_repairs.variants,source,name,header) + _generated(masked_counter_repairs.variants,source,name) + _generated(initial_draft_repairs.frame_variants,source,name,asm,arch) + _generated(delay_slot_duplicate_repairs.variants,source,name) + _generated(constant_exit_return_repairs.variants,source,name) + _generated(target_constant_repairs.variants,source,name,asm) + _generated(load_store_order_repairs.variants,source,name) + _generated(passthrough_argument_repairs.variants,source,name,asm=asm,arch=arch,header=header,callees=callees,require_evidence=True) + _generated(goto_loop_repairs.variants,source,name) + _generated(carried_store_arms_repairs.variants,source,name) + _generated(compared_load_inline_repairs.variants,source,name) + _generated(if_tree_switch_repairs.variants,source,name) + _generated(call_site_prototype_repairs.variants,source,name) + _generated(masked_flag_test_repairs.variants,source,name) + _generated(row_subscript_repairs.variants,source,name) + _generated(shared_product_repairs.variants,source,name) + _generated(store_expression_forms.variants,source,name) + _generated(stack_run_array_repairs.variants,source,name,asm) + _generated(busy_wait_repairs.variants,source,name) + _generated(global_record_copy_repairs.variants,source,name,asm) + _generated(assignment_tree_switch_repairs.variants,source,name) + _generated(range_case_switch_repairs.variants,source,name) + _generated(register_carrier_repairs.variants,source,name) + _generated(shared_constant_store_repairs.variants,source,name) + _generated(ternary_argument_repairs.variants,source,name) + _generated(counted_call_loop_repairs.variants,source,name) + _generated(leaf_frame_repairs.variants,source,name,asm) + _generated(nested_guard_repairs.variants,source,name) + _generated(offset_base_local_repairs.variants,source,name) + _generated(parameter_mask_drop_repairs.variants,source,name,asm) + _generated(parameter_shape_repairs.variants,source,name,asm) + _generated(search_exit_loop_repairs.variants,source,name) + _generated(stored_pointer_read_repairs.variants,source,name) + _generated(halfword_sign_repairs.variants,source,name) + _generated(source_variable_reuse_repairs.variants,source,name) + _generated(target_call_order_repairs.variants,source,name,asm) + _generated(wrapped_counter_repairs.variants,source,name) + _generated(address_param_copy_repairs.variants,source,name) + _generated(compare_tree_switch_repairs.variants,source,name) + _generated(float_record_copy_repairs.variants,source,name,asm) + _generated(leading_parameter_repairs.variants,source,name,asm) + _generated(switch_case_order_repairs.variants,source,name) + _generated(tail_shape_repairs.variants,source,name) + _generated(varargs_signature_repairs.variants,source,name,asm) + _generated(call_index_split_repairs.variants,source,name) + _generated(case_split_repairs.variants,source,name) + _generated(comma_temporary_repairs.variants,source,name) + _generated(deferred_store_repairs.variants,source,name) + _generated(global_pointer_local_repairs.variants,source,name) + _generated(loop_address_inline_repairs.variants,source,name) + _generated(loop_shape_repairs.variants,source,name) + _generated(result_debris_repairs.variants,source,name) + _generated(saved_register_argument_repairs.variants,source,name,asm) + _generated(stack_record_repairs.variants,source,name) + _generated(tail_call_arm_repairs.variants,source,name) + _generated(unknown_table_index_repairs.variants,source,name,asm) + _generated(counter_loop_repairs.variants,source,name) + _generated(float_prototype_repairs.variants,source,name) + _generated(switch_default_if_repairs.variants,source,name) + _generated(field_width_repairs.variants,source,name,asm) + _generated(goto_structure_repairs.variants,source,name) + _generated(symbol_base_repairs.variants,source,name) + _generated(target_call_arity_repairs.variants,source,name,asm) + _generated(unsigned_conversion_repairs.variants,source,name) + _generated(guard_inversion_repairs.variants,source,name) + _generated(integer_sum_repairs.variants,source,name) + _generated(stored_return_value_repairs.variants,source,name,asm) + _generated(word_block_copy_repairs.variants,source,name) + _generated(comma_flag_condition_repairs.variants,source,name) + _generated(compound_global_update_repairs.variants,source,name) + _generated(conditional_ternary_repairs.variants,source,name) + _generated(duplicate_return_node_repairs.variants,source,name) + _generated(join_copy_sink_repairs.variants,source,name) + _generated(join_store_split_repairs.variants,source,name) + _generated(field_load_hoist_repairs.variants,source,name) + _generated(flag_returns_repairs.variants,source,name) + _generated(float_zero_local_repairs.variants,source,name,asm) + _generated(narrow_widening_repairs.variants,source,name) + _generated(narrowed_call_argument_repairs.variants,source,name) + _generated(reloaded_global_repairs.variants,source,name,asm) + _generated(short_counter_loop_repairs.variants,source,name) + _generated(unknown32_float_repairs.variants,source,name,asm) + _generated(assignment_use_repairs.variants,source,name) + _generated(comparison_sides_repairs.variants,source,name) + _generated(narrow_shift_repairs.variants,source,name) + _generated(pointer_scale_repairs.variants,source,name,asm) + _generated(returned_flag_repairs.variants,source,name) + _generated(search_loop_repairs.variants,source,name) + _generated(signed_division_repairs.variants,source,name) + _generated(stack_extent_repairs.variants,source,name,asm) + _generated(stack_unpack_loop_repairs.variants,source,name,asm) + _generated(stack_object_size_repairs.variants,source,name,asm) + _generated(switch_range_repairs.variants,source,name,asm) + _generated(target_string_repairs.variants,source,name,asm) + _generated(symbol_width_repairs.variants,source,name,asm) + _generated(call_index_staging_repairs.variants,source,name) + _generated(matched_prototype_repairs.variants,source,name,header,callees) + _generated(scan_load_repairs.variants,source,name,header,arch) + _generated(byte_address_inline_repairs.variants,source,name,flags,header,arch) + _generated(byte_increment_repairs.variants,source,name,header,arch) + _generated(loop_tail_update_order_repairs.variants,source,name,header) + _generated(loop_top_label_repairs.variants,source,name) + _generated(product_operand_reuse_repairs.variants,source,name) + _generated(dead_local_stage_repairs.variants,source,name) + _generated(counter_companion_repairs.variants,source,name) + _generated(global_pointer_run_repairs.variants,source,name) + semantic + _generated(phase_union_repairs.array_variants,source,name,arch,flags,header) + _generated(macro_address_repairs.variants,source,name,arch,flags,header) + _generated(live_return_address_repairs.variants,source,name,arch,asm,header) + _generated(copy_lifetime_repairs.variants,source,name,header) + _generated(debug_boundary_repairs.variants,source,name,flags,header,limit=None) + _generated(conversion_scheduling_repairs.variants,source,name,header,arch,asm,flags) + _generated(hardware_operation_repairs.variants,source,name,arch,asm) + _generated(shared_offset_repairs.variants,source,name,header) + _generated(branch_layout_repairs.store_tails,source,name,header) + _generated(branch_layout_repairs.scalar_tails,source,name,header) + _generated(captured_index_repairs.variants,source,name,header) + _generated(decision_address_repairs.variants, source,name,arch,header) + _generated(recent_capture_repairs.variants,source,name,arch,asm,header,callees)
+                  + _generated(out_of_line_guard_repairs.variants, source, name, header)
+                  + _generated(mips_float_local_reuse.variants, source, name, asm)
+                  + _generated(stored_float_zero_repairs.variants, source, name, asm)
+                  + _generated(opposing_float_bounds_repairs.variants, source, name, asm)
+                  + _generated(vector_output_capture.variants, source, name, asm)
+                  + _generated(float_forwarded_argument.variants, source, name, asm)
+                  + _generated(entry_pointer_capture.variants, source, name, asm)
+                  + _generated(vector_accumulator_stage.variants, source, name, asm)
+                  + _generated(vector_component_order.variants, source, name, asm)
+                  + _generated(epsilon_predicate_order.variants, source, name, asm))
+    scoped += _generated(guarded_pointer_copy.variants, source, name, header, arch)
+    early=scoped+_generated(switch_constant_dispatch.variants,source,name,header,**(entry_scope or {})) + _generated(guarded_call_repairs.variants,source,name,header,arch) + _generated(decoded_byte_repairs.variants,source,name,header,arch,**(entry_scope or {})) + _generated(zero_chain_repairs.variants,source,name,header,**(entry_scope or {})) + _generated(component_index_repairs.variants,source,name,header,**(entry_scope or {})) + _generated(unsigned_shift_repairs.variants,source,name,header,**(entry_scope or {})) + _generated(preheader_order_repairs.variants,source,name,header,**(entry_scope or {})) + _generated(terminal_guard_repairs.variants,source,name,header) + _generated(promoted_entry_repairs.variants,source,name,header,**(entry_scope or {})) + _generated(zero_argument_repairs.variants,source,name,header,callees) + _generated(float_bit_argument_repairs.variants,source,name,header,arch,flags) + _generated(unknown_symbol_offset_repairs.variants,source,name,header) + _generated(masked_counter_repairs.variants,source,name) + _generated(initial_draft_repairs.frame_variants,source,name,asm,arch) + _generated(delay_slot_duplicate_repairs.variants,source,name) + _generated(constant_exit_return_repairs.variants,source,name) + _generated(target_constant_repairs.variants,source,name,asm) + _generated(load_store_order_repairs.variants,source,name) + _generated(passthrough_argument_repairs.variants,source,name,asm=asm,arch=arch,header=header,callees=callees,require_evidence=True) + _generated(goto_loop_repairs.variants,source,name) + _generated(carried_store_arms_repairs.variants,source,name) + _generated(compared_load_inline_repairs.variants,source,name) + _generated(if_tree_switch_repairs.variants,source,name) + _generated(call_site_prototype_repairs.variants,source,name) + _generated(masked_flag_test_repairs.variants,source,name) + _generated(masked_range_equalities.variants,source,name) + _generated(row_subscript_repairs.variants,source,name) + _generated(shared_product_repairs.variants,source,name) + _generated(store_expression_forms.variants,source,name) + _generated(stack_run_array_repairs.variants,source,name,asm) + _generated(busy_wait_repairs.variants,source,name) + _generated(global_record_copy_repairs.variants,source,name,asm) + _generated(assignment_tree_switch_repairs.variants,source,name) + _generated(range_case_switch_repairs.variants,source,name,asm) + _generated(register_carrier_repairs.variants,source,name) + _generated(shared_constant_store_repairs.variants,source,name) + _generated(ternary_argument_repairs.variants,source,name) + _generated(counted_call_loop_repairs.variants,source,name) + _generated(leaf_frame_repairs.variants,source,name,asm) + _generated(nested_guard_repairs.variants,source,name) + _generated(offset_base_local_repairs.variants,source,name) + _generated(parameter_mask_drop_repairs.variants,source,name,asm) + _generated(parameter_shape_repairs.variants,source,name,asm) + _generated(search_exit_loop_repairs.variants,source,name) + _generated(stored_pointer_read_repairs.variants,source,name) + _generated(halfword_sign_repairs.variants,source,name) + _generated(source_variable_reuse_repairs.variants,source,name) + _generated(goto_tail_order_repairs.variants,source,name) + _generated(prelude_pointer_inline_repairs.variants,source,name) + _generated(switch_variable_split_repairs.variants,source,name) + _generated(target_call_order_repairs.variants,source,name,asm) + _generated(wrapped_counter_repairs.variants,source,name) + _generated(address_param_copy_repairs.variants,source,name) + _generated(compare_tree_switch_repairs.variants,source,name) + _generated(float_record_copy_repairs.variants,source,name,asm) + _generated(leading_parameter_repairs.variants,source,name,asm) + _generated(switch_case_order_repairs.variants,source,name,asm) + _generated(tail_shape_repairs.variants,source,name) + _generated(varargs_signature_repairs.variants,source,name,asm) + _generated(call_index_split_repairs.variants,source,name) + _generated(case_split_repairs.variants,source,name) + _generated(comma_temporary_repairs.variants,source,name) + _generated(deferred_store_repairs.variants,source,name) + _generated(global_pointer_local_repairs.variants,source,name) + _generated(loop_address_inline_repairs.variants,source,name) + _generated(loop_shape_repairs.variants,source,name) + _generated(result_debris_repairs.variants,source,name) + _generated(saved_register_argument_repairs.variants,source,name,asm) + _generated(stack_record_repairs.variants,source,name) + _generated(tail_call_arm_repairs.variants,source,name) + _generated(unknown_table_index_repairs.variants,source,name,asm) + _generated(counter_loop_repairs.variants,source,name) + _generated(float_prototype_repairs.variants,source,name) + _generated(switch_default_if_repairs.variants,source,name) + _generated(field_width_repairs.variants,source,name,asm) + _generated(goto_structure_repairs.variants,source,name) + _generated(loop_goto_form_repairs.variants,source,name) + _generated(symbol_base_repairs.variants,source,name,asm) + _generated(target_call_arity_repairs.variants,source,name,asm) + _generated(unsigned_conversion_repairs.variants,source,name) + _generated(guard_inversion_repairs.variants,source,name) + _generated(integer_sum_repairs.variants,source,name) + _generated(stored_return_value_repairs.variants,source,name,asm) + _generated(word_block_copy_repairs.variants,source,name) + _generated(comma_flag_condition_repairs.variants,source,name) + _generated(compound_global_update_repairs.variants,source,name) + _generated(conditional_ternary_repairs.variants,source,name) + _generated(duplicate_return_node_repairs.variants,source,name) + _generated(join_copy_sink_repairs.variants,source,name) + _generated(join_store_split_repairs.variants,source,name) + _generated(arm_pointer_split_repairs.variants,source,name) + _generated(param_address_local_repairs.variants,source,name) + _generated(slot_helper_repairs.variants,source,name) + _generated(field_load_hoist_repairs.variants,source,name) + _generated(flag_returns_repairs.variants,source,name) + _generated(float_zero_local_repairs.variants,source,name,asm) + _generated(narrow_widening_repairs.variants,source,name) + _generated(narrowed_call_argument_repairs.variants,source,name) + _generated(reloaded_global_repairs.variants,source,name,asm) + _generated(short_counter_loop_repairs.variants,source,name) + _generated(unknown32_float_repairs.variants,source,name,asm) + _generated(assignment_use_repairs.variants,source,name) + _generated(comparison_sides_repairs.variants,source,name) + _generated(narrow_shift_repairs.variants,source,name) + _generated(pointer_scale_repairs.variants,source,name,asm) + _generated(returned_flag_repairs.variants,source,name) + _generated(search_loop_repairs.variants,source,name,header) + _generated(loaded_search_fold.variants,source,name) + _generated(signed_division_repairs.variants,source,name) + _generated(stack_extent_repairs.variants,source,name,asm) + _generated(stack_unpack_loop_repairs.variants,source,name,asm) + _generated(stack_object_size_repairs.variants,source,name,asm) + _generated(switch_range_repairs.variants,source,name,asm) + _generated(target_string_repairs.variants,source,name,asm) + _generated(symbol_width_repairs.variants,source,name,asm) + _generated(call_index_staging_repairs.variants,source,name) + _generated(matched_prototype_repairs.variants,source,name,header,callees) + _generated(scan_load_repairs.variants,source,name,header,arch) + _generated(byte_address_inline_repairs.variants,source,name,flags,header,arch) + _generated(byte_increment_repairs.variants,source,name,header,arch) + _generated(loop_tail_update_order_repairs.variants,source,name,header) + _generated(loop_top_label_repairs.variants,source,name) + _generated(product_operand_reuse_repairs.variants,source,name) + _generated(float_hold_reuse_repairs.variants,source,name) + _generated(dead_local_stage_repairs.variants,source,name) + _generated(copy_back_repairs.variants,source,name) + _generated(counter_companion_repairs.variants,source,name) + _generated(global_pointer_run_repairs.variants,source,name) + semantic + _generated(phase_union_repairs.array_variants,source,name,arch,flags,header) + _generated(macro_address_repairs.variants,source,name,arch,flags,header) + _generated(live_return_address_repairs.variants,source,name,arch,asm,header) + _generated(copy_lifetime_repairs.variants,source,name,header) + _generated(debug_boundary_repairs.variants,source,name,flags,header,limit=None) + _generated(conversion_scheduling_repairs.variants,source,name,header,arch,asm,flags) + _generated(hardware_operation_repairs.variants,source,name,arch,asm) + _generated(shared_offset_repairs.variants,source,name,header) + _generated(branch_layout_repairs.store_tails,source,name,header) + _generated(branch_layout_repairs.scalar_tails,source,name,header) + _generated(captured_index_repairs.variants,source,name,header) + _generated(decision_address_repairs.variants, source,name,arch,header) + _generated(recent_capture_repairs.variants,source,name,arch,asm,header,callees)
     if '#' in clean[opening:end]:
         def generate(masked):
             inner_labels = {}
@@ -500,6 +578,8 @@ def _variants(source: str, name: str, arch: str, asm: str = '', flags=(), labels
     early = early + _generated(guarded_do_for_repairs.variants,source,name)
     # (m2c's local copy of a parameter the game changed in place, dropped; decomprepair.parameter_copy_drop_repairs)
     early = early + _generated(parameter_copy_drop_repairs.variants,source,name)
+    if arch == "mips":
+        early = _generated(shifted_byte_lifetime.variants, source, name, header) + early
     for family,text in early:
         proposals.append(text);labels[text]=family
     for family,text in _generated(copy_shape_repairs.variants, source,name,header) + _generated(capture_followup_repairs.variants, source,name,header,callees):
@@ -564,7 +644,7 @@ def _variants(source: str, name: str, arch: str, asm: str = '', flags=(), labels
     for family, text in _generated(captured_lifetimes.variants, source, name):
         proposals.append(text)
         labels[text] = family
-    for family, text in _generated(increment_expression_repairs.variants, source, name) + _generated(loop_weight_repairs.variants, source, name, header) + _generated(equal_value_flow.variants, source, name, header):
+    for family, text in _generated(increment_expression_repairs.variants, source, name) + _generated(loop_weight_repairs.variants, source, name, header) + _generated(equal_value_flow.variants, source, name, header) + _generated(macro_scope_weight.variants, source, name, header) + _generated(condition_table_anchor.variants, source, name, header) + _generated(compare_operand_stage.variants, source, name, header):
         proposals.append(text)
         labels[text] = family
     for family, text in (_generated(loop_guard_storage_repairs.variants, source, name, asm, header)
@@ -644,6 +724,22 @@ def _variants(source: str, name: str, arch: str, asm: str = '', flags=(), labels
     for family, text in _generated(clamp_barrier_repairs.variants, source, name):
         proposals.append(text)
         labels[text] = family
+    # (the chain of one 719-instruction function, 5060 -> exact: a loop's derived pointer, defaults in `else` arms, a stored
+    # value compared from memory, a signed count, a counter's entry reset, a temporary sunk into its guard, a staged shift,
+    # a scoped clamp default, a dropped volatile, merged and split locals, an accumulator chain; decomprepair 0.5.369)
+    # (a display-list cursor as a record pointer with each advance by its command's words, an or-chain's literal first and a volatile
+    # halfword global as the plain one: the chain of a 318-instruction N64 function, 1825 -> exact; decomprepair 0.5.373)
+    for module in (loop_head_giv_repairs, default_else_repairs, stored_compare_repairs, loop_entry_reset_repairs,
+                   guard_temp_sink_repairs, product_shift_stage_repairs, clamp_default_scope_repairs,
+                   volatile_local_drop_repairs, disjoint_local_merge_repairs, reused_temp_split_repairs,
+                   accumulator_chain_repairs, display_cursor_record_repairs, or_chain_order_repairs,
+                   volatile_global_plain_repairs):
+        for family, text in _generated(module.variants, source, name):
+            proposals.append(text)
+            labels[text] = family
+    for family, text in _generated(narrow_count_copy_repairs.variants, source, name, header):
+        proposals.append(text)
+        labels[text] = family
     for family, text in _generated(field_struct_view_repairs.variants, source, name):
         proposals.append(text)
         labels[text] = family
@@ -660,6 +756,9 @@ def _variants(source: str, name: str, arch: str, asm: str = '', flags=(), labels
         proposals.append(text)
         labels[text] = family
     for family, text in _generated(frame_padding_repairs.variants, source, name, asm):
+        proposals.append(text)
+        labels[text] = family
+    for family, text in _generated(frame_padding_repairs.drop_variants, source, name):
         proposals.append(text)
         labels[text] = family
     for family, text in _generated(loop_index_inline_repairs.variants, source, name):
@@ -814,24 +913,35 @@ def _finish(source,name,proposals,labels,allocation_candidates,limit):
     for text in proposals:
         labels.setdefault(text,'expression_or_near_repair')
     # Round-robin families so a new family cannot crowd existing repairs out of a short pass.
-    groups = {}
+    from itertools import chain, islice, zip_longest
+
     from decomprepair.repair_preflight import invalid_call
 
     from .repair_generation import ACTIVE
-    for text in dict.fromkeys(proposals):
-        if text == source:
-            continue
-        if ACTIVE.get() is None and invalid_call(text, name):
-            continue
-        groups.setdefault(labels[text],[]).append(text)
-    # Missing argument positions and unknown-object types need refinement before speculative
-    # call scopes; adding a scope family must not displace this existing short preflight lane.
     from .repair_ranking import GUARDED, STRUCTURAL
-    first=('m2c_refinement',)+GUARDED+STRUCTURAL
-    groups={**{family:groups[family] for family in first if family in groups},**groups}
-    ordered = []
-    while any(groups.values()):
-        for items in groups.values():
-            if items:
-                ordered.append(items.pop(0))
-    return ordered if limit is None else ordered[:limit]
+
+    groups = {}
+    for position, text in enumerate(dict.fromkeys(proposals)):
+        if text != source:
+            groups.setdefault(labels[text], []).append((position, text))
+    preflight = ACTIVE.get() is None
+
+    # The first valid proposal sets each family's original insertion order.
+    # Keep the rest lazy so candidates beyond the search limit need no preflight.
+    families = []
+    for family, items in groups.items():
+        valid = filter(lambda item: not invalid_call(item[1], name), items) if preflight else iter(items)
+        head = next(valid, None)
+        if head is not None:
+            families.append((family, head[0], chain((head,), valid)))
+
+    first = ('m2c_refinement',) + GUARDED + STRUCTURAL
+    priority = {family: i for i, family in enumerate(dict.fromkeys(first))}
+    families.sort(key=lambda item: (priority.get(item[0], len(first)), item[1]))
+    ordered = (item[1] for batch in zip_longest(*(stream for _, _, stream in families))
+               for item in batch if item is not None)
+    if limit is None:
+        return list(ordered)
+    if limit < 0:
+        return list(ordered)[:limit]
+    return list(islice(ordered, limit))

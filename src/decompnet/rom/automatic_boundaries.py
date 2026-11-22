@@ -387,8 +387,13 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
             markers += 1
             continue
         if (previous is not None and owner(previous)==owner(fn)
-                and fn.vram in (explicit | pointers)
-                and shared_entry_leaf(previous,fn,image,console,order,segments,entered)):
+                and (fn.vram in (explicit | pointers)
+                     and shared_entry_leaf(previous,fn,image,console,order,segments,entered)
+                     or previous.vram in direct_calls and fn.vram in direct_calls
+                     and shared_called_leaf(previous,fn,image,console,order,segments,
+                                            explicit | pointers | {address for address, sources in references.items()
+                                                if any(not previous.rom <= src < fn.rom+fn.size for src, _ in sources)},
+                                            data))):
             kept[-1] = replace(previous,lines=previous.lines+fn.lines,
                                labels=previous.labels|fn.labels,
                                entry_aliases={**previous.entry_aliases,fn.vram:fn.name})
@@ -460,6 +465,24 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
         log(f'Recovered {recovered_shared} closed leaves with independently entered assembly tails.')
     return kept if dropped or markers or recovered_data or recovered_shared else result if changed else functions
 
+
+
+def shared_called_leaf(head, tail, image, console, order, segments, entered, data):
+    """Keep both called entries when a short prefix falls through into a closed leaf."""
+    if (head.size != 4 or tail.size < 8 or head.rom+head.size != tail.rom
+            or head.vram+head.size != tail.vram or head.entry_aliases or tail.entry_aliases
+            or any(tail.vram < address < tail.vram+tail.size for address in entered)):
+        return False
+    if sum(s.contains(head.vram,head.size+tail.size) for s in segments) != 1:
+        return False
+    end = tail.rom+tail.size
+    if any(d.rom is not None and d.rom < end and head.rom < d.rom+d.size for d in data):
+        return False
+    if image[head.rom:end] != b''.join(line.word.to_bytes(4,order) for fn in (head,tail) for line in fn.lines):
+        return False
+    options = dict(big_endian=console.big_endian, cpu=console.cpu_variant, asm_check=console.asm_reason)
+    return (leaf_extent(image,head.rom,end,head.vram,**options) == head.size+tail.size
+            and leaf_extent(image,tail.rom,end,tail.vram,**options) == tail.size)
 
 
 def shared_entry_leaf(head, tail, image, console, order, segments, entered):
@@ -1172,22 +1195,36 @@ def shared_slot_calls(functions, image, console, segments):
     fmt='>I' if console.big_endian else '<I'
     def word(at):
         return struct.unpack_from(fmt,image,at)[0] if 0<=at<=len(image)-4 else None
+    # Splat may split a single contiguous loaded bank into several units. Calls
+    # into any of those units describe the same slot and need joint evidence.
+    groups = []
+    for segment in sorted(segments, key=lambda s: s.rom_start):
+        if (groups and groups[-1][-1].rom_end == segment.rom_start
+                and groups[-1][-1].vram-groups[-1][-1].rom_start == segment.vram-segment.rom_start
+                and groups[-1][-1].exclusive_ram_id == segment.exclusive_ram_id):
+            groups[-1].append(segment)
+        else:
+            groups.append([segment])
     calls=defaultdict(list)
     for fn in functions:
         for line in fn.lines:
             if line.word>>26!=3:continue
             dest=((line.vram+4)&0xf0000000)|((line.word&0x3ffffff)<<2)
-            for s in segments:
-                if s.contains(dest,4) and not (s.rom_start<=line.rom<s.rom_end
-                                                 and line.vram-line.rom==s.vram-s.rom_start):
-                    calls[s.name].append((dest,line.rom,fn.segment,dest-s.vram+s.rom_start,s.rom_start))
+            for group_index, group in enumerate(groups):
+                for segment in group:
+                    if (segment.contains(dest,4)
+                            and not (group[0].rom_start<=line.rom<group[-1].rom_end
+                                     and line.vram-line.rom==segment.vram-segment.rom_start)):
+                        calls[group_index].append((dest,line.rom,fn.segment,
+                                                   dest-segment.vram+segment.rom_start,group[0].rom_start))
     out,slots=[],[]
-    for name,found in calls.items():
+    for group_index,found in calls.items():
         targets={c[3]:c[4] for c in found}
         if len(targets)<SHARED_SLOT_CALLS:continue
         fit=sum(1 for at,start in targets.items() if at==start or is_frame(word(at) or 0) or word(at-8)==JR_RA)
         if fit*2<len(targets):
-            out+=[c[:3] for c in found];slots+=[s for s in segments if s.name==name]
+            out += [c[:3] for c in found]
+            slots += groups[group_index]
     return out,slots
 
 

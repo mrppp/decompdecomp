@@ -24,6 +24,19 @@ def test_early_return_is_shared_and_keeps_expression(arch):
     assert any('if (x < 0) return 0;' in out and 'return (int)root((float)x);' in out for out in outputs)
 
 
+def test_guard_with_call_returns_can_be_inverted():
+    src = '''int f(int x) {
+    if (x == 1) {
+        return send(x);
+    }
+    return receive(x, nested());
+}
+'''
+    outputs = variants(src, 'f', 'mips', limit=None)
+    assert any('if (x != 1)' in out and out.index('return receive(x, nested());') < out.index('return send(x);')
+               for out in outputs)
+
+
 def test_nested_call_argument_boundary_and_opaque_text():
     src = 'int f(int x) { /* other(x, 123) */ return send(inner(x, 2), 0x40); }'
     out = variants(src, 'f', 'mips')
@@ -160,7 +173,7 @@ def test_member_address_cast_with_optional_parentheses(pointer, wrapped):
 def test_member_rule_excludes_calls_and_increments():
     for expr in ['get()->base', 'obj[i++].base', 'obj->base++']:
         src = f'int f(int i) {{ return *(int *)(((u8 *) {expr}) + i); }}'
-        assert all('side();' in out and (f'result={expr};' in out or (expr=='result + x' and ('result = result; result += x;' in out or 'result= (x) + (result);' in out))) for out in variants(src, 'f', 'mips'))
+        assert all(f'((u8 *) {expr}) + i' in out for out in variants(src, 'f', 'mips'))
 
 
 @pytest.mark.parametrize('imported', [False,True])
@@ -295,3 +308,185 @@ def test_progress_movement_abandons_stale_repair_snapshot_without_caching(monkey
     monkeypatch.setattr(perm, '_score', ScriptedPermuter._score.__get__(perm))
     perm._repair_round(AGENT, net.project_row('game'), State())
     assert len(perm.judged) == 2
+
+
+@pytest.mark.parametrize('arch', ['mips', 'ppc', 'x86', 'arm'])
+def test_shared_switch_default_tail_reaches_permuter_candidates(arch):
+    source = """\
+void f(int x) {
+    switch (x) {
+        case 0: start();
+        default:
+        joined:
+            finish();
+            break;
+        case 1: goto joined;
+        case 2: break;
+    }
+}
+"""
+    labels = {}
+    choices = variants(source, 'f', arch, labels=labels)
+    [lifted] = [choice for choice in choices if labels[choice] == 'switch_default_tail']
+    assert lifted.index('case 2: break;') < lifted.index('joined:\n')
+    assert lifted.index('goto after_switch_tail;') < lifted.index('joined:\n')
+
+
+def test_a_byte_range_test_and_masked_equality_become_the_masked_chain():
+    # A KMC GCC 2.7.2 function at 215 (an lb and a missing andi): the unsigned local and the masked chain, 15.
+    src = ('s32 f(void *p) {\n    s8 t;\n    s32 r;\n\n    t = M2C_FIELD(p, u8 *, 0x82);\n'
+           '    if (((u32) (t - 9) < 2U) || ((t & 0xFF) == 0xB)) {\n        r = 1;\n    } else {\n        r = 0;\n    }\n'
+           '    return r;\n}\n')
+    outputs = variants(src, 'f', 'mips')
+    assert any('u8 t;' in out and '((t & 0xFF) == 9) || ((t & 0xFF) == 0xA) || ((t & 0xFF) == 0xB)' in out for out in outputs)
+
+
+def test_list_search_copy_respects_header_macros():
+    source = '''
+#define M2C_FIELD(expr, type_ptr, offset) (*(type_ptr)((s8 *)(expr) + (offset)))
+void *find(s32 key) {
+    void *node;
+    void *result;
+    node = get_head();
+    result = NULL;
+    if (node != NULL) {
+loop_1:
+        result = node;
+        if (M2C_FIELD(node, s32 *, 12) != key) {
+            node = M2C_FIELD(node, void **, 4);
+            result = NULL;
+            if (node != NULL) {
+                goto loop_1;
+            }
+        }
+    }
+    return result;
+}
+'''
+    labels = {}
+    candidates = variants(source, 'find', 'mips', labels=labels, limit=None)
+    assert any(labels.get(candidate) == 'goto_search_loop' for candidate in candidates)
+    labels = {}
+    candidates = variants(source, 'find', 'mips', labels=labels, limit=None, header='#define HIDDEN result')
+    assert all(labels.get(candidate) != 'goto_search_loop' for candidate in candidates)
+
+
+def test_field_store_tail_is_available_to_drafts():
+    source = '''
+#define M2C_FIELD(expr, type_ptr, offset) (*(type_ptr)((s8 *)(expr) + (offset)))
+void paint(void *obj, int selected) {
+    if (selected) {
+        M2C_FIELD(obj, u8 *, 0) = 0xFE;
+    } else {
+        M2C_FIELD(obj, u8 *, 0) = 0xFF;
+    }
+    M2C_FIELD(obj, u8 *, 3) = 0xFF;
+}
+'''
+    labels = {}
+    candidates = variants(source, 'paint', 'mips', labels=labels, limit=None)
+    assert any(labels.get(candidate) == 'branch_store_tail' for candidate in candidates)
+
+
+def test_short_repair_pass_validates_only_ranked_candidates(monkeypatch):
+    from decompnet.app import draft_repairs
+    from decomprepair import repair_preflight
+
+    checked = []
+
+    def invalid(candidate, name):
+        checked.append(candidate)
+        return candidate.startswith('invalid')
+
+    monkeypatch.setattr(repair_preflight, 'invalid_call', invalid)
+    proposals = ['invalid_a', 'b1', 'a1', 'b2', 'a2', 'b3', 'a3']
+    labels = {candidate: candidate[-2] if not candidate.startswith('invalid') else 'a' for candidate in proposals}
+    assert draft_repairs._finish('source', 'f', proposals, labels, [], 3) == ['b1', 'a1', 'b2']
+    assert 'invalid_a' in checked
+    assert 'b3' not in checked
+    assert 'a3' not in checked
+
+
+def test_draft_repairs_offer_direct_selected_byte_store():
+    from decompnet.app import draft_repairs
+
+    source = """
+extern unsigned char selected;
+extern unsigned char fallback;
+void f(int outer, int inner) {
+    volatile short scratch;
+    if (outer) {
+        if (inner) { scratch = 4; } else { scratch = 4; }
+    } else { scratch = fallback; }
+    selected = scratch;
+}
+"""
+    labels = {}
+    proposals = draft_repairs.variants(source, 'f', 'mips', labels=labels)
+    [direct] = [candidate for candidate in proposals if labels[candidate] == 'branch_store_tail']
+    assert 'volatile short scratch;' not in direct
+    assert direct.count('selected = 4;') == 2
+
+
+def test_draft_repairs_offer_cleanup_for_uninitialized_identical_arms():
+    from decompnet.app import draft_repairs
+
+    source = """
+int f(void) {
+    float scratch;
+    if (scratch) {
+        setup();
+    } else {
+        setup();
+    }
+    return 0;
+}
+"""
+    labels = {}
+    proposals = draft_repairs.variants(source, 'f', 'mips', labels=labels)
+    [cleaned] = [candidate for candidate in proposals if labels[candidate] == 'common_scalar_tail']
+    assert 'if (scratch)' not in cleaned
+    assert cleaned.count('setup();') == 1
+
+
+def test_draft_repairs_offer_a_separate_float_clamp_lifetime():
+    from decompnet.app import draft_repairs
+
+    source = """
+float f(float x, float y, int enabled) {
+    float value;
+    if (enabled) {
+        value = x / y;
+        if (value < -1.0f) value = -1.0f;
+        else if (value > 1.0f) value = 1.0f;
+        return value * x;
+    }
+    value = x + y;
+    return value;
+}
+"""
+    asm = 'div.s $f4, $f2, $f0\nc.lt.s $f4, $f6\nc.lt.s $f2, $f4'
+    labels = {}
+    proposals = draft_repairs.variants(source, 'f', 'mips', asm=asm, labels=labels)
+    [clamp] = [candidate for candidate in proposals if labels[candidate] == 'split_float_clamp_lifetime']
+    assert 'float __repair_clamped_float = x / y;' in clamp
+    assert 'value = x + y;' in clamp
+
+
+def test_shifted_byte_lifetime_is_offered_to_the_permuter():
+    source = '''
+void f(Voice *v, Note *n) {
+    u32 pitch;
+    u32 w;
+    pitch = ((u32) (((u8 *) n)[2] * v->rate)) >> 7;
+    pitch += ((u8 *) n)[1] << 16;
+    w = n->word;
+    use(pitch, w);
+}
+'''
+    labels = {}
+    children = variants(source, 'f', 'mips', labels=labels, header='typedef volatile u32 vu32;')
+    assert any(labels.get(child) == 'shifted_byte_lifetime' and
+               'if (__repair_shifted_byte & 1)' in child for child in children)
+    assert not any(labels.get(child) == 'shifted_byte_lifetime'
+                   for child in variants(source, 'f', 'x86', labels=labels))

@@ -6,7 +6,7 @@ description: Match one function by hand against the running decompdecomp app, th
 # Match a function by hand, then teach the permuter
 
 In Claude Code, use `/match-function PROJECT [FUNCTION]`. In Codex, use
-`$match-function PROJECT [FUNCTION]`. Both clients load this file and use the same scripts.
+`$match-function PROJECT [FUNCTION]`. Both clients load this file and use the same MCP tools.
 For persistent Codex goal tracking, start with `/goal` and include the skill, the project and the
 optional function in the goal. The completion condition is a recorded score of 0 and any permuter
 improvements found during the run merged with their tests.
@@ -17,12 +17,13 @@ improvements found during the run merged with their tests.
   report the exact blocker and the current verdict.
 - **Keep a visible plan and say what you are doing in a line** when you start a long run, so a user following along
   can see the loop is alive. Long runs go in the background.
-- **Never start the Deep Permuter** (`judge.py permute`, `scratch_run.py`, any long search job). The user runs it in
-  their live app and it already uses every core. To test a repair, call it directly: the library's family (or the
-  app's `draft_repairs.variants`) on the current best source, scoring its variants with `fast_judge.py` and
-  confirming the best one with `judge.py try`.
-- When context grows long, keep going from the plan and the function's notes; do not wrap up early.
-- Report success after the judge records 0 and any permuter PRs from step 5 are merged.
+- **Leave the user's Deep Permuter run alone.** It already uses most cores. Use its saved results to
+  identify a gap, then test one named repair at a time with the bounded procedure in step 4.
+  The deliverable is a tested permuter improvement that can reproduce the measured gain.
+- Keep a private checkpoint with the latest live verdict, the measured search seeds and their scores, pending
+  MCP calls, the next experiment, and open PRs or release tags. Resume from it across context changes.
+  A plateau calls for a different experiment. Keep the claim while working on the match.
+- Report success after the judge records 0 and the tested permuter improvements from step 5 are merged.
 
 The aim is two things, and a run that delivers only the first has not finished:
 
@@ -51,35 +52,54 @@ skip it: a near-match that the permuter cannot close is always a permuter gap.
 The permuter's rewrites live in the decomp-repair library (AGENTS.md, "Agents": change it there, tag, bump the tag
 in `pyproject.toml`, `uv lock`). What runs candidates stays in `src/decompnet/app/`. Read that section first.
 
-## Which function: claim it first, always
+## Connect through the Rust MCP gateway
 
-Before any other step, generate a holder name for this session with
-`python3 -c "import secrets;print('match-'+secrets.token_hex(4))"`. Pass it as `--holder NAME` on
-**every** `judge.py` call in the session. The app keeps one claim per holder and uses the window's
-shared "you" when the holder is omitted. A unique holder keeps concurrent sessions from taking
-over or releasing one another's claims.
+Use the running app's decompdecomp MCP tools for claims, saved candidates, judging and release.
+If the app started this client as a helper, use its existing connection. Otherwise, use a dedicated
+project-scoped connection for this session. In the app, open **Agents & models → Connect another AI
+tool with MCP**, select the requested project and use the configuration it provides for the client.
+Use the Streamable HTTP URL on the Rust gateway's MCP port, with the connection's bearer credential.
+The app keeps that port in `.decomp/mcp-gateway.port` in its data home. Let the client supply the
+credential. If the gateway or project connection is missing, report which dependency is missing
+and continue read-only investigation or isolated scoring while setup is pending. Do not send claims
+through the window API or restart the app.
 
-- **Only a project given** (no function): `judge.py --holder NAME claim SLUG` claims a random open function that no
-  agent, app job or other session holds, and prints its name. That function is the goal's function from here on.
-  Never pick one yourself from the function list: a function you chose without claiming may be the one another
-  session is already working on. If it says nothing is left, tell the user; that is the one case with nothing to do.
-- **A function given**: `judge.py --holder NAME claim SLUG FUNC` claims it by name. If it is held by someone else,
-  say so and ask the user whether to take another (`claim SLUG`), rather than working on it beside them.
-- Claims expire when idle: run `claim SLUG FUNC` again (it renews your own claim) before a long stretch of local
-  work, and after any message that the claim was lost.
-- When the goal is met (or the user stops it), `judge.py --holder NAME release SLUG FUNC` gives it back. A matched
-  function needs no claim any more, but release it anyway.
+Call `project_info` and verify that the connection is scoped to the requested project. Use the same
+connection throughout the run so the app keeps attempts and claims under one identity.
+If the endpoint disappears, check the running app's advertised gateway port and verify
+`project_info` again before sending mutations. An app restart can retire a temporary endpoint.
+If sending raw MCP requests, use a distinct JSON-RPC ID for each request, including retries.
+The gateway deduplicates pending calls by connection, tool and arguments.
+
+## Claim one function
+
+- On a reused connection, start with `get_claims` to recover existing work. If it holds this
+  function, resume it. If it holds unrelated work, use a separate project connection. A newly
+  created connection that has made no claim can go straight to the first claim.
+- **Only a project given**: call `claim_function(strategy="random")` and use the name the app returns.
+- **A function given**: call `claim_function(function=FUNC, fallback=false)` when the tool exposes
+  `fallback`. If someone else holds it, report the conflict and continue in the isolated judge.
+  Older app versions may assign a different function when a named claim fails. If that happens,
+  release the replacement with its own claim token, `move_on=true`, and a note that the named
+  task did not include it. Wait for the requested function to become available before retrying.
+- If the gateway replies **still running**, repeat the identical tool call with the same arguments and
+  connection to collect its result. Keep other experiments local while a claim or compile is pending.
+  If it replies **accepted** and says not to repeat, let the app finish and read the notice on the next reply.
+- If the client loses the response without a gateway receipt, recover with `get_claims` for a claim
+  or the recorded verdict and history for a submission before retrying. Keep the canonical name and
+  current claim token, and wait for the claim to be confirmed before submitting.
+- Keep the claim across submissions. A compile renews it. If it expires, reclaim the same
+  function when available. If the app ends the claim for low progress, continue in the isolated judge
+  during the retry cooldown. Reclaim for a measured candidate once the app allows it.
+- On completion or stop, check `get_claims`. If the claim is still held, use `release_function`
+  with its current token. Follow the tool's release guidance if the claim has no compile yet.
 
 ## Rules that keep other people's work safe
 
 - **Never restart, update or quit the running app, and never `uv sync` under it.** Other agents use it. If it
   quits or says "shutting down", wait for it; do not start another. Work on a copy for anything destructive.
-- Find the app: `ps -E -o pid,command | grep -E 'bin/decomp( |$)'`, then `<home>/.decomp/server.json` (port,
-  secret, pid). Dev checkouts use `~/Decomp-RetroReversing-dev` on 6474. More than one app, or none: ask.
-- Judging goes through the app (`scripts/judge.py --holder NAME try`), so the user sees your attempts, credited to
-  your holder. Your claim can clash with another of the same holder ("you hold another claim": an earlier attempt
-  of yours): `judge.py` releases that claim and asks again. That is why each session needs its own holder. `judge.py` is standard library only; the other
-  scripts need an environment with decompnet (`.venv/bin/python`, read only: do not `uv sync` it).
+- Local compiler probes need an isolated Python environment with decompnet. If a probe needs
+  game data, identify the app's data home as described in AGENTS.md and read the project files there.
 - Game data (ROMs, extracted code) is read only and never copied into the repo or a PR.
 - Use the scratchpad for experiments, a worktree + branch + PR for repo changes (AGENTS.md workflow).
 - **Never `git pull`/`checkout` in the primary checkout**: the user's live app runs from its `.venv`, and a pull
@@ -92,11 +112,9 @@ over or releasing one another's claims.
 
 ## 1. Orient (5 minutes, do not skip)
 
-```bash
-python3 .claude/skills/match-function/scripts/judge.py --holder NAME claim SLUG          # no function given: prints FUNC
-python3 .claude/skills/match-function/scripts/judge.py --holder NAME best SLUG FUNC /scratch/best.c
-python3 .claude/skills/match-function/scripts/judge.py --holder NAME diff SLUG FUNC
-```
+Read `get_function(function=FUNC, section="work")` for the current C, mismatch and recent
+measurements. Use `get_candidate(function=FUNC, base="saved_best")` when you need the saved best C
+and write it to a scratch file for local probes. Use `get_assembly` for the target instructions.
 
 - **Is it the project's compiler?** Before any source shape, read the target's idioms and ask which compiler writes
   them (this is the cheapest question and the one that cost most when skipped: 243 attempts under the wrong
@@ -108,8 +126,18 @@ python3 .claude/skills/match-function/scripts/judge.py --holder NAME diff SLUG F
   candidate the other compiler can build and whose shape fits it will ever match there.
 - Read `best.c` and the **diff of the best source**, not the score. Group mismatches: register choice, instruction
   order, missing/extra instructions, branch shape, stack frame. Say which group dominates.
-- Read the function's notes (`GET /api/function` → `notes`) and the history. Earlier agents' dead ends are
+- Read the function's notes and history with the corresponding `get_function` sections. Earlier agents' dead ends are
   evidence; repeat none of them.
+- Keep a newly improved candidate as a private search seed even if it contains a suspicious read.
+  Record the issue and keep the prior candidate as a control. Compare the exact judge diffs and, where
+  supported, the compiler's allocation and scheduling dumps to find what the edit changed. An identical-arm
+  float guard can affect floating-point live ranges before the compiler merges the arms, so removing
+  the guard immediately can also discard useful allocation evidence.
+- Work from the improved seed. Try one named repair family at a time against it and measure its
+  children. For an uninitialized float guard, test alternatives that retain the useful guard or
+  lifetime shape while supplying an initialized value, and measure which other repairs combine with it.
+  If generation or routing misses the improvement, add a regression that starts from that seed and
+  test the emitted child with the exact judge. A lower score alone does not establish source behavior.
 - **Saved sources go stale when symbols are renamed.** A source using a name that no longer exists doesn't link
   ("not a known symbol") and scores terribly. Rewrite to the address names the assembly shows (`D_80102EFC`).
 - **Edit the current best; don't rewrite the function from scratch.** Start from `best.c` (or the app's draft) and
@@ -122,8 +150,8 @@ python3 .claude/skills/match-function/scripts/judge.py --holder NAME diff SLUG F
 
 ## 2. Work fast and locally
 
-The app takes seconds per compile. A pinned compiler through the app's own compiler path takes about a second. Use
-`scripts/compile_snippet.py` for thinking and searching, and the app only to confirm:
+Use `scripts/compile_snippet.py` for quick compiler probes. Confirm the best candidate with
+`compile_and_diff(function=FUNC, source=...)` and use `last_diff` to page the submitted trial's diff.
 
 ```bash
 .venv/bin/python .claude/skills/match-function/scripts/compile_snippet.py ido-7.1 cand.c --asm FUNC.s
@@ -132,13 +160,17 @@ The app takes seconds per compile. A pinned compiler through the app's own compi
 
 It prints how many of the target's instructions agree and where the first differences are (registers and
 immediates normalised; the callee's address ignored). When a candidate reaches 1.000 it still has to pass the app's
-judge: `judge.py try`. A candidate that looks better locally has to beat the best in the app.
+judge: `compile_and_diff`. A candidate that looks better locally has to beat the best in the app.
 
 **For a search, use the app's own judge standalone.** `decomp judge-worker` returns exactly the app's score (a
 source judged 1090 in the app judged 1090 here) in about 0.1 s, needs no claim, runs beside the app without touching
-its state, and parallelises across processes. `scripts/fast_judge.py` wraps it (`Judge(...).score(source)`).
+its state. Reuse a single `scripts/fast_judge.py` worker (`Judge(...).score(source)`) for these probes.
 **Do not search on an approximation**: a home-made scorer (opcode alignment plus register counts) ranked candidates
-wrongly: a 1000 → 680 local improvement was 1090 → 1030 in the app. Confirm any result once with `judge.py try`.
+wrongly: a 1000 → 680 local improvement was 1090 → 1030 in the app. Confirm any result once with `compile_and_diff`.
+
+Before searching, reproduce the live baseline with the same source, effective compiler, flags and
+project context. Resolve a score discrepancy before ranking variants. Measure children against the
+seed they came from and keep the earlier control so the effect of a questionable edit stays visible.
 
 ## 3. What has worked (extend this list when you learn more; it is the permuter's to-do list)
 
@@ -204,6 +236,13 @@ wrongly: a 1000 → 680 local improvement was 1090 → 1030 in the app. Confirm 
   the operand written first first (`(p[0] & 0xF) << 2 | (p[1] >> 6) & 3` is not `(p[1] >> 6) & 3 | ...`). IDO refuses
   `void *` arithmetic; GCC accepts it. Bit-field structs never produced `lbu`/`sra` at all.
 
+- **A loop whose every access is `lui $at,%hi(sym); addu $at,$at,$sN` (no pointer per table).** The target was built
+  with `-fno-strength-reduce` (this project's per-function profile) and the source indexes by byte offset; under the
+  default profile the same source is strength-reduced and every step scores worse, so profile and source must be
+  changed together (cc1 `-dL` prints the givs "not worth while" alone and reduced once combined). Measure each step
+  under the profile, not the default. decomp-repair `strided_table_loop` (0.5.363) has the nine steps and `probes()`
+  the joint child; the notes in COMPILER_MATCHING_LEARNINGS.md give the order.
+
 ## 3b. Out of hand-written shapes? Trace the compiler instead of guessing
 
 Three or four structurally different sources landing on the same score (or the same missing/extra instruction) means
@@ -239,16 +278,22 @@ the shape is decided by a compiler pass, not by how you spell the C. Stop writin
    target's register order and change uses/live ranges (above, in 3). An empty `.lreg` means cc1 didn't get the
    flag or failed to parse: run the compiler's own `gcc -E` first and strip comments.
 
-## 4. Search only when you can name the mismatch
+## 4. Test one repair at a time
 
-A blind hill-climb through the app's `/api/try` is too slow. With `fast_judge` it is cheap: random statement
-swaps, call-wrapper toggles and local type changes took one function from 1090 to 785 in a round of six seeds, then
-plateaued: two more rounds, including token-level rewrites (`x += 1` vs `++x`, `& 0xFFFF` vs a cast), found
-nothing. Use it to clear the easy rows, then stop and read the diff: a search that cannot name what it is looking for
-will not find the last rows. Verify its best in the app before believing it.
+1. Name the mismatch and the repair family that could change it. Use the function's saved Deep
+   Permuter results to see whether the family already ran and what it emitted.
+2. Run that family directly on the saved seed and score only the variants that test the hypothesis.
+   Start with a small batch and score serially through one local judge worker. If using MCP
+   `try_local_repairs`, pass exactly one family and a small explicit `max_trials`. A call with no
+   family selects repairs automatically.
+3. Compare the exact diff to the seed. Use `compile_and_diff` to confirm a measured
+   improvement or exact candidate. Score ties and regressions in the isolated judge to preserve the
+   live claim's compile budget.
+   If the family misses the shape or routing skips it, prove the missing behavior with a regression
+   and land the fix in step 5. When results plateau, read the diff and choose a new hypothesis.
 
-Do not start the Deep Permuter (`judge.py permute`): the user runs it in their app and it takes every core. Its
-saved results (`judge.py job ID`, the function's Deep permuter tab) may be read as leads.
+Do not start a full Deep Permuter run, a sweep, `scripts/scratch_run.py`, or an equivalent broad
+search, even for one function. Leave the running job's settings and worker count alone.
 
 ## 5. Teach the permuter (do it first, merge it, then continue hunting)
 
@@ -258,28 +303,25 @@ For each manual step that moved the score, answer: **could the permuter have don
 - No: write the rewrite or the search guide. Smallest useful form: a function in decomp-repair that takes source
   and returns variants, with a test that fails without it (see `call_scope_repairs.py` for the shape). Prove it by
   running it on the function you just matched: starting from the state *before* your fix, it must reach the fix.
-- **Never run `scripts/scratch_run.py`, or any throwaway app, fresh import or long proof search.** It takes too much
-  CPU for the whole machine (other agents and the user's app share it), and the user tests every repair themselves in
-  their own app later. Your job is **new repairs in the permuter**, not proving old ones: spend the time finding the
-  next gap and writing its rewrite. To check a repair, test it on the function's *current best source* from
-  `judge.py best` as well as on the draft (the search saves its own best in a printed dialect,
-  `*((u8 *) (((char *) p) + 5))`, `v = v + 2;`, a braced `goto`, and a rewrite written against m2c's raw spelling never
-  fires on that), add the unit test, wire it into the permuter, **merge, and then connect to the running app to make
-  sure the function is matched there too** (`judge.py diff SLUG FUNC` says "matched"; the saved best is the source that
-  judged 0). Say in the PR what you ran and that the real proof is the user's run.
+- Test the specific repair on the saved source and, when relevant, the draft. The saved source can
+  spell the same operation differently from m2c. Add a unit test, verify that the permuter lane
+  offers the candidate, and use the exact judge to measure it. After merging, check the live verdict
+  with `get_function(section="summary")`. Describe the isolated evidence in the PR.
 - Record the evidence in `docs/COMPILER_MATCHING_LEARNINGS.md`: exact compiler and flags, the source change, the
   measured before/after, and failed experiments. Say which are controlled results and which are one function.
 - A change here needs its PR (AGENTS.md): branch `<type>/<name>`, test, `uv run ruff check`, merged after creation.
   Say in the PR which features you ran and how, and for a library change the tag you bumped. Other sessions release
   the library too: before tagging, `git fetch --tags` and read `git ls-remote origin refs/tags/vX.Y.Z`; a tag that
   exists is taken (use the next version, never move a tag), and after the library's release check its archive
-  contains your module before bumping the app's pin.
+  contains your module before bumping the app's pin. If main already pins a newer archive with the
+  repair, keep that pin and test against it. While CI runs, keep the next independent local experiment
+  ready without changing a worktree used by an active judge.
 
   Tag gotchas seen in one batch: `git fetch --tags` "would clobber existing tag" means a tag you made locally was
   released meanwhile by another session: `git tag -d` it, take the next free version, tag only right before the
   push; and a run's "No module named decomprepair.<x>" meant the pinned tag predates your module (check the archive).
-- After the first 0, re-read `judge.py diff`: it must say **"matched best 0"**. "open best N" means the match was not
-  recorded (one run's 0 wasn't until resubmitted); resubmit the exact source with `judge.py try`.
+- After the first 0, read `get_function(section="summary")` again and verify the function is recorded as matched
+  with a best score of 0. If it still shows open, check the compile result before resubmitting.
 
 Step 5 is merged *before* you continue hunting, not saved for the end. If you still cannot match the function
 afterwards, leave its note with the evidenced blocker.
@@ -287,7 +329,7 @@ afterwards, leave its note with the evidenced blocker.
 ## 5b. Mistakes this method has already made (each cost a run or an hour)
 
 - **Decode the target's own assembly before writing shapes.** The project's `asm/nonmatchings/**/FUNC.s` has the
-  offsets and delay slots; `judge.py diff` rows do not. Reading delay slots (`bnez` with `li` in its slot, a `j` whose
+  offsets and delay slots; the short mismatch summary may omit them. Reading delay slots (`bnez` with `li` in its slot, a `j` whose
   slot is the other path's value) gave the branch *polarity* in minutes after an hour of spelling variants that all
   had it backwards. Do this in step 1 whenever the diff is a layout difference, not only when stuck.
 - **A search's own scaffolding is part of the diff.** `__repair_constant`-style locals and `s8 *` stores of constants
@@ -306,12 +348,13 @@ afterwards, leave its note with the evidenced blocker.
 - **One manual step is often several permuter gaps.** Here the match needed three changes at once (sink, literal, `u8`);
   each alone left the score unchanged or worse, so a one-step-at-a-time search cannot see them. The rewrite should
   emit the whole combination as one child, and its test should assert the combination, not the parts.
-- **`judge.py best` writes the function without the project's typedefs** (`u8`, `f32`, its structs). Fed to
+- **The saved function can omit the project's typedefs** (`u8`, `f32`, its structs). Fed to
   `fast_judge.py` or `compile_snippet.py` as is, it fails to parse and the score comes back `None` (looks like "no
   verdict", not an error). Build one header once (typedefs plus the externs) and prepend it to every candidate; and
   test scores with `is None`, never `score or BIG`, which turns an exact 0 into a failure.
-- **`fast_judge.Judge` needs the target bytes**: `judge.App().function(SLUG, FUNC)` gives `rom_offset`, `size`,
-  `vram`; slice `<project>/rom.z64` (the project folder in the app's home, `ps -E` shows which home) with them.
+- **`fast_judge.Judge` needs the target bytes**. If you use it on a ROM project, read the function's offset,
+  size and address from the read-only project metadata and slice the ROM in place. Use the MCP judge when
+  that local metadata is unavailable.
 - **Check what already exists before writing a rewrite.** `passthrough_argument` already did the argument fix and
   `symbol_width_repairs` was one regex away from the cast fix; ten minutes of grep over the library's docstrings
   found both. Run the existing families on the saved best first: what they don't produce is the gap.
@@ -330,13 +373,13 @@ afterwards, leave its note with the evidenced blocker.
 
 Confirm these results before reporting success.
 
-- the function's judged score is 0 (`judge.py diff` reports the app's verdict; re-read it, don't recall it), "matched best 0";
+- the app records the function as matched with a best score of 0 (`get_function(section="summary")`);
 - the `docs/COMPILER_MATCHING_LEARNINGS.md` entry is written (step 5; skipped until reminded in one run); and
 - the permuter or app change from step 5 is merged if an improvement was found, the function is
-  confirmed matched in the app after the merge (`judge.py diff`), and your final message gives the before/after
+  confirmed matched in the app after the merge (`get_function(section="summary")`), and your final message gives the before/after
   evidence. Do not run `scratch_run.py`; the user tests the repair in their app.
 
 A long search with no new idea is not progress, and not a stopping point: when the score stops moving, go back to
 step 1 and read the diff again before spending more compiles.
 
-Release the claim (`judge.py --holder NAME release SLUG FUNC`), then report the score, what matched the function, the relevant PR links, and any remaining permuter gaps.
+Release any remaining claim through MCP, then report the score, what matched the function, the relevant PR links, and any remaining permuter gaps.

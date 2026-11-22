@@ -327,8 +327,22 @@ def _vram(name: str, where: dict[str, int]) -> int | None:
     return int(auto.group(1), 16) if auto else None
 
 
+def _import_addresses(where: dict[str, int], renames: dict[str, str]) -> dict[str, int]:
+    """Keep the ROM address when the linker renames a call to a detected library routine.
+
+    An arctangent routine called two conversion helpers by their automatic names. Detection named them, but
+    the port lost their addresses under those names and generated stubs returning zero despite having the ROM
+    code. If more than one address was renamed to the same import, only a name in the split can resolve it.
+    """
+    candidates: dict[str, set[int]] = {}
+    for source, target in renames.items():
+        if target not in where and (address := _vram(source, where)) is not None:
+            candidates.setdefault(target, set()).add(address)
+    return where | {name: next(iter(addresses)) for name, addresses in candidates.items() if len(addresses) == 1}
+
+
 def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[Path], recomp_h: Path,
-            library_names=None, log=print) -> dict:
+            library_names=None, log=print, *, renames=None) -> dict:
     """Write the port's recompiled C into `out` (recomp.h, funcs.h, rec_*.c and bridges.c, each only when it
     changed); returns {"units": [paths], "include": out, "counts": {...}, "pointers_lose_floats": bool}."""
     out = Path(out)
@@ -356,8 +370,16 @@ def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[
         refused = set()
     broken |= {c for name, c in recompiled.values() if c and (name in refused or c in refused)}
     choice, counts = {}, {"decomp": 0, "host": 0, "recomp": 0, "missing": 0}
+    # The split can retain both an automatic name and the SDK name at one address. The recompiler calls the
+    # automatic name, but the host must own the queue and thread routines used by its scheduler.
+    hosted_at = {}
+    for name, address in where.items():
+        if name in hosted:
+            hosted_at.setdefault(address, set()).add(name)
     for vram, (name, c) in sorted(recompiled.items()):
         library = library_names.get(name.removesuffix("_recomp"), name.removesuffix("_recomp"))
+        if library not in hosted and len(hosted_at.get(vram, ())) == 1:
+            library = next(iter(hosted_at[vram]))
         kind = ("decomp" if vram in exported else "host" if library in hosted
                 else "recomp" if c and c not in broken else "missing")
         choice[vram] = (kind, name, c, library)
@@ -450,12 +472,20 @@ def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[
         lines.append(f"void {r}(uint8_t* rdram, recomp_context* ctx) {{ (void)rdram; {body} }}")
     # what N64Recomp declared but left to its runtime, and nothing above covers: the host's if it has it
     covered = {f"R_{c or name}" for _, name, c, _ in choice.values()}
+    # A runtime alias can name a function the recompiler refused. Route it through that function's address so
+    # the interpreter gets the ROM body instead of a zero-address stub.
+    by_name = {}
+    for vram, (_, name, c, _) in choice.items():
+        by_name.setdefault(name.removesuffix("_recomp"), []).append((vram, c or name))
     for n in sorted(seen - names - {c for _, _, c, _ in choice.values() if c}):
         if f"R_{n}" in covered:
             continue
         library = library_names.get(n.removesuffix("_recomp"), n.removesuffix("_recomp"))
         if library in hosted:
             body = call_host(library)
+        elif len(by_name.get(n.removesuffix("_recomp"), ())) == 1:
+            _, target = by_name[n.removesuffix("_recomp")][0]
+            body = f"R_{target}(rdram, ctx);"
         else:
             body = f'port_recomp_missing(0, "{n}", rdram, ctx);'
         lines.append(f"void R_{n}(uint8_t* rdram, recomp_context* ctx) {{ (void)rdram; {body} }}")
@@ -463,9 +493,10 @@ def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[
                           for n in sorted(used)]
     # the game's C calling what only recompiled C has: its import, typed as the C declares it
     imported = 0
+    imports = _import_addresses(where, renames or {})
     for m in IMPORT.finditer(game_h):
         name, ret, c, params = m.groups()
-        vram = _vram(name, where)
+        vram = _vram(name, imports)
         if vram is None or vram not in choice or choice[vram][0] != "recomp" or _demangle(c[8:]) in hosted:
             continue
         types = [t.strip() for t in params.split(",") if t.strip()]
@@ -509,6 +540,10 @@ def _write(path: Path, text: str) -> None:
 BRIDGE_RUNTIME = r'''
 /* the MIPS stack recompiled code runs on: one per host thread, handed down as it calls into the game's C and back */
 __thread uint32_t port_recomp_sp;
+/* C called by the interpreter can call back into recompiled code. Its next frame must be below the
+   interpreter's live frames, rather than the older stack pointer saved by the recompiled caller. */
+uint32_t port_recomp_stack_enter(uint32_t sp) { uint32_t saved = port_recomp_sp; port_recomp_sp = sp; return saved; }
+void port_recomp_stack_leave(uint32_t saved) { port_recomp_sp = saved; }
 void port_recomp_thread(int number) { port_recomp_sp = 0x%(stacks)Xu + (uint32_t)(number + 2) * 0x%(size)Xu - 0x100u; }
 static void port_recomp_frame(recomp_context *c, int words) {
     memset(c, 0, sizeof *c);

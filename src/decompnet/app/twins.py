@@ -25,6 +25,7 @@ import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from io import BytesIO
+from itertools import chain
 from pathlib import Path
 
 from .. import arch, similarity
@@ -38,15 +39,18 @@ log = logging.getLogger("decompdecomp")
 IDENT = re.compile(r"^[A-Za-z_]\w*$")
 _MACHINE = {"EM_PPC": ("ppc", "big"), "EM_PPC64": ("ppc64", "big"), "EM_MIPS": ("mips", None), "EM_ARM": ("arm", "little"),
             "EM_X86_64": ("x86_64", "little")}
-_CACHE_VERSION = 9  # of twins.json: 2 added why code is hand-written assembly, 3 ARM's BIOS call stubs, 4 ARM's
+_CACHE_VERSION = 10  # of twins.json: 2 added why code is hand-written assembly, 3 ARM's BIOS call stubs, 4 ARM's
 # system instructions, 5 COFF objects (PC) and the C names of their symbols, 6 MIPS NOP-only targets, 7 x86-64 ELF
-# objects (PS4), 8 stores the masked prefix for locating donor code inside a ROM function; 9 stores the ELF relocation layout.
+# objects (PS4), 8 stores the masked prefix for locating donor code inside a ROM function; 9 stores the ELF relocation layout;
+# 10 stores the raw function digest for ordering donor candidates.
 # A twin's code that didn't match isn't tried again for this long while neither function's code changes (the
 # same source gives the same result): every agent start's pass would otherwise redo hundreds of compiles (Mario
 # Party 6: about 900, 15 minutes beside the agents). After a while it's tried again: a header can have changed.
 MISS_TTL = 24 * 3600
 # Across games, functions this small are the same everywhere (a return, a stub): they match on their own anyway
 ACROSS_MIN_BYTES = 32
+SHORT_TRANSFER_BYTES = 1  # an explicit search can verify short C without transferring its name
+
 FORK_PRINTS_TTL = 10 * 60  # a fork's target objects are looked at again after this long (they can be rebuilt)
 WHOLE_WORD = (0, 4, 0xFFFFFFFF)  # a relocation of a type MASKS_BY_ARCH doesn't know: its whole word is masked
 LABELS_BACK, LABEL_REACH = 64, 0x10000  # rom_renames looks this many labels down, at most this many bytes below
@@ -55,6 +59,11 @@ WHY_CHARS = 300  # how much of a compiler's message a miss keeps
 UNDECLARED_RETRIES = 4  # names a fork twin's file declares later, declared and built again, at most
 _GENERATED = ("__dt__", "__ct__", "__sinit", "__vt__")  # C++ code the compiler writes: nothing to copy
 
+
+
+
+def transfer_min_bytes(job):
+    return SHORT_TRANSFER_BYTES if getattr(job, 'cross_exhaustive', False) else ACROSS_MIN_BYTES
 
 
 def prefer_own_compilers(sources: list, wanted: dict, own) -> None:
@@ -75,6 +84,7 @@ class Print:
     name: str = ""  # how C writes the function's own name, where its symbol isn't that (Visual C++'s _f@8: f)
     prefix: str = ""  # first eight masked bytes, for finding a function inside a merged ROM entry
     layout: list[tuple[int, int]] | None = None  # ELF relocation offsets and types
+    raw_digest: str = ""  # rank identical instruction bytes before masked matches
 
 
 def _mask(code: bytearray, relocs: list[tuple[int, int]], arch: str, order: str) -> None:
@@ -93,6 +103,10 @@ def _key(code: bytes, layout: list[tuple[int, int]]) -> str:
     return digest.hexdigest()
 
 
+def _raw_digest(code: bytes) -> str:
+    return hashlib.blake2b(code, digest_size=16).hexdigest()
+
+
 def coff_prints(data: bytes) -> dict[str, Print]:
     """object_prints for a COFF object (a PC project's targets: a section per function), its names as C writes them
     (coffobj.c_name: `_func_0041B470@8` is func_0041B470), so a twin's code is renamed where its C says them; a jump
@@ -109,7 +123,7 @@ def coff_prints(data: bytes) -> dict[str, Print]:
         _mask(code, [(off, kind) for off, kind, *_ in relocs], processor, "little")
         refs = [f"$L+{value:X}" if section else coffobj.c_name(name) for _, _, name, section, value in relocs]
         out[owner] = Print(_key(bytes(code), [(off, kind) for off, kind, *_ in relocs]), refs, len(raw),
-                           name=coffobj.c_name(owner))
+                           name=coffobj.c_name(owner), raw_digest=_raw_digest(raw))
     return out
 
 
@@ -161,6 +175,7 @@ def object_prints(data: bytes) -> dict[str, Print]:
         section_modes = sorted(modes[shndx])
         for s in syms:
             lo = s["st_value"] & ~1 if arch_id == "arm" else s["st_value"]  # (bit 0: a Thumb function)
+            function = raw[lo:lo + s["st_size"]]
             mine = [(o - lo, t, n) for o, t, n in rels if lo <= o < lo + s["st_size"]]
             facts = {}
             if arch_id == "arm":  # its mode: bit 0, else the mapping symbol it starts under (dsd's objects)
@@ -169,16 +184,18 @@ def object_prints(data: bytes) -> dict[str, Print]:
             out[s.name] = Print(_key(bytes(code[lo:lo + s["st_size"]]), [(o, t) for o, t, _ in mine]),
                                 [n for _, _, n in mine], s["st_size"],
                                 prefix=code[lo:lo + 8].hex(), layout=[(o, t) for o, t, _ in mine],
-                                asm=(reason(raw[lo:lo + s["st_size"]], order == "big", **facts) or "") if reason else "")
+                                asm=(reason(function, order == "big", **facts) or "") if reason else "",
+                                raw_digest=_raw_digest(function))
     return out
 
 
 def rom_print(fn, arch: str, big_endian: bool, label) -> Print:
     """Fingerprint of a ROM project's function, from its target bytes and the addresses its relocations fill in."""
     relocs = sorted((int(r[0]), int(r[1]), int(r[2])) for r in json.loads(fn["relocs"] or "[]") if len(r) >= 3)
-    code = mask_relocs(fn["target"] or b"", [Reloc(o, t, "", 0) for o, t, _ in relocs], arch, big_endian)
+    raw = fn["target"] or b""
+    code = mask_relocs(raw, [Reloc(o, t, "", 0) for o, t, _ in relocs], arch, big_endian)
     return Print(_key(code, [(o, t) for o, t, _ in relocs]), [label(a) for _, _, a in relocs], len(fn["target"] or b""),
-                 [a for _, _, a in relocs])
+                 [a for _, _, a in relocs], raw_digest=_raw_digest(raw))
 
 
 def rom_renames(syms, source: str, a: Print, b: Print, a_name: str, b_name: str, syms_b=None) -> dict[str, str] | None:
@@ -360,7 +377,7 @@ class Twins:
         revision = self.net.project_store(proj['id']).read_version('fingerprints', proj['id'])
         def build():
             return {str(fid): asdict(p) for fid, p in self._build_rom_prints(proj).items()}
-        values = persistent(self.net.project_store(proj['id']), ('rom-fingerprints', proj['id']), (2, revision, self._print_generations[proj['id']]), build)
+        values = persistent(self.net.project_store(proj['id']), ('rom-fingerprints', proj['id']), (3, revision, self._print_generations[proj['id']]), build)
         return {int(fid): Print(**value) for fid, value in values.items()}
 
     def _build_rom_prints(self, proj) -> dict[int, Print]:
@@ -416,14 +433,14 @@ class Twins:
                     prints = object_prints(unit.target.read_bytes())
                 except Exception:  # an object pyelftools can't read: no twins for it
                     prints = {}
-                entry = {"mtime": mtime, "prints": {k: [p.key, p.refs, p.size, p.asm, p.name, p.prefix, p.layout] for k, p in prints.items()}}
+                entry = {"mtime": mtime, "prints": {k: [p.key, p.refs, p.size, p.asm, p.name, p.prefix, p.layout, p.raw_digest] for k, p in prints.items()}}
                 cache[uname] = entry
                 changed = True
             for r in urows:
                 sym = json.loads(r["meta"] or "{}").get("symbol") or r["name"].split("@")[0]
                 p = entry["prints"].get(sym)
                 if p:
-                    out[r["id"]] = Print(p[0], p[1], p[2], asm=p[3], name=p[4], prefix=p[5], layout=p[6])
+                    out[r["id"]] = Print(p[0], p[1], p[2], asm=p[3], name=p[4], prefix=p[5], layout=p[6], raw_digest=p[7])
         if changed:
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -860,6 +877,35 @@ class Twins:
             return False
         return bool(source) and self._missed(b_id, source, project_id=proj['id'])
 
+    def _refresh_overlay_metadata(self, proj, job):
+        cfg = self.net.cfg(proj)
+        banks = cfg.get('donor_overlays')
+        if not banks:
+            return
+        from .cross_game_progress import report
+
+        report(job, 'Checking overlay loader records')
+        store = self.net.project_store(proj['id'])
+        rows = {row['id']: row for row in store.all(
+            "SELECT id,meta,target,rom_offset FROM functions WHERE project_id=? AND status='open' AND rom_offset IS NOT NULL",
+            proj['id'])}
+        if job.stop.is_set() or not rows:
+            return
+        image, _ = self.net._rom(proj)
+        updates = self.net.console(proj).overlay_metadata_updates(image, cfg, rows.values())
+        changes = []
+        for fid, meta in updates:
+            if job.stop.is_set():
+                return
+            row = rows[fid]
+            changes.append((meta, fid, row['meta'], row['target'], row['rom_offset']))
+        if changes and not job.stop.is_set():
+            with store.tx() as db:
+                db.executemany("UPDATE functions SET meta=? WHERE id=? AND meta IS ? AND target=? AND rom_offset=? AND status='open' "
+                               "AND NOT EXISTS (SELECT 1 FROM claims WHERE function_id=functions.id AND expires_at>?)",
+                               [(*change, time.time()) for change in changes])
+            self.net.bump_generation(proj['id'])
+
     def across_games(self, slug: str, job: Job | None = None) -> int:
         """Matched code from the user's other games, tried on this game's identical functions: libraries (an SDK's,
         a compiler's runtime, middleware) come in the same code from one game to the next, built by the same
@@ -872,6 +918,8 @@ class Twins:
         from .cross_game_progress import report
         if job is not None and job.stop.is_set():
             return 0
+        if not fork and getattr(job, 'cross_exhaustive', False) and slug not in self.net.links:
+            self._refresh_overlay_metadata(proj, job)
         report(job, 'Reading the local verified-match library')
         others = list(shared_reuse.compatible(self.net, proj))
         archived = self.net.match_library.reuse(self, proj, job) if hasattr(self.net, "match_library") else 0
@@ -904,7 +952,7 @@ class Twins:
         wanted: dict[str, list[int]] = defaultdict(list)
         for r in self.net.project_store(slug).all("SELECT id FROM functions WHERE project_id=? AND status='open'", proj["id"]):
             p = mine.get(r["id"])
-            if p is not None and not p.asm and p.size >= ACROSS_MIN_BYTES:
+            if p is not None and not p.asm and p.size >= transfer_min_bytes(job):
                 wanted[p.key].append(r["id"])
         if not wanted:
             return archived
@@ -1358,14 +1406,16 @@ class Twins:
         report(job, 'Reading imported target objects', game=other['name'])
         theirs = self._fork_prints(other, matched_only=True, job=job)
         matched = 0
-        from . import donor_build, donor_relocations
+        checked = defaultdict(set)
+        from . import donor_build, donor_relocations, donor_unit
         from .donor_boundaries import merged_candidates, recover
         manual = getattr(job, 'cross_exhaustive', False)
         build = donor_build.Settings(fp) if manual and hasattr(fp, 'root') else None
         units = {unit.name: unit for unit in fp.units()} if build else {}
         merged = merged_candidates(self.net, proj, theirs.values(), job) if manual else {}
         relaxed = donor_relocations.candidates(self.net, proj, theirs.values(), job) if manual else {}
-        label = self.net.symbols(proj['id']).label if relaxed else None
+        identical = donor_relocations.identical_targets(mine, theirs.values(), job) if manual else {}
+        label = self.net.symbols(proj['id']).label if relaxed or identical else None
         donors = self.net.project_store(other['id']).all(
             "SELECT id,project_id,name,unit,meta FROM functions WHERE project_id=? AND status='matched'", other["id"])
         if manual:
@@ -1381,12 +1431,16 @@ class Twins:
                     return (0, count)
                 return (1 if key in merged else 2, 0)
             donors.sort(key=priority)
-        for a in donors:
+        # Exhaust identical bytes across all donor files before fanning out
+        # through masked fingerprints that can describe many unrelated functions.
+        exact_donors = ((a, True) for a in donors if a['id'] in theirs
+                        and theirs[a['id']].raw_digest in identical)
+        for a, identical_only in chain(exact_donors, ((a, False) for a in donors)):
             pa = theirs.get(a["id"])
             if pa is None or pa.asm:
                 continue
             found = list(wanted.get(pa.key, ()))
-            if pa.key in merged and not job.stop.is_set():
+            if not identical_only and pa.key in merged and not job.stop.is_set():
                 try:
                     repaired = recover(self, proj, other, fp, a, pa, merged[pa.key], job)
                 except NetworkError as error:
@@ -1397,8 +1451,11 @@ class Twins:
                     mine[row['id']] = fingerprint
                     wanted.setdefault(pa.key, []).append(row['id'])
                     found.append(row['id'])
-            extra = relaxed.get(pa.key, ())
-            for b_id in dict.fromkeys([*found, *extra]):
+            same_bytes = identical.get(pa.raw_digest, ())
+            candidates = same_bytes if identical_only else dict.fromkeys([*found, *relaxed.get(pa.key, ())])
+            for b_id in candidates:
+                if not identical_only and b_id in same_bytes:
+                    continue
                 if job is not None and (job.stop.is_set() or (bounded and (
                         job.reuse_attempts >= job.reuse_limit or time.monotonic() >= job.reuse_deadline))):
                     return matched
@@ -1407,35 +1464,72 @@ class Twins:
                     continue
                 if b["size"] != pa.size:  # A recovered boundary can shorten an entry from the initial index.
                     continue
-                target = (mine[b_id] if b_id in found else donor_relocations.donor_refs(pa, b, label))
-                if target is None:
+                target = mine.get(b_id)
+                if target is None or target.key != pa.key:
+                    target = donor_relocations.donor_refs(pa, b, label) if pa.layout is not None else None
+                donor_name = pa.name or a["name"].split("@")[0]
+                names = renames(pa, target, donor_name, b["name"]) if target else None
+                overlay_names = donor_relocations.overlay_names(self.net, proj, b, pa, donor_name) if build else None
+                if names is None:
+                    names = overlay_names
+                if self.net.forks.is_asm(other, a):
                     continue
-                names = renames(pa, target, pa.name or a["name"].split("@")[0], b["name"])
-                if names is None or self.net.forks.is_asm(other, a):
-                    continue
-                original = self.net.forks._current_source(fp, a)
-                if not original:
-                    continue
-                source = apply(original, names)
                 unit = units.get(a['unit'])
                 settings = build.for_unit(unit) if unit is not None else None
-                known_miss = self._missed(b_id, source, project_id=proj['id'])
-                if known_miss and not settings:
+                replacement = build.replacement_source(unit, donor_name) if unit is not None else None
+                if names is None and not (settings or replacement):
+                    continue
+                original = self.net.forks._current_source(fp, a)
+                source = apply(original, names) if original and names is not None else None
+                private_source = settings and (original or (
+                    proj['arch'] == 'mips' and donor_unit.has_owned_definition(fp.root, unit, donor_name)))
+                if source is None and not (replacement or private_source):
+                    continue
+                # Let the compiled object's relocations drive private verification when
+                # static mapping is ambiguous. Generic source reuse still needs a mapping.
+                trial_names = names if names is not None else {}
+                known_miss = source is not None and self._missed(b_id, source, project_id=proj['id'])
+                if known_miss and not (settings or replacement):
                     continue
                 if job is not None:
                     job.cross_candidates += 1
                     job.cross_tried += 1
                 if bounded:
                     job.reuse_attempts += 1
+                if manual:
+                    checked[b_id].add(a['id'])
                 report(job, 'Compiling candidate', game=other['name'], function=b['name'], donor=a['name'])
                 outcome, why = 'skip', ''
                 fallback = None
-                if settings:
+                if settings or replacement:
                     try:
-                        outcome, why = donor_build.verify(self.net, proj, b, other, a, names, settings, agent, job, build.headers)
+                        outcome, why = donor_build.verify(
+                            self.net, proj, b, other, a, trial_names, settings, agent, job, build.headers,
+                            **({'replacement': replacement} if replacement else {}))
+                        if outcome == 'miss' and overlay_names is not None and overlay_names != names and not job.stop.is_set():
+                            outcome, why = donor_build.verify(
+                                self.net, proj, b, other, a, overlay_names, settings, agent, job, build.headers)
+                        if outcome != 'match' and unit is not None and not job.stop.is_set():
+                            fallback_settings = build.fallback_for_unit(unit, settings)
+                            if fallback_settings:
+                                alternate, detail = donor_build.verify(
+                                    self.net, proj, b, other, a, trial_names, fallback_settings, agent, job,
+                                    build.headers)
+                                if alternate == 'match' or not why:
+                                    outcome, why = alternate, detail
+                        if outcome == 'miss' and identical_only and why.startswith(donor_build.LENGTH_MISS):
+                            for alternate_settings, alternate_body in donor_build.optimization_trials(settings, replacement):
+                                if job.stop.is_set():
+                                    break
+                                alternate, detail = donor_build.verify(
+                                    self.net, proj, b, other, a, trial_names, alternate_settings, agent, job,
+                                    build.headers, replacement=alternate_body)
+                                if alternate == 'match':
+                                    outcome, why = alternate, f'Alternate donor optimization: {detail}'
+                                    break
                     except (NetworkError, OSError, ValueError) as error:
                         outcome, why = 'skip', str(error)
-                if outcome != 'match' and not known_miss and not (job and job.stop.is_set()):
+                if outcome != 'match' and source is not None and not known_miss and not (job and job.stop.is_set()):
                     fallback, detail = self._attempt_twin(
                         agent, proj, a, b, source, origin=f" in {other['name']}", mapping=names)
                     if fallback == 'match' or not why:
@@ -1454,6 +1548,10 @@ class Twins:
                     matched += 1
                     if job is not None:
                         job.cross_matched += 1
+        if build and proj['arch'] == 'mips' and not job.stop.is_set():
+            from . import imported_literals
+
+            matched += imported_literals.run(self, agent, proj, other, donors, theirs, units, build, job, checked=checked)
         return matched
 
     def _try_pair(self, agent, proj, a, b, *, partial=False) -> str:

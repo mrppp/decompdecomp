@@ -1,17 +1,41 @@
 """Judge cartridge overlay text before runtime relocation, checking bytes and symbol bindings."""
+import re
+from collections import defaultdict
 from dataclasses import dataclass
-from io import BytesIO
 
 from elftools.common.exceptions import ELFError
 from elftools.elf.elffile import ELFFile
+from elftools.elf.relocation import RelocationSection
 
+from ...candidate_work import elf as candidate_elf
 from ...elfobj import FunctionObj, Reloc, _function_symbols, unmangle
 from ...rom.link import LinkResult
 from ...rom.match import RomTarget, raw_relocs
+from .uso import POOL_LOAD_WIDTHS
 
 
 def alias(section, index):
     return f'uso_{section:X}_sym_{index}'
+
+
+_CALL_MASK = 0x03ffffff
+
+
+def local_alias(section, index, offset):
+    return f'{alias(section, index)}_text_{offset:X}'
+
+
+_REFERENCE = re.compile(r'(uso_[0-9A-F]+_sym_[0-9]+(?:_text_[0-9A-F]+)?)__ref[1-9][0-9]*')
+_BINDING = re.compile(r'uso_[0-9A-F]+_sym_[0-9]+(?:_text_[0-9A-F]+)?')
+
+
+def separate_reference(binding, number):
+    """Give the compiler a distinct name that resolves to the same loader record."""
+    return f'{binding}__ref{number}' if _BINDING.fullmatch(binding) else binding
+
+
+def _local_calls(info):
+    return {(at, index): offset for at, index, offset in info.get('local_calls', ())}
 
 
 @dataclass
@@ -23,19 +47,104 @@ def symbolic_target(target):
     from ...elfobj import MASKS_BY_ARCH
 
     relocations = []
+    linker_relocs = []
+    local_calls = _local_calls(target.uso)
+    pool_sites = {at for at, _, _ in target.uso.get('pool_loads', ())}
+    pool_sites.update(at for at, _, _ in target.uso.get('jump_tables', ()))
     for at, kind, index in target.uso['relocs'] or ():
         delta, length, mask = MASKS_BY_ARCH.get(('mips', kind), (0, 4, 0xFFFFFFFF))
         field = int.from_bytes(target.code[at + delta:at + delta + length], 'big') & mask
-        relocations.append(Reloc(at, kind, alias(target.uso['section'], index), field))
-    return FunctionObj(target.name, 'mips', True, target.code, relocations)
+        section = target.uso['section']
+        offset = local_calls.get((at, index)) if kind == 4 else None
+        binding = local_alias(section, index, offset) if offset is not None else alias(section, index)
+        relocation = Reloc(at, kind, binding, field)
+        relocations.append(relocation)
+        if offset is not None or at in pool_sites:
+            linker_relocs.append(relocation)
+    return FunctionObj(target.name, 'mips', True, target.code, relocations, linker_relocs=linker_relocs)
+
+
+def _matches_table(blob, relocations, offset, targets, entry):
+    section, start, size = entry
+    end = offset + len(targets) * 4
+    if end > len(blob) or any(at % 4 for at in relocations if offset - 3 <= at < end):
+        return False
+    for at, destination in zip(range(offset, end, 4), targets, strict=True):
+        if at not in relocations or not 0 <= destination < size or destination % 4:
+            return False
+        relocation, symbols = relocations[at]
+        symbol = symbols.get_symbol(relocation['r_info_sym'])
+        if (relocation['r_info_type'] != 2 or relocation.is_RELA() or symbol['st_shndx'] != section
+                or symbol['st_info']['type'] != 'STT_SECTION' or symbol['st_value']
+                or int.from_bytes(blob[at:at + 4], 'big') != start + destination):
+            return False
+    return True
+
+
+def _pool_fields(elf, raw, code, target, expected, info, entry):
+    """Bind read-only data only when every constant or jump table load is proven."""
+    pool = {(at, index): bytes.fromhex(value) for at, index, value in info.get('pool_loads', ())}
+    tables = {(at, index): targets for at, index, targets in info.get('jump_tables', ())}
+    if not (pool or tables) or len(code) != len(target):
+        return {}
+    groups = defaultdict(list)
+    for item in raw:
+        symbol = item['symtab'].get_symbol(item['symidx'])
+        section_index = symbol['st_shndx']
+        if symbol['st_info']['type'] == 'STT_SECTION' and isinstance(section_index, int):
+            groups[section_index].append(item)
+    verified = {}
+    for section_index, uses in groups.items():
+        data = elf.get_section(section_index)
+        if data.name not in ('.rodata', '.rdata') or data['sh_type'] != 'SHT_PROGBITS' or data['sh_flags'] & 1:
+            continue
+        if any(item['rela'] or item['type'] not in (5, 6)
+               or item['off'] not in expected or expected[item['off']][0] != item['type'] for item in uses):
+            continue
+        indices = {expected[item['off']][1] for item in uses}
+        if len(indices) != 1:
+            continue
+        index, = indices
+        highs = [item for item in uses if item['type'] == 5]
+        lows = [item for item in uses if item['type'] == 6]
+        if not highs or not lows or any(item['value'] or target[item['off']+2:item['off']+4] != b'\0\0'
+                                        for item in highs):
+            continue
+        data_relocs = [(r, elf.get_section(section['sh_link'])) for section in elf.iter_sections()
+                       if isinstance(section, RelocationSection) and section['sh_info'] == section_index
+                       for r in section.iter_relocations()]
+        if any(r['r_info_type'] not in (2, 5, 6) for r, _ in data_relocs):
+            continue
+        by_offset = {r['r_offset']: (r, symbols) for r, symbols in data_relocs}
+        if len(by_offset) != len(data_relocs):
+            continue
+        blob = data.data()
+        for item in lows:
+            opcode = code[item['off']] >> 2
+            offset = item['value']
+            width = POOL_LOAD_WIDTHS.get(opcode)
+            if not width or offset % width or offset >= 0x8000:
+                break
+            if targets := tables.get((item['off'], index)):
+                if opcode != 0x23 or not _matches_table(blob, by_offset, offset, targets, entry):
+                    break
+                continue
+            original = pool.get((item['off'], index), b'')
+            if (any(offset - 3 <= off < offset + width for off in by_offset)
+                    or len(original) != width or original != blob[offset:offset + width]):
+                break
+        else:
+            verified.update((item['off'], int.from_bytes(target[item['off']+2:item['off']+4], 'big')) for item in uses)
+    return verified
 
 
 def link(obj, name, target, info):
     section = info['section']
-    expected = {at: (kind, alias(section, index)) for at, kind, index in info['relocs'] or ()}
+    expected = {at: (kind, index) for at, kind, index in info['relocs'] or ()}
+    local_calls = _local_calls(info)
     try:
         obj = unmangle(obj, lambda symbol: symbol == name)
-        elf = ELFFile(BytesIO(obj))
+        elf = candidate_elf(obj, ELFFile)
         if elf.little_endian or elf['e_machine'] != 'EM_MIPS':
             return LinkResult(None, False, ['Overlay text requires a big-endian MIPS object.'])
         entry = _function_symbols(elf).get(name)
@@ -44,10 +153,12 @@ def link(obj, name, target, info):
         shndx, start, size = entry
         code = elf.get_section(shndx).data()[start:start + size]
         raw = raw_relocs(elf, shndx, start, size, code)
+        pool = _pool_fields(elf, raw, code, target, expected, info, entry)
     except (ELFError, ValueError, TypeError, IndexError):
         return LinkResult(None, False, ['The compiler object could not be read as overlay text.'])
 
     candidate = []
+    linked = bytearray(code)
     problems = (['This overlay function needs validated relocation metadata. Reimport the ROM and try again.']
                 if info['relocs'] is None else [])
     seen = set()
@@ -55,15 +166,36 @@ def link(obj, name, target, info):
         at, kind = item['off'], item['type']
         symbol = item['symtab'].get_symbol(item['symidx'])
         binding = symbol.name
-        candidate.append(Reloc(at, kind, binding, item['value']))
-        # The cartridge stores relocation addends in its text. Retain them and require an
-        # undefined ELF reference to the specific loader symbol, with no RELA override.
-        if item['rela'] or symbol['st_shndx'] != 'SHN_UNDEF' or at in seen or expected.get(at) != (kind, binding):
-            wanted = expected[at][1] if at in expected else 'no relocation'
+        if at in pool:
+            candidate.append(Reloc(at, kind, alias(section, expected[at][1]), pool[at]))
+        else:
+            candidate.append(Reloc(at, kind, binding, item['value']))
+        distinct = _REFERENCE.fullmatch(binding)
+        if distinct:
+            binding = distinct[1]
+        original = expected.get(at)
+        valid = False
+        if original and kind == original[0] and not item['rela'] and symbol['st_shndx'] == 'SHN_UNDEF' and at not in seen:
+            index = original[1]
+            valid = binding == alias(section, index)
+            offset = local_calls.get((at, index)) if kind == 4 else None
+            # A local alias names a checked offset under the original loader symbol.
+            # The object must still make an undefined direct call with no offset of its own.
+            if not valid and offset is not None and binding == local_alias(section, index, offset):
+                word = int.from_bytes(code[at:at + 4], 'big')
+                if word >> 26 == 3 and not item['value'] and 0 < offset <= _CALL_MASK * 4 and offset % 4 == 0:
+                    linked[at:at + 4] = (word | (offset >> 2)).to_bytes(4, 'big')
+                    valid = True
+        if at in pool and at not in seen:
+            linked[at+2:at+4] = pool[at].to_bytes(2, 'big')
+            valid = True
+        if not valid:
+            wanted = alias(section, original[1]) if original else 'no relocation'
             problems.append(f'Overlay relocation at +0x{at:X} requires {wanted} with the original relocation kind.')
         seen.add(at)
     for at in expected.keys() - seen:
-        problems.append(f'Overlay relocation at +0x{at:X} requires {expected[at][1]}.')
-    exact_bytes = code == target
+        problems.append(f'Overlay relocation at +0x{at:X} requires {alias(section, expected[at][1])}.')
+    linked_code = bytes(linked)
+    exact_bytes = linked_code == target
     return LinkResult(FunctionObj(name, 'mips', True, code, candidate), exact_bytes and not problems,
-                      problems, instructions_exact=exact_bytes, linked_code=code)
+                      problems, instructions_exact=exact_bytes, linked_code=linked_code)

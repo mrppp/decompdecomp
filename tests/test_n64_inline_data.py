@@ -87,3 +87,64 @@ def test_audio_coprocessor_suffix_is_data_even_if_the_text_mapping_ends_inside_i
     segments = yaml.safe_load(config.read_text())['segments'][0]['subsegments']
     assert segments[1][:2] == [start, 'rodata']
     assert segments[2] == [start + 20, 'data']
+
+
+def test_unentered_boot_padding_requires_call_and_terminal_break():
+    import struct
+
+    image = bytearray(0x80)
+    struct.pack_into('>3I', image, 0x28, 0x0c000010, 0, 0x0001008d)
+    struct.pack_into('>I', image, 0x40, 0x27bdffe0)
+    ranges = [(0x20, 0x34, 0x80000020), (0x34, 0x80, 0x80000034)]
+    assert list(inline_data._startup_padding(image, ranges)) == [(0x34, 0x40)]
+    struct.pack_into('>I', image, 0x50, 0x0c00000d)
+    assert not list(inline_data._startup_padding(image, ranges))
+
+
+def test_unaligned_store_filler_after_return_is_data():
+    import struct
+
+    image = struct.pack('>2I', 0x03e00008, 0)+bytes.fromhex('ffffffff 00000000')*5+bytes.fromhex('27bdffe0')
+    assert (8, 48) in list(inline_data.spans(image))
+
+
+def test_linker_markers_after_return_are_data():
+    from decompnet.consoles.n64.inline_data import spans
+
+    marker = bytes.fromhex('12345678') + bytes(12)
+    image = bytes.fromhex('03e0000800000000ffffffff') + marker * 3 + bytes.fromhex('27bdffe0')
+    assert (8, 60) in list(spans(image))
+    assert (8, 60) not in list(spans(bytes(8) + image[8:]))
+
+
+def test_all_one_padding_before_scheduled_frame():
+    from decompnet.consoles.n64.inline_data import spans
+
+    image = bytes.fromhex('03e00008ace20000ffffffffffffffff3c02800e8c422f2827bdffc8')
+    assert (8, 16) in list(spans(image))
+    assert (8, 16) not in list(spans(image[:-4] + bytes(4)))
+
+
+def test_verified_tables_end_before_the_following_code(tmp_path, monkeypatch):
+    data = b'table contents!!'
+    monkeypatch.setattr(inline_data, '_TABLES', ((data[:8].hex(), len(data), hashlib.sha256(data).hexdigest()),))
+    image = b'code' + data + b'next'
+    config = tmp_path / 'game.yaml'
+    config.write_text(yaml.safe_dump(dict(segments=[
+        dict(type='code', start=0, vram=0x80000000, subsegments=[[0, 'c', 'program']]), [len(image)],
+    ])))
+    inline_data.apply(config, image, lambda _: None)
+    assert code_ranges(config) == [(0, 4, 0x80000000), (20, 24, 0x80000014)]
+    assert not list(inline_data.spans(b'code' + data[:-1] + b'?' + b'next'))
+
+
+def test_startup_stack_zero_region_rejects_control_flow_into_it():
+    import struct
+
+    image = bytearray(b'\x44'*0x1400)
+    struct.pack_into('>2I', image, 0x1000, 0x3c1d8000, 0x27bd1000)
+    image[0x1100:0x1180] = bytes(128)
+    ranges = [(0x1000, 0x1010, 0x80000400), (0x1100, 0x1200, 0x80001000)]
+    assert list(inline_data._stack_padding(image, ranges)) == [(0x1100, 0x1180)]
+    struct.pack_into('>I', image, 0x1008, 0x0c000400)
+    assert not list(inline_data._stack_padding(image, ranges))

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from decompnet.port.wasm import recomp
+from decompnet.port.wasm import build, interp, recomp
 
 HEADER = Path.home() / "Library/Application Support/decompnet/toolchains/n64recomp/include/recomp.h"
 
@@ -108,6 +108,47 @@ HOST_C = ("u32 w2c_env_osSendMesg(struct w2c_env *e, u32 mq, u32 msg, u32 flag) 
           "u32 w2c_env_0x5F_osSiRawStartDma(struct w2c_env *e, u32 direction, u32 dram) {\n    return 0;\n}\n")
 
 
+def test_runtime_alias_reaches_the_original_when_recompilation_refuses_it(tmp_path):
+    folder = tmp_path / "recomp"
+    _output(folder)
+    symbols = folder / "syms.toml"
+    symbols.write_text(symbols.read_text().replace('name = "func_80003000"', 'name = "queue_pop"'))
+    source = folder / "funcs/funcs_0.c"
+    source.write_text(source.read_text().replace("func_80003000", "queue_pop").replace(
+        "__osSiRawStartDma_recomp(rdram, ctx);", "queue_pop_recomp(rdram, ctx);"))
+    (folder / "funcs/runtime.h").write_text("void queue_pop_recomp(uint8_t* rdram, recomp_context* ctx);\n")
+    (folder / "recomp.json").write_text('{"refused": [{"name": "queue_pop"}]}')
+    out = tmp_path / "build"
+    recomp.prepare(folder, out, "", [], [], _header(), {}, lambda *a: None)
+    bridges = (out / "bridges.c").read_text()
+    assert 'port_recomp_missing(0x80003000u, "queue_pop"' in bridges
+    assert "R_queue_pop_recomp(uint8_t* rdram, recomp_context* ctx) { (void)rdram; R_queue_pop(rdram, ctx); }" in bridges
+
+
+def test_recompiled_automatic_name_uses_host_for_named_address(tmp_path):
+    folder = tmp_path / "recomp"
+    _output(folder)
+    host = tmp_path / "host.c"
+    host.write_text(HOST_C)
+    out = tmp_path / "build"
+    recomp.prepare(folder, out, "", ["osSendMesg 0x80003000 func"], [host], _header(), {}, lambda *a: None)
+    bridges = (out / "bridges.c").read_text()
+    assert "void R_func_80003000(uint8_t* rdram, recomp_context* ctx)" in bridges
+    assert "w2c_env_osSendMesg(NULL, (uint32_t)ctx->r4, (uint32_t)ctx->r5, (uint32_t)ctx->r6)" in bridges
+
+
+def test_recompiled_address_with_ambiguous_host_names_keeps_game_code(tmp_path):
+    folder = tmp_path / "recomp"
+    _output(folder)
+    host = tmp_path / "host.c"
+    host.write_text(HOST_C + "u32 w2c_env_other(struct w2c_env *e, u32 a) { return 0; }\n")
+    out = tmp_path / "build"
+    prepared = recomp.prepare(folder, out, "", ["osSendMesg 0x80003000 func", "other 0x80003000 func"],
+                              [host], _header(), {}, lambda *a: None)
+    assert "RECOMP_FUNC void R_func_80003000(" in (out / "rec_funcs_0.c").read_text()
+    assert prepared["counts"]["recomp"] == 2
+
+
 def test_each_function_runs_as_the_games_c_the_hosts_or_recompiled(tmp_path):
     folder = tmp_path / "recomp"
     _output(folder)
@@ -159,6 +200,38 @@ def test_each_loop_of_recompiled_c_gives_other_threads_their_turn():
     out = recomp.loops(text)
     assert "{ port_recomp_poll(); goto L_80001000; }" in out
     assert "    goto L_80001010;" in out and "port_recomp_poll(); goto L_80001010" not in out
+
+
+def test_renamed_library_import_keeps_its_address_for_either_fallback(tmp_path):
+    folder = tmp_path / "recomp"
+    _output(folder)
+    caller = tmp_path / "caller.ll"
+    caller.write_text("declare double @func_80003000(i64)\n")
+    library_names = {"func_80003000": "convertFixed"}
+    renames = build.renames([caller], [], library_names)
+    assert renames == library_names
+    game_h = ("/* import: 'env' 'convertFixed' */\n"
+              "f64 w2c_env_convertFixed(struct w2c_env*, u64);\n")
+
+    interpreted, counts = interp.generate(game_h, [], [], library_names, renames=renames)
+    assert counts["imports"] == 1
+    assert "f64 w2c_env_convertFixed(struct w2c_env *e, u64 a0)" in interpreted
+    assert "port_mips_run(0x80003000u, r, f)" in interpreted
+
+    out = tmp_path / "build"
+    prepared = recomp.prepare(folder, out, game_h, [], [], _header(), library_names, renames=renames)
+    assert prepared["counts"]["imports"] == 1
+    bridges = (out / "bridges.c").read_text()
+    assert "f64 w2c_env_convertFixed(struct w2c_env *e, u64 a0)" in bridges
+    assert "R_func_80003000(rdram, &c);" in bridges
+    assert interp.generate(game_h, [], [], library_names, {"w2c_env_convertFixed"},
+                           renames=renames)[1]["imports"] == 0
+
+
+def test_a_library_import_can_only_inherit_one_address():
+    renames = {"func_80003000": "convertFixed", "func_80004000": "convertFixed"}
+    assert "convertFixed" not in recomp._import_addresses({}, renames)
+    assert recomp._import_addresses({"convertFixed": 0x80003000}, renames)["convertFixed"] == 0x80003000
 
 
 def test_the_port_header_has_the_loops_safe_point():
