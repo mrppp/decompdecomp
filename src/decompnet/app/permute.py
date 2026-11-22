@@ -44,10 +44,10 @@ from ..compile_sessions import batched
 from ..forks.project import ForkError
 from ..hostenv import NO_WINDOW
 from ..network import NetworkError
-from ..permuter import mutate
+from ..permuter import MUTATIONS, mutate
 from ..project import compiler_for
 from ..repair_feedback import trial as repair_trial
-from . import draft_repairs, local_claims, switch_tables, workers
+from . import deep_line_order, draft_repairs, local_claims, switch_tables, workers
 from .trial_bookkeeping import buffered
 
 log = logging.getLogger("decompdecomp")
@@ -62,6 +62,7 @@ GENERATOR_SECONDS = 30  # a batch that takes longer is stuck: its randomizer ret
 READ_BYTES = 1 << 16
 MAX_SEED = 2**31  # seeds of the generator's runs: the same function and turn write the same variants
 REWRITE_MISSES = 200  # simple rewrites in a row that change nothing: none applies to the C
+LINE_FOCUS_OVERGENERATION = 2  # variants written per compile slot when C lines are known: deep_line_order.py keeps the ones on them
 SIMPLE_BATCH = 8  # simple rewrites written together, so they compile ahead (and together) while earlier ones are judged
 MAX_INSNS = 400  # default size ceiling; larger functions cost more time per variant
 REPAIR_MAX_INSNS = 1024  # deterministic hypotheses keep their own 32-attempt / 20-second cap
@@ -165,6 +166,23 @@ class TracedVariant(str):
         # Copying or pickling a variant (it crosses worker boundaries) rebuilt it from the text alone and failed with
         # "missing 1 required positional argument: 'lineage'", stopping a long Deep Permuter run.
         return (str(self), self.lineage)
+
+
+class RewriteRandom(random.Random):
+    """Observe the library's selected fallback mutation without changing its random draws."""
+
+    def choice(self, choices):
+        selected = super().choice(choices)
+        if callable(selected) and selected in MUTATIONS:
+            self.rewrite = 'simple_' + selected.__name__.lstrip('_')
+        return selected
+
+    def variant(self, source, focus, header):
+        self.rewrite = None
+        candidate = mutate(source, self, focus, header=header)
+        if candidate and self.rewrite:
+            return TracedVariant(candidate, [self.rewrite])
+        return candidate
 
 
 class GenerationStopped(Exception):
@@ -664,6 +682,15 @@ class Permuter:
 
     @buffered
     @batched
+    def _start_random_window(self):
+        pass
+
+    def _random_trials_remaining(self):
+        return None
+
+    def _random_budget_available(self):
+        return True
+
     def _permute(self, agent, proj, fn, st: State) -> None:
         seconds = self.seconds
         preflight_deadline = time.monotonic() + seconds
@@ -691,7 +718,7 @@ class Permuter:
         fork = self.net.fork_slug(proj["slug"])
         from . import random_safety
         from .progress import ProgressMoved
-        rng = random.Random(f"{fn['id']}-{fn['permuted']}"+getattr(self, "random_salt", ""))
+        rng = RewriteRandom(f"{fn['id']}-{fn['permuted']}"+getattr(self, "random_salt", ""))
         gen = None
         header = ''
         held = ExitStack()
@@ -749,9 +776,12 @@ class Permuter:
             from .search_frontier import Frontier
             frontier = self.search_frontier = Frontier()
             frontier.offer(best_src, best, rows, arch=proj['arch'])
+            self._start_random_window()
             batches = misses = 0
+            crossed = set()  # pairs of frontier candidates already merged (deep_line_order.crossovers)
+            shape = ''
             refused, taken = None, 0  # the last refusal of a variant (NetworkError), variants the project took
-            while time.monotonic() < deadline and best > 0 and not st.stop.is_set():
+            while time.monotonic() < deadline and best > 0 and not st.stop.is_set() and self._random_budget_available():
                 if gen is not None:
                     # a batch of decomp-permuter's variants, of the C the turn started from and of the best so far in
                     # turn: from the best alone, rewrites piled on rewrites and got stuck on one of nine near misses of
@@ -785,20 +815,32 @@ class Permuter:
                     base = (best_src if reseed else frontier.choose(batches//3, best_src) if batches % 3 == 2
                             else best_src if batches % 2 else start_src)
                     batches += 1
+                    if batches % 25 == 0 and (line_note := deep_line_order.summary()):
+                        (getattr(self, 'log', None) or log.info)(line_note)
                     if batches % 2 == 0:
                         boosts = adaptive_repairs.boosts(self.net, proj, fn, rows, permuter_focus.boosts(rows))
                     # Alternate upstream defaults with focused weights: preserve an exploratory lane when
                     # the advisory mismatch category is incomplete or points at the wrong repair.
+                    ordering = getattr(self, 'candidate_order', None)
+                    # C lines the compiler ties to the differing instructions (deep_line_order.py): the generator keeps
+                    # most rewrites there, and writes extra variants that the batch order then thins to those that do
+                    lines = getattr(ordering, 'focus', lambda _: [])(base)
+                    # what is on those lines (a call, a multiply by a constant...) is a second key for the measured policy
+                    shape = getattr(ordering, 'shape', lambda _: '')(base) if lines else ''
+                    job_boosts = adaptive_repairs.with_shape(self.net, proj, fn, boosts, focus, shape) if shape and batches % 2 == 0 else boosts
                     job = {"header": gen_header, "source": base, "function": name, "family": family,
-                           "seed": rng.randrange(MAX_SEED), "count": BATCH, "weight_boosts": boosts if batches % 2 == 0 else {},
+                           "seed": rng.randrange(MAX_SEED), "count": BATCH, "weight_boosts": job_boosts if batches % 2 == 0 else {},
                            "trace": True}
+                    if lines:
+                        job['focus_lines'] = lines
+                        job['count'] = BATCH * LINE_FOCUS_OVERGENERATION
                     if hasattr(gen, 'chunks'):
                         if gen._closed.is_set():gen = Generator()
                         def check_generation(fn=fn):
                             random_safety.checkpoint(self.net, fn)
-                            if st.stop.is_set() or time.monotonic() >= deadline:
+                            if st.stop.is_set() or time.monotonic() >= deadline or not self._random_budget_available():
                                 raise GenerationStopped()
-                        batch = self._stream_variants(gen.chunks(job, check_generation), agent, proj, fn, fork)
+                        batch = self._stream_variants(gen.chunks(job, check_generation), agent, proj, fn, fork, parent=base)
                     else:
                         batch = gen.batch(job)
                     if batch is None:  # C it can't read: the simple rewrites can still try
@@ -812,22 +854,29 @@ class Permuter:
                     # Several siblings at a time, as the generator's batches are: one at a time, each was compiled and
                     # judged before the next was written, so a deep search's compile slots sat idle (99.7% of a lane's
                     # compiles ran inline on a game whose C decomp-permuter couldn't read).
-                    written = [mutate(base, rng, focus, header=simple_header) for _ in range(SIMPLE_BATCH)]
+                    written = [rng.variant(base, focus, simple_header) for _ in range(SIMPLE_BATCH)]
                     # none of them applies to this C (lerp's `a + (b - a) * t`): a minute of trying burnt a core
                     misses = 0 if any(written) else misses + len(written)
                     if misses >= REWRITE_MISSES:
                         break
                     written = list(dict.fromkeys(cand for cand in written if cand))
-                    batch = self._stream_variants((chunk for chunk in [written]), agent, proj, fn, fork) if written else []
+                    batch = self._stream_variants((chunk for chunk in [written]), agent, proj, fn, fork, parent=base) if written else []
+                # Two frontier candidates that edit different lines of the best source: their merge is one compile and
+                # may carry both repairs, where the frontier only ever offers them as competing parents.
+                merged = deep_line_order.crossovers(
+                    best_src, [n['source'] for n in frontier.nodes if n['source'] != best_src and n['score'] <= best * 2], 3, crossed)
+                if merged:
+                    batch = deep_line_order.Prefixed([TracedVariant(text, ['line_crossover']) for text in merged], batch)
                 for cand in batch:
-                    if cand is None or time.monotonic() >= deadline or st.stop.is_set():
+                    if cand is None or time.monotonic() >= deadline or st.stop.is_set() or not self._random_budget_available():
                         break
                     if random_safety.unsafe_update(fn['best_source'], cand):
                         continue  # reject introduced update chains or empty constant-loop scaffolding
                     lineage = getattr(cand, 'lineage', None)
                     cand = m2cfix.static_helpers(cand)  # (a global helper would not link: m2cfix.py)
                     st.add(variants=1)
-                    provenance = {'kind': 'random rewrite', 'family': lineage[-1] if lineage else 'random_rewrite_unattributed',
+                    unattributed = 'random_generator_unattributed' if gen else 'random_simple_unattributed'
+                    provenance = {'kind': 'random rewrite', 'family': lineage[-1] if lineage else unattributed,
                                   'lineage': lineage or [], 'base_source_sha256': hashlib.sha256(base.encode()).hexdigest(),
                                   'source_sha256': hashlib.sha256(cand.encode()).hexdigest()}
                     started = time.monotonic()
@@ -846,9 +895,14 @@ class Permuter:
                         refused = e
                         continue
                     taken += 1
+                    deep_line_order.outcome(cand, score is not None and score < best, getattr(self, '_trial_output', None))
                     if not getattr(self, 'trace_variants', False) and getattr(self, '_trial_outcome', '') != 'no_edit':
                         adaptive_repairs.record(self.net, adaptive_repairs.profile(self.net, proj, fn), focus,
                                                 provenance['family'], best, score, (time.monotonic()-started)*1000, origin="background random")
+                        if shape and gen:
+                            adaptive_repairs.record(self.net, adaptive_repairs.profile(self.net, proj, fn), f'{focus}@{shape}',
+                                                    provenance['family'], best, score, (time.monotonic()-started)*1000,
+                                                    origin="background random", coverage=False)
                     if score is None:
                         continue
                     measured_rows = repair_ranking.evidence(self.net, fn['id'], agent.id)
@@ -889,10 +943,14 @@ class Permuter:
                 st.holding(fn["name"], False)
                 self._let_go(agent, fn)
 
-    def _stream_variants(self, chunks, agent, proj, fn, fork):
+    def _stream_variants(self, chunks, agent, proj, fn, fork, *, parent=None):
+        rank = getattr(self, 'candidate_order', None)
         try:
             for chunk in chunks:
-                sources = [m2cfix.static_helpers(cand) for cand in chunk]
+                if rank is not None:
+                    chunk = rank(parent, chunk)
+                allowance = self._random_trials_remaining()
+                sources = [m2cfix.static_helpers(cand) for cand in chunk[:allowance]]
                 if hasattr(self, '_prime_trials'):
                     self._prime_trials(agent, proj, fn, sources, fork)
                 from .deep_compilation import chunk as compile_chunk
@@ -1052,8 +1110,8 @@ class Permuter:
                 self._trial_locations=res.get('repair_locations')
             return res.get("score")
         ctx = self.net._context(proj["id"], fn["unit"])
-        from decomprepair.repair_preflight import invalid_call
-        if source != fn['best_source'] and invalid_call(source, fn['name'], ctx['header']):
+        from .random_safety import invalid_candidate_call
+        if source != fn['best_source'] and invalid_candidate_call(source, fn['name'], ctx['header']):
             return None
         guard = None
         if getattr(self, "parallel_claims", False):

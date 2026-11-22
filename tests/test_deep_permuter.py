@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 
@@ -271,6 +272,7 @@ def test_local_repairs_chain_from_saved_improvements_with_fresh_diffs(monkeypatc
 
 def test_chained_local_repairs_share_the_original_compile_limit(monkeypatch):
     net = setup(monkeypatch)
+    monkeypatch.setattr(deep_permuter, 'EXTEND_MAX', 0)  # the hard limit, not the extension
     generated = []
     def variants(source, *args, **kwargs):
         generated.append(source)
@@ -311,6 +313,14 @@ def test_recipe_counts_and_winner_provenance_survive_reopening(monkeypatch):
     winner = reopened.recipe_wins(proj['id'])[0]
     assert (winner['previous_score'], winner['new_score']) == (40, 30)
     assert winner['provenance']['lineage'] == ['perm_temp', 'perm_cast']
+    assert winner['provenance']['phase'] == 'random rewrites'
+    measured = reopened.measurements(proj['id'])[0]
+    assert (measured['phase'], measured['attempted']) == ('random rewrites', 3)
+
+    # A stored row written before the phase fix still belongs to the random phase.
+    reopened.record_recipes(fn['id'], {}, [], {('perm_cast', 'compiler preflight'): (1, 0, 0, 1, 0, 0, 0, 18, 0)}, project=proj['id'])
+    assert len(reopened.measurements(proj['id'])) == 1
+    assert reopened.measurements(proj['id'])[0]['attempted'] == 4
     assert winner['provenance']['source_sha256']
 
 
@@ -579,6 +589,7 @@ def test_room_search_publishes_one_result_note_not_lease_notes(monkeypatch, note
 
 def test_side_search_keeps_other_agents_lease_and_defers_compiler_changes(monkeypatch):
     net = setup(monkeypatch)
+    monkeypatch.setattr(deep_permuter, 'EXTEND_MAX', 0)
     with net.store.tx() as db:
         db.execute("INSERT INTO agents(id,name,token_hash) VALUES(2,'owner','owner-token')")
         db.execute('INSERT INTO claims VALUES(1,2,123,9999999999)')
@@ -622,16 +633,86 @@ def test_local_phase_deadline_yields_without_consuming_global_budget(monkeypatch
 
 
 @pytest.mark.parametrize('imported',[False,True])
-def test_initial_local_phase_reserves_compile_allowance_for_random(monkeypatch,imported):
+def test_random_probe_returns_unused_allowance_to_local_repairs(monkeypatch,imported):
     net = setup(monkeypatch,imported)
     monkeypatch.setattr(draft_repairs,'variants',lambda *a,**kw: ['local'+str(i) for i in range(50)])
     seen = []
     monkeypatch.setattr(Permuter,'_score',lambda self,agent,proj,fn,source,best,fork: seen.append(source) or 40)
     batches(monkeypatch,['random'])
     result = deep_permuter.run(net,'game','f',1,10,Log())
-    assert len([s for s in seen if s.startswith('local')])<=5
-    assert 'random' in seen
-    assert result['tested']<=10
+    assert seen.index('random') == 8
+    assert seen[-1] == 'local8'
+    assert result['tested'] == 10
+
+
+def test_random_probe_extends_only_when_a_candidate_improves(monkeypatch):
+    net = setup(monkeypatch)
+    monkeypatch.setattr(deep_permuter, 'RANDOM_TRIAL_WINDOW', 2)
+    seen = []
+
+    def judge(self, agent, proj, fn, source, best, fork):
+        seen.append(source)
+        score = 30 if source == 'winner' else best
+        if score < best:
+            with net.store.tx() as db:
+                db.execute('UPDATE functions SET best_score=?,best_source=? WHERE id=?', (score, source, fn['id']))
+        return score
+
+    monkeypatch.setattr(Permuter, '_score', judge)
+    batches(monkeypatch, ['miss1', 'winner', 'obsolete'], ['miss2', 'miss3', 'too late'])
+    result = deep_permuter.run(net, 'game', 'f', 1, 20, Log())
+    assert [source for source in seen if source != 'local'] == ['miss1', 'winner', 'miss2', 'miss3']
+    assert result['best_score'] == 30
+
+
+@pytest.mark.parametrize('fails', [False, True])
+def test_compiler_preflight_restores_callers_phase(monkeypatch, fails):
+    net = setup(monkeypatch)
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 20, Log(), fn)
+    search.phase = 'random rewrites'
+
+    def preflight(*args, **kwargs):
+        assert search.phase == 'compiler preflight'
+        if fails:
+            raise NetworkError('preflight failed')
+        return {'tested': 0}
+
+    monkeypatch.setattr('decompnet.app.matching_preflight.run', preflight)
+    if fails:
+        with pytest.raises(NetworkError, match='preflight failed'):
+            search._compiler_preflight(proj, fn, None, search.deadline)
+    else:
+        search._compiler_preflight(proj, fn, None, search.deadline)
+    assert search.phase == 'random rewrites'
+
+
+def test_evidence_prioritises_targeted_repairs_and_limits_generic_ones():
+    from decompnet.app import repair_ranking
+
+    rows = [('|', 'lbu $v0, 0($a0)', 'lw $v0, 0($a0)'),
+            ('r', 'jal foo', 'jal bar')]
+    assert list(repair_ranking.evidence_priority(rows)) == ['symbol_access_width', 'float_argument_bits', 'm2c_refinement']
+    assert repair_ranking.weak_limits(rows, 'mips') == {
+        'global_scalar_type': 2, 'local_storage': 2, 'local_declaration_order': 2}
+    assert repair_ranking.weak_limits([('s', 'sw $v0, 4($sp)', 'sw $v0, 8($sp)')], 'mips')['local_storage'] == 8
+
+
+def test_local_queue_caps_generic_storage_trials_without_supporting_evidence(monkeypatch):
+    net = setup(monkeypatch)
+    candidates = [f'generic{i}' for i in range(8)]
+
+    def proposals(*args, labels=None, **kwargs):
+        labels.update(dict.fromkeys(candidates, 'local_storage'))
+        return candidates
+
+    seen = []
+    monkeypatch.setattr(draft_repairs, 'variants', proposals)
+    monkeypatch.setattr(Permuter, '_score', lambda self, agent, proj, fn, source, best, fork: seen.append(source) or best)
+    fn = net.function()
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    search.local_repairs(AGENT, net.project_row('game'), fn, fn['best_score'], None)
+    assert seen == candidates[:2]
 
 
 def test_structurally_distinct_high_score_seed_can_recover_exact_match(monkeypatch):
@@ -756,7 +837,13 @@ def test_failed_cleanup_resumes_broad_search_without_repeating_inverse(monkeypat
         return 40
     monkeypatch.setattr(Permuter, '_score', judge)
     result = deep_permuter.run(net, 'game', 'f', 1, 10, Log())
-    assert result['matched'] and len(visited)==2 and visited[-1]=='exact'
+    # The local pass also judges the library's own rewrites of the saved best before the cleanup (decomprepair
+    # 0.5.583's `mask_parameter_narrow` offers `u8 a` for this masked parameter), so the visits are that, the
+    # cleanup and the broad search's match. What this test pins: the cleanup's inverse is not judged again and the
+    # broad search still runs once, to the match.
+    assert result['matched'] and visited[-1]=='exact'
+    assert len(visited)==len(set(visited))
+    assert source not in visited
     assert len(generated)==1
 
 
@@ -1075,6 +1162,22 @@ def test_targeted_register_pass_compiles_bitwise_and_float_lifetime_candidates(m
     search.winner_diff = ([('r', 'add.s $f2, $f2, $f0', 'add.s $f0, $f0, $f2')], '')
     assert search.operand_order_pass(AGENT, proj, dict(fn, best_source=draft), 5, None) == 5
     assert any('float repair_float_increment' in candidate for candidate in seen)
+
+
+def test_loop_vector_shape_pass_tries_interleaving_first_for_scheduling_diffs(monkeypatch):
+    from decompnet.app import generation_calls
+
+    net = setup(monkeypatch)
+    fn, proj = net.function(), net.project_row('game')
+    search = deep_permuter.Search(net, 1, 30, Log(), fn)
+    left, right = 'addiu $v0, $v0, 1', 'addiu $v1, $v1, 1'
+    search.winner_diff = ([('o', left, right), ('o', right, left)], '')
+    monkeypatch.setattr(generation_calls, 'library', lambda calls: [
+        [('loop_vector_shapes', 'loop'), ('statement_interleave', 'interleaved')]])
+    seen = []
+    monkeypatch.setattr(search, '_score', lambda agent, project, function, source, best, fork: seen.append(source) or 0)
+    assert search.loop_vector_shape_pass(AGENT, proj, fn, 40, None) == 0
+    assert seen == ['interleaved']
 
 
 def test_loop_vector_shape_pass_composes_shapes_that_only_help_together(monkeypatch):
@@ -1509,3 +1612,122 @@ def test_reused_temp_split_lane_rejects_a_branch_join_with_old_values(monkeypatc
     proposals, _ = search._local_proposals(source, proj, fn, [])
     assert not any(family == 'reused_temp_split' and 'value_b2 = 0;' in candidate
                    for family, candidate in proposals)
+
+
+def test_masked_phase_merge_and_guard_sink_reach_focused_lane(monkeypatch):
+    from decompnet.app import generation_calls
+    from decomprepair.integer_lifetime_repairs import masked_phase_reuse
+
+    net = setup(monkeypatch)
+    fn, proj = net.function(), net.project_row('game')
+    source = '''int f(int input, int color) {
+    u32 earlier;
+    s32 phase;
+    earlier = input;
+    sink(earlier);
+    phase = color;
+    sink((phase & 0xff) << 16);
+    phase = input;
+    if (color != 255) {
+        int copy = input;
+        if (phase < 0) sink(copy);
+    }
+    return 0;
+}'''
+    monkeypatch.setattr(generation_calls, 'library', lambda calls: [
+        masked_phase_reuse(*arguments) if name == 'decomprepair.integer_lifetime_repairs.masked_phase_reuse' else []
+        for name, arguments, *_ in calls
+    ])
+    search = deep_permuter.Search(net, 1, 10, Log(), fn)
+    proposals, _ = search._local_proposals(source, proj, fn, [])
+    assert any(family == 'merge_integer_lifetimes' and 'earlier = color;' in candidate
+               and 'int copy = input;\n        phase = input;' in candidate
+               for family, candidate in proposals)
+
+
+def test_guarded_split_scope_reaches_focused_lane(monkeypatch):
+    from decompnet.app import generation_calls
+    from decomprepair.reused_temp_split_repairs import guarded_scope_variants
+
+    net = setup(monkeypatch)
+    fn, proj = net.function(), net.project_row('game')
+    source = '''int f(int *p) {
+    int value;
+    if (p != 0) {
+        value = *p;
+        sink(value);
+        value = p[1];
+        sink(value);
+    }
+    return 0;
+}'''
+    monkeypatch.setattr(generation_calls, 'library', lambda calls: [
+        guarded_scope_variants(*args) if name == 'decomprepair.reused_temp_split_repairs.guarded_scope_variants' else []
+        for name, args, *_ in calls
+    ])
+    search = deep_permuter.Search(net, 1, 10, Log(), fn)
+    proposals, _ = search._local_proposals(source, proj, fn, [])
+    assert any(family == 'reused_temp_split' and 'value_b1 = p[1];' in candidate
+               and '} while (0);' in candidate for family, candidate in proposals)
+
+
+def _budget_search(monkeypatch, **attrs):
+    net = setup(monkeypatch)
+    search = deep_permuter.Search(net, 1, 100, Log())
+    search.best = 10
+    for key, value in attrs.items():
+        setattr(search, key, value)
+    return search
+
+
+def test_a_search_still_improving_at_its_limit_extends_its_budget(monkeypatch):
+    search = _budget_search(monkeypatch)
+    search.tested = 100
+    search.improved_at = (95, time.monotonic())
+    search.check()  # extended instead of raising
+    assert (search.limit, search.extensions) == (150, 1)
+    assert search.deadline - search.started_at == pytest.approx(90)
+
+
+def test_extensions_need_fresh_improvement_and_are_capped(monkeypatch):
+    search = _budget_search(monkeypatch)
+    search.tested = 100
+    search.improved_at = (95, time.monotonic())
+    search.check()
+    search.tested = 150  # no improvement since the extension began
+    with pytest.raises(deep_permuter.SearchLimit):
+        search.check()
+    for expected in (2, 3):
+        search.improved_at = (search.tested - 1, time.monotonic())
+        search.check()
+        assert search.extensions == expected
+        search.tested = search.limit
+    search.improved_at = (search.tested - 1, time.monotonic())
+    with pytest.raises(deep_permuter.SearchLimit):  # EXTEND_MAX reached
+        search.check()
+
+
+@pytest.mark.parametrize('attrs', [
+    {'improved_at': None},                                   # never improved
+    {'improved_at': (10, 0.0)},                              # improved early in the budget
+    {'extendable': False, 'improved_at': (99, 1e12)},        # a caller capped the run
+    {'best': 0, 'improved_at': (99, 1e12)},                  # matched
+])
+def test_a_search_that_is_not_improving_late_ends_at_its_limit(monkeypatch, attrs):
+    search = _budget_search(monkeypatch, **attrs)
+    search.tested = 100
+    with pytest.raises(deep_permuter.SearchLimit):
+        search.check()
+
+
+def test_a_run_that_keeps_improving_spends_the_extended_budget(monkeypatch):
+    net = setup(monkeypatch)
+    monkeypatch.setattr(draft_repairs, 'variants', lambda source, *args, **kwargs: [source + ' '])
+    def judge(self, agent, proj, fn, source, best, fork):
+        with net.store.tx() as db:
+            db.execute('UPDATE functions SET best_score=?,best_source=? WHERE id=?', (best-1, source, fn['id']))
+        return best-1
+    monkeypatch.setattr(Permuter, '_score', judge)
+    result = deep_permuter.run(net, 'game', 'f', 1, 2, Log())
+    assert result['reason'] == 'Variant limit reached'
+    assert result['tested'] > 2  # extended while still improving, then stopped at the cap

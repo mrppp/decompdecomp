@@ -12,7 +12,15 @@ Requests:
 - {"op": "judge", "slug", "function": {"name", "vram", "target" (hex)}, "compiler": {"toolchain", "flags"},
   "source"} -> {"score": 0 for a match, the difference otherwise, null when it didn't compile; "detail"}, or
   {"error": ...} when it can't be judged here. That happens when the project isn't here, or its function's target
-  bytes differ from the hosted ones (another build of the game).
+  bytes differ from the hosted ones (another build of the game). With "diff": true the reply also carries "diff", the
+  app's own side-by-side rows for the candidate (DiffResult.render: the same normalisation compile_and_diff shows).
+- {"op": "function", "slug", "name", "vram" (optional, for overlays)} -> {"name", "vram", "target" (hex), "unit",
+  "arch", "asm" (the target's assembly text), "header" (the project's typedefs and externs the judge prepends),
+  "compiler": {"toolchain", "flags"} (this function's own profile)}: everything a local search needs to judge without being told the function's bytes
+  (the match-function skill's fast_judge.py).
+- {"op": "passes", "slug", "name", "source", "passes" (optional)} -> {"text"}: the compiler's allocation priority
+  table, register preferences and scheduling orders for that C under the function's profile (compiler_passes.report,
+  the code behind the compiler_passes tool; the skill's passes.py).
 
 Opened as the reader process does (store.ATTACH_ONLY, no saved-progress sync), so it can run beside the app.
 
@@ -81,11 +89,65 @@ def judge(net, request: dict) -> dict:
     if not toolchain:
         return {"error": "no compiler named"}
     matched, diff, log = net._judge_with(proj, fn, toolchain, list(flags), source)
+    shown = {"diff": diff.render()} if request.get("diff") and diff is not None else {}
     if matched:
-        return {"score": 0, "detail": "byte-identical"}
+        return {"score": 0, "detail": "byte-identical", **shown}
     if diff is None:
         return {"score": None, "detail": (log or "it didn't compile")[-2000:]}
-    return {"score": max(1, int(diff.score)), "detail": (log or "")[-2000:]}
+    return {"score": max(1, int(diff.score)), "detail": (log or "")[-2000:], **shown}
+
+
+def lookup(net, request: dict):
+    """(project, function row) for a request's slug, name and optional address, or an {"error": ...} reply."""
+    from .network import Network
+    slug = str(request.get("slug") or "")
+    try:
+        proj = Network._project(net, slug)
+    except Exception:
+        return {"error": f"this computer has no project {slug!r}"}
+    if net.cfg(proj).get("kind") == "fork":
+        return {"error": f"{slug} is a fork project; only ROM projects are judged here"}
+    rows = net.project_store(proj["id"]).all(
+        "SELECT * FROM functions WHERE project_id=? AND name=? AND gone_mark IS NULL", proj["id"], request.get("name"))
+    if request.get("vram") is not None:
+        rows = [row for row in rows if row["vram"] == request["vram"]]
+    if len(rows) != 1:
+        where = ", ".join(hex(row["vram"] or 0) for row in rows)
+        return {"error": f"{slug} has {len(rows)} functions named {request.get('name')!r}"
+                         + (f" (at {where}): pass the address" if rows else "")}
+    return proj, rows[0]
+
+
+def function_info(net, request: dict) -> dict:
+    """A function's target bytes, header and compiler profile, so a local search needs only its name."""
+    from .project import compiler_for
+    found = lookup(net, request)
+    if isinstance(found, dict):
+        return found
+    proj, fn = found
+    profile = compiler_for(net.cfg(proj), fn["vram"], fn)
+    return {"name": fn["name"], "vram": fn["vram"], "target": bytes(fn["target"] or b"").hex(), "unit": fn["unit"],
+            "arch": proj["arch"], "asm": fn["asm"] or "",
+            "header": net._context(proj["id"], fn["unit"])["header"],
+            "compiler": {"toolchain": profile.get("toolchain"), "flags": list(profile.get("flags") or [])}}
+
+
+def passes_report(net, request: dict) -> dict:
+    """The compiler's own allocation, preference and scheduling output for a candidate (compiler_passes' code)."""
+    from .app import compiler_passes
+    from .network import NetworkError
+    found = lookup(net, request)
+    if isinstance(found, dict):
+        return found
+    proj, fn = found
+    source = request.get("source")
+    if not isinstance(source, str) or not source.strip():
+        return {"error": "no source"}
+    passes = tuple(request.get("passes") or compiler_passes.SKILL_PASSES)
+    try:
+        return {"text": compiler_passes.report(net, proj, fn, source, passes)}
+    except NetworkError as error:
+        return {"error": str(error)}
 
 
 class Packs:
@@ -135,6 +197,10 @@ def serve(net, lines=sys.stdin, out=sys.stdout) -> None:
                 reply = packs.describe() if packs else describe(net)
             elif request.get("op") == "judge":
                 reply = packs.judge(request) if packs else judge(net, request)
+            elif request.get("op") == "function" and not packs:
+                reply = function_info(net, request)
+            elif request.get("op") == "passes" and not packs:
+                reply = passes_report(net, request)
             else:
                 reply = {"error": f"unknown op {request.get('op')!r}"}
         except Exception as error:  # this request only: the verifier releases it for another

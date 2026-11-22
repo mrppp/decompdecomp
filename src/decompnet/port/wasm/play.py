@@ -210,11 +210,37 @@ def library_names(net, slug: str) -> dict[str, str]:
     return out
 
 
+def relative_bank_code(net, slug: str, log=print) -> set[str]:
+    """Do not compile analysis-only functions as if their bank-relative offsets were runtime addresses."""
+    from ...app.saves import _source_file
+
+    with net.progress.view():
+        proj = net._project(slug)
+    recompiler = net.console(proj).recompiler
+    classify = getattr(recompiler, "banked_functions", None)
+    if classify is None:
+        return set()
+    rows = net.project_store(proj["id"]).all(
+        "SELECT name, rom_offset, size FROM functions WHERE project_id=? AND rom_offset IS NOT NULL", proj["id"])
+    functions = [{"name": r["name"], "rom": r["rom_offset"], "size": r["size"]} for r in rows]
+    cfg = net.cfg(proj)
+    rom = cfg.get("rom") or {}
+    image_name = rom.get("donor_analysis_base") or rom.get("file")
+    image_path = Path(proj["root"]) / image_name if image_name else None
+    if image_path and not image_path.is_file() and rom.get("file"):
+        image_path = Path(proj["root"]) / rom["file"]
+    image = image_path.read_bytes() if image_path and image_path.is_file() else None
+    names = {_source_file(f["name"]) for f in classify(cfg.get("segments") or [], functions, image)}
+    if names:
+        log(f"leaving out C for {len(names)} relocatable overlay functions until their runtime addresses are known")
+    return names
+
+
 def inputs(net, slug: str, log=print) -> dict:
     """What the build takes from the project besides its save: the library the host provides (`leave_out`), library
     code built from ultralib's C (`library_c`), library code's own names (`library_names`), and the recompiled C for
     functions with no C yet (`recomp`)."""
-    return {"leave_out": library(net, slug, log) | unverified(net, slug, log), "library_c": library_c(net, slug),
+    return {"leave_out": library(net, slug, log) | unverified(net, slug, log) | relative_bank_code(net, slug, log), "library_c": library_c(net, slug),
             "library_names": library_names(net, slug), "recomp": recompiled(net, slug, log),
             "function_headers": function_headers(net, slug)}
 
@@ -267,14 +293,14 @@ def play(net, slug: str, log=print, *, adapter: Path | None = None) -> dict:
         return view
     repo, cfg, rom = game(net, slug)
     steps = (*build.STEPS, STARTING)
-    program = build.build(repo, console=cfg.get("platform", "n64"), log=log, steps=steps,
+    program = build.build(repo, console=cfg.get("platform", "n64"), log=log, steps=steps, runtime_image=rom,
                           **inputs(net, slug, log))
     build.Progress(log, steps).start(STARTING)
     port = _free_port()
     out = program.parent
     # what the game runs that no function starts, kept beside the project for its next import (runtime_entries)
     from ...consoles.n64.code import RUNTIME_ENTRIES
-    env = {**os.environ, "PORT_LIVE": str(port), "PORT_SAVE": str(out / "game.eep"),
+    env = {**os.environ, "PORT_LIVE": str(port), "PORT_SAVE": str(out / "game.eep"), "PORT_SRAM": str(out / "game.sra"),
            "PORT_ENTRIES": str(rom.parent / RUNTIME_ENTRIES)}
     env.pop("PORT_RT64", None)
     if adapter:

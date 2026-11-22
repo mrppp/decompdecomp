@@ -310,12 +310,16 @@ Use `allocation_initialization_order`, `pointer_argument_alias`, `spill_declarat
 `byte_fill_constant` and the bounded `allocation_schedule_bridge` when offered. In a large switch with a
 register-only difference, also `case_temporary_split` / `case_temporary_merge` (one local per case, or locals that
 never meet merged) and `phantom_wide_local` (an unused `long long` at a block start, which breaks an allocation
-tie by moving one insn). They automate
+tie by moving one insn). A spilled halfword eight bytes off the target (every other slot right) is a declaration-order
+fact: `declaration_scope_sink` moves a function-level local into the one block that uses it. Also `arm_label_share`,
+`element_update_shape`, `narrow_test_share` and `phase_storage_split` (an effect spawner, 1397 to 0). A word parameter read only through byte masks is a `u8` parameter (its copy is placed after the body's first statements), a `((u16) x) >> 16` is the constant 0, an id kept from `x >> 16` is a `u16` local, and a clamp whose range test is computed in the block before its sign test keeps the compare out of the hoisted copy's way (`narrow_clamp_chain`, a key/velocity dispatch, 500 to 0). They automate
 subsets of these observations, not the complete historical search. Exact results do not prove
 original variable names, types or source spelling. See `docs/COMPILER_MATCHING_LEARNINGS.md`.
 
 For stubborn misses, Repair examples' GCC diagnostics now compare frozen before/after allocator and
-scheduler phases (`compiler_passes(function, revision, passes=[...])` dumps them for your candidate). Compare `lreg`/`greg` assignments and lifetimes with `sched`/`sched2`/`dbr`, only when
+scheduler phases (`compiler_passes(function, revision, passes=[...])` dumps them for your candidate, and names where
+the compiler's source is: `gcc-2.7.2-kmc-source` in the toolchains folder, decompals' reconstruction with `sched.c`,
+`local-alloc.c`, `global.c`, `reorg.c` at its top). Compare `lreg`/`greg` assignments and lifetimes with `sched`/`sched2`/`dbr`, only when
 both diagnostic builds preserve ordinary output. Pseudo numbering changes are not causal proof. New
 captures can run bounded ablation automatically; use the retained edit set as a hypothesis for a local
 family, keeping the original exact source until a separate ordinary judge accepts any replacement.

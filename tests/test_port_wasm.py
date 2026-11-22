@@ -774,3 +774,53 @@ def test_idle_rewrite_leaves_do_while_trailers_alone(body):
     assert ido_c(f"void f(void) {{ {body} }}") == f"void f(void) {{ {body} }}"
     mixed = ido_c(f"void f(void) {{ {body} while (1); }}")
     assert f"{body} for (;;) port_idle_forever();" in mixed
+
+
+def test_bitfield_conversion_preserves_ordinary_lines_around_fields():
+    from decompnet.port.wasm.build import big_endian_bitfields
+
+    source = ('struct flags {\n' + '    int ordinary;\n' * 1000
+              + '    u32 a:3;\n    u32 b:29;\n'
+              + '    int after; // note: 4;\n};\n')
+    result = big_endian_bitfields(source)
+    assert result.count('    int ordinary;\n') == 1000
+    assert result.index('u32 b : 29;') < result.index('u32 a : 3;')
+    assert '    int after; // note: 4;\n' in result
+
+
+def test_uncompilable_saved_c_uses_original_only_when_its_helpers_are_available(tmp_path):
+    from decompnet.port.wasm.build import fallback_failed_sources
+
+    repo = tmp_path / 'game'
+    saved = repo / 'progress' / 'src'
+    out = repo / 'port' / 'wasm' / 'build'
+    saved.mkdir(parents=True)
+    (out / 'src').mkdir(parents=True)
+    (out / 'll').mkdir()
+    failed = 'broken.c'
+    original = saved / failed
+    original.write_text('void broken(void) {}\n')
+    (out / 'src' / failed).write_text('void broken(void) {}\nvoid helper(void) {}\n')
+    good = saved / 'good.c'
+    good.write_text('void good(void) {}\n')
+    sources = {failed: original, 'good.c': good}
+    fixed = ['broken 0x80001000 func', 'good 0x80002000 func']
+    ll = out / 'll' / 'good.ll'
+    ll.write_text('declare void @helper()\n')
+    (out / 'll' / 'good.ll.key').write_text('key')
+    errors = ['broken.c: compiler error']
+    assert not fallback_failed_sources(errors, sources, repo, out, fixed)
+    ll.write_text('define void @helper() {\n ret void\n}\n')
+    assert fallback_failed_sources(errors, sources, repo, out, fixed) == {failed}
+    assert not fallback_failed_sources(errors, {failed: out / 'src' / failed}, repo, out, fixed)
+    assert not fallback_failed_sources(errors, sources, repo, out, ['broken 0x00001000 func'])
+
+
+def test_loader_with_adjacent_stack_objects_uses_original_code():
+    from pathlib import Path
+
+    from decompnet.port.wasm.build import original_code
+
+    host = Path(__file__).resolve().parents[1] / 'src/decompnet/consoles/n64/port_wasm'
+    manifest = {'game': {'sha1': '79cd1166c365e5809dec9b62e6d40d6032d5db3a'}}
+    assert original_code(host, manifest, ['loader 0x800018A8 func']) == {'loader.c'}

@@ -94,3 +94,151 @@ The synthetic saved source starts at a conservative score rather than a fabricat
 near-match. Otherwise reloading that row could overwrite the measured baseline and
 make the reported best-score digest depend on scheduling. This fixture correction
 must also be applied to the baseline checkout when comparing revisions.
+
+## CPU and Metal candidate ranking
+
+The benchmark can replay the same proposals in their original order or rank them
+before compilation. This fixture uses a synthetic KMC MIPS function that adds a
+constant. The ranker extracts the target's constant from its `lui`/`ori` pair and
+scores each candidate by bit distance from that constant. The replay plants the
+exact constant once per function at a seeded position in the original order.
+Both backends compute the same scores, keep original order on ties and send the
+results through the normal ROM candidate stream and judge. The replay stops each
+function at the first verified match.
+
+On an Apple M5 Max, three unprofiled full-search runs with 16 functions, 32
+variants, eight workers and eight compiler slots took 6.31–8.69 seconds at
+54–58 compiler invocations per second. This unrestricted generator found zero
+matches on the fixture. The first concurrent run hit a lazy import error before
+measuring throughput, so the benchmark loads the MIPS runtime alias before
+starting workers. Asynchronous repair-outcome analysis is disabled for these
+benchmark commands.
+
+The controlled replay used eight functions, 32 candidates each, and four workers
+and compiler slots. Each order verified eight exact matches on each of three
+runs. Times below are medians across those runs. Time to match is the median
+across functions in each run, measured from the start of the batch so it includes
+queueing and ranker startup.
+
+| Order | Time to match | Wall time for all eight | Judged candidates | Compiler invocations |
+| --- | ---: | ---: | ---: | ---: |
+| Original proposal order | 1.07 s | 1.35 s | 118 | 123–128 |
+| Swift CPU | 0.43 s | 0.48 s | 8 | 24 |
+| Metal | 0.61 s | 0.65 s | 8 | 21–24 |
+
+The compiler count includes speculative work already started when a match stopped
+the stream. For 256 candidates, CPU scoring took about 2 µs. The GPU kernel took
+about 10 µs, and buffer setup, dispatch, waiting and readback took 3–5 ms
+combined. The one-shot helper, JSON exchange, reference-score verification and
+sorting together took about 8 ms on CPU and 112 ms on Metal. A persistent helper
+could amortize startup, but the CPU already computes this feature cheaply.
+The planted matches make this a test of dispatch cost and the value of knowing
+which candidate to try first. It does not measure discovery on real near-misses
+or modified candidate ordering in the full search.
+
+On a Mac with the pinned compiler and a scratch `TMPDIR` and `DECOMP_HOME`:
+
+```sh
+swiftc -O tools/deep_candidate_metal.swift -o "$TMPDIR/deep-candidate-rank"
+PYTHONPATH=src uv run --locked python tools/benchmark_deep_pipeline.py \
+  --full-search --functions 16 --variants 32 --workers 8 --slots 8
+for backend in current cpu metal; do
+  PYTHONPATH=src uv run --locked python tools/benchmark_deep_pipeline.py \
+    --functions 8 --variants 32 --workers 4 --slots 4 \
+    --replay-order "$backend" --ranker "$TMPDIR/deep-candidate-rank"
+done
+```
+
+## Reading a live project pass
+
+The throughput line under **Deep Permuter → Activity** reports active compiler
+slots and waiters across the pass's workers. Each worker reports a snapshot about
+twice a second, so the active count can miss short compiles. The average slot
+utilization includes short compiles through accumulated compiler time. The slot
+count reflects the allocations to worker processes, which can differ from the
+number entered in settings when the app divides capacity among those processes.
+Work elsewhere in the app is outside the pass count.
+
+When CPU constant ranking is enabled and has scored a batch, the same line shows
+total thread CPU time spent extracting C literals, the number of ranked batches
+and the average CPU milliseconds per batch. The total includes parent extraction
+on cache misses across all workers. It excludes sorting, distance calculations
+and time spent waiting for a CPU. A low active count with few compiler waiters
+suggests the compiler queue has room for more work.
+
+### Rust extraction experiment
+
+On an Apple M5 Max, an optimized Rust byte scanner called in-process through
+`ctypes` processed batches of eight ASCII candidate texts in a median of
+0.023 ms versus 0.673 ms for the current Python extractor, including FFI and
+result conversion. The inputs were 128 saved, open-function bodies from a local
+MIPS project with synthetic edits. The prototype matched Python's results on
+all 1,024 candidate texts and on 1,000 generated token edge cases. This measured
+literal extraction only.
+
+Packaged builds now use the Rust scanner for eligible ASCII candidate source.
+With the shipped scanner's validation and result conversion, the same 128-body
+test measured 0.030 ms per eight candidates versus 0.699 ms in Python.
+On the 12 bodies with supported target constants, the entire ranking step
+took 0.041 ms versus 1.051 ms per batch. These timings exclude candidate
+generation, compilation and judging. Literal sets and the stable candidate order
+are checked against Python. A missing native library or symbol, non-ASCII source,
+unterminated comments or strings, and source larger than 256 KiB use Python.
+
+For a source checkout, run `uv run --locked python packaging/build_alignment.py`
+with Rust installed. Restart after building the library. To compare against
+Python with the same ranking option enabled, start the app with
+`DECOMP_NATIVE_RANK_LITERALS=0`.
+
+## Candidate source checks
+
+A compile session reuses source-shape and call-arity results between admission
+and judging. The bounded caches use exact source text, function spelling and
+header as applicable. The Rust scanner counts nested compound updates and
+empty constant `do` loops for supported ASCII inputs. Non-ASCII text, raw
+strings, unterminated comments or strings, oversized inputs and unavailable
+native libraries use the Python checks. Call-arity analysis still uses the
+existing Python implementation.
+
+On an Apple M5 Max, the isolated source-shape scan took 5.2 µs in Rust versus
+230 µs in Python at the median for a synthetic body with 80 neutral statement
+pairs. The compile-path benchmark produced these results across five runs per
+configuration, alternating configurations with four workers and four slots.
+
+| Candidate checks | Median compiler invocations/s | Range |
+| --- | ---: | ---: |
+| Before the change | 92.3 | 79.4–103.0 |
+| Session caches with Python scanner | 94.7 | 75.0–100.5 |
+| Session caches with Rust scanner | 94.8 | 84.9–114.5 |
+
+Each run made 192 compiler invocations, wrote 192 history rows, and produced
+the same score digest. Run-to-run variation was larger than the change in
+median throughput. The benchmark uses fixed proposals through compile
+admission and the real KMC compiler and judge. It excludes candidate generation
+and does not establish a match-rate gain on real projects.
+
+With the pinned compiler installed and scratch data and temporary directories,
+build the native library first and then run:
+
+```sh
+uv run --locked python packaging/build_alignment.py
+PYTHONPATH=src uv run --locked python tools/benchmark_deep_pipeline.py \
+  --functions 12 --variants 16 --workers 4 --slots 4 --declarations 600 --source-statements 80
+```
+
+Set `DECOMP_NATIVE_CANDIDATE_CHECKS=0` for the cache-only run. For the baseline,
+use the same benchmark fixture with the application code from before this change.
+
+## Where the processor goes, in the running app
+
+The app and each helper process it starts (the proposal workers that run the decomp-repair library, the permuter
+worker) sample their own threads twice a second (`thread_cpu.py`; under 1% of a core) and charge the kernel's CPU time to
+the code each thread is in. Reports are `<home>/.decomp/logs/thread-cpu*.log` (and a `.json` twin), rewritten every
+minute; code inside decomprepair and decompassets is named by module. To add every process up:
+
+```bash
+uv run python -m decompnet.thread_cpu            # this edition's home; or pass a logs folder
+```
+
+Compiler processes are not Python: their time is in `compile_timing` (the run's `throughput`). `DECOMP_THREAD_CPU=0`
+turns all of it off. Helper reports older than a day are removed when a helper starts.
