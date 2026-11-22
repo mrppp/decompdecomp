@@ -129,11 +129,51 @@ def find_segments(rom: bytes, taken: list[tuple[int, int, int]], ends: tuple[int
     from .loader_mapping import refine, verified
 
     found=complete(rom,sorted(found),taken)
+    found=reconcile_between(rom,found,taken,log)
     found=reconcile_adjacent(rom,found,taken,log)
     from .code_references import complete as referenced_gaps
 
     found=refine(rom,found+referenced_gaps(rom,sorted(taken+found),declared),taken,log)
     return close_gaps(rom, loaded_code(rom,found,verified(rom,taken),taken,log), taken)
+
+
+def reconcile_between(rom, found, taken=(), log=print):
+    """Correct a middle range when both neighbours and independent calls agree."""
+    ordered = sorted(found)
+    result = list(ordered)
+    callers = sorted((*taken, *ordered))
+    for i in range(1, len(ordered)-1):
+        lo, hi, old = ordered[i]
+        left, right = ordered[i-1], ordered[i+1]
+        mapping = left[2] - left[0]
+        if (right[2] - right[0] != mapping or mapping == old-lo
+                or not 0 <= lo-left[1] <= 16 or not 0 <= right[0]-hi <= 16
+                or abs(mapping-(old-lo)) > 16):
+            continue
+        base = lo+mapping
+        if (not 0x80000400 <= base < base+hi-lo <= 0x80800000
+                or any(a < hi and lo < b or v < base+hi-lo and base < v+b-a
+                       for a,b,v in callers if (a,b,v) != ordered[i])):
+            continue
+        words = struct.unpack_from(f'>{(hi-lo)//4}I', rom, lo)
+        entries = {lo+4*j for j,w in enumerate(words)
+                   if is_frame(w) or j >= 2 and words[j-2] == JR_RA}
+        support = [set(), set()]
+        old_support = [set(), set()]
+        for start, end, entry in callers:
+            targets = jal_targets(struct.unpack_from(f'>{(end-start)//4}I',rom,start),entry)
+            inside = start == lo and end == hi
+            for target in targets:
+                if target-mapping in entries:
+                    support[inside].add(target)
+                if target-(old-lo) in entries:
+                    old_support[inside].add(target)
+        if (all(len(hits) >= 3 for hits in support)
+                and all(len(good) > len(bad) for good,bad in zip(support,old_support))
+                and sum(map(len,support)) >= 2*max(1,sum(map(len,old_support)))):
+            result[i] = lo, hi, base
+            log('Recovered a middle code mapping from neighbouring ranges and independent calls.')
+    return result
 
 
 def reconcile_adjacent(rom, found, taken=(), log=print):
@@ -447,7 +487,7 @@ def unpack_code(rom: bytes) -> list[tuple[int, bytes]]:
 
 # ---------------------------------------------------------------------------------------------- into splat's config
 
-def add_segments(config: Path, workdir: Path, image: str, log=print) -> str:
+def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_replacing_boot=False) -> str:
     """An N64 game's code outside the main segment (n64code.py), added to splat's config as code segments of their
     own. Compressed code (Rare's, Yaz0, RNC method 1) is unpacked first and appended to a working copy of the ROM, which splat then
     reads instead (and an export rebuilds). Code the search can't place is then found by running the game, when the
@@ -457,6 +497,7 @@ def add_segments(config: Path, workdir: Path, image: str, log=print) -> str:
     import yaml
 
     from . import (
+        boot_brs,
         boot_gzip,
         copied_overlays,
         dma_overlays,
@@ -477,7 +518,16 @@ def add_segments(config: Path, workdir: Path, image: str, log=print) -> str:
     taken = split.code_ranges(config)
     if taken and (result := resident_deflate.add(config,workdir,image,rom,taken,log)):
         return result
-    if taken and (result := boot_gzip.add(config, workdir, image, rom, taken, log)):
+    if taken and not skip_replacing_boot and boot_brs.find(rom, taken):
+        # The replacement program reuses the boot addresses. Recover the boot
+        # code first, before the expanded image introduces overlapping banks.
+        base = add_segments(config, workdir, image, log, skip_replacing_boot=True)
+        if base == original:
+            taken = split.code_ranges(config)
+            if result := boot_gzip.add(config, workdir, image, rom, taken, log):
+                return result
+        return base
+    if taken and not skip_replacing_boot and (result := boot_gzip.add(config, workdir, image, rom, taken, log)):
         return result
     if taken and (slots := raw_slots.registered(rom, taken)):
         recovered = raw_slots.recover_registered(rom, slots, taken, log)
@@ -532,6 +582,7 @@ def add_segments(config: Path, workdir: Path, image: str, log=print) -> str:
 
     found = trim(rom, found, taken, log)
     found = recover_scheduled_mapping_entries(rom, found, taken, log)
+    found = bridge_loaded_prologues(rom, found, loaded.get('segments', ()), taken, log)
     recover(config, rom, found, log)
     extend_startup_trap(config, rom, log)
     extend_startup_data(config, rom, log)
@@ -551,11 +602,41 @@ def add_segments(config: Path, workdir: Path, image: str, log=print) -> str:
         cfg["sha1"] = hashlib.sha1(rom).hexdigest()
     from . import inferred_overlays
 
+    before_mapping = found
     found, runtime = inferred_overlays.runtime_mappings(rom, found, loaded.get('moved_ranges', ()), taken)
-    if runtime:
-        log(f'Corrected {len(runtime)} inferred code ranges using RAM-observed bytes and their internal calls.')
+    found = inferred_overlays.extend_adjacent_frame(rom, found)
+    found, banks = inferred_overlays.split_concatenated(rom, found, getattr(log, 'check_cancel', lambda: None))
     found, scoped = inferred_overlays.recover(rom, found, taken, getattr(log, 'check_cancel', lambda: None),
-                                             changed=runtime)
+                                             changed=runtime | banks)
+    # Corrected addresses can expose a called prologue whose frame lies beyond
+    # the scanner's original alignment tail.
+    from .code_tails import complete as complete_tails
+    called = set()
+    for start,end,entry in (*taken, *found):
+        words = struct.unpack_from(f'>{(end-start)//4}I', rom, start)
+        called.update(jal_targets(words, entry))
+    found = complete_tails(rom, found, taken, called=called)
+    # A complete framed tail can overlap a different inferred ROM bank at the
+    # same runtime address. Keep both only when exclusive scopes can hold them.
+    expanded = complete_tails(rom, found, taken, called=called, allow_inferred_overlap=True)
+    expanded_scoped = set(scoped)
+    for lo, hi, base in expanded:
+        for other, other_end, other_base in expanded:
+            if lo != other and base < other_base+other_end-other and other_base < base+hi-lo:
+                expanded_scoped.update((lo, other))
+    safe_expanded = inferred_overlays.safe_scopes(expanded, expanded_scoped, taken)
+    if safe_expanded is not None:
+        found, scoped = expanded, safe_expanded
+    found = inferred_overlays.drop_pointer_fragments(rom, found, taken)
+    scoped &= {start for start,_,_ in found}
+    safe = inferred_overlays.safe_scopes(found, scoped, taken)
+    if safe is None:
+        found, scoped = before_mapping, set()
+        log('Kept the original code mappings because independent banks would overlap the global address range.')
+    else:
+        scoped = safe
+    if runtime and scoped:
+        log(f'Corrected {len(runtime)} inferred code ranges using RAM-observed bytes and their internal calls.')
     insert_segments(config, cfg, found, len(rom))
     if scoped:
         cfg = yaml.safe_load(config.read_text(encoding='utf-8'))
@@ -603,6 +684,38 @@ def recover_scheduled_mapping_entries(image, found, taken, log=print):
     return result
 
 
+def bridge_loaded_prologues(image, found, loaded, taken=(), log=print):
+    """Keep a two-instruction address load with the adjacent RAM-observed frame."""
+    from ...arch.mips_references import references
+
+    original = sorted(found)
+    result = list(original)
+    loaded_starts = {start for start, _, _ in loaded}
+    for index, (left, right) in enumerate(zip(original, original[1:])):
+        start, end, base = left
+        seam, stop, address = right
+        if (seam not in loaded_starts or seam - end != 4 or end - start < 12
+                or address - seam != base - start or not is_frame(int.from_bytes(image[seam:seam+4], 'big'))):
+            continue
+        entry = end - 4
+        ret, pop, upper, load = struct.unpack_from('>4I', image, entry - 8)
+        reg = (upper >> 16) & 31
+        if (ret != JR_RA or pop >> 16 != 0x27bd or not 0 < (pop & 0xffff) < 0x8000
+                or upper >> 26 != 15 or not reg or load >> 26 != 35
+                or (load >> 21) & 31 != reg or (load >> 16) & 31 != reg):
+            continue
+        interior = {address - 4, address}
+        if any(target in interior for lo, hi, vram in (*taken, *original)
+               for target, _, _ in references(image, lo, hi, vram)):
+            continue
+        if any(target.to_bytes(4, 'big') in image for target in interior):
+            continue
+        result[index] = (start, entry, base)
+        result[index+1] = (entry, stop, address - 8)
+        log('Kept a scheduled address load with its RAM-observed code range.')
+    return result
+
+
 def insert_segments(config: Path, cfg: dict, found, size: int) -> None:
     """Write `found` (rom_start, rom_end, vram) into splat's config `cfg` as code segments of their own, each
     followed by raw bytes up to the next segment, and save it to `config`. Used by the import, and by
@@ -625,7 +738,8 @@ def insert_segments(config: Path, cfg: dict, found, size: int) -> None:
     segs = [s for s in cfg["segments"] if not (isinstance(s, dict) and s.get("type") == "bin" and start_of(s) in starts)
             and not isinstance(s, list)]  # the end marker comes back at the image's end
     for st, en, vram in found:
-        name = f"code_{vram:08X}"
+        duplicate = sum(base == vram for _, _, base in found) > 1
+        name = f"code_{vram:08X}_{st:X}" if duplicate else f"code_{vram:08X}"
         segs.append({"name": name, "type": "code", "start": st, "vram": vram, "subsegments": [[st, "c", name]]})
         if en < size and en not in starts and not any(start_of(s) == en for s in segs if not isinstance(s, list)):
             segs.append({"type": "bin", "start": en})

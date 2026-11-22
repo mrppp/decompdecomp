@@ -19,7 +19,9 @@ def audio_spans(image):
     """Find audio RSP programs adjacent to the verified libultra bootstrap."""
     from .port import RSPBOOT
 
-    for match in re.finditer(re.escape(RSPBOOT), image):
+    variant = bytes.fromhex('342100010900041a') + RSPBOOT[4:]
+    pattern = re.escape(RSPBOOT) + b'|' + re.escape(variant)
+    for match in re.finditer(pattern, image):
         end = match.start()
         # Some audio tasks place the bootstrap immediately before their
         # 4 KiB text. Its entry initializes DMEM command pointers or reads SP status first.
@@ -42,8 +44,10 @@ def audio_spans(image):
             status, data, size = struct.unpack_from('>3I', image, start)
             # The first operations read SP_STATUS and the two task DMEM
             # fields for its command list.
-            if (status & 0xffe0ffff != 0x40005800 or data & 0xffe0ffff != 0x8c200030
-                    or size & 0xffe0ffff != 0x8c200034):
+            status_first = (status & 0xffe0ffff == 0x40005800 and data & 0xffe0ffff == 0x8c200030
+                            and size & 0xffe0ffff == 0x8c200034)
+            pointers_first = image[start:start+16] == bytes.fromhex('2018036020170f908c3c00308c3b0034')
+            if not (status_first or pointers_first):
                 continue
             words = struct.unpack_from(f'>{(end-start)//4}I', image, start)
             if sum(map(_vector, words)) < _MIN_VECTORS:
@@ -52,6 +56,85 @@ def audio_spans(image):
             if sum(0x01000400 <= target < 0x01000800 for target in branches) >= 3:
                 yield start, end
                 break
+
+
+def graphics_spans(image):
+    """Find a bootstrap variant and its vector-rich 4 KiB graphics program."""
+    from .port import RSPBOOT
+
+    # This bootstrap also precedes graphics text whose first instruction
+    # jumps into IMEM; the vector body corroborates the entire task image.
+    for match in re.finditer(re.escape(RSPBOOT), image):
+        start = match.start()
+        code = start + 0xd0
+        end = code + 0x1000
+        if start % 16 or end > len(image):
+            continue
+        words = struct.unpack_from('>1024I', image, code)
+        first = words[0]
+        targets = {word & 0x03ffffff for word in words if word >> 26 in (2, 3)}
+        if (first >> 26 == 2 and 0x01000400 <= first & 0x03ffffff < 0x01000800
+                and sum(map(_vector, words)) >= _MIN_VECTORS
+                and sum(0x01000400 <= target < 0x01000800 for target in targets) >= 3):
+            yield start, end
+
+    signature = bytes.fromhex('342100010900041a') + RSPBOOT[4:]
+    for match in re.finditer(re.escape(signature), image):
+        start = match.start()
+        code = start + 0xd0
+        end = code + 0x1000
+        if start % 16 or end > len(image):
+            continue
+        words = struct.unpack_from('>1024I', image, code)
+        branches = {word & 0x03ffffff for word in words if word >> 26 in (2, 3)}
+        if (sum(map(_vector, words)) >= _MIN_VECTORS
+                and sum(0x01000400 <= target < 0x01000800 for target in branches) >= 3):
+            yield start, end
+
+    # A graphics microcode family starts with vector setup. Its linked
+    # overlays can extend past the 4 KiB task image, ending at the next
+    # vector program or a separately recognizable CPU interrupt routine.
+    entry = bytes.fromhex('4a00002cc81f201bc81e201c')
+    overlay = bytes.fromhex('080007f6201f108c200c4000400b5800')
+    entries = [match.start() for match in re.finditer(re.escape(entry), image)]
+    for index, start in enumerate(entries):
+        end = start+0x1000
+        if start % 16 or end+len(overlay) > len(image) or image[end:end+len(overlay)] != overlay:
+            continue
+        words = struct.unpack_from('>1024I', image, start)
+        targets = {word & 0x3ffffff for word in words if word >> 26 in (2, 3)}
+        if (sum(map(_vector, words)) < _MIN_VECTORS
+                or sum(0x400 <= target < 0x800 for target in targets) < 3):
+            continue
+        following = entries[index+1] if index+1 < len(entries) else 0
+        if end < following <= end+0x800:
+            tail = struct.unpack_from(f'>{(following-end)//4}I', image, end)
+            if sum(map(_vector, tail)) >= _MIN_VECTORS:
+                yield start, following
+                continue
+        for at in range(end+0x100, min(end+0x400, len(image)-20), 4):
+            a, b, c, d, e = struct.unpack_from('>5I', image, at)
+            if (a >> 16 == 0x3c0a and b >> 16 == 0x254a and c == 0x8d4b0000
+                    and d == 0x316bff00 and e == 0x40086000
+                    and b'\x03\xe0\x00\x08' in image[at:at+256]):
+                yield start, at
+                break
+        else:
+            # Some variants end their RSP overlay with a jump within IMEM,
+            # its DMEM load delay slot and alignment, followed by a CPU frame.
+            # The frame saves the return address and closes within its body.
+            for at in range(end+0x100, min(end+0x400, len(image)-40), 4):
+                jump, delay, pad0, pad1, frame = struct.unpack_from('>5I', image, at-16)
+                if (jump >> 26 != 2 or not 0x400 <= jump & 0x3ffffff < 0x800
+                        or delay != 0x8c1800cc or pad0 or pad1 or not is_frame(frame)):
+                    continue
+                following = struct.unpack_from('>8I', image, at+4)
+                if (not any(word & 0xffff0000 == 0xafbf0000 for word in following)
+                        or b'\x03\xe0\x00\x08' not in image[at:at+0x400]):
+                    continue
+                yield start, at
+                break
+
 
 def trim(image, found, known, log=print):
     """Trim a vector-code prefix only where scalar calls establish the CPU boundary."""

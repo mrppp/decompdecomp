@@ -298,6 +298,12 @@ class Console:
         whose code keeps a minimal TOC. None by default."""
         return []
 
+    def splat_create_config(self, args, workdir, log):
+        """Create the initial splat configuration for a copied image."""
+        from ..rom.split import _splat
+
+        return _splat(args, workdir, log)
+
     def add_code(self, config: Path, workdir: Path, image: str, picked: Picked, log=print) -> str:
         """Before splat splits: code its own look misses (segments loaded later, overlays), added to its config.
         Returns the image splat reads."""
@@ -359,6 +365,18 @@ class Console:
     def export_overlay(self, target):
         """Return the checked cartridge placement for an independently loaded function."""
         return None
+
+    def separate_overlay_reference(self, binding, number):
+        """Return a separate source name for the same loader binding, where supported."""
+        return binding
+
+    def overlay_cartridge_placement(self, fn, cfg):
+        """Return loader metadata for a stored row with a verified placement."""
+        return None
+
+    def overlay_metadata_updates(self, image, cfg, rows):
+        """Yield fresh metadata for existing functions after checking the original loader records."""
+        return ()
 
     def rebuild_overlays(self, image, entries):
         """Put compiled overlay text back in the cartridge using its loader format."""

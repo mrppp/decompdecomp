@@ -41,8 +41,11 @@ def _auto_addresses(texts, defined) -> dict[str, int]:
     its name carries, so the standalone link can resolve them."""
     found = {}
     for text in texts:
-        for word in set(re.findall(r"\b[A-Za-z]\w*_[0-9A-Fa-f]{1,8}\b", text)):
-            if (m := AUTO_NAME.match(word)) and word not in defined:
+        for word in set(re.findall(r"\b[A-Za-z]\w*_[0-9A-Fa-f]{1,8}(?:_code_[0-9A-Fa-f]{8})?\b", text)):
+            # Inferred overlay scopes append their segment name after the
+            # address; the suffix names a scope, not a second address.
+            base = re.sub(r'_code_[0-9A-Fa-f]{8}$', '', word)
+            if (m := AUTO_NAME.fullmatch(base)) and word not in defined:
                 found.setdefault(word, int(m.group(1), 16))
     return found
 
@@ -99,7 +102,7 @@ def _first_address(path: Path) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _symbol_lines(net, proj, rows=None, excluded=(), segments=()) -> list[str]:
+def _symbol_lines(net, proj, rows=None, excluded=(), segments=(), unsized=()) -> list[str]:
     """symbol_addrs.txt entries for every function and every named symbol, so splat writes the project's names. A
     function's size too: spimdisasm ends a function with a switch at its first return, and the import put the cases
     back (split.merge_switch_cases: a PSP game's GCC and EE-GCC 3.2 load jump tables that way), so splat must too."""
@@ -121,7 +124,8 @@ def _symbol_lines(net, proj, rows=None, excluded=(), segments=()) -> list[str]:
             raise ExportError("An overlapping function has no matching scoped ROM bank.")
         if owner is not None and owner.get("exclusive_ram_id"):
             suffix = f" rom:0x{rom:X} segment:{owner['name']}"
-        lines.append(f"{row['name']} = 0x{vram:08X}; // type:func size:0x{row['size']:X}{suffix}")
+        size = "" if row["name"] in unsized else f" size:0x{row['size']:X}"
+        lines.append(f"{row['name']} = 0x{vram:08X}; // type:func{size}{suffix}")
     # One name per address: splat refuses two ("Duplicate symbol detected", an N64 game whose agents gave one address
     # two names). The table's own name for the address labels it; the other names still link, from build.json.
     named = set(funcs)
@@ -131,6 +135,14 @@ def _symbol_lines(net, proj, rows=None, excluded=(), segments=()) -> list[str]:
         named.add(s.address)
         lines.append(f"{s.name} = 0x{s.address:08X};")
     return lines
+
+
+def _fallthrough_entries(rows, console):
+    """Let splat split a reviewed entry that falls directly into another entry."""
+    starts = {(r['vram'], r['rom_offset']) for r in rows}
+    return {r['name'] for r in rows if r['rom_offset'] is not None
+            and (r['vram'] + r['size'], r['rom_offset'] + r['size']) in starts
+            and console.boundary_reason(r['target'] or b'')}
 
 
 def _segments(config: dict) -> list[dict]:
@@ -341,12 +353,15 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     proj = net._project(slug)
     cfg = net.cfg(proj)
     store = net.project_store(proj['id'])
-    population = store.all('SELECT name,vram,size,rom_offset FROM functions WHERE project_id=?', proj['id'])
+    population = store.all('SELECT name,vram,size,rom_offset,meta,target FROM functions WHERE project_id=?', proj['id'])
     banks = cfg.get('donor_overlays') or {}
     native_end = min(banks.values(), default=None)
-    excluded = ({r['name'] for r in population if r['rom_offset'] is not None and r['rom_offset'] >= native_end}
-                if native_end is not None else set())
-    population = [row for row in population if row['name'] not in excluded]
+    analysis_only = ({r['name'] for r in population if r['rom_offset'] is not None and r['rom_offset'] >= native_end}
+                     if native_end is not None else set())
+    excluded = analysis_only | {r['name'] for r in population if r['meta'] and console.overlay_cartridge_placement(r, cfg)}
+    # Raw overlay entries still occupy space in the cartridge split; build their C
+    # through the loader path while the assembly supplies the original placeholders.
+    population = [row for row in population if row['name'] not in analysis_only]
     if EXPORT not in console.features:
         raise ExportError(f"exporting a rebuildable project isn't supported for {console.name or 'this console'} yet")
     work = Path(proj["root"])
@@ -376,7 +391,11 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     for extra in ("reloc_addrs.txt",):
         if (work / extra).exists():
             shutil.copyfile(work / extra, out / extra)
-    (out / "symbol_addrs.txt").write_text("\n".join(_symbol_lines(net, proj, population, excluded, _segments(split_config))) + "\n", encoding="utf-8")
+    # A sized fallthrough entry can make splat absorb all following entries into
+    # its assembly file. Leave its extent to splat when another entry begins
+    # exactly at its end; boundary review still decides whether it is valid.
+    unsized = _fallthrough_entries(population, console)
+    (out / "symbol_addrs.txt").write_text("\n".join(_symbol_lines(net, proj, population, analysis_only, _segments(split_config), unsized)) + "\n", encoding="utf-8")
     res = run([console_python(), "-m", "splat", "split", "splat.yaml"], out, log)
     if res.returncode != 0:
         raise ExportError("splat failed:\n" + (res.stdout + res.stderr)[-1500:])
@@ -572,7 +591,7 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     data_c = _data_in_c(net, proj, out, layout, objects, image, cfg, log)
     defined.update(d["name"] for d in data_c)
     syms = net.symbols(proj["id"])
-    absolute = {s.name: s.address for s in syms.by_name.values() if s.name not in defined and s.name not in excluded}
+    absolute = {s.name: s.address for s in syms.by_name.values() if s.name not in defined and s.name not in analysis_only}
     # Startup assembly can retain an import-time alias after a discovered function receives an address-based
     # name. Keep those known addresses too; otherwise its named jump target is undefined in the standalone link.
     for name, address in split.named_symbols(work).items():
@@ -672,7 +691,7 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     (out / "objdiff.json").write_text(json.dumps({"build_base": False, "build_target": False, "units": units_json}, indent=2),
                                       encoding="utf-8")
     matched = sum(1 for f in functions if f["kind"] == "c") + len(overlays)
-    total_functions = len(functions) + len(excluded)
+    total_functions = len(functions) + len(analysis_only)
     _write_docs(out, proj["name"], console.name, base, matched, total_functions, as_fallback)
     if overlays:
         with (out / 'README.md').open('a', encoding='utf-8') as readme:

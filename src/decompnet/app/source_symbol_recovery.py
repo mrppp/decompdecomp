@@ -1,41 +1,76 @@
 """Turn independently measured addresses into private, normally judged alternatives."""
 import re
+from functools import lru_cache
 from io import BytesIO
 
 from elftools.common.exceptions import ELFError
 from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
 
-from ..elfobj import _function_symbols
+from ..elfobj import _function_symbols, mask_relocs
 from ..forks.csource import _blank
 
 MAX_HELPER_BYTES = 256
 MAX_HELPERS = 3
 
 
+@lru_cache(maxsize=64)
+def _alias_pattern(names):
+    return re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r')\b')
+
+
 def rename(text, aliases):
-    clean = _blank(text)
-    for match in reversed(list(re.finditer(r'\b[A-Za-z_]\w*\b',clean))):
-        if match[0] in aliases:text = text[:match.start()]+aliases[match[0]]+text[match.end():]
-    return text
+    """Apply identifier aliases in one pass, retaining original comments, strings and whitespace."""
+    names = tuple(sorted(name for name, replacement in aliases.items()
+                         if name != replacement and re.fullmatch(r'[A-Za-z_]\w*', name)))
+    if not names:
+        return text
+    pattern = _alias_pattern(names)
+    if not pattern.search(text):
+        return text
+    parts = []
+    start = 0
+    for match in pattern.finditer(_blank(text)):
+        parts.extend((text[start:match.start()], aliases[match[0]]))
+        start = match.end()
+    if not parts:
+        return text
+    parts.append(text[start:])
+    return ''.join(parts)
 
 
-def relocation_aliases(candidate, target):
-    """Propose aliases for loader symbols when raw code and the relocation sites agree."""
-    if candidate is None or candidate.code != target.code:
-        return {}
+def comparable_overlay_code(candidate, target, *, masked=None):
+    """Compare the instruction bits outside the proposed relocation fields."""
+    if candidate is None:
+        return False
+    fields = target.linker_relocs if masked is None else masked
+    if not fields:
+        return candidate.code == target.code
+    def comparable(code):
+        return mask_relocs(code, fields, target.arch, target.big_endian)
+    return comparable(candidate.code) == comparable(target.code)
+
+
+def overlay_bindings(candidate, target, *, masked=None):
+    """Map loader symbols only when code and relocation sites support one binding per symbol."""
+    if not comparable_overlay_code(candidate, target, masked=masked):
+        return None
     expected = {(r.offset, r.type): r.symbol for r in target.relocs}
     actual = {(r.offset, r.type): r.symbol for r in candidate.relocs}
     if expected.keys() != actual.keys() or len(actual) != len(candidate.relocs) or len(expected) != len(target.relocs):
-        return {}
+        return None
     aliases = {}
     for site, source in actual.items():
         name = expected[site]
         if not re.fullmatch(r'[A-Za-z_]\w*', source) or not re.fullmatch(r'[A-Za-z_]\w*', name):
-            return {}
+            return None
         if aliases.setdefault(source, name) != name:
-            return {}
-    return {old: new for old, new in aliases.items() if old != new}
+            return None
+    return aliases
+
+
+def relocation_aliases(candidate, target):
+    return {old: new for old, new in (overlay_bindings(candidate, target) or {}).items() if old != new}
 
 
 def variants(source, header, measurement):

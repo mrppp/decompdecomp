@@ -140,3 +140,45 @@ void f(void) {
     labels = {}
     out = draft_repairs.variants(source, 'f', 'mips', '', FLAGS, labels, limit=None)
     assert any('g(D_A[var_s2]);' in text and labels.get(text) == 'pointer_walk_index' for text in out)
+
+
+def test_braced_early_return_reaches_guard_inversion():
+    source = '''s32 f(void *p) {
+    if (p == NULL) {
+        return 0;
+    }
+    M2C_FIELD(p, s32 *, 8) = 3;
+    return 1;
+}'''
+    labels = {}
+    texts = draft_repairs.variants(source, 'f', 'mips', '', FLAGS, labels, limit=None, header=HEADER)
+    assert any(labels.get(text) == 'guard_inversion' and 'if (p != NULL)' in text for text in texts)
+
+
+def test_mixed_call_arity_repair_reaches_draft_search():
+    source = '''extern void *state;
+int g();
+void f(int value) {
+    int saved = g(1);
+    g(saved, state);
+}'''
+    asm = '''addiu $a0, $zero, 1
+jal g
+nop
+move $a0, $s0
+jal g
+nop
+'''
+    labels = {}
+    texts = draft_repairs.variants(source, 'f', 'mips', asm, FLAGS, labels, limit=None, header=HEADER)
+    assert any(labels.get(text) == 'target_call_arity' and 'g(saved);' in text for text in texts)
+
+
+def test_unsigned_parameter_used_for_high_bytes_gets_unsigned_widening():
+    source = '''void f(u8 value, void *out) {
+    M2C_FIELD(out, s8 *, 0) = (s8)(value >> 8);
+    M2C_FIELD(out, s8 *, 1) = (s8)(value >> 0x18);
+}'''
+    labels = {}
+    texts = draft_repairs.variants(source, 'f', 'mips', '', FLAGS, labels, limit=None, header=HEADER)
+    assert any(labels.get(text) == 'narrow_widening' and 'u32 value' in text for text in texts)

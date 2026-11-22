@@ -159,8 +159,9 @@ class Lanes:
         return self._request(function_log, action='search', slug=slug, name=name, minutes=minutes,
                              variants=variants, **options)
 
-    def donors(self, slug, function_ids, function_log):
-        return self._request(function_log, action='donors', slug=slug, function_ids=function_ids)
+    def donors(self, slug, function_ids, function_log, *, imported_since=None):
+        return self._request(function_log, action='donors', slug=slug, function_ids=function_ids,
+                             imported_since=imported_since)
 
     def _request(self, function_log, **payload):
         function_log.check_cancel()
@@ -370,7 +371,7 @@ def child(db_path, workspace, background):
                 if stop.is_set():
                     raise _Cancelled('Deep pass stopped')
         try:
-            options = {key: message[key] for key in ('compiler_profiles', 'threads_per_function') if key in message}
+            options = {key: message[key] for key in ('compiler_profiles', 'threads_per_function', 'expanded_budget') if key in message}
             result = deep_permuter.run(net, message['slug'], message['name'], message['minutes'], message['variants'],
                                        Log(), **options)
             finished.set()
@@ -397,7 +398,8 @@ def child(db_path, workspace, background):
         try:
             def report(value):
                 emit({'kind': 'progress', 'ident': ident, 'value': value})
-            result = search_partition(net, message['slug'], message['function_ids'], stop, report)
+            result = search_partition(net, message['slug'], message['function_ids'], stop, report,
+                                      imported_since=message.get('imported_since'))
             emit({'kind': 'reply', 'ident': ident, 'result': result})
         except Exception as error:
             log.exception('Cross-game search lane failed')
