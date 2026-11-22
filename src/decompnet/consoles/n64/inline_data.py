@@ -23,6 +23,21 @@ _LITERALS = (
     ('03e0000827bd00300c02755c', 48, 4, '13ec5d51f99bd16db8707a6998bed12b30068088386b351723a223853d3dc3df'),
     ('03e0000827bd00403c028017', 52, 12, '34b121cd140788b5b23116223e23dd20bcb5524bb5558bb35b865c7ea7afbdac'),
     ('03e00008000000002c420001', 48, 4, '49830624758d30c49e92e004a0853afc50fde493869335ccd655082f6acab850'),
+    # Unentered compiler marker words sit between closed returns and called entries.
+    ('03e000080000000052000004', 48, 4, '3be9e47dc91c673cb93e9e513ed3b6229aba4a2f78082a446da0ead14bb5ac02'),
+    ('03e000080000000053544154', 48, 4, 'd8f4b132316edaac2f5178fbe8ec303fb25c608443d9e0ccd2e1e68b8784d734'),
+    ('03e000080000000052000044', 48, 4, '83178991f99bcc0041ab47a2c0c583c3fd6abfc6203cd9c04df32b939dc5cb8d'),
+    ('03e000080000000052000000', 48, 4, 'b0ac798cab20dc9a9369753f71196cf6b33710f85be21970726e39ed95cefa3b'),
+    ('03e000080000000010000000', 48, 4, 'fa6d59dfa548cce49e4a461e2ab122dfe551391100f6f1d276fae3be566bf583'),
+    ('03e000080000000052495054', 48, 4, 'be2d9b59b841da75e5558b16da535455a324957ac2776a94515820d716b02e6b'),
+    ('03e000080000000052000016', 48, 4, '2aacfa79b7bc53846081c07edea6df7d658b9a5a9ffd9a8a9c02934052fe4ebc'),
+    ('03e000080000000010400016', 48, 4, '453dae64d91224c009d97ea335665532d6474e111016dcec634b27d0649f2bd8'),
+    ('03e000080000000008001100', 48, 4, 'd21e5ad9c226075a16d1a76d353d4b7e4d4c738a7df91a6d234eb41c5bda3b0f'),
+    ('03e000080000000001000008', 48, 4, '3ec66f24afd9310290010b72eb820a4c88f2dbd82f2a9578c2267821ee8607c3'),
+    ('03e00008000000000b696478', 48, 4, '978c199c82659070959cabe8d2e21f97ee17a723cccfeb5f95fb6757b561b984'),
+    ('03e000080140102100000008', 48, 4, '3a1a332bb8fa429785827f8614c1f26f45582675a1f9021fd5ffc0e5ede372da'),
+    # An unentered scheduling NOP sits between a boot call and a CP0 entry.
+    ('0c0258940000202500000000', 48, 4, '4f7df4643dae98253995027c806f62745d748f373ee367a593e746032490efae'),
     # The task's verified boot and text pointers address RSP code in this DMA bank.
     # Keep the microcode's tail out of the VR4300 function inventory.
     ('000000000000000009000419', 5736, 5728, '4a6a97f4bc7f9fd0382c92e810f62763d18bc0674515ea23f03ef2abe90df621'),
@@ -135,10 +150,46 @@ def _startup_padding(image, ranges):
             yield start, start+12
 
 
+def _stack_padding(image, ranges):
+    """Keep a zero-filled startup stack out of the function inventory."""
+    if len(image) < 0x1008:
+        return
+    high, low = struct.unpack_from('>2I', image, 0x1000)
+    if high >> 16 != 0x3c1d or low >> 16 != 0x27bd:
+        return
+    value = low & 0xffff
+    target = (((high & 0xffff) << 16) + (value-0x10000 if value & 0x8000 else value)) & 0xffffffff
+    mapped = [(start + target-base, end) for start, end, base in ranges
+              if base <= target < base+end-start]
+    if len(mapped) != 1:
+        return
+    start, limit = mapped[0]
+    if start % 4 or start+64 > limit or any(image[start:start+64]):
+        return
+    match = re.search(rb'[^\0]', image[start:limit])
+    end = start + (match.start() if match else limit-start)
+    end &= ~3
+    for lo, hi, base in ranges:
+        for offset in range(lo, hi-3, 4):
+            word = int.from_bytes(image[offset:offset+4], 'big')
+            op = word >> 26
+            pc = base+offset-lo
+            if op in (2, 3):
+                dest = ((pc+4)&0xf0000000) | ((word&0x3ffffff)<<2)
+            elif op in (1, 4, 5, 6, 7, 20, 21, 22, 23) or op == 17 and (word >> 21)&31 == 8:
+                delta = word&0xffff
+                dest = pc+4+(delta-0x10000 if delta&0x8000 else delta)*4
+            else:
+                continue
+            if target <= dest < target+end-start:
+                return
+    yield start, end
+
+
 def apply(config, image, log=print):
     """Split mapped text subsegments at verified inline data boundaries."""
     code = split.code_ranges(config)
-    regions = sorted([*spans(image), *_startup_padding(image, code)])
+    regions = sorted([*spans(image), *_startup_padding(image, code), *_stack_padding(image, code)])
     if not regions:
         return
     ranges = {start: end for start, end, _ in code}

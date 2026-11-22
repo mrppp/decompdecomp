@@ -6,6 +6,23 @@ KMC = 'gcc-2.7.2-kmc'
 EGCS = 'gcc-egcs-2.91.66'
 
 
+def test_case_float_sign_route_requires_both_measured_changes():
+    source = ('extern float step; void f(int kind) { switch (kind) {'
+              'case 1: step = 0.1f; break; case 2: step = -0.1f; break; } }')
+    rows = [
+        ('i', 'lui $at, 0xbdcc', 'lui $at, 0x3dcc'),
+        (' ', 'ori $at, $at, 0xcccd', 'ori $at, $at, 0xcccd'),
+        (' ', 'mtc1 $at, $f0', 'mtc1 $at, $f0'),
+        ('i', 'lui $at, 0x3dcc', 'lui $at, 0xbdcc'),
+        (' ', 'ori $at, $at, 0xcccd', 'ori $at, $at, 0xcccd'),
+        (' ', 'mtc1 $at, $f0', 'mtc1 $at, $f0'),
+    ]
+    options = dict(proposals(source, 'f', '', 'mips', 'gcc-2.7.2-kmc', rows, ''))
+    assert 'case 1: step = -0.1f; break; case 2: step = 0.1f;' in options['measured_case_float_sign']
+    options = dict(proposals(source, 'f', '', 'mips', 'gcc-2.7.2-kmc', rows[:3], ''))
+    assert 'measured_case_float_sign' not in options
+
+
 def case_rows(*ops):
     return [(' ', '', '')] + [('<', op, '') for op in ops]
 
@@ -2270,3 +2287,274 @@ def test_byte_signature_routes_to_kmc_with_symbol_resolver(monkeypatch):
     assert 'byte_signature_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, '', resolve=resolver))
     assert 'byte_signature_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, '', resolve=resolver))
     assert 'byte_signature_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, '', resolve=resolver))
+
+
+def test_scoped_float_phase_initializer_is_routed_for_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    source = 'void update(void) {}'
+    rows = [('>', '', 'move $s5, $zero')]
+    trial = diff_gated_repairs.scoped_phase_initializer
+
+    def variant(text, name, received, *, header, max_bytes):
+        assert (text, name, received, header) == (source, 'update', rows, '')
+        assert max_bytes == diff_gated_repairs.MAX_SOURCE_BYTES
+        return [(trial.FAMILY, 'void update(void) { return; }')]
+
+    monkeypatch.setattr(trial, 'variants', variant)
+    for compiler in (KMC, EGCS, 'ido-7.1'):
+        labels = dict(proposals(source, 'update', '', 'mips', compiler, rows, ''))
+        assert (trial.FAMILY in labels) == (compiler == KMC)
+
+
+def test_phase_projection_holders_route_only_for_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    source = 'void update(void) {}'
+    rows = [('r', 'lwc1 $f26, 0x14($s1)', 'lwc1 $f20, 0x14($s1)')]
+    trial = diff_gated_repairs.phase_projection_holders
+
+    def variant(text, name, received, *, header, max_bytes):
+        assert (text, name, received, header) == (source, 'update', rows, '')
+        assert max_bytes == diff_gated_repairs.MAX_SOURCE_BYTES
+        return [(trial.FAMILY, 'void update(void) { return; }')]
+
+    monkeypatch.setattr(trial, 'variants', variant)
+    for compiler in (KMC, EGCS, 'ido-7.1'):
+        labels = dict(proposals(source, 'update', '', 'mips', compiler, rows, ''))
+        assert (trial.FAMILY in labels) == (compiler == KMC)
+
+
+def test_guarded_signed_byte_routes_to_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    monkeypatch.setattr(diff_gated_repairs.measured_guarded_byte, 'variants',
+                        lambda text, name, header, diff: [('guarded_byte_fixture', text)])
+    assert 'guarded_byte_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, ''))
+    assert 'guarded_byte_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, ''))
+    assert 'guarded_byte_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, ''))
+
+
+def test_list_key_search_routes_to_kmc_with_resolver(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    resolver = lambda symbol: 123  # noqa: E731
+    monkeypatch.setattr(diff_gated_repairs.measured_list_key_search, 'variants',
+                        lambda text, name, header, diff, resolve: [('list_key_fixture', text)] if resolve is resolver else [])
+    assert 'list_key_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, '', resolve=resolver))
+    assert 'list_key_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, '', resolve=resolver))
+    assert 'list_key_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, '', resolve=resolver))
+
+
+def test_strided_halfword_copy_routes_to_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    monkeypatch.setattr(diff_gated_repairs.measured_strided_halfword_copy, 'variants',
+                        lambda text, name, header, diff: [('strided_copy_fixture', text)])
+    assert 'strided_copy_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, ''))
+    assert 'strided_copy_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, ''))
+    assert 'strided_copy_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, ''))
+
+
+def test_word_byte_packing_routes_to_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    monkeypatch.setattr(diff_gated_repairs.measured_word_byte_packing, 'variants',
+                        lambda text, name, header, diff: [('word_byte_fixture', text)])
+    assert 'word_byte_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, ''))
+    assert 'word_byte_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, ''))
+    assert 'word_byte_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, ''))
+
+
+def test_balanced_signed_reset_copy_routes_only_for_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    source = 'void update(void) {}'
+    rows = [('r', 'move $v0, $v1', 'move $v1, $v0')]
+    trial = diff_gated_repairs.balanced_reset_copy
+
+    def variant(text, name, received, *, header, max_bytes):
+        assert (text, name, received, header) == (source, 'update', rows, '')
+        assert max_bytes == diff_gated_repairs.MAX_SOURCE_BYTES
+        return [(trial.FAMILY, 'void update(void) { return; }')]
+
+    monkeypatch.setattr(trial, 'variants', variant)
+    for compiler in (KMC, EGCS, 'ido-7.1'):
+        labels = dict(proposals(source, 'update', '', 'mips', compiler, rows, ''))
+        assert (trial.FAMILY in labels) == (compiler == KMC)
+
+
+def test_balanced_inline_field_writeback_is_routed_for_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    source = 'void update(void) {}'
+    rows = [('r', 'addiu $v0, $v1, -1', 'addiu $v0, $v0, -1')]
+    trial = diff_gated_repairs.balanced_inline_writeback
+
+    def variant(text, name, received, *, header, max_bytes):
+        assert (text, name, received, header) == (source, 'update', rows, '')
+        assert max_bytes == diff_gated_repairs.MAX_SOURCE_BYTES
+        return [(trial.FAMILY, 'void update(void) { return; }')]
+
+    monkeypatch.setattr(trial, 'variants', variant)
+    for compiler in (KMC, EGCS, 'ido-7.1'):
+        labels = dict(proposals(source, 'update', '', 'mips', compiler, rows, ''))
+        assert (trial.FAMILY in labels) == (compiler == KMC)
+
+
+def test_saved_pointer_copy_routes_to_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    monkeypatch.setattr(diff_gated_repairs.measured_saved_pointer_copy, 'variants',
+                        lambda text, name, header, diff: [('saved_pointer_fixture', text)])
+    assert 'saved_pointer_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, ''))
+    assert 'saved_pointer_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, ''))
+    assert 'saved_pointer_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, ''))
+
+
+def test_forward_entry_pointer_routes_to_kmc_with_asm(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    monkeypatch.setattr(diff_gated_repairs.measured_forward_entry_pointer, 'variants',
+                        lambda text, name, header, diff, asm: [('entry_pointer_fixture', text)] if asm == 'asm' else [])
+    assert 'entry_pointer_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, 'asm'))
+    assert 'entry_pointer_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, 'asm'))
+    assert 'entry_pointer_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, 'asm'))
+
+
+def test_frameless_padding_routes_to_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    monkeypatch.setattr(diff_gated_repairs.measured_frameless_padding, 'variants',
+                        lambda text, name, header, diff: [('frameless_padding_fixture', text)])
+    assert 'frameless_padding_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, ''))
+    assert 'frameless_padding_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, ''))
+    assert 'frameless_padding_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, ''))
+
+
+def test_branch_byte_tail_routes_to_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    monkeypatch.setattr(diff_gated_repairs.measured_branch_byte_tail, 'variants',
+                        lambda text, name, header, diff: [('byte_tail_fixture', text)])
+    assert 'byte_tail_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, ''))
+    assert 'byte_tail_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, ''))
+    assert 'byte_tail_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, ''))
+
+
+def test_packed_quad_routes_to_kmc_with_abi_evidence(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    monkeypatch.setattr(diff_gated_repairs.measured_packed_quad, 'variants',
+                        lambda text, name, header, diff, flags, big: [('packed_quad_fixture', text)] if big else [])
+    assert 'packed_quad_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, '', big_endian=True))
+    assert 'packed_quad_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, '', big_endian=False))
+    assert 'packed_quad_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, '', big_endian=True))
+
+
+def test_indexed_allocations_route_to_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    monkeypatch.setattr(diff_gated_repairs.measured_indexed_allocations, 'variants',
+                        lambda text, name, header, diff: [('indexed_alloc_fixture', text)])
+    assert 'indexed_alloc_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, ''))
+    assert 'indexed_alloc_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, ''))
+    assert 'indexed_alloc_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, ''))
+
+def test_stack_vector_call_reload_routes_to_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'lwc1 $f20, 0x10($sp)', 'lwc1 $f0, 0x10($sp)')]
+    monkeypatch.setattr(diff_gated_repairs.stack_vector_call_reload, 'variants',
+                        lambda text, name, asm: [('stack_vector_fixture', text)] if asm == 'target evidence' else [])
+    assert 'stack_vector_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, 'target evidence'))
+    assert 'stack_vector_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, 'target evidence'))
+
+
+
+def test_byte_loop_key_routes_to_kmc_with_flags_and_resolver(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    resolver = lambda symbol: 123  # noqa: E731
+    monkeypatch.setattr(diff_gated_repairs.measured_byte_loop_key, 'variants',
+                        lambda text, name, header, diff, flags, resolve: [('byte_loop_fixture', text)] if resolve is resolver else [])
+    assert 'byte_loop_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, '', resolve=resolver))
+    assert 'byte_loop_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, '', resolve=resolver))
+    assert 'byte_loop_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, '', resolve=resolver))
+
+
+def test_guarded_zero_routes_to_kmc(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'nop', 'nop')]
+    monkeypatch.setattr(diff_gated_repairs.measured_guarded_zero, 'variants',
+                        lambda text, name, header, diff: [('guarded_zero_fixture', text)])
+    assert 'guarded_zero_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, ''))
+    assert 'guarded_zero_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, ''))
+    assert 'guarded_zero_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', 'ido-7.1', rows, ''))
+
+
+def test_fixed_blend_routes_only_to_kmc_mips(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'mult $v0, $a2', 'mult $v1, $a2')]
+    monkeypatch.setattr(diff_gated_repairs.fixed_blend_staging, 'variants',
+                        lambda text, name, diff, *, header: [('fixed_blend_fixture', text)])
+    assert 'fixed_blend_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, ''))
+    assert 'fixed_blend_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, ''))
+    assert not proposals('void f(void) {}', 'f', '', 'arm', KMC, rows, '')
+
+
+def test_flag_count_loop_receives_project_symbol_resolver(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'lw $v0, 0($a0)', 'lw $v1, 0($a0)')]
+    resolve = lambda name: {'bound': 0x1000}.get(name)
+
+    def candidate(text, name, header, diff, resolver):
+        assert resolver is resolve
+        return [('flag_count_fixture', text)]
+
+    monkeypatch.setattr(diff_gated_repairs.measured_flag_count_loop, 'variants', candidate)
+    assert 'flag_count_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, '', resolve=resolve))
+    assert 'flag_count_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, '', resolve=resolve))
+
+
+def test_indexed_setup_receives_target_flags_and_symbol_resolver(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'lw $v0, 0($a0)', 'lw $v1, 0($a0)')]
+    flags = ('-mgp32',)
+    resolve = lambda name: {'table': 0x1000}.get(name)
+
+    def candidate(text, name, header, diff, compiler_flags, resolver):
+        assert compiler_flags is flags and resolver is resolve
+        return [('indexed_setup_fixture', text)]
+
+    monkeypatch.setattr(diff_gated_repairs.measured_indexed_setup, 'variants', candidate)
+    assert 'indexed_setup_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, '',
+                                                     flags=flags, resolve=resolve))
+    assert 'indexed_setup_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, '',
+                                                         flags=flags, resolve=resolve))
+
+
+def test_field_base_lifetimes_route_only_to_kmc_mips(monkeypatch):
+    from decompnet.app import diff_gated_repairs
+
+    rows = [('r', 'lw $v0, 0($a0)', 'lw $v1, 0($a0)')]
+    monkeypatch.setattr(diff_gated_repairs.measured_field_base_lifetimes, 'variants',
+                        lambda text, name, header, diff: [('field_base_fixture', text)])
+    assert 'field_base_fixture' in dict(proposals('void f(void) {}', 'f', '', 'mips', KMC, rows, ''))
+    assert 'field_base_fixture' not in dict(proposals('void f(void) {}', 'f', '', 'mips', EGCS, rows, ''))
+    assert not proposals('void f(void) {}', 'f', '', 'arm', KMC, rows, '')

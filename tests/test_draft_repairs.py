@@ -24,6 +24,19 @@ def test_early_return_is_shared_and_keeps_expression(arch):
     assert any('if (x < 0) return 0;' in out and 'return (int)root((float)x);' in out for out in outputs)
 
 
+def test_guard_with_call_returns_can_be_inverted():
+    src = '''int f(int x) {
+    if (x == 1) {
+        return send(x);
+    }
+    return receive(x, nested());
+}
+'''
+    outputs = variants(src, 'f', 'mips', limit=None)
+    assert any('if (x != 1)' in out and out.index('return receive(x, nested());') < out.index('return send(x);')
+               for out in outputs)
+
+
 def test_nested_call_argument_boundary_and_opaque_text():
     src = 'int f(int x) { /* other(x, 123) */ return send(inner(x, 2), 0x40); }'
     out = variants(src, 'f', 'mips')
@@ -458,3 +471,22 @@ float f(float x, float y, int enabled) {
     [clamp] = [candidate for candidate in proposals if labels[candidate] == 'split_float_clamp_lifetime']
     assert 'float __repair_clamped_float = x / y;' in clamp
     assert 'value = x + y;' in clamp
+
+
+def test_shifted_byte_lifetime_is_offered_to_the_permuter():
+    source = '''
+void f(Voice *v, Note *n) {
+    u32 pitch;
+    u32 w;
+    pitch = ((u32) (((u8 *) n)[2] * v->rate)) >> 7;
+    pitch += ((u8 *) n)[1] << 16;
+    w = n->word;
+    use(pitch, w);
+}
+'''
+    labels = {}
+    children = variants(source, 'f', 'mips', labels=labels, header='typedef volatile u32 vu32;')
+    assert any(labels.get(child) == 'shifted_byte_lifetime' and
+               'if (__repair_shifted_byte & 1)' in child for child in children)
+    assert not any(labels.get(child) == 'shifted_byte_lifetime'
+                   for child in variants(source, 'f', 'x86', labels=labels))

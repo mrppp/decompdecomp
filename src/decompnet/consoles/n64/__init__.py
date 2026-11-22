@@ -11,7 +11,7 @@
 - indexed_overlays.py: shared RAM slots and DMA bounds recovered from loader arrays and cache calls.
 - inferred_overlays.py: overlapping code-bank mappings supported by independently called local entries.
 - inline_data.py: verified constants and alignment bytes embedded among code.
-- boot_gzip.py, boot_raw_deflate.py, boot_brs.py: compressed programs placed at addresses supplied by the boot loader.
+- boot_gzip.py, boot_raw_deflate.py, boot_brs.py, boot_refpack.py: compressed programs placed by the boot loader.
 - boot_mapping.py: returning TLB boot stubs separated from code with a strongly supported later load mapping.
 - sdk_assembly.py: exact self-contained libultra body fingerprints, classified before C claims.
 - port.py: its port kit, libultraship and Torch: what they replace and which graphics microcode they render.
@@ -365,6 +365,11 @@ class Nintendo64(Console):
         """splat's look at the code first (it says KMC or IDO), then the ROM reader's."""
         by_guess = {c.guess: c.id for c in self.compilers if c.guess}
         return by_guess.get(splat_guess) or by_guess.get(info.get("compiler_guess", "")) or self.compilers[0].id
+
+    def splat_create_config(self, args, workdir, log):
+        from .splat_config import create
+
+        return create(args, workdir, log)
 
     def add_code(self, config: Path, workdir: Path, image: str, picked: Picked, log=print) -> str:
         from .code import add_segments

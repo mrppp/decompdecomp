@@ -1,5 +1,24 @@
 # Compiler matching learning log
 
+### KMC GCC 2.7.2: vary independent float capture and store orders together
+
+A private N64 draft scored 1,115 with `-G0 -mips3 -mgp32 -mfp32 -O2`.
+The draft captured several float sums through an inline helper and
+then stored them to distinct offsets from one base. Changing both
+the order of the captures and the order of the stores scored 1,105.
+The combined search keeps all captures ahead of all stores and
+requires measured evidence of mismatched store offsets. The target
+remains unmatched.
+
+### KMC GCC 2.7.2: restore opposite float constants in two switch cases
+
+A private N64 draft scored 120 under `-G0 -mips3 -mgp32 -mfp32 -O2`.
+Two aligned float materializations had the same low halves as the
+target, with both sign bits reversed. Exchanging the signs in the two
+cases that set the same float scored 100 through the normal judge.
+The rule requires the paired instruction evidence and a unique source
+pair. The example remains unmatched.
+
 ### KMC GCC 2.7.2: hoist a counter start without a one-shot scope
 
 A private N64 draft scored 11,072 under `-G0 -mips3 -mgp32 -mfp32 -O2`.
@@ -16032,3 +16051,255 @@ Two saved MIPS examples built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` 
 ### KMC GCC 2.7.2 staged byte signature
 
 A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` checked three signature bytes. The generated draft's combined condition used different registers and a shared result copy. Staging the input bytes and comparison constants in word locals changed the linked difference score from 250 to an exact match while retaining the integer return type. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the complete source, measured instructions and constants, and resolved addresses for all three byte loads.
+
+### Restore a natural pointer spill through the shared reset word
+
+A private N64 function built with
+`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` stored a cached pointer in
+an explicit frame member. The target used a separate register at entry
+and at two nested reloads, and its final call filled the global
+arguments before reloading the pointer. Keeping the pointer as a
+scalar alone displaced an accumulator and lost the jump-table
+bindings. Reusing a known zero word in repeated calls restored the
+natural pointer spill and final call order.
+
+Removing the unused frame tail restored the original frame and slot,
+reducing the linked score from 675 to 390. Sharing that zero's float
+view for the first stack reset brought the score to 385. Both linked
+trials retained 3,034 instructions and all three jump tables. The
+repeated calls themselves still differ in the register that supplies
+zero. This is one measured case. The trial checks pointer loads,
+register use, reset word ownership and entry into the reset scope
+before asking the judge to test the change.
+
+### Inline a staged global-backed float capture and reschedule its stores
+
+A private N64 function built with
+`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` read an external float
+before its actor field when both were passed through an inline sum
+helper. The target read the field first. Expressing that capture as
+direct arithmetic and bringing an independent store forward reduced
+the linked score from 855 to 780. Also inlining the terminal union-backed
+capture and transposing two earlier stores from the target order brought
+the score to 675. The original frame, all three jump tables and 3,034
+instructions were retained. This is measured evidence from one function.
+
+Inlining the global capture alone added a delay-slot nop and lost a
+jump-table binding. The trial checks the crossed global and field loads
+and reordered stores on the same base. Every capture remains ahead of
+distinct aligned stores, and the judge must verify the resulting bytes.
+
+### Scope an accumulator initializer before a setup call
+
+A private N64 function built with
+`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` initialized a motion
+accumulator after an unrelated flag guard. KMC placed that move in a
+later countdown branch delay slot, which changed three branch
+encodings. Declaring and initializing the accumulator in a new scope
+after the two reset stores and before the setup call restored those
+branches. The linked score fell from 1,070 to 855 with the original
+frame, all three jump tables and 3,034 instructions.
+
+Placing the declaration at the phase entry scored 1,055. Simply moving
+the unscoped assignment before the guard scored 1,085 and swapped two
+long-lived registers. The trial checks the delayed move and matching
+flag, call and byte offset. It also checks that all uses fit within the
+new scope and that no branch can enter that scope after the initializer.
+
+### Reuse dead phase locals to recover direct positive zeros
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a private N64 function
+already held a sampled axis and a blend gain in saved floating-point
+registers. Both values were dead before the next projection. Reusing the
+axis local for the reload and the gain local for the absolute result lets
+the first projection accumulate into its initialized local. The two
+positive-zero expressions now compile to direct transfers with their
+original delay instructions. The linked score fell from 1,755 to 1,260
+with all 3,034 instructions and all three jump tables. This allocation
+swapped the general-purpose registers for the two motion accumulators.
+
+Moving the first accumulator's zero initialization across an intervening
+guard that never reads it restored those two register assignments and
+scored 1,245. The prologue and all jump tables remained intact. The staged
+stack storage remains reserved to preserve the frame layout. Removing the
+stages without changing the projection left the last jump table unresolved.
+Changing the accumulation alone displaced other saved registers and left two
+tables unresolved. These are pinned compiler replays against one private
+function. Synthetic regressions cover the observed operand relationships and
+the requirement that the reused locals are dead on every outgoing path.
+
+
+### KMC GCC 2.7.2 guarded signed-byte read
+
+A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` advanced a cursor, compared it with an end address and checked a signed byte when still in range. Its generated draft read a word at the cursor. Switching to a signed byte reduced the linked difference score from 255 to 55; wrapping the end assignment in a single-iteration scope restored the target's saved-register order and produced an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the measured instructions and complete source shape.
+
+### KMC GCC 2.7.2 list key search
+
+A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` searched a null-terminated list for a matching word key. The generated draft used explicit jumps and a shared result variable. Returning directly from a conventional list loop changed the linked difference score from 265 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the complete generated source, the measured instructions and field offsets, and the resolved list-head address.
+
+### KMC GCC 2.7.2 strided halfword copy
+
+A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` copied a rectangular block of halfwords, advancing the source by four bytes per item and skipping 0x500 bytes after each row. The generated draft used byte pointers and an explicit inner-loop jump. Restoring typed halfword pointers and nested loops changed the linked difference score from 286 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the complete generated loop, measured load/store instructions, bounds and strides.
+
+### KMC GCC 2.7.2 word-to-byte packing
+
+A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` split a word into four byte stores. The generated draft declared its value as an unsigned byte, causing the compiler to store zero for the upper bytes. Widening the parameter to an unsigned word changed the linked difference score from 315 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the complete source, all measured shifts and store offsets, and no conflicting function declaration.
+
+### Compare the signed reset through its saved copy
+
+With `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a private N64 function
+copied a signed byte into a signed halfword for its conditional increment.
+Making the comparison use that copy too, and writing the reset byte after
+the local comparison, restored seven instructions with their original
+registers. The comparison alone needed a larger frame and scored 1,114.
+A now-unused final scratch word in the private frame could be removed to
+restore the original offsets. That pairing reduced the linked score from
+1,115 to 1,080 and retained 3,034 instructions and all three jump tables.
+Removing the scratch word alone reduced the frame below its original size
+and scored 1,149.
+
+The proposal needs the linked reset, load, compare and increment flow,
+the same source field offsets and signed widths, and an unused final
+scratch word in a local record. The compiler evidence comes from one
+private replay, with synthetic tests for the rule's guards.
+
+### Balance a signed countdown with inline field sums
+
+In a private N64 function built with
+`gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`, a direct signed-byte
+field decrement restored a move in a branch delay slot. It also shifted
+the last jump table by one instruction. Expressing all six staged field
+sums through a shared inline load-and-add function gave the scheduler
+independent stores to place between the final integer-to-float transfer
+and its sum. That removed the preceding delay instruction and restored
+the table positions. The linked score fell from 1,245 to 1,115, with all
+3,034 instructions and all three jump tables. Several writeback
+registers and the store order still differ.
+
+Both argument orders in the inline helper produced the same linked
+instructions. Using it only for the speed and roll fields or only for
+the three position components left the last table unresolved. Synthetic
+regressions require the linked countdown, transfer and six field
+offsets. The rewrite checks that the original operands are float values
+to preserve the arithmetic width.
+
+
+### KMC GCC 2.7.2 saved pointer for a final call
+
+A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` freed two owned blocks and then freed their owner. Its draft reused one saved register for the owner, while the target kept a separate copy for the final call. Copying the unchanged pointer at entry and using the copy for that call changed the linked difference score from 374 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the measured saved-register moves and rejects a parameter that is reassigned or whose address escapes.
+
+### KMC GCC 2.7.2 forwarded entry pointer
+
+A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` wrote a command and passed its context pointer to a helper. The generated draft instead passed the command constant as the helper's argument. Forwarding the pointer and correcting the local prototype changed the linked difference score from 325 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the target control flow to prove the incoming pointer reaches the unique call unchanged, and rejects ambiguous prototypes and pointer mutations.
+
+### KMC GCC 2.7.2 unused frame in a leaf loop
+
+A saved MIPS byte-fill example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` reserved an eight-byte stack frame but otherwise matched a frameless generated draft. Declaring an unused two-word local changed the linked difference score from 320 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires an otherwise identical leaf instruction stream, matching frame entry and return restoration, and branch destinations shifted only by the extra entry instruction.
+
+### KMC GCC 2.7.2 byte-store branch tail
+
+A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` selected between two groups of byte stores followed by a shared byte store. Duplicating that last store into both source arms changed the linked difference score from 350 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the measured branch/store sequence and two complete arms containing only byte stores to the same object.
+
+### KMC GCC 2.7.2 packed command and stack halfword
+
+A saved big-endian MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` packed four small fields into two command words. The generated draft combined the fields in a different order and loaded the fifth argument as a word rather than its low halfword. Restoring the measured staging and halfword access changed the linked difference score from 315 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the complete source and instruction shape, the big-endian 32-bit ABI, and no conflicting declaration.
+
+### KMC GCC 2.7.2 indexed allocation loop
+
+A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` allocated and cleared buffers using a count array and a pointer array. Its generated draft advanced two cursors, while the target corresponded to one index with separate two-byte and four-byte strides. Restoring the indexed form changed the linked difference score from 300 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the complete generated loop and the measured branch, stride, count and pointer-store evidence.
+
+### KMC GCC 2.7.2 stack vector output reused across calls
+
+A saved MIPS wrapper built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` called the same callee twice with one stack output. The original draft subtracted each component from itself after the second call. Saving each component before that call changed the linked score from 972 to a byte match with the original frame extent. The rule requires two calls using the same output slot, three preserved float loads, and subtraction against three matching reloads. This is evidence from one saved function.
+
+
+### KMC GCC 2.7.2 byte loop comparison key
+
+A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` scanned records and compared a byte with a staged address value. The generated draft read a word and initialized the loop offset before staging the address. Correcting the load width reduced the linked difference score from 260 to 60; staging the address before the offset produced an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the measured instruction order, 32-bit ABI and resolved table address.
+
+### KMC GCC 2.7.2 zero initialization after a guard call
+
+A saved MIPS example built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` initialized a loop counter after a guard call. The generated draft initialized it before the call. Moving the non-escaped local initialization into the guarded block changed the linked difference score from 390 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The proposal requires the measured call and branch sequence and rejects observable uses outside the block.
+
+### C89 byte-mask retry candidates
+
+On an N64 function, GCC 2.7.2 KMC (`-G0 -mips3 -mgp32 -mfp32 -O2`) left one operand difference: the target had `andi 0xff` after `lbu`, while a saved source with `& 0x7f` scored 10. That mask is not behaviorally equivalent for values with bit 7 set, so it is a search seed, not evidence of correct source. Explicit `& 0xff` or an unsigned-char cast eliminated the redundant instruction and scored 240. Twenty-five additional cast, arithmetic and bitwise spellings likewise scored 240–380, and conditional intermediate forms scored 350–1455; none matched. These are observations on one function, not controlled regression results.
+
+The `last_byte_mask` family previously produced five candidates from that seed: two scored 240 and three were rejected, two because declarations followed statements under C89 and one because it used forbidden inline assembly. Moving declarations to function entry and omitting inline assembly produced four compiling candidates, scoring 240, 240, 240 and 330 in the standalone app judge. This improves valid search coverage; it does not improve the function's score. The library regression checks declaration placement and excludes inline assembly.
+### KMC GCC 2.7.2 branch between call returns
+
+A saved MIPS message-queue wrapper built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` returned the result of one of two calls. Widening a parameter from a byte to `s32` changed the linked difference score from 976 to 220; inverting the final guard so the other call returned first produced an exact match. This is one saved example, not a controlled cross-compiler experiment. The return expressions remain in their original execution paths.
+
+### Alternate IDO optimization for similar donor functions
+
+In an isolated N64 cross-game search, an SDK DMA routine compiled from the donor
+with IDO 7.1 `-O2 -G 0 -mips2 -32 -non_shared -Xcpluscomm -Wab,-r4300_mul`
+produced 132 bytes against a 140-byte target. The same source at `-O1`
+reproduced the linked target exactly. An SDK peripheral I/O routine also matched
+with the donor's IDO 7.1 `-O1` profile. Both source/header/profile pairs were
+compiled again and saved by the destination app's exact judge. The similar
+donor search now tries the existing bounded optimization alternatives when a
+search encounters a compiled length mismatch.
+
+### KMC GCC 2.7.2 fixed-point vector blend staging
+
+A saved three-component MIPS blend built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` multiplied two signed halfword inputs by integer gains, added them, and biased negative sums before shifting. Staging each product and rounded shift and reusing the first gain after its last read changed the generated draft's linked difference score from 995 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The candidate requires the complete source shape and six target multiplies and three arithmetic shifts; the judge still verifies every proposed match.
+
+A follow-up found the missing combination on the same function: a volatile byte read retains the target's `andi 0xff`, but using the multiplication inline materializes the global address and scores 435. Assigning the scaled index to a signed `int` temporary immediately before that read restores the target's indexed addressing; the exact standalone app judge scores the generated full-byte candidate 0 from the saved score-10 seed. The byte is read once, and the comparison covers all eight bits. `last_byte_mask` now emits that combined form for signed integer parameters; the library and app routing regressions verify the proposal. This is one function's measured result.
+### A shifted byte as an allocation lifetime
+
+Compiler: `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. On one N64 function (99 instructions), the exact
+standalone judge reproduced the saved score 10: the two loads feeding a multiply used each other's registers.
+Staging the shifted byte in an initialized `u32`, commutating the multiply, and putting the next ordinary member
+read in identical arms guarded by `shifted_byte & 1` scored 0. The guard is always false because the byte was
+shifted left by 16; both arms perform the same read. This is one function, not a controlled compiler regression.
+The `shifted_byte_lifetime` family emits the combination as one candidate.
+
+A combined multiply/shift/add expression also scored 10, fixing the load registers but moving the two differences
+to the shift destination and following addition. Staging the loads, adding unused wide locals, and the existing
+allocation-schedule bridge did not improve the score. `-fno-schedule-insns` and `-fno-schedule-insns2` scored
+1045 and 460 respectively; disabling CSE follow-jumps, peephole or strength reduction retained 10.
+
+### KMC GCC 2.7.2 counted flag walk
+
+A saved MIPS record-counting function built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` tested two flag masks while walking a globally sized array. Its generated draft addressed the count as an offset from another symbol and used nested labels. Resolving the exact count symbol and simplifying the equivalent branches changed the linked difference score from 710 to an exact match. This is one saved example, not a controlled cross-compiler experiment. The candidate checks the original and target symbol addresses, the complete source shape, and the measured halfword load and record stride.
+
+### Separate aliases for one SDK hardware flag
+
+An N64 audio DMA routine compiled from a donor with IDO 7.1
+`-O2 -G 0 -mips2 -32 -non_shared -Xcpluscomm -Wab,-r4300_mul -DNON_MATCHING`
+produced 116 bytes, equal in length and instruction bits outside its three
+unresolved data-symbol references to the target. The donor declared separate
+names for a read and two writes, while target relocation evidence placed all
+three references at the same byte. Renaming all three to one C identifier
+produced 112 bytes and changed scheduling. Replacing them with volatile
+absolute-address expressions also produced 112 bytes and missed. Trying
+`-O1` and `-O0` on the donor yielded 148 and 184 bytes respectively.
+Evidence is one isolated cross-game comparison; the function remains open.
+
+### KMC GCC 2.7.2 signed table index and setup pointers
+
+A saved MIPS setup function built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` read a byte through a signed table index, then wrote several fields through a global pointer. Staging the table base before the index reduced the draft's linked difference score from 310 to 90; keeping the two measured pointer snapshots for the subsequent stores produced an exact match. This is one saved example, not a controlled cross-compiler experiment. The candidate checks the complete source shape, 32-bit ABI, resolved table address and the target load/store order.
+### Split temporary lifetimes across branch joins
+
+On one N64 function, `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` produced a saved score of 15: the
+only three instruction differences used `$a2` for a byte-clamp sum where the target used `$v0`. The exact
+standalone judge reproduced 15. Splitting the shared sum local scored 100; splitting and moving the sum into
+the guarded branch scored 85, recovering the sum register but changing other allocations. Reusing the earlier
+pointer for the later store scored 520. These are measurements on one function, not controlled compiler tests.
+
+The `reused_temp_split` family also offered an unsafe candidate on that saved source: it renamed a write in one
+branch and the read after the join, leaving the new local undefined on the other branch. Reaching-definition
+checks now reject such splits and splits that leave a read outside the renamed span using an older value. A
+controlled regression covers both joins and confirms that a branch-local split remains available.
+
+
+### KMC GCC 2.7.2 field-store pointer lifetimes
+
+A saved MIPS setup function built with `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2 -g3` loaded a global pointer, stored fields through it and passed it to calls. Keeping the measured pointer for the later store and call changed the generated draft's linked difference score from 300 to 20; also retaining the earlier measured pointer for its store and call produced an exact match. This is one saved example, not a controlled cross-compiler experiment. The candidates check the relevant load/store/call instructions and offer the two lifetime changes separately and together for the judge to evaluate.
+A follow-up on the same N64 function reused an earlier unsigned local for the first packed-color phase,
+then moved the shade sum into its guard: the exact standalone judge measured 15 → 25 → 10, and the running
+app recorded 10. The two remaining differences use `$a2` instead of `$a0` for an earlier load and shift.
+`guard_temp_sink` now emits the second step for an attached brace, placing the assignment after safe C89
+body declarations. On the score-25 seed its generated child measured 10 in the exact standalone judge.
+This is one function's measurement, not a controlled compiler regression.
