@@ -4990,14 +4990,24 @@ class ForkEngine:
                            "check": "confirmed", "said": f"{p['file']}: its matched functions match with it"}
                           for p in parts]}
 
-    def set_compiler_ranges(self, slug: str, ranges: list[list[int]], compiler: str | None, log=lambda line: None) -> str:
+    def set_compiler_ranges(self, slug: str, ranges: list[list[int]], compiler: str | None, log=lambda line: None,
+                            by_user: bool = False) -> str:
         """The Settings panel's "only for these address ranges", where each source file has a compiler: the files
-        whose code is in them get `compiler` (None: the project's own again), each only when its matches hold."""
+        whose code is in them get `compiler` (None: the project's own again), each only when its matches hold.
+
+        Background passes call this too (range checks, file-compiler checks, applied suggestions). Where the game was
+        built with one known compiler (Console.keeps_game_compiler), only the user's own choice (`by_user`, the
+        Settings panel) moves a file off it: the morning after try_compiler stopped switching one game's files to
+        Watcom 9.5, these passes switched five, "chosen in decompdecomp's project settings"."""
         _, fp, cfg = self.get(slug)
         console = consoles.get(cfg.get("platform"))
         own = console.file_compiler(fp, "")
         if own is None:
             raise NetworkError("this project's own build sets its compilers")
+        game = console.keeps_game_compiler(fp)
+        if game and not by_user and compiler and compiler != game:
+            raise NetworkError(f"this game was built with {game} alone: files stay with it unless you choose "
+                               f"another in the project's settings")
         files = sorted(f for f, spans in console.file_ranges(fp).items()
                        if any(a < e and s < b for a, b in ranges for s, e in spans))
         if not files:

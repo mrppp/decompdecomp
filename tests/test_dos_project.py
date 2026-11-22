@@ -290,3 +290,26 @@ def test_a_compile_that_runs_too_long_is_stopped(tmp_path, monkeypatch):
         compile_tool._run_limited([sys.executable, "-c", "import time; time.sleep(30)"], {})
     done = compile_tool._run_limited([sys.executable, "-c", "print('ok')"], {})
     assert done.returncode == 0 and done.stdout.strip() == "ok"
+
+
+def test_background_passes_dont_move_a_file_off_the_games_compiler(monkeypatch):
+    """Range checks, file-compiler checks and applied suggestions switch files through set_compiler_ranges: on a game
+    built with one known Watcom, only the user's own choice (by_user, the Settings panel) moves a file off it."""
+    from decompnet.app import forkengine
+    from decompnet.network import NetworkError
+
+    class Console:
+        def file_compiler(self, fp, source): return "watcom-10.0a"
+        def keeps_game_compiler(self, fp): return "watcom-10.0a"
+        def file_ranges(self, fp): return {"src/auto/a.c": [(0x10, 0x20)]}
+    engine = forkengine.ForkEngine.__new__(forkengine.ForkEngine)
+    monkeypatch.setattr(engine, "get", lambda slug: (None, None, {"platform": "dos"}), raising=False)
+    monkeypatch.setattr(forkengine.consoles, "get", lambda platform: Console())
+    switched = []
+    monkeypatch.setattr(engine, "set_file_compiler_by_hand", lambda slug, f, c: switched.append((f, c)), raising=False)
+    with pytest.raises(NetworkError, match="built with watcom-10.0a alone"):
+        engine.set_compiler_ranges("game", [[0x10, 0x20]], "watcom-9.5")
+    assert not switched
+    engine.set_compiler_ranges("game", [[0x10, 0x20]], "watcom-9.5", by_user=True)  # the user's choice
+    engine.set_compiler_ranges("game", [[0x10, 0x20]], None)  # back to the game's own: always allowed
+    assert switched == [("src/auto/a.c", "watcom-9.5"), ("src/auto/a.c", "watcom-10.0a")]
