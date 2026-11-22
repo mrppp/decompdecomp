@@ -78,12 +78,21 @@ through MCP first when you learned something.
 function). It calls `compile_and_diff` over the session's own MCP connection, the one that holds the claim, and prints the
 app's verdict. Use it for every submit and confirmation; do not write your own gateway client, and do not use `judge.py try`
 in a session (its claim belongs to the connection, so it answers HTTP 400). `judge.py try` is for a claim made with
-`judge.py claim` only. `last_diff` and the rest stay MCP calls from your client.
+`judge.py claim` only.
+
+**Any other MCP tool: `mcp.py <holder> <tool> ['{"json":"args"}']`** (`get_function`, `get_candidate`, `get_assembly`,
+`last_diff`, `report_repair`, `add_note`, ...) over the same connection, printing the result. `mcp.py <holder> --list` lists
+the tools; `mcp.py <holder> <tool> --help` shows a tool's arguments with their allowed values (for `report_repair`, the valid
+categories, read from the app's own schema; a wrong category is refused with them). It repeats a "still running" reply for
+you and never repeats an "accepted ... do not repeat" one. Do not write your own MCP caller or gateway client.
+
+**The session's environment: `setup.py env <holder>`** prints `export UV_PROJECT_ENVIRONMENT=... DECOMP_HOME=...
+DECOMP_PORT=...` (the token is never printed); `eval "$(setup.py env <holder>)"` in a new shell, and `setup.py` itself ends with the same line.
 
 The other scripts, run with that venv's python (`$UV_PROJECT_ENVIRONMENT/bin/python`): `fast_judge.py FILE.c --slug S
 --function F [--diff [--rows N|all]]` (score, and the app's differing rows: 60 by default, then a "... N more rows" line; `--rows all` shows every row; a session's worktree off an older origin/main may lack `--rows`: `git pull --rebase` there and `setup.py sync <holder>`), `passes.py FILE.c --slug S --function F` (allocation
 priorities, register preferences, scheduler orders), `prove_chain.py --slug S --function F --families a,b|all` (greedy
-chain of library families, scored), `families.py [words]` (the library's families, one line each), `similar.py SLUG FUNC` (matched look-alikes and their saved C; step 1), `grid.py FILE.c --slug S --function F` (every combination of marked alternatives and statement orders, scored; step 2), `shared_types.py list|add SLUG` (the shared header's types; propose or add one, step 2), `regions.py` (a large function region by region, step 2),
+chain of library families, scored), `families.py [words]` (the library's families, one line each), `similar.py SLUG FUNC` (matched look-alikes and their saved C; step 1), `callers.py SLUG FUNC` (every call site with the instructions around it, and whether the callers read a result: the return type; step 1), `grid.py FILE.c --slug S --function F` (every combination of marked alternatives and statement orders, scored; step 2), `shared_types.py list|add SLUG` (the shared header's types; propose or add one, step 2), `regions.py` (a large function region by region, step 2),
 `tools/learnings.py` (evidence entries; `search "<symptom>"` ranks them by symptom, step 3).
 
 ## Connect through the Rust MCP gateway
@@ -112,7 +121,7 @@ Call `project_info` and verify that the connection is scoped to the requested pr
 connection throughout the run so the app keeps attempts and claims under one identity.
 If the endpoint disappears, check the running app's advertised gateway port and verify
 `project_info` again before sending mutations. An app restart can retire a temporary endpoint.
-If sending raw MCP requests, use a distinct JSON-RPC ID for each request, including retries.
+In a session, `mcp.py` (above) sends the requests; only a client with no session writes raw ones: use a distinct JSON-RPC ID for each request, including retries.
 The gateway deduplicates pending calls by connection, tool and arguments.
 
 ## Claim one function
@@ -193,6 +202,10 @@ and write it to a scratch file for local probes. Use `get_assembly` for the targ
 - **Look at matched look-alikes first**: `similar.py SLUG FUNC` (a session's python) lists matched functions with
   similar instruction patterns (the app's `find_similar`) with their similarity and prints the saved C of the best
   three (`--sources N`, `--out DIR` writes files, `--all` adds unmatched ones). Their spelling is a lead to adapt; judge it.
+- **When the return type or the arguments are unclear, read the callers**: `callers.py SLUG FUNC` (the app's
+  `get_callers`) lists each call site with the instructions around it and a verdict. A caller that reads `$v0`/`$f0`
+  after the call proves the function returns a value (a void function leaves it unread); a matched caller's C is
+  exact; callers that all drop the result only weakly say `void`. Write that result type, then judge.
 - Read the function's notes and history with the corresponding `get_function` sections. Earlier agents' dead ends are
   evidence; repeat none of them.
 - Keep a newly improved candidate as a private search seed even if it contains a suspicious read.
@@ -417,8 +430,8 @@ the shape is decided by a compiler pass, not by how you spell the C. Stop writin
 4. **Register-only rows: dump priorities, not passes.** `passes.py CAND.c --slug S --function F` prints the allocation
    priority table (refs, live length, priority, register), each pseudo's register preference and both schedulers'
    instruction order with the project's compiler and flags, and where the compiler's source is; compare with the
-   target's register order and change uses/live ranges (above, in 3). The raw `-dl -dg` dump is the same thing by hand. An empty `.lreg` means cc1 didn't get the
-   flag or failed to parse: run the compiler's own `gcc -E` first and strip comments.
+   target's register order and change uses/live ranges (above, in 3). The raw `-dl -dg` dump is the same thing by hand. To run cc1 by hand, get the `.i` from `preprocess.py CAND.c --slug S --function F -o CAND.i`: it preprocesses exactly as the app does (the function's flags, includes and the project's header) and prints the cc1 command line to add `-dl -dg` to. Never run the bundled `cpp`/`cccp` yourself and never hand-expand macros: GCC 2.7.2's own predefined-macro list is malformed, so the bare program aborts (exit 134) on every file, even `int f(void){return 1;}`; only the `gcc` driver (which passes `-undef` and its own defines) works. `passes.py` does all of it for you. It also lists the hard registers each pseudo is live with (`;; N conflicts:` minus the pseudos): a register missing there is free for it, so a pseudo that lands on another one lost it to a *copy* preference (a plain move to an argument register, global.c `find_reg`; a `subreg`/extend source is only a plain preference and loses to a lower-numbered register: a `u8` result local took `$v0` instead of `$a3` that way). `passes.py --sched-verbose` prints the first scheduler's launch priorities and set-count notes: no patching compiler_diagnostics.py. An empty `.lreg` means cc1 didn't get the
+   flag or failed to parse: preprocess with `preprocess.py` first.
 
 **Stuck near 0:** no long blind or random searches. Decode the rows, read the cc1 dumps (`-dl -dg` allocation
 priorities and preferences, `-dS -dR` scheduling), and run the recent repair families on the best first.
@@ -439,7 +452,11 @@ priorities and preferences, `-dS -dR` scheduling), and run the recent repair fam
 
 `prove_chain.py --slug S --function F [SOURCE.c] --families a,b|all` applies the best-scoring child of those families
 step by step (bounded: one judge, capped children and steps; `--list` shows which families produce children) and prints
-each step's family and score: the cheap answer to "would the library have reached this from here".
+each step's family and score: the cheap answer to "would the library have reached this from here". When edits are each
+worse alone, `--combine 10` merges a stalled step's 10 best children in pairs and triples (off by default: it found
+none on three three-edit functions, whose edits ranked far below the 10 best; narrow `--families` first).
+The Deep Permuter does the same after its operand pass (`Search.repair_pair_pass`, `app/pair_search.py`: the best 30 children
+from different families composed in pairs, judged by a pool of two workers).
 
 Never start or wait on a Deep Permuter run, a sweep, `scripts/scratch_run.py`, or an equivalent broad search,
 even for one function, and leave the running jobs' settings alone. Test a repair by calling it directly and scoring
@@ -453,11 +470,16 @@ For each manual step that moved the score, answer: **could the permuter have don
 - No: write the rewrite or the search guide. Smallest useful form: a function in decomp-repair that takes source
   and returns variants, with a test that fails without it (see `call_scope_repairs.py` for the shape). Prove it by
   running it on the function you just matched: starting from the state *before* your fix, it must reach the fix.
-- **Every step the permuter couldn't find becomes a decomp-repair family wired into BOTH the draft repair path
-  (`app/draft_repairs.py`) and the deep permuter's local/beam lane** (`tests/test_library_family_wiring.py` fails on
-  unwired modules). Offer steps that only pay off together as one combined child. Before releasing, check the family
-  returns the same `(family, source)` shape the app expects (run the app's related test), and prove the chain from
-  the saved best where possible. A docs entry alone doesn't finish the goal.
+- **Every step the permuter couldn't find becomes a decomp-repair family that declares itself** with a `REPAIR` dict at
+  the end of its module (`REPAIR = {'families': FAMILIES, 'variants': variants, 'needs': ('source', 'name', 'header')}`,
+  optional `order`, `lanes`, `archs`; `decomprepair/registry.py`). The app runs every declared module in the draft repair
+  path, the Deep Permuter's beam and its local lane (`app/library_registry.py`) and lists its families for the agents, so
+  **there is no app wiring to write**: the library PR is enough (the library's `tests/test_registry.py` fails for a module
+  with `variants` and no `REPAIR`). `needs` are `variants` parameters by name: `source`, `name`, `header`, `arch`, `asm`,
+  `flags`. Offer steps that only pay off together as one combined child. Before releasing, check the family returns
+  `[(family, source)]` (or `[source]`) and prove the chain from the saved best where possible. A docs entry alone doesn't
+  finish the goal. The ~700 older modules are still wired by hand in `app/draft_repairs.py` and `deep_permuter.py`
+  (`tests/registry_legacy.txt` in the library); change those calls only to fix their behaviour.
 - **Label compiler explanations not confirmed in the compiler source as hypotheses**, in docstrings and docs.
 - Test the specific repair on the saved source and, when relevant, the draft. The saved source can
   spell the same operation differently from m2c. Add a unit test, verify that the permuter lane
@@ -471,10 +493,9 @@ For each manual step that moved the score, answer: **could the permuter have don
   Say in the PR which features you ran and how. **Never tag the library or bump its pin yourself.** Merge the library PR
   with no version bump and no tag; its release workflow tags the merge (it runs on every merge, and `gh workflow run
   release -R RetroReversing/decomp-repair` starts it at once), and the library-pin workflow here opens and merges the pin
-  PR (`gh workflow run library-pin`). Wait until `pyproject.toml` on origin/main pins a release containing your module
-  (`git fetch -q origin && git show origin/main:pyproject.toml | grep decomprepair`, and check the module is in
-  the archive), then wire it in a PR of its own. A new family the app doesn't call turns that workflow's run red until
-  it is wired (tests/test_library_family_wiring.py). While CI runs, keep the next independent local experiment ready
+  PR (`gh workflow run library-pin`); once the pin is on origin/main the app runs the module by itself
+  (`git fetch -q origin && git show origin/main:pyproject.toml | grep decomprepair`). Run the module in the app's own
+  paths from your worktree after `setup.py sync`. While CI runs, keep the next independent local experiment ready
   without changing a worktree used by an active judge. A run's "No module named decomprepair.<x>" means the pinned
   release predates your module.
 - After the first 0, read `get_function(section="summary")` again and verify the function is recorded as matched
@@ -543,7 +564,8 @@ To hand off:
    the edit list from the saved best, each idea tried with its score, any scaffolding in the best, and the compiler
    findings (dumps read, pass orders, allocation priorities).
 2. Merge any library or app work it produced (step 5), with tests, as on a match.
-3. `release_function(function=F, notes=<one line>, claim_token=...)`, then `setup.py stop <holder>`.
+3. `release_function(function=F, notes=<one line>, claim_token=...)` (the app accepts it once the clock allows and your
+   `add_note` is written, whatever the compile count says), then `setup.py stop <holder>`.
 4. Report **"handed off"**, with the clock's line, the best score and the note's summary, so a stronger agent resumes
    from the history.
 

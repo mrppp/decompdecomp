@@ -820,7 +820,10 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Called framed recovery inside dropped raw text | ✓ | ✓ | ✓ scalar MIPS | — | — | ✓ scalar MIPS | — | — build-owned adapter planned | — reader/build adapter planned | — | — ARM/build adapter planned | — own-build adapter planned |
 | Judge | link · compare | link · compare | link · compare | link · compare | objdiff | link · compare | link · compare | objdiff | objdiff | objdiff | objdiff | objdiff |
 | Machine drafts (m2c, Ghidra for x86) | ✓ | ✓ | ✓ | — | ✓ Ghidra | ✓ | ✓ (m2c `gba-gcc-c`) | ✓ | ✓ Ghidra | ✓ Ghidra | — (no assembly to read) | by architecture |
-| Draft cleanup stage (record views, gbi macros) | ✓ | ✓ m2c path | ✓ m2c path | — | — Ghidra drafts planned | ✓ m2c path | ✓ m2c path | ✓ m2c path | — Ghidra drafts planned | — Ghidra drafts planned | — (no assembly to read) | m2c drafts |
+| Draft cleanup stage (record views, gbi macros, m2c's byte steps, table cursors as indexes) | ✓ | ✓ m2c path | ✓ m2c path | — | — Ghidra drafts planned | ✓ m2c path | ✓ m2c path | ✓ m2c path | — Ghidra drafts planned | — Ghidra drafts planned | — (no assembly to read) | m2c drafts |
+| Drafts from a close matched look-alike (`twin_drafts`) | ✓ | ✓ not run yet | ✓ not run yet | — | — | ✓ not run yet | — | — project-mode alignment planned | — project-mode alignment planned | — | — project-mode alignment planned | — |
+| Draft result type from the exits and callers (`draft_return_type`, on: the callers decide where the exits cannot; 5 better / 7 worse of 20 fires, 2 exact) | ✓ reader | ✓ reader | ✓ reader | — PPC reader planned | — | ✓ reader | — ARM reader planned | — PPC reader planned | — x86 reader planned | — x86 reader planned | — ARM reader planned | — |
+| Callers and the result type they show (`get_callers`, the brief's line, `callers.py`) | ✓ stored callees | ✓ not run yet | ✓ not run yet | — | — | ✓ not run yet | — ARM reader planned | — project callees not stored | — project callees not stored | — | — project callees not stored | — |
 | Compile-tested draft refresh and saved diagnostics | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ m2c | ✓ Ghidra | — | — draft generator planned | ✓ supported draft generators |
 | Initial callback, forwarded-argument and overlapping-frame recovery | ✓ bounded MIPS | ✓ bounded MIPS | ✓ bounded MIPS | — | — | ✓ bounded MIPS | — | — processor reader planned | — processor reader planned | — | — processor reader planned | ✓ MIPS C; other readers planned |
 | Autopilot: free matches from drafts | ✓ | ✓ | ✓ | twins only | — | ✓ | ✓ (demo: 34 matches) | ✓ | ✓ exact drafts of tiny shapes (32-bit); Ghidra's made compilable | ✓ as PC | twins only (no drafts yet) | — |
@@ -843,7 +846,10 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Permuter on near misses | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Experimental CPU constant ranking in Deep Permuter | ✓ MIPS pairs | ✓ MIPS pairs | ✓ MIPS pairs | — | — | ✓ MIPS pairs | — | — | — | — | — | ✓ with MIPS target bytes |
 | Agents read compiler passes and allocation priorities (`compiler_passes`) | ✓ GCC (IDO —: no pass dumps) | — GCC unchecked | — GCC unchecked | — | — | — GCC unchecked | — | — Metrowerks prints none | — MSVC prints none | — | — | — own build |
-| Agents grid statement orders and edit combinations with the exact judge (`score_permutations`) | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — judge worker is ROM-only | — judge worker is ROM-only | — | — judge worker is ROM-only | — judge worker is ROM-only |
+| Agents read a pass function from the compiler's installed source (`compiler_source`) | ✓ GCC, checked on KMC 2.7.2 (IDO —: no source) | ✓ GCC with a pinned source, unchecked | ✓ GCC with a pinned source, unchecked | — unchecked | — unchecked | ✓ GCC with a pinned source, unchecked | — unchecked | — Metrowerks has no source | — MSVC has no source | — MSVC has no source | — Metrowerks has no source | ✓ GCC with a pinned source, unchecked |
+| Agents grid statement orders, edit combinations and marked grids up to 2000 with the exact judge (`score_permutations`) | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — judge worker is ROM-only | — judge worker is ROM-only | — | — judge worker is ROM-only | — judge worker is ROM-only |
+| Agents run a bounded greedy chain of repair families (`prove_chain`) | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — judge worker is ROM-only | — judge worker is ROM-only | — | — judge worker is ROM-only | — judge worker is ROM-only |
+| Agents search the recorded matching evidence by symptom (`search_learnings`) | ✓ checkout | ✓ checkout | ✓ checkout | ✓ checkout | ✓ checkout | ✓ checkout | ✓ checkout | ✓ checkout | ✓ checkout | ✓ checkout | ✓ checkout | ✓ checkout |
 | Hand-written assembly set aside | ✓ | ✓ | ✓ | ✓ (`sc` stubs) | — | ✓ | ✓ (`_call_via` helpers, `svc`/`swi` stubs) | ✓ | Visual C++'s exception-handling stubs (64-bit: the funclets its exception data names) | Visual C++'s exception-handling stubs | BIOS call stubs, pieces of functions | MIPS, PowerPC, ARM's BIOS stubs and pieces of functions |
 | Source splitting (`split_file`) | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | by project |
 | Pieces of functions joined to their function | — | — | — | — | — | — | — | — | ✓ (`scratch.merge_pieces`; 64-bit: .pdata's extents, none to join) | ✓ (`scratch.merge_pieces`) | ✓ (`recover.merge_pieces`) | — |
@@ -1165,6 +1171,16 @@ judge worker for project-mode units, then the same pass. It found nothing on the
 Machine drafts from m2c get cleaned copies judged beside them (`app/draft_cleanup.py`, measured in
 docs/learnings/finding/draft-cleanup-measurement.md). Consoles that draft with Ghidra (`Console.own_drafts`) return
 before that stage; the same record-view rewrite should be measured on their drafts and wired in where it helps.
+
+### Drafts from look-alikes in project mode, and result-type readers beyond MIPS
+
+A ROM function with a matched look-alike (90 % of its instructions) gets that function's C with its own names as a draft
+candidate (`app/twin_drafts.py`, docs/learnings/finding/draft-start-candidates.md). Project mode has twins by object
+fingerprints but not the relocation alignment the names come from (as for the similar-code reuse pass), so it has none
+yet. The result-type reader (`Arch.return_contract`) is MIPS only; x86, PPC and ARM readers would let
+`draft_return_type` run there, and the callers' verdict (`app/call_evidence.py`, MIPS only: `Arch.call_sites`) would do the same. On the N64 game
+measured the exits alone gained nothing; the callers decide where they cannot, and it is on
+(docs/learnings/finding/return-type-from-callers.md). Project mode stores no callees, so it has no `get_callers` yet.
 
 ## Recently done
 
@@ -2127,10 +2143,15 @@ reuse the saved map. See [ROM Explorer](docs/ROM_EXPLORER.md) for support and li
   gets the copy's secure area checksum (of the area encrypted, which a dump no longer is; dsd left it 0). The game
   that differed rebuilds identical, its 1,784 recovered functions included. Projects made before get their build
   fixed at start (`scratch.write_tools`, kept unless an identical rebuild stops being one).
+- **The matching evidence in installed copies.** `search_learnings` reads `docs/learnings/` and
+  `COMPILER_MATCHING_LEARNINGS.md` from the checkout the app runs from; an installed wheel carries only the package,
+  so there it answers that the evidence is missing. Ship the entries (or a built index of them) as package data
+  (`app/learnings_search.py`).
 - **Near-match tools in project mode and on other GCC consoles.** `compiler_passes` runs only where the app's own
   compiler adapter compiles a native GCC driver (checked on N64 KMC GCC); PS1/PS2/PSP GCC builds need a run each, and
   project-mode units compile through their own build. `score_permutations` needs a standalone objdiff judge worker
-  for project mode (`app/score_permutations.py`, `app/compiler_passes.py`).
+  for project mode (`app/score_permutations.py`, `app/compiler_passes.py`); `prove_chain` needs the same
+  (`app/prove_chain.py`).
 - **The permuter's real rewrites in forks.** decomp-permuter got no header in a fork, so it refused every
   function ("Syntax error in base.c": `u16` was no type it knew) and only the six simple rewrites ran, in every
   fork and on DS. It now reads what the function's file includes and declares.

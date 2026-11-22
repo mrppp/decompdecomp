@@ -56,6 +56,14 @@ def test_preferences_name_the_pseudo_and_what_it_got():
     assert lines[1] == "pseudo 73 (temp) prefers hard reg 5"  # not in the allocation table: nothing to compare
 
 
+def test_conflicts_name_the_hard_registers_a_pseudo_is_live_with():
+    greg = ";; 2 regs to allocate: 80 77\n;; 77 conflicts: 77 80 2 4 29\n;; 80 conflicts: 77 80 4 5 6\n;; 80 preferences: 2 7\n"
+    lines = compiler_passes.conflicts({"phases": {"greg": {"excerpt": greg}}, "allocation": {"values": [
+        {"pseudo": 80, "aliases": ["a3"]}]}})
+    assert lines == ["pseudo 77 (temp) is live with hard regs 2 4 29", "pseudo 80 (a3) is live with hard regs 4 5 6"]
+    assert compiler_passes.conflicts({}) == []
+
+
 def test_the_scheduling_order_lists_insns_in_the_dumps_order_without_notes():
     assert compiler_passes.schedule_order(result(), "sched") == ["4 movsi_internal2", "58 branch_zero"]
     assert compiler_passes.schedule_order(result(), "sched2") == []
@@ -66,6 +74,7 @@ def test_the_worker_answers_a_passes_request_and_reports_a_missing_compiler(tmp_
     monkeypatch.setattr(compiler_passes, "diagnose", lambda *a, **k: (result() | {"toolchain": "gcc-2.7.2-kmc"}, {}))
     reply = hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}"})
     assert "prefers hard reg 4" in reply["text"] and "Scheduling order, sched" in reply["text"]
+    assert "is live with hard regs" in reply["text"]
     assert hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": " "}) == {"error": "no source"}
     assert "no project" in hosted_judge.passes_report(net, {"slug": "x", "name": "f1", "source": "a"})["error"]
 
@@ -87,7 +96,7 @@ STUB = textwrap.dedent("""\
     for line in sys.stdin:
         r = json.loads(line)
         out = ({{"name": "f", "vram": 1, "target": "00", "header": "", "compiler": {{"toolchain": "t", "flags": []}}}}
-               if r["op"] == "function" else {{"text": "passes for " + ",".join(r.get("passes", ["default"]))}})
+               if r["op"] == "function" else {{"text": "passes for " + ",".join(r.get("passes", ["default"])) + (" verbose" if r.get("sched_verbose") else "")}})
         print(json.dumps(out), flush=True)
 """)
 
@@ -104,6 +113,8 @@ def test_passes_py_asks_the_worker_and_prints_its_text(tmp_path, monkeypatch, ca
     (tmp_path / "c.c").write_text("int f(void){return 0;}")
     module.main([str(tmp_path / "c.c"), "--slug", "g", "--function", "f", "--passes", "greg,sched2"])
     assert capsys.readouterr().out.strip() == "passes for greg,sched2"
+    module.main([str(tmp_path / "c.c"), "--slug", "g", "--function", "f", "--passes", "sched", "--sched-verbose"])
+    assert capsys.readouterr().out.strip() == "passes for sched verbose"
 
 
 def test_the_skills_report_lists_every_pseudo_not_just_the_first_sixteen():
@@ -113,3 +124,28 @@ def test_the_skills_report_lists_every_pseudo_not_just_the_first_sixteen():
     text = compiler_passes.render({"allocation": {"values": values}}, (), "candidate", rows=None)
     assert "pseudo 119" in text and "pseudo 200 (temp) -> spilled to the stack" in text
     assert "pseudo 119" not in compiler_passes.render({"allocation": {"values": values}}, (), "candidate")
+
+
+VERBOSE = SCHED + """
+;; ready list (t = 3): 58:2 4:1
+;; launching insn 58 (priority 2)
+;; set-count rule: insn 4 first
+"""
+
+
+def test_the_verbose_scheduler_notes_need_no_compiler_flag_and_print_only_the_notes(tmp_path, monkeypatch):
+    net = project(tmp_path)
+    seen = {}
+
+    def diagnose(net, proj, fn, source, passes, excerpt_chars=None, extra_flags=()):
+        seen.update(passes=passes, extra_flags=extra_flags)
+        return result() | {"toolchain": "gcc-2.7.2-kmc", "phases": {"sched": {"excerpt": VERBOSE}}}, {}
+    monkeypatch.setattr(compiler_passes, "diagnose", diagnose)
+    plain = hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}"})["text"]
+    assert seen["extra_flags"] == () and "-fsched-verbose-2" not in plain
+    text = hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}",
+                                            "passes": ["greg"], "sched_verbose": True})["text"]
+    assert seen["extra_flags"] == () and "sched" in seen["passes"]  # cc1 2.7.2 refuses -fsched-verbose-2
+    assert "First scheduler notes (3 lines):" in text
+    assert ";; launching insn 58 (priority 2)" in text and ";; set-count rule: insn 4 first" in text
+    assert compiler_passes.verbose_schedule({"phases": {}}) == []

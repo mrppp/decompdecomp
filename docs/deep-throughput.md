@@ -146,3 +146,43 @@ transaction per read.
 counters this search has queued (`trial_bookkeeping.pending_counters`) to the stored rows, in the table's order, which
 is what a flush followed by the read returned. Before, the policy read before each batch of candidates forced a
 writer transaction each time, so the batch never batched (the 3% and 2% entries above, in the writer gate).
+
+## Per-candidate lookups (a permuter worker, measured)
+
+A fresh maximum-throughput pass beside the project's own permuter worker: the worker used 1.8 cores and the lanes
+0.4, the pass made 18 compiles a second and its history writes cost 48.8 ms a compile (the writer was shared).
+Of the worker's CPU, 45% was queries for facts that change little: `fork_slug` (the project row's revision and its
+parsed settings, asked several times for each candidate: 19%), the repair policy's rows (10.7%) and scope
+lookups (about 10%). `fork_slug` now keeps its answer for 10 s (`FORK_SLUG_SECONDS`; a project's kind never
+changes) and the stored policy and input-effect rows are read at most once a second and again after any
+flush of this process (`trial_bookkeeping.stored`); this process's own queued counts are added on top as before.
+The scope lookups are not cached: they are the revision checks that keep a candidate from reusing a result across a
+change of inputs, and a stale one would weaken that.
+
+## A 29-lane pass at 220-290 compiles a second
+
+On the first pass with the batching, caching and library fixes: 81,254 compiles in the first 5 minutes (268 a second),
+228 a second over the next 161 s (a steady-state diff of two thread_cpu snapshots; load average 58 on 18 cores). The
+lanes used 5.7 cores, the proposal workers 0.6. Largest lane entries then: starting the compiler's three programs and
+waiting for them (`_exec_driver`, `spawner._spawn`: 27% together, about 8 ms of CPU a compile); two per-candidate
+write transactions through the writer gate, `deep_profiles.probe` (14.6%) and `repair_sequences.observe` (5.2%, three
+transactions a trial: costs, the CREATE TABLE and outcomes). Both now queue their rows with the batch
+(`repair_sequence_metrics.record`/`record_outcome`, the profile probe's `reuse_trials` miss), the readers add the
+queue to the table, and the tables are created once per engine. Next: difflib's `find_longest_match` in
+`paired_local_repairs.edit` and `layout_frontiers.project` (3.7%), and `repair_preflight.invalid_call` in the
+proposal workers (3.8% of theirs).
+
+## Compiler runs per judged candidate
+
+A 29-lane pass made 220-290 compiler runs a second but judged only 55-62 candidates a second, about four runs a
+candidate. The throughput line (and `/api/permuter/pass`) now says where they go: `compile_groups` and
+`compile_group_tickets` (candidates a worker took into one group; up to eight of a function share one run of the
+compiler's three programs), `batch_runs`, `batched_candidates`, `batch_alone` (candidates that compiled again alone
+after their batch), `batch_alone_local` (those that use file-local data: strings, constants, jump tables, whose place
+differs in a file of their own), `batch_ineligible` (a preprocessor line or `__LINE__` in the definition),
+`batch_refused`, `batch_failed`, and for the lookahead window `ahead_submitted`, `ahead_used`, `ahead_wasted`
+(compiled, then dropped because a better parent arrived) and `ahead_cancelled` (dropped while still queued).
+
+A controlled run of `compile_batch` over the standalone-compilable functions of a small C library (KMC GCC 2.7.2, eight
+variants each): of 11 functions, 4 batched completely and 7 (64%) were set aside for file-local data. A batch that
+holds such candidates costs its own run and then one run each, so it can cost more than not batching.

@@ -419,6 +419,57 @@ def near_match(best_score) -> bool:
     return best_score is not None and 0 < best_score <= NEAR_MATCH_SCORE
 
 
+HANDOFF_MINUTES = 45  # the match-function skill's hand-off clock: a near-match this long without a better score
+
+
+def quiet_minutes(rows, claimed_at, baseline, now=None) -> float:
+    """Minutes since this claim last improved on everything before it (the inherited best, then its own compiles):
+    the hand-off clock, measured in time beside the move-on count's compiles. `rows`: (score, created_at) of the
+    claim's compiles in order. A helper at a near-match spent hours on one function in 6 compiles that each took a
+    long think; the compile count never ran out."""
+    now = time.time() if now is None else now
+    best, last = baseline, claimed_at or now
+    for score, at in rows:
+        if score is not None and (best is None or score < best):
+            best, last = score, at or last
+    return max(0.0, (now - last) / 60)
+
+
+def handoff_due(status) -> bool:
+    """Whether the hand-off clock has run out: a near-match (by its best on this claim or the inherited one) with no
+    better score in HANDOFF_MINUTES."""
+    best = status.get("best") if status.get("best") is not None else status.get("inherited_best")
+    return bool(status.get("claimed_at")) and near_match(best) and (status.get("quiet_minutes") or 0) >= HANDOFF_MINUTES
+
+
+def handoff_clock_ran_out(status, now=None) -> bool:
+    """The match-function skill's clock (scripts/clock.py), for any function and not only a near-match: at least
+    HANDOFF_MINUTES since the claim and HANDOFF_MINUTES since its last improvement. A release after this and a
+    hand-off note goes through whatever the compile count says (release_function's push-back): the skill said
+    "hand-off allowed" and the compile-count rule then refused the release it had just asked for."""
+    now = time.time() if now is None else now
+    claimed = status.get("claimed_at")
+    return bool(claimed) and (now - claimed) / 60 >= HANDOFF_MINUTES and (status.get("quiet_minutes") or 0) >= HANDOFF_MINUTES
+
+
+def handoff_line(status) -> str:
+    """The clock as compile results and release push-backs show it, for a near-match only; past the clock on any
+    other function, the way to hand it off."""
+    best = status.get("best") if status.get("best") is not None else status.get("inherited_best")
+    if status.get("handoff_clock") and not near_match(best):
+        return (f" ⏱ Hand-off clock: {int(status.get('quiet_minutes') or 0)} min without a better score. To hand off, "
+                "write a hand-off note with add_note (edits tried with scores, rows left, next idea), then "
+                "release_function with the current claim_token; it goes through now.")
+    if not status.get("claimed_at") or not near_match(best):
+        return ""
+    quiet = int(status.get("quiet_minutes") or 0)
+    if quiet < HANDOFF_MINUTES:
+        return f" Hand-off clock: {quiet}/{HANDOFF_MINUTES} min without a better score."
+    return (f" ⏱ Hand-off clock: {quiet} min without a better score on this near-match (hand off at {HANDOFF_MINUTES}). "
+            "Write a hand-off note with add_note (the edits you tried and their scores, the rows left, the next idea), "
+            "then release_function(move_on=true) with the current claim_token; it goes through now.")
+
+
 def large_plateau(fn):
     """Restrict the shorter lease budget to large functions with a saved score and repeated releases."""
     return (fn['n_insns'] or 0) >= 128 and fn['abandons'] >= ESCALATE_AFTER and (fn['best_score'] or 0) > 0
@@ -434,8 +485,27 @@ def stall_budget_text() -> str:
             "best score counts as progress")
 
 
-def move_on_brief(fn, after=None) -> str:
-    """The brief's line naming the function's own move-on number (the one compile_and_diff counts against)."""
+def symptom_pointer(rows) -> str:
+    """Which part of guide("near-match") a near-match's remaining rows call for (the last compile's diff rows, marker
+    first): helpers read the guide top to bottom and missed the rule that fit their rows."""
+    marks = [row[0] for row in rows or () if row[0] != " "]
+    if not marks:
+        return ""
+    frame = any(re.search(r"\$sp\b|\bsp\b", f"{row[1]} {row[2]}") and "addiu" in f"{row[1]} {row[2]}"
+                for row in rows if row[0] != " ")
+    if "s" in marks or frame:
+        return ' Your last diff has frame rows: guide("near-match"), "Frame-size rows", first; every other row shifts with the frame.'
+    if set(marks) == {"r"}:
+        return ' Your last diff is register-only: guide("near-match"), "Register-only rows", and compiler_passes(passes=["greg"]).'
+    if "o" in marks and set(marks) <= {"o", "r"}:
+        return (' Your last diff has order rows: guide("near-match"), "Order rows", and '
+                'compiler_passes(passes=["sched", "sched2"]).')
+    return ""
+
+
+def move_on_brief(fn, after=None, rows=None) -> str:
+    """The brief's line naming the function's own move-on number (the one compile_and_diff counts against), with
+    find_similar for a matched twin and, for a near-match, the guide section its last diff rows call for."""
     custom = after is not None
     best = fn["best_score"] if "best_score" in fn.keys() else None
     after = after if custom else stall_budget(fn["n_insns"] or 0, best)
@@ -446,7 +516,10 @@ def move_on_brief(fn, after=None) -> str:
             'To leave earlier with a reason, use release_function(move_on=true, claim_token="the current claim_token", notes="what you tried and why").'
             + (' Near-match: read guide("near-match") first; for register or order rows, compiler_passes shows the '
                'allocation priorities and passes, and score_permutations grids statement orders and edit combinations.'
-               if near_match(best) else ''))
+               + symptom_pointer(rows)
+               + f' Hand-off clock: after {HANDOFF_MINUTES} minutes without a better score, write a hand-off note and '
+               'release; each compile result shows the clock.' if near_match(best) else '')
+            + ' find_similar(function) lists matched look-alikes with their C: adapt a twin before writing your own.')
 
 
 def normalized_source(source: str) -> str:
@@ -2057,7 +2130,8 @@ class Network:
             lines.append(f"claimed by {who}, lease expires in {int(claim['expires_at'] - time.time()) // 60} min "
                          f"(each compile_and_diff renews it)")
         if fn["status"] != "matched":
-            lines.append(move_on_brief(fn, self.agent_stall_budget(fn, agent)))
+            kept = self._last_diffs.get((agent.id, fn["id"])) if agent else None
+            lines.append(move_on_brief(fn, self.agent_stall_budget(fn, agent), kept[0] if kept else None))
             lines += self.tried_at_best(fn)
         if fn["status"] == "matched":
             lines += [f"MATCHED by {self._agent_name(fn['matched_agent_id'])} {_ago(fn['matched_at'])}:",
@@ -2394,19 +2468,25 @@ class Network:
         baseline = None
         if claim is not None:
             start = claim["claimed_at"] or 0
-            rows = store.all("SELECT score,score_before,diff_digest FROM attempts WHERE function_id=? AND agent_id=? AND created_at >= ? "
+            rows = store.all("SELECT score,score_before,diff_digest,created_at FROM attempts WHERE function_id=? AND agent_id=? AND created_at >= ? "
                                   "ORDER BY id", function_id, agent_id, start)
             scores = [r["score"] for r in rows]
             digests = [r["diff_digest"] for r in rows]
             baseline = rows[0]["score_before"] if rows else None
+            quiet = quiet_minutes([(r["score"], r["created_at"]) for r in rows], start,
+                                  baseline if rows else (row["best_score"] if row else None))
         else:
             start = None
+            quiet = None
             rows = store.all(f"SELECT score,diff_digest FROM attempts WHERE function_id=? AND agent_id=? ORDER BY id DESC "
                                   f"LIMIT {max(STALL_LOOKBACK, after + 1)}", function_id, agent_id)
             scores = [r["score"] for r in reversed(rows)]
             digests = [r["diff_digest"] for r in reversed(rows)]
-        return {"claimed_at": start, "compiles": len(scores), "no_better": _no_better(scores, baseline, digests), "after": after, "inherited_best": baseline,
-                "best": min((s for s in scores if s is not None), default=None)}
+        status = {"claimed_at": start, "compiles": len(scores), "no_better": _no_better(scores, baseline, digests), "after": after, "inherited_best": baseline,
+                  "best": min((s for s in scores if s is not None), default=None), "quiet_minutes": quiet}
+        status["handoff"] = handoff_due(status)
+        status["handoff_clock"] = handoff_clock_ran_out(status)
+        return status
 
     def stall_note(self, function_id: int, agent_id: int, *, project_id: int | None = None) -> str:
         """Every compile result's last line: where the agent stands against the function's move-on number and, once
@@ -2419,7 +2499,7 @@ class Network:
             return ""
         since, after = st["no_better"], st["after"]
         if since < after:
-            return f"\n\nMove-on count: {stall_line(since, after)}."
+            return f"\n\nMove-on count: {stall_line(since, after)}." + handoff_line(st)
         from .release_receipts import instruction
         action=instruction(self,function_id,agent_id,project_id=project_id)
         st_best = st.get("best") if st.get("best") is not None else st.get("inherited_best")
