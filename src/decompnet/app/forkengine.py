@@ -2902,7 +2902,8 @@ class ForkEngine:
                 lines.append('claim_token: '+lease)
         from .. import candidate_quality
         if fn["status"] != "matched":
-            lines.append(move_on_brief(fn, self.net.agent_stall_budget(fn, agent)))
+            kept = self.net._last_diffs.get((agent.id, fn["id"])) if agent else None
+            lines.append(move_on_brief(fn, self.net.agent_stall_budget(fn, agent), kept[0] if kept else None))
             lines += self.net.tried_at_best(fn)
         if meta.get("demangled"):
             lines.append(f"C++ name: {meta['demangled']}")
@@ -4156,7 +4157,13 @@ class ForkEngine:
             yield "",candidate
         from . import draft_cleanup
         if draft_cleanup.enabled(cfg):
-            for _, source in draft_cleanup.cleaned(original, meta.get('symbol') or fn['name'], proj['arch'], '', self._known(fp, unit)):
+            # the target's asm, when the project has it, lets the cleanup read m2c's byte steps (pointer_byte_step)
+            found = drafts.find_asm(fp.root, unit.name, meta.get('symbol') or fn['name'], current)
+            try:
+                target = found.read_text(encoding='utf-8', errors='replace') if found and found.stat().st_size <= drafts.MAX_ASM else ''
+            except OSError:
+                target = ''
+            for _, source in draft_cleanup.cleaned(original, meta.get('symbol') or fn['name'], proj['arch'], target, self._known(fp, unit)):
                 yield "", source
         if report is not None and not report.get('compiled'):
             from .. import seeds

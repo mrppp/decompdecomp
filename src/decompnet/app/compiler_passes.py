@@ -40,13 +40,13 @@ def run(net, agent, slug, function, revision, passes=None):
     return render(result, passes, revision) + source_line(result.get('toolchain') or profile.get('toolchain'))
 
 
-def diagnose(net, proj, fn, source, passes, excerpt_chars=compiler_diagnostics.EXCERPT_CHARS):
+def diagnose(net, proj, fn, source, passes, excerpt_chars=compiler_diagnostics.EXCERPT_CHARS, extra_flags=()):
     """The isolated diagnostic compile of `source` under the function's own profile (the tool's and the skill's
     passes.py share it): (result, profile)."""
     header = net._context(proj['id'], fn['unit'])['header']
     profile = compiler_for(net.cfg(proj), fn['vram'], fn)
     result = compiler_diagnostics.diagnose(profile, header, source, fn['name'], root=proj['root'], excerpts=passes,
-                                           excerpt_chars=excerpt_chars)
+                                           excerpt_chars=excerpt_chars, extra_flags=extra_flags)
     if result.get('skipped'):
         raise NetworkError(f"{result['skipped']} compiler_passes needs a pinned, installed GCC-family compiler "
                            f"(this function's is {profile.get('toolchain') or 'a custom command'}); use compile_variants "
@@ -72,6 +72,23 @@ def preferences(result):
     return lines
 
 
+def conflicts(result):
+    """The hard registers each global pseudo is live alongside (greg's `;; N conflicts:` lines minus the other
+    pseudos): the registers the allocator cannot give it, so what a preference can and cannot win. A pseudo whose
+    preferred register is absent here has that register free; one that still lands elsewhere lost it to an earlier
+    pseudo or to a stronger (copy) preference (global.c find_reg)."""
+    text = ((result.get('phases') or {}).get('greg') or {}).get('excerpt', '')
+    order = re.search(r'^;; \d+ regs to allocate:\s*([\d ]*)$', text, re.M)
+    pseudos = set(order[1].split()) if order else set()
+    values = {v['pseudo']: v for v in (result.get('allocation') or {}).get('values') or []}
+    lines = []
+    for pseudo, rest in re.findall(r'^;; (\d+) conflicts:([\d ]*)$', text, re.M):
+        hard = [n for n in rest.split() if n not in pseudos]
+        names = ','.join(values.get(int(pseudo), {}).get('aliases') or []) or 'temp'
+        lines.append(f"pseudo {pseudo} ({names}) is live with hard reg{'s' if len(hard) != 1 else ''} {' '.join(hard) or 'none'}")
+    return lines
+
+
 def schedule_order(result, phase):
     """A scheduling pass's instruction order, `uid pattern` per insn (the pass's dump lists them in the order it
     chose): compare `sched` (first scheduler) with `sched2` and with the target's order."""
@@ -80,18 +97,36 @@ def schedule_order(result, phase):
             re.findall(r'^\((?:insn|jump_insn|call_insn) (\d+) .*?\{(\w+)\}', text, re.M | re.S)]
 
 
-def report(net, proj, fn, source, passes=SKILL_PASSES):
+def verbose_schedule(result):
+    """The first scheduler's notes (the `;;` lines the pass writes into the sched dump: each ready list with its
+    launch priorities, the insns launched, the set-count rule), apart from the insns themselves. The pinned KMC cc1
+    writes them with plain `-dS` and refuses `-fsched-verbose-2` ("Invalid option", so the whole dump failed and
+    passes.py --sched-verbose answered "did not accept phase capture"): no flag is added."""
+    text = ((result.get('phases') or {}).get('sched') or {}).get('excerpt', '')
+    return [line for line in text.splitlines() if line.startswith(';;')]
+
+
+def report(net, proj, fn, source, passes=SKILL_PASSES, sched_verbose=False):
     """What the skill's passes.py prints: the allocation priority table, register preferences, scheduling orders and
-    where the compiler's source is. Diagnostic only, like the tool: nothing is recorded or judged."""
+    where the compiler's source is. Diagnostic only, like the tool: nothing is recorded or judged. `sched_verbose`
+    makes sure the first scheduler's dump is taken and prints its notes (the launch priorities)."""
+    if sched_verbose and 'sched' not in passes:
+        passes = (*passes, 'sched')
     result, profile = diagnose(net, proj, fn, source, passes, SKILL_EXCERPT_CHARS)
     out = [render(result, (), 'candidate', rows=None)]
     if prefs := preferences(result):
         out += ['', 'Register preferences (greg):', *prefs]
+    if lines := conflicts(result):
+        out += ['', 'Hard registers each pseudo is live with (it cannot take these):', *lines]
     for phase in ('sched', 'sched2'):
         if phase in passes:
             order = schedule_order(result, phase)
             out += ['', f"Scheduling order, {phase} ({'first' if phase == 'sched' else 'second'} scheduler), "
                         f"{len(order)} insns:", '  ' + '  '.join(order) if order else '  (not written by this compiler build)']
+    if sched_verbose:
+        notes = verbose_schedule(result)
+        out += ['', f'First scheduler notes ({len(notes)} lines):',
+                *(notes or ['  (this compiler build wrote no verbose notes into its sched dump)'])]
     return '\n'.join(out) + source_line(result.get('toolchain') or profile.get('toolchain'))
 
 

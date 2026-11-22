@@ -28,9 +28,12 @@ from . import (
     claim_state,
     compiler_experiments,
     compiler_passes,
+    compiler_source,
     focused_agents,
+    learnings_search,
     local_experiments,
     polish_automation,
+    prove_chain,
     repair_search,
     reviewed_search_seeds,
     score_permutations,
@@ -703,8 +706,12 @@ HANDLERS: dict[str, Callable[..., str]] = {
     "compiler_experiments": compiler_experiments.run,
     "compiler_passes": lambda net, agent, slug, function, revision, passes=None:
         compiler_passes.run(net, agent, slug, function, revision, passes),
-    "score_permutations": lambda net, agent, slug, function, revision, statements=None, patches=None, max=64:
-        score_permutations.run(net, agent, slug, function, revision, statements, patches, max),
+    "score_permutations": lambda net, agent, slug, function, revision, statements=None, patches=None, max=64, marked='':
+        score_permutations.run(net, agent, slug, function, revision, statements, patches, max, marked),
+    "prove_chain": lambda net, agent, slug, function, revision, families=None, steps=4, children=40:
+        prove_chain.run(net, agent, slug, function, revision, families, steps, children),
+    "compiler_source": lambda net, agent, slug, compiler, function_name: compiler_source.run(net, agent, slug, compiler,
+                                                                                             function_name),
     "get_compiler_trial": compiler_experiments.retrieve,
     "review_search_seed": reviewed_search_seeds.review,
     "get_search_brief": search_brief.read,
@@ -776,6 +783,8 @@ HANDLERS: dict[str, Callable[..., str]] = {
         net.try_compiler(agent, slug, function, compiler, flags, source),
     "search_notes": lambda net, agent, slug, query: net.search_notes(slug, query),
     "find_similar": lambda net, agent, slug, function, limit=5: net.find_similar(slug, function, limit),
+    "get_callers": lambda net, agent, slug, function, limit=8: net.get_callers(slug, function, limit),
+    "search_learnings": lambda net, agent, slug, symptom, top=5: learnings_search.run(net, agent, slug, symptom, top),
     "guide": lambda net, agent, slug, topic="": guide_text(topic, net.overview(slug).get("platform")),
     "read_file": lambda net, agent, slug, path, start=1, count=200:
         net.forks.read_file(_fork(net, slug, "read_file"), path, start, count),
@@ -792,7 +801,7 @@ HANDLERS: dict[str, Callable[..., str]] = {
 
 READ_ONLY = frozenset({"search_repair_examples", "get_repair_examples", "get_search_brief","get_boundary_evidence", "get_claims", "resolve_addresses", "project_info", "get_function", "last_diff", "get_context", "read_data", "get_class",
                        "guess_struct", "compiler_map", "list_functions", "search_flags", "search_notes",
-                       "find_similar", "guide", "read_file", "search_code", "file_status", "standins_for",
+                       "find_similar", "get_callers", "search_learnings", "compiler_source", "guide", "read_file", "search_code", "file_status", "standins_for",
                        "port_readiness", "get_data_unit", "check_for_pc", "watch_in_emulator"})
 
 # Read-only tools that read a function's saved C or the headers: they read the saved folder first (an edit made there
@@ -806,7 +815,7 @@ PUBLISH_AFTER = frozenset({"edit_context", "rename_symbol", "split_function", "j
 
 # Tools whose work is judging a candidate: the check before them reads only what a judge reads.
 JUDGE_TOOLS = frozenset({"compile_and_diff", "compile_patch", "compile_variants", "compile_family", "try_local_repairs",
-                         "try_compiler", "compiler_experiments", "compiler_passes", "score_permutations",
+                         "try_compiler", "compiler_experiments", "compiler_passes", "score_permutations", "prove_chain",
                          # (they read and write the database, not the saved files: release_function waited 3.2 s
                          # a call for the project's lock, behind other helpers' full checks)
                          "claim_function", "release_function", automatic_assignment.RELEASE, "add_note"})
@@ -817,7 +826,7 @@ REPAIR_CAPTURE_TOOLS = frozenset({'compile_and_diff', 'compile_patch', 'compile_
 
 ROM_ONLY = {"watch_in_emulator","compare_behaviour","compare_candidate_behaviour","get_data_unit","compile_data","claim_data","release_data","claim_port_fix","release_port_fix","check_for_pc","fix_for_pc","claim_asset_region","inspect_asset_region","preview_asset_region","propose_asset_region","defer_asset_region","review_search_seed","get_boundary_evidence", "suggest_boundary", "get_context", "edit_context", "split_function", "redraft", "search_flags",
             # GCC pass dumps and the standalone judge worker are ROM-mode (compiler_passes.py, score_permutations.py)
-            "compiler_passes", "score_permutations"}
+            "compiler_passes", "score_permutations", "prove_chain"}
 FORK_ONLY = {"read_file", "search_code", "edit_file", "file_status", "split_file", "join_functions", "tidy_done", "tidy_file",
              "standins_for"}
 LTCG_ONLY = {"standins_for"}  # only projects of games built with link-time code generation have harness/ files
@@ -844,6 +853,8 @@ def _supports(console, name: str, fork: bool) -> bool:
         return console.reads_structs
     if name == "compiler_map":
         return console.file_compilers if fork else arch.COMPILER_MAP in console.features
+    if name == "get_callers":
+        return not fork  # a project's callees aren't stored yet (ROADMAP.md)
     return True
 
 
@@ -1155,7 +1166,7 @@ def _unoffered(net: RomNetwork, slug: str, name: str) -> str:
     where = f"{console.name} projects" if console.name else "this project"
     subject = "its console"
     why = {"join_functions": "can't join functions yet", "report_boundary": "can't report function ends yet",
-           "get_class": "can't read C++ classes yet", "guess_struct": "can't read struct layouts yet",
+           "get_class": "can't read C++ classes yet", "get_callers": "can't list callers yet", "guess_struct": "can't read struct layouts yet",
            "compiler_map": "can't read a compiler map yet"}.get(name)
     if name == "join_functions" and not net.fork_slug(slug):
         subject, why = "the ROM engine", "can't join functions yet"  # ROM joins are the engine's (#192), not a console's
@@ -1184,7 +1195,7 @@ ALWAYS_LOAD = agents.TOOL_META
 # Tools that read, claim or note without compiling: they share a lane no compile can fill.
 QUICK_TOOLS = frozenset({
     'guide', 'project_info', 'get_claims', 'list_functions', 'get_function', 'get_assembly', 'get_context',
-    'last_diff', 'search_notes', 'read_file', 'search_code', 'file_status', 'get_class', 'compiler_map',
+    'last_diff', 'search_notes', 'search_learnings', 'read_file', 'search_code', 'file_status', 'get_class', 'get_callers', 'compiler_map',
     'get_candidate', 'get_compiler_trial', 'get_search_brief', 'family_targets', 'get_boundary_evidence',
     'resolve_addresses', 'read_data', 'standins_for', 'claim_function', 'claim_readable', 'release_function', automatic_assignment.RELEASE,
     'search_repair_examples', 'get_repair_examples', 'upvote_repair_example',
@@ -1394,12 +1405,28 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
 
     @tool
     async def score_permutations(ctx: Context, function: str, revision: str, statements: list[str] | None = None,
-                                 patches: list[dict] | None = None, max: int = 64) -> str:
-        """Judge up to 64 candidates at once with the exact judge: every order of 2-6 statements (exact whole lines
-        of your candidate), or every combination of 2-6 old/new patches. Only a candidate that beats the saved best
-        is recorded (through compile_and_diff); otherwise nothing is recorded and no move-on count is spent. ROM projects."""
+                                 patches: list[dict] | None = None, max: int = 64, marked: str = '') -> str:
+        """Judge many candidates at once with the exact judge: every order of 2-6 statements (exact whole lines of
+        your candidate), every combination of 2-6 old/new patches (up to 64), or every combination marked in a full
+        source (`marked`: /*{*/a/*|*/b/*}*/ alternatives, /*permute{*/ one statement per line /*}permute*/; up to
+        2000, 5 minutes). Only a candidate beating the saved best is recorded; else nothing, no move-on count. ROM projects."""
         return await run(ctx, 'score_permutations', function=function, revision=revision, statements=statements,
-                         patches=patches, max=max)
+                         patches=patches, max=max, marked=marked)
+
+    @tool
+    async def prove_chain(ctx: Context, function: str, revision: str, families: list[str] | None = None,
+                          steps: int = 4, children: int = 40) -> str:
+        """Would the repair library reach the match from here? Applies the best child of the named families (default
+        all) step by step, judged with the exact judge (at most 8 steps, 80 children a step, 2 minutes). Only a final
+        source beating the saved best is recorded; otherwise nothing, and no move-on count. ROM projects."""
+        return await run(ctx, 'prove_chain', function=function, revision=revision, families=families, steps=steps,
+                         children=children)
+
+    @tool
+    async def compiler_source(ctx: Context, compiler: str, function_name: str) -> str:
+        """Read one function or macro of a compiler pass from the compiler's installed source (e.g. "gcc-2.7.2-kmc",
+        "birthing_insn_p"; sched.c, local-alloc.c, global.c, loop.c...): the rule behind your last rows. Bounded."""
+        return await run(ctx, 'compiler_source', compiler=compiler, function_name=function_name)
 
     @tool
     async def compiler_experiments(ctx: Context, function: str, revision: str, trials: list[CompilerTrial]) -> str:
@@ -1491,6 +1518,8 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
         Leave a brief handoff only if you learned something. Released before that (fewer compiles than
         the move-on rule), it answers once with what to try instead; call it again to release anyway. A release with
         no compile since you claimed it is not taken, however often you ask: compile first, or end your session.
+        After the 45-minute hand-off clock (45 minutes on the claim and since your last improvement) and an add_note
+        hand-off, the release goes through whatever the compile count says.
 
         Args:
             function: the function you hold
@@ -1830,6 +1859,19 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
         """Functions whose instructions look like this one's (copy-pasted code, the same inlined helper,
         template instances), matched ones first, with the matching source of the best one. Start there."""
         return await run(ctx, "find_similar", function=function, limit=limit)
+
+    @tool
+    async def get_callers(ctx: Context, function: str, limit: int = 8) -> str:
+        """Where a function is called from: each call site with its caller and the instructions around the call, and
+        what the callers say about the function's result type (a caller that reads $v0 or $f0 after the call proves
+        it returns a value). Use it when the function's own code leaves its return type or its arguments unclear."""
+        return await run(ctx, "get_callers", function=function, limit=limit)
+
+    @tool
+    async def search_learnings(ctx: Context, symptom: str, top: int = 5) -> str:
+        """The recorded compiler-matching evidence, ranked by a symptom ("register swap", "store too early", "frame
+        size", "hoisted constant"): each entry's fix and the repair families that make it (try them with prove_chain)."""
+        return await run(ctx, "search_learnings", symptom=symptom, top=top)
 
     @tool
     async def guide(ctx: Context, topic: str = "") -> str:
