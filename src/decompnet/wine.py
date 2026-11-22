@@ -43,8 +43,9 @@ APP_FOLDERS = ("/Applications", str(Path.home() / "Applications"))
 PLACES = (*PACKAGE_BINS,
           *(f"{folder}/{app}.app/Contents/Resources/wine/bin" for folder in APP_FOLDERS for app in MAC_APPS))
 # what wine is told: no debug output (it goes to the compiler's log), and no offer to install Mono or Gecko when the
-# prefix is made (a dialog nobody answers: cl.exe needs neither)
-QUIET = {"WINEDEBUG": "-all", "WINEDLLOVERRIDES": "mscoree,mshtml="}
+# prefix is made (a dialog nobody answers: cl.exe needs neither), and no crash dialog when a compiler crashes on some
+# C (winedbg off: it exits with an error, a failed build; an old Watcom opened one on the desktop for each)
+QUIET = {"WINEDEBUG": "-all", "WINEDLLOVERRIDES": "mscoree,mshtml=;winedbg.exe=d"}
 PREPARE_SECONDS = 600  # wineboot on a slow computer: a minute measured in a 2-core workspace
 
 

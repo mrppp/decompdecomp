@@ -134,7 +134,9 @@ def main() -> int:
                     prefix = ""
             if prefix:
                 env["WINEPREFIX"] = prefix
-            env.update(WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=", WATCOM=windows(home))
+            # (winedbg off: a compiler that crashes on some C, as an old Watcom can, exits with an error, which is a
+            # failed build, instead of Wine opening a crash dialog on the desktop for every such compile)
+            env.update(WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d", WATCOM=windows(home))
             keep_wine_server(wine, env)
             headers = ";".join(windows(Path(p).resolve()) for p in (args.include, *args.system_include))
             cmd = [wine, args.compiler, *args.flags, f"-i={headers}", windows(Path(args.source).resolve()),
