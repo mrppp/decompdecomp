@@ -137,6 +137,11 @@ def main() -> int:
             # (a crash on some C, as an old Watcom can, is a failed build: the app's prefix has its crash dialog off,
             # wine.quiet_crashes)
             env.update(WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=", WATCOM=windows(home))
+            # No display for the compiler, a console program: Watcom 9.5's runtime answers its own crash with an
+            # "Application Error" message box, which waited for a click on the desktop until the time limit killed
+            # the compile (60 s a try, a box each). With no display it can't open one: the crash exits at once.
+            for name in ("DISPLAY", "WAYLAND_DISPLAY"):
+                env.pop(name, None)
             keep_wine_server(wine, env)
             headers = ";".join(windows(Path(p).resolve()) for p in (args.include, *args.system_include))
             cmd = [wine, args.compiler, *args.flags, f"-i={headers}", windows(Path(args.source).resolve()),
