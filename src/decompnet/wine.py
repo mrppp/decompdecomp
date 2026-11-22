@@ -43,9 +43,8 @@ APP_FOLDERS = ("/Applications", str(Path.home() / "Applications"))
 PLACES = (*PACKAGE_BINS,
           *(f"{folder}/{app}.app/Contents/Resources/wine/bin" for folder in APP_FOLDERS for app in MAC_APPS))
 # what wine is told: no debug output (it goes to the compiler's log), and no offer to install Mono or Gecko when the
-# prefix is made (a dialog nobody answers: cl.exe needs neither), and no crash dialog when a compiler crashes on some
-# C (winedbg off: it exits with an error, a failed build; an old Watcom opened one on the desktop for each)
-QUIET = {"WINEDEBUG": "-all", "WINEDLLOVERRIDES": "mscoree,mshtml=;winedbg.exe=d"}
+# prefix is made (a dialog nobody answers: cl.exe needs neither). Crash dialogs are off in the prefix (quiet_crashes)
+QUIET = {"WINEDEBUG": "-all", "WINEDLLOVERRIDES": "mscoree,mshtml="}
 PREPARE_SECONDS = 600  # wineboot on a slow computer: a minute measured in a 2-core workspace
 
 
@@ -186,6 +185,22 @@ def prepare(log=print, where: Path | None = None) -> Path:
         if done.returncode or not (where / "system.reg").is_file():
             raise RuntimeError(f"wine couldn't prepare its prefix in {where} (wineboot exited with {done.returncode}): "
                                f"{tail}")
+    quiet_crashes(wine, where)
     # no server is started here: wine's idle countdown (-p600) only begins once a wine program has run and ended, so
     # a server nothing used would stay for good (measured: wine 9.0). The first compile starts it (tools/compile.py)
     return where
+
+
+def quiet_crashes(wine: str, where: Path) -> None:
+    """No crash dialog in the prefix (WineDbg's ShowCrashDialog 0): an old Watcom crashes on some C, and each crash
+    opened "has encountered a serious problem" on the desktop while helpers compiled. The crash is still a failed
+    build. (Turning winedbg off instead made Wine show a plain "Application Error" box.) Once per prefix."""
+    try:
+        if '"ShowCrashDialog"=dword:00000000' in (where / "user.reg").read_text(errors="replace"):
+            return
+        with tempfile.TemporaryFile() as said:  # (a file, not a pipe: see prepare)
+            subprocess.run([wine, "reg", "add", r"HKCU\Software\Wine\WineDbg", "/v", "ShowCrashDialog",
+                            "/t", "REG_DWORD", "/d", "0", "/f"], env=environment(where), stdin=subprocess.DEVNULL,
+                           stdout=said, stderr=said, timeout=120, creationflags=NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # (dialogs, not failures: compiles work either way)
