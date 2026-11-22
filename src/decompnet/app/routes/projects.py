@@ -1224,6 +1224,10 @@ def register(app: App) -> None:
                 raise
         return {'job': check.cross_job}
 
+    def p_globals(slug, request, data):
+        from ..globals_view import globals_list
+        return globals_list(net, slug)
+
     def p_variants(slug, request, data):
         from .. import variants
         if request.method == 'POST':
@@ -1459,6 +1463,7 @@ def register(app: App) -> None:
         "/api/sdk-signatures": (p_sdk, ["POST"]),
         "/api/cross-game/run": (p_cross_run, ["POST"]),
         "/api/variants": (p_variants, ["GET", "POST"]),
+        "/api/globals": (p_globals, ["GET"]),
         "/api/regional": (p_regional, ["GET", "POST"]),
         "/api/regional/names": (p_regional_names, ["POST"]),
         "/api/regional/code": (p_regional_code, ["POST"]),
