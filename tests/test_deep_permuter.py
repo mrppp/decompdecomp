@@ -33,6 +33,7 @@ def setup(monkeypatch, imported=False):
         return draft_repairs.variants(*args, labels=labels, **kwargs), labels, 0
     monkeypatch.setattr(deep_proposals.Pool, 'generate', generate)
     monkeypatch.setattr('decompnet.app.compiler_preflight.warnings', lambda *args: '')
+    monkeypatch.setattr('decompnet.app.deep_profile_sweep.run', lambda *args: False)  # (own tests: test_deep_profile_sweep)
     net._function = lambda name, slug: net.function()
     net.local_agent = lambda name: (AGENT, None)
     net.fork_slug = lambda slug: 'fork' if imported else None
@@ -45,6 +46,13 @@ def setup(monkeypatch, imported=False):
     monkeypatch.setattr(deep_permuter.Search, '_baseline', lambda *args: (40, 0))
     monkeypatch.setattr(draft_repairs, 'variants', lambda *args, **kwargs: ['local'])
     monkeypatch.setattr(permuter_local, 'variants', lambda *args: [])
+    # (these two read any arithmetic, so the tiny synthetic sources would give the lane children of their own:
+    # their wiring test turns one back on)
+    from decompnet.app import generation_calls
+    from decomprepair import reassociation_repairs, temporary_hoist_repairs
+    monkeypatch.setattr(generation_calls, 'IN_SERVER', True)  # (so the patches below reach the lane's calls)
+    monkeypatch.setattr(temporary_hoist_repairs, 'variants', lambda *args, **kwargs: [])
+    monkeypatch.setattr(reassociation_repairs, 'variants', lambda *args, **kwargs: [])
     return net
 
 
@@ -227,7 +235,7 @@ def test_live_metrics_count_only_verified_strict_improvements_and_keep_starting_
     assert metrics.pop('history') == [{'tested':0,'score':50},{'tested':2,'score':30},{'tested':5,'score':20},
                                       {'tested':7,'score':0}]
     assert metrics == {'starting_score':50,'starting_percent':95.0,'best_score':0,
-                                'best_percent':100.0,'improvements':3,'local_search':{},
+                                'best_percent':100.0,'improvements':3,'extensions':0,'extension_max':deep_permuter.EXTEND_MAX,'local_search':{},
                                 'allocation_trials':0,'allocation_diagnostic_compiles':0,'reviewed_seeds':{}}
     assert search.log.updates[-1]['improvements'] == 3
 
@@ -1152,10 +1160,16 @@ def test_targeted_register_pass_compiles_bitwise_and_float_lifetime_candidates(m
     monkeypatch.setattr(search, '_score', score)
     search.winner_diff = ([('r', 'and $v0, $v0, $v1', 'and $v0, $v1, $v0')], '')
     assert search.operand_order_pass(AGENT, proj, fn, 5, None) == 5
-    assert len(seen) == 2 and any('a = b & a' in candidate for candidate in seen)
+    assert any('a = b & a' in candidate for candidate in seen)
+    # The operand swap is the repair under test. Other local families (statement reordering) now also propose
+    # candidates for the same near miss, so the count is not pinned.
+    assert 2 <= len(seen) <= 12
 
     # Give the independent floating fixture its own compile allowance.
     search.tested = 0
+    # More local families now propose first for a float near miss and the pass spends half the allowance, so give
+    # the float repair room behind them rather than pinning its position in the proposal order.
+    search.limit = 60
     seen.clear()
     field = 'M2C_FIELD(obj, f32 *, 4)'
     draft = f'void f(void *obj) {{ {field} = (compute({field}) * 0.5f) + {field}; }}'
@@ -1420,9 +1434,11 @@ def test_deep_search_sets_aside_hand_written_assembly_instead_of_searching_it(mo
     monkeypatch.setattr(deep_permuter, '_run', lambda *a, **k: pytest.fail('searched hand-written assembly'))
     log = Log()
     result = deep_permuter.run(net, 'game', 'f', 30, 10, log)
-    assert not result['matched'] and result['tested'] == 0 and 'addi' in result['reason']
+    # The N64 entry stub is now recognised as SDK boot code (library detection), so it is set aside under that
+    # label before any search; it no longer names its first instruction.
+    assert not result['matched'] and result['tested'] == 0 and 'SDK library code' in result['reason']
     row = net.function()
-    assert row['status'] == 'asm' and 'addi' in json.loads(row['meta'])['asm_code']
+    assert row['status'] == 'asm' and 'excluded from C matching' in json.loads(row['meta'])['asm_code']
 
 
 def test_deep_search_leaves_a_function_the_user_gave_back_to_the_agents(monkeypatch):
@@ -1731,3 +1747,12 @@ def test_a_run_that_keeps_improving_spends_the_extended_budget(monkeypatch):
     result = deep_permuter.run(net, 'game', 'f', 1, 2, Log())
     assert result['reason'] == 'Variant limit reached'
     assert result['tested'] > 2  # extended while still improving, then stopped at the cap
+
+
+def test_extensions_are_reported_in_the_progress_metrics(monkeypatch):
+    search = _budget_search(monkeypatch)
+    assert (search.metrics()['extensions'], search.metrics()['extension_max']) == (0, deep_permuter.EXTEND_MAX)
+    search.tested, search.improved_at = 100, (95, time.monotonic())
+    search.check()
+    assert search.metrics()['extensions'] == 1
+    assert _budget_search(monkeypatch, extendable=False).metrics()['extension_max'] == 0

@@ -13,10 +13,14 @@ Requests:
   "source"} -> {"score": 0 for a match, the difference otherwise, null when it didn't compile; "detail"}, or
   {"error": ...} when it can't be judged here. That happens when the project isn't here, or its function's target
   bytes differ from the hosted ones (another build of the game). With "diff": true the reply also carries "diff", the
-  app's own side-by-side rows for the candidate (DiffResult.render: the same normalisation compile_and_diff shows).
+  app's own side-by-side rows for the candidate, the first "rows" of them (default 60; the last line counts the rest)
+  (DiffResult.render: the same normalisation compile_and_diff shows). With "raw_rows": true it carries "rows", every
+  (marker, target, candidate) row of that diff, unrendered (the skill's region view, regions.py).
 - {"op": "function", "slug", "name", "vram" (optional, for overlays)} -> {"name", "vram", "target" (hex), "unit",
   "arch", "asm" (the target's assembly text), "header" (the project's typedefs and externs the judge prepends),
-  "compiler": {"toolchain", "flags"} (this function's own profile)}: everything a local search needs to judge without being told the function's bytes
+  "compiler": {"toolchain", "flags"} (this function's own profile), "tables" ([[low, [targets...]], ...]: its jump
+  tables, as switch_tables.read), "callees" (its callees' matched C, capture_followup_repairs.callee_evidence) and
+  "entry_scope" (promoted_entry_repairs.scope): the context the app's draft path hands draft_repairs.variants}: everything a local search needs to judge without being told the function's bytes
   (the match-function skill's fast_judge.py).
 - {"op": "passes", "slug", "name", "source", "passes" (optional)} -> {"text"}: the compiler's allocation priority
   table, register preferences and scheduling orders for that C under the function's profile (compiler_passes.report,
@@ -89,7 +93,12 @@ def judge(net, request: dict) -> dict:
     if not toolchain:
         return {"error": "no compiler named"}
     matched, diff, log = net._judge_with(proj, fn, toolchain, list(flags), source)
-    shown = {"diff": diff.render()} if request.get("diff") and diff is not None else {}
+    rows = request.get("rows")  # how many rows the diff shows (default 60); the rest is counted in its last line
+    shown = {}
+    if request.get("diff") and diff is not None:
+        shown = {"diff": diff.render(max_rows=rows if isinstance(rows, int) and rows > 0 else 60, more_hint=False)}
+    if request.get("raw_rows") and diff is not None:
+        shown["rows"] = [list(row) for row in diff.rows]
     if matched:
         return {"score": 0, "detail": "byte-identical", **shown}
     if diff is None:
@@ -125,10 +134,16 @@ def function_info(net, request: dict) -> dict:
     if isinstance(found, dict):
         return found
     proj, fn = found
+    from .app import draft_repairs, switch_tables
     profile = compiler_for(net.cfg(proj), fn["vram"], fn)
+    # What draft_repairs.variants needs beyond the source: families like switch_gap_goto read the jump tables, so a
+    # script that calls variants without them never sees those families fire.
     return {"name": fn["name"], "vram": fn["vram"], "target": bytes(fn["target"] or b"").hex(), "unit": fn["unit"],
             "arch": proj["arch"], "asm": fn["asm"] or "",
             "header": net._context(proj["id"], fn["unit"])["header"],
+            "tables": [[low, list(targets)] for low, targets in switch_tables.read(net, proj, fn)],
+            "callees": draft_repairs.capture_followup_repairs.callee_evidence(net, proj, fn, fn["best_source"] or ""),
+            "entry_scope": draft_repairs.promoted_entry_repairs.scope(net, proj, fn),
             "compiler": {"toolchain": profile.get("toolchain"), "flags": list(profile.get("flags") or [])}}
 
 

@@ -44,6 +44,10 @@ def prove(source, generate, score, families, steps=DEFAULT_STEPS, children=DEFAU
             if (families is None or family in families) and child not in seen:
                 seen.add(child)
                 options.append((family, child))
+        cut = len(options) - children
+        if cut > 0:
+            log(f"step {step}  note: {cut} of {len(options)} children cut off by --children {children}; "
+                f"raise it (or name --families) if the right child may be among them")
         scored = []
         for family, child in options[:children]:
             result = score(child)
@@ -60,13 +64,28 @@ def prove(source, generate, score, families, steps=DEFAULT_STEPS, children=DEFAU
     return current, best, chain
 
 
+def current_name(source, name, vram):
+    """A source saved before a rename defines `func_<VRAM>`, and the families look the function up by `name`: they
+    propose nothing (13 of 34 stalls in the whole-path audit). Rename it, as the app's canonical_source does."""
+    from decompnet.app.function_names import rename_identifiers
+    from decompnet.forks.csource import find
+    old = f"func_{vram:08X}" if isinstance(vram, int) else None
+    if old and old != name and find(source, name) is None and find(source, old) is not None:
+        return rename_identifiers(source, {old: name})
+    return source
+
+
 def generator(judge, name):
     from decompnet.app import draft_repairs
+    vram = (getattr(judge, "request", None) or {}).get("function", {}).get("vram")
 
     def generate(source):
+        source = current_name(source, name, vram)
         labels = {}
         texts = draft_repairs.variants(source, name, judge.arch, judge.asm, judge.compiler["flags"], labels,
-                                       limit=None, header=judge.header)
+                                       limit=None, header=judge.header, tables=getattr(judge, "tables", ()),
+                                       callees=getattr(judge, "callees", ""),
+                                       entry_scope=getattr(judge, "entry_scope", None))
         return [(labels.get(text, "unlabelled"), text) for text in texts]
     return generate
 

@@ -12,9 +12,11 @@ from tests.test_permute import AGENT, FakeNet, ProjectStub, ScriptedPermuter
 
 def test_address_conversion_and_commutation_are_combined():
     src = 'int f(int i) { return *(int *)((u8 *)table + i); }'
-    assert 'int f(int i) { return *(int *)(i + (int)table); }' in variants(src, 'f', 'mips')
-    assert not variants(src, 'f', 'x86_64')
-    assert not variants(src, 'f', 'unknown')
+    expected = 'int f(int i) { return *(int *)(i + (int)table); }'
+    assert expected in variants(src, 'f', 'mips')
+    # (the temporary and regrouping families read only C, so every processor gets those; the address one is MIPS's)
+    assert expected not in variants(src, 'f', 'x86_64')
+    assert expected not in variants(src, 'f', 'unknown')
 
 
 @pytest.mark.parametrize('arch', ['mips', 'ppc', 'x86', 'x86_64', 'arm', 'thumb', 'unknown'])
@@ -55,7 +57,12 @@ def test_only_requested_definition_and_no_directives():
     # Extra statements and references to the accumulator must not be discarded.
     for expr in ('result + x', 'x'):
         src = f'int f(int x) {{ int result; result=0; side(); if(x>=0){{result={expr};}} return result; }}'
-        assert all('side();' in out and (f'result={expr};' in out or (expr=='result + x' and ('result = result; result += x;' in out or 'result= (x) + (result);' in out))) for out in variants(src, 'f', 'mips'))
+        labels = {}
+        outputs = variants(src, 'f', 'mips', labels=labels)
+        assert all('side();' in out for out in outputs)
+        # (a sub-expression held in a temporary writes the same expression under another name: its own tests check it)
+        assert all(f'result={expr};' in out or (expr=='result + x' and ('result = result; result += x;' in out or 'result= (x) + (result);' in out))
+                   for out in outputs if not labels.get(out, '').startswith('temporary_hoist'))
 
 
 def setup_repair_net(count=1):
@@ -166,8 +173,9 @@ def test_member_address_cast_with_optional_parentheses(pointer, wrapped):
     if wrapped:
         cast = f'({cast})'
     src = f'int f(int i) {{ return *(int *)({cast} + i); }}'
-    assert f'int f(int i) {{ return *(int *)(i + (int){pointer}); }}' in variants(src, 'f', 'mips')
-    assert not variants(src, 'f', 'x86_64')
+    expected = f'int f(int i) {{ return *(int *)(i + (int){pointer}); }}'
+    assert expected in variants(src, 'f', 'mips')
+    assert expected not in variants(src, 'f', 'x86_64')
 
 
 def test_member_rule_excludes_calls_and_increments():
@@ -490,3 +498,14 @@ void f(Voice *v, Note *n) {
                'if (__repair_shifted_byte & 1)' in child for child in children)
     assert not any(labels.get(child) == 'shifted_byte_lifetime'
                    for child in variants(source, 'f', 'x86', labels=labels))
+
+
+def test_a_best_saved_before_a_rename_still_gets_children():
+    # the whole-path audit: 13 of 34 stalls had no children at all, their best defining func_<VRAM> after a rename
+    net = setup_repair_net()
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET name='sendSeven', vram=?, best_source=? WHERE id=1",
+                   (0x80001000, 'int func_80001000(int x) { return send(x, 7); }'))
+    perm = ScriptedPermuter(net, {})
+    perm._repair_round(AGENT, net.project_row('game'), State())
+    assert perm.judged and all('int sendSeven(' in source for source in perm.judged)

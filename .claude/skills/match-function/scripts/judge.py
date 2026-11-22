@@ -3,11 +3,15 @@
 
 Standard library only: it reads the app's own connection file and calls the same local API the window does.
 
-    judge.py claim SLUG [FUNC]           claim FUNC, or with none a random open function nobody holds; prints its name
+    judge.py claim SLUG [FUNC] [--nearest] [--max-size N]
+                                         claim FUNC, or with none a random open function nobody holds (--nearest: the
+                                         lowest saved score first; --max-size: at most N instructions); prints its name
     judge.py release SLUG FUNC           give the claim back
     judge.py best SLUG FUNC OUT.c        the function's saved best C, to a file
     judge.py diff SLUG FUNC              the diff of the saved best (rows), and the app's verdict
-    judge.py try SLUG FUNC CAND.c        judge a candidate; release the claim afterwards
+    judge.py try SLUG FUNC CAND.c        judge a candidate as the window's "you" (or --holder); release the claim afterwards.
+                                         NOT for a setup.py session: its claim is held by the session's MCP connection and
+                                         this is refused (HTTP 400); use `setup.py try HOLDER CAND.c` there
     judge.py seed SLUG FUNC              judge the app's own untouched draft, so a search has scored C to start from
     judge.py permute SLUG FUNC MIN VAR   start the Deep Permuter (stock settings), print the job id
     judge.py job ID                      state, progress and the log's improvements for a job
@@ -61,8 +65,15 @@ class App:
     def function(self, slug, name):
         return self.call("/api/function?" + urllib.parse.urlencode({"slug": slug, "name": name}))
 
-    def claim(self, slug, name=""):
-        return self.call("/api/claim", {"slug": slug, "name": name})
+    def claim(self, slug, name="", strategy="random", max_insns=0):
+        """An app started before `nearest` existed refuses it: ask for closest (its near-miss order), then random."""
+        result = {}
+        for wanted in dict.fromkeys([strategy] + (["closest", "random"] if strategy == "nearest" else [])):
+            result = self.call("/api/claim", {"slug": slug, "name": name, "strategy": wanted,
+                                              "max_insns": int(max_insns or 0)})
+            if "strategy must be one of" not in str(result.get("error", "")):
+                break
+        return result
 
     def release(self, slug, name):
         return self.call("/api/release", {"slug": slug, "name": name})
@@ -109,8 +120,19 @@ def main(argv):
     if not argv:
         sys.exit(__doc__)
     app, (command, *args) = App(options["--home"], options["--holder"]), argv
-    if command == "claim" and len(args) in (1, 2):
-        result = app.claim(*args)
+    if command == "claim":
+        strategy, cap, plain = "random", 0, []
+        while args:
+            word, args = args[0], args[1:]
+            if word == "--nearest":
+                strategy = "nearest"
+            elif word == "--max-size" and args:
+                cap, args = int(args[0]), args[1:]
+            else:
+                plain.append(word)
+        if len(plain) not in (1, 2):
+            sys.exit(__doc__)
+        result = app.claim(*plain, strategy=strategy, max_insns=cap)
         if "name" not in result:
             sys.exit(f"no claim: {result.get('error') or result}")
         print(result["name"])
@@ -132,6 +154,9 @@ def main(argv):
         slug, name, path = args
         result = app.try_source(slug, name, Path(path).read_text())
         print(result.get("text") or result)
+        if result.get("HTTP") == 400:
+            print("If this function was claimed by a setup.py session, submit with `setup.py try HOLDER CAND.c` instead: "
+                  "that claim belongs to the session's MCP connection, not to this holder.")
         print("score", result.get("score"), "matched", result.get("matched"), "exact", result.get("exact"))
     elif command == "seed" and len(args) == 2:
         # The Deep Permuter refuses a function with no scored C ("Choose an unmatched function with saved, scored
