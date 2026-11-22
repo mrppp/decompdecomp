@@ -4782,3 +4782,10 @@ leaving the public owner function authoritative. The linker still rejects unreso
 Extend the open-candidate behavior check to consoles and imported builds as
 they gain compatible record/replay and isolated candidate runners. Sampled
 behavior remains advisory for the exact judge.
+
+- (22 November 2026) a DOS project's tools/compile.py waits forever when no Wine session is running: the first
+  compile's Wine starts its background programs (services.exe, winedevice, rpcss and a wineserver), they inherit
+  the compile's output pipes, and communicate() waits for them to close, also after the 60 s limit killed the
+  compiler. Inside the app its Wine runtime is already up, so it rarely shows; a reset of files' compilers run with
+  the app stopped hung on every compile. Start the session detached first (wine with stdio to /dev/null), or give
+  the compiler files instead of pipes, and never wait without a limit after the kill.
