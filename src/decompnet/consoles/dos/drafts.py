@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 
 GHIDRA_HEADER = "ghidra.h"
-GHIDRA_H = """/* ghidra.h 4. Ghidra's names for the types and operations it can't tell yet, so its machine drafts compile as they are:
+GHIDRA_H = """/* ghidra.h 5. Ghidra's names for the types and operations it can't tell yet, so its machine drafts compile as they are:
  * autopilot tries them (`#include "ghidra.h"`). The game's own types are better: agents write those in common.h. */
 #ifndef GHIDRA_H
 #define GHIDRA_H
@@ -41,6 +41,7 @@ typedef unsigned short ushort;
 typedef unsigned short word;
 typedef unsigned int uint;
 typedef unsigned int uint3;
+typedef unsigned char bool;  /* (Ghidra declares bool bVar1; with the game's types it often does: C89 has none) */
 typedef int int3;  /* (CONCAT31((int3)x, y): its 3-byte signed part, as an int) */
 typedef unsigned long ulong;
 typedef unsigned int dword;
@@ -113,6 +114,71 @@ def _definition(known: str, name: str) -> str | None:
     return " ".join(m.group(1).split()) if m else None
 
 
+_SCALARS = {"int", "char", "short", "long", "unsigned", "signed", "u8", "s8", "u16", "s16", "u32", "s32", "uint",
+            "ushort", "uchar", "byte", "word", "dword", "undefined", "undefined1", "undefined2", "undefined3",
+            "undefined4", "bool"}
+_CONVENTIONS = re.compile(r"\b(__cdecl|__stdcall|__fastcall|__pascal|__watcall|extern|static|near|far)\b")
+
+
+def _param_type(param: str) -> str:
+    """A parameter's type without its name: "u8 *p" -> "u8 *", "unsigned int" stays, "int" stays."""
+    param = " ".join(param.split())
+    m = re.match(r"^(.*?[\s\*])([A-Za-z_]\w*)$", param)
+    if m and m.group(2) not in _SCALARS and m.group(1).strip() and not m.group(1).strip().endswith(("struct", "union")):
+        return m.group(1).strip()
+    return param
+
+
+def _prototype(known: str, name: str, declarations_only: bool = False) -> tuple[str, list[str]] | None:
+    """(return type, parameter types) that `known` gives `name`: a declaration ("int f(u8 *, int);"), or else a
+    definition unless `declarations_only`. None: none, or one with (...) or a function pointer in it."""
+    end = ";" if declarations_only else "[;{]"
+    for m in re.finditer(rf"^([A-Za-z_][\w \t\*]*?)\b{name}\s*\(([^;{{}}()]*)\)\s*{end}", known, re.M):
+        ret = " ".join(_CONVENTIONS.sub(" ", m.group(1)).split())
+        params = [p.strip() for p in m.group(2).split(",")]
+        if params in ([""], ["void"]):
+            return ret, []
+        if any(p == "..." for p in params):
+            return None
+        return ret, [_param_type(p) for p in params]
+    return None
+
+
+def _castable(ctype: str) -> bool:
+    """A parameter type an argument can be cast to without changing the code: a pointer, or a 32-bit-or-smaller
+    integer (not a structure passed by value)."""
+    return "*" in ctype or all(w in _SCALARS for w in ctype.replace("const", "").replace("volatile", "").split())
+
+
+def _cast_arguments(body: str, callee: str, types: list[str]) -> str:
+    """Each argument of each call to `callee` cast to its parameter type where that's castable: a draft passed
+    an int where the file's prototype says u8 * (Watcom: "Type of parameter does not agree", E1071)."""
+    out, i = [], 0
+    for m in re.finditer(rf"\b{callee}\s*\(", body):
+        if m.start() < i:
+            continue
+        j, depth, args, start = m.end(), 1, [], m.end()
+        while j < len(body) and depth:
+            c = body[j]
+            if c in "([":
+                depth += 1
+            elif c in ")]":
+                depth -= 1
+                if depth == 0:
+                    args.append(body[start:j])
+                    break
+            elif c == "," and depth == 1:
+                args.append(body[start:j])
+                start = j + 1
+            j += 1
+        if depth or len(args) != len(types) or args == [""]:
+            continue
+        cast = [f"({t})({a.strip()})" if _castable(t) and a.strip() else a for a, t in zip(args, types)]
+        out.append(body[i:m.end()] + ", ".join(cast) + ")")
+        i = j + 1
+    return "".join(out) + body[i:]
+
+
 def compilable(draft: str, symbol: str, stack: dict[str, str], known: str = "") -> tuple[str, str] | None:
     """Ghidra's draft (as it gave it) as C that compiles in the function's source file, (prelude, definition), or None.
     `symbol`: its Watcom symbol (_func_X@8: __stdcall); `stack`: the C name of each of the game's stack-convention
@@ -144,7 +210,32 @@ def compilable(draft: str, symbol: str, stack: dict[str, str], known: str = "") 
         kind = "undefined1" if m.group(1) else "undefined4"
         if globals_.setdefault(m.group(2), kind) != kind:
             return None  # read as a word and as a byte: Ghidra's view of it isn't one C declaration
+    # &D is Ghidra's address of a global it sees as bytes: (&D)[i] its i-th byte, &D + n the byte n past it. A file
+    # that declares D an array of unknown size (unsigned char D[]; void (*D[])(void);) makes &D a pointer to an
+    # incomplete type, which Watcom can neither index nor add to ("pointer to void", a third of one game's draft
+    # failures). As a byte pointer, ((undefined1 *)&D), it means what Ghidra meant whatever the file's type.
+    for g, kind in globals_.items():
+        if kind == "undefined1" and re.search(rf"\b{g}\b", known):
+            body = re.sub(rf"(?<![&\w])&{g}\b", f"((undefined1 *)&{g})", body)
+    # (longlong)(x) / n is Ghidra's cdq; idiv: a signed 32-bit division whose dividend it widens. Watcom before 11
+    # has no 64-bit integer (ghidra.h's longlong is a structure, which nothing can be cast to: E1037), and (int)(x)
+    # / n makes the same cdq; idiv. The entity-index arithmetic of one game, (p - entities) / 0xA4, was all this.
+    body = re.sub(r"\(\s*longlong\s*\)", "(int)", body)
+    body = re.sub(r"\(\s*ulonglong\s*\)", "(unsigned int)", body)
     callees = sorted({m.group(1) for m in _FUNC.finditer(body)} - {name})
+    for callee in callees:  # (the file's prototypes: its parameter types, which Watcom holds every call to)
+        if (proto := _prototype(known, callee)) is not None and proto[1]:
+            body = _cast_arguments(body, callee, proto[1])
+    # the function's own declaration in the file: its return type and parameter types (Watcom: "Inconsistent return
+    # type", E1062, "Type of parameter does not agree", E1071, where the draft's differ)
+    if (own_proto := _prototype(known, name, declarations_only=True)) is not None:
+        if own_proto[0]:
+            ret = own_proto[0]
+        if ret == "void":  # (Ghidra returns what it saw left in eax: a void function can't, its side effects stay)
+            body = re.sub(r"\breturn\s+([^;]+);", r"{ \1; return; }", body)
+        if len(own_proto[1]) == len(params):
+            params = [f"{t} {p.split()[-1].lstrip('*')}" if re.search(r"\w$", p) else p
+                      for t, p in zip(own_proto[1], params)]
     lines = []
     for callee in callees:
         defined = _definition(known, callee)

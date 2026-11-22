@@ -373,3 +373,24 @@ def test_ghidra_is_given_the_types_and_its_cache_tells_them_apart(tmp_path, monk
     assert plain != typed  # (the types are part of the cache key: a draft without them isn't reused)
     assert ghidra.decompile_object(obj, tmp_path / "cache", types=("typedef int T;", {"_D_000ADF6C": "T *"})) == typed
     assert len(given) == 2
+
+
+def test_drafts_fit_the_file_they_go_into():
+    """Watcom held MC1's drafts to the file's own declarations, and nearly every draft failed: a global the file
+    declares as an array of unknown size read byte-wise (&D), calls passing an int to a u8 * parameter, the
+    function's own return type, and Ghidra's (longlong) cdq; idiv."""
+    known = ("extern unsigned char D_000DDFB0[];\nextern void (*D_000219C4[])(void);\n"
+             "extern int func_0003CBE0(char *, void *p);\nvoid func_00010C30(void);\n")
+    draft = ("undefined4 func_00010C30(void)\n{\n  int iVar1;\n"
+             "  iVar1 = (uint)(&_D_000DDFB0)[iVar1 * 2];\n"
+             "  (**(code **)(&_D_000219C4 + iVar1 * 4))();\n"
+             "  func_0003CBE0(iVar1 + 4, (iVar1 * 2));\n"
+             "  return (u16)((longlong)(iVar1 - 0x7463) / 0xa4);\n}\n")
+    prelude, definition = drafts.compilable(draft, "func_00010C30", {}, known)
+    assert "((undefined1 *)&D_000DDFB0))[iVar1 * 2]" in definition
+    assert "((undefined1 *)&D_000219C4)) + iVar1 * 4" in definition or "((undefined1 *)&D_000219C4) + iVar1 * 4" in definition
+    assert "func_0003CBE0((char *)(iVar1 + 4), (void *)((iVar1 * 2)))" in definition
+    assert "(int)(iVar1 - 0x7463) / 0xa4" in definition and "longlong" not in definition
+    assert definition.startswith("void func_00010C30(void)")  # (the file's own declaration says void)
+    assert "{ (u16)((int)(iVar1 - 0x7463) / 0xa4); return; }" in definition  # (a void function returns nothing)
+    assert "extern" not in prelude  # (the file declares both globals already)
