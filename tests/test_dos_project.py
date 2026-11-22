@@ -261,6 +261,15 @@ def test_a_source_file_keeps_a_compiler_of_its_own():
     assert fp.manifest["dos_compilers_map"] == {}
 
 
+def test_a_game_built_with_one_identified_watcom_keeps_it():
+    """try_compiler only tests other compilers on a DOS game whose Watcom import identified (keeps_game_compiler):
+    helpers moved eleven of one game's files to OpenWatcom 2 or Watcom 9.5 for one small function each."""
+    assert DOS.keeps_game_compiler(_Fp({"created": "from scratch", "compiler": "watcom-10.0a"})) == "watcom-10.0a"
+    # OpenWatcom 2 is import's default when no Watcom here matched the game's library code: nothing identified
+    assert DOS.keeps_game_compiler(_Fp({"created": "from scratch", "compiler": "openwatcom-2.0"})) is None
+    assert DOS.keeps_game_compiler(_Fp({"compiler": "watcom-10.0a"})) is None  # (a project not made from scratch)
+
+
 def test_a_drafts_callees_are_declared_as_their_file_defines_them():
     # a draft calling a function its file defines `void f(void)`: an `int f();` before it would clash (E1062)
     known = "void func_0002C780(void)\n{\n}\n"

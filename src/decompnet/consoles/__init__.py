@@ -598,6 +598,12 @@ class Console:
         its own: then try_compiler can switch it. None: the project's build decides alone."""
         return None
 
+    def keeps_game_compiler(self, fp) -> str | None:
+        """The one compiler the whole game was built with, when that is known: try_compiler then only tests another
+        compiler on a file and never switches it (a match there is reported, for the user to decide). None: files may
+        each have their own (a DS game mixes CodeWarrior versions)."""
+        return None
+
     # what file_compiler and file_ranges read (globs in the project): the overview, asked every second, reads them
     # again only when one changed (forkengine._file_parts). None named: read again every time
     compiler_config: tuple[str, ...] = ()

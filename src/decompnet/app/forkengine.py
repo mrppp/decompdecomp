@@ -3878,6 +3878,10 @@ class ForkEngine:
         current = compiler.strip().lower() == "current"
         if current:
             compiler = own
+        game = console.keeps_game_compiler(fp)
+        held_to_game = bool(game) and own == game and keep_match
+        if held_to_game:
+            keep_match = False  # tested, never switched: the game was built with one compiler
         if compiler.strip().lower() == "all":
             wanted = sorted(known, key=lambda c: abs(known.index(c) - known.index(own))) if own in known else known
         else:
@@ -3909,6 +3913,12 @@ class ForkEngine:
                         if res["matched"] and c == own:
                             return f"{c}: {res['text']}\nThat's {unit.source}'s own compiler: nothing to switch."
                         if res["matched"]:
+                            if held_to_game:
+                                return (f"{c}: {res['text']}\n{unit.source} stays with {own}: this game was built "
+                                        f"with {own} alone, so a file isn't moved to another compiler. That {c} "
+                                        f"matches is a clue to how this function was written (or that it is library "
+                                        f"code), not a reason to switch: keep working with {own}, and say what you "
+                                        f"found in your notes.")
                             if not keep_match:
                                 return f"{c}: {res['text']}\nDiagnostic only; the original file compiler is restored."
                             kept = c
@@ -5052,10 +5062,12 @@ class ForkEngine:
                     self._build_unit(proj, fp, u)  # the file's objects are its own compiler's again
         return before, after
 
-    def set_file_compiler_by_hand(self, slug: str, source: str, compiler: str) -> None:
+    def set_file_compiler_by_hand(self, slug: str, source: str, compiler: str, force: bool = False) -> list[str]:
         """The user's choice of a source file's compiler (the project's Settings), kept only when every function of
         the file that matched still matches with it: the rule try_compiler's switches follow. What matches with it
-        now is a match like any other."""
+        now is a match like any other. `force`: kept even so (a file put back on the game's own compiler after a
+        switch it shouldn't have had), and what no longer matches reopens; a file that doesn't build still stays.
+        Returns the functions that reopened."""
         proj, fp, cfg = self.get(slug)
         console = consoles.get(cfg.get("platform"))
         own = console.file_compiler(fp, source)
@@ -5065,7 +5077,7 @@ class ForkEngine:
         if compiler not in {c.id for c in console.compilers}:
             raise NetworkError(f"{compiler!r} isn't one of this platform's compilers")
         if compiler == own:
-            return
+            return []
         text = (fp.root / source).read_text(errors="replace", encoding="utf-8")
         with self._tree(proj).exclusive(), self._units_locked(proj, [u.name for u in units]):
             before = {u.name: self._baseline(proj, fp, u, text)[0] or {} for u in units}
@@ -5080,7 +5092,7 @@ class ForkEngine:
                     after[u.name] = {}
                 broken += [n for n, pct in before[u.name].items()
                            if (pct or 0) >= 100 and (after[u.name].get(n) or 0) < 100]
-            if broken or not all(after.values()):
+            if (broken and not force) or not all(after.values()):
                 with self._build_locks[proj["id"]]:
                     console.set_file_compiler(fp, source, own)
                 for u in units:
@@ -5088,11 +5100,13 @@ class ForkEngine:
                 why = (f"{', '.join(sorted(broken)[:8])} no longer match with it" if broken
                        else f"the file doesn't build with it:\n{_tail(log)}")
                 raise NetworkError(f"{source} stays with {own}: {why}")
-            self._commit(proj, fp, rel, f"Build {source} with {compiler}\n\nChosen in decompdecomp's project settings.")
+            why = (f"\n\nNo longer matching with it, reopened: {', '.join(sorted(broken))}." if broken else "")
+            self._commit(proj, fp, rel, f"Build {source} with {compiler}\n\nChosen in decompdecomp's project settings.{why}")
             self.net.bump_generation(proj["id"])  # (the file's compiler: earlier compiles aren't repeats any more)
             for u in units:
                 self._keep_scores(proj, u, text, after[u.name])
                 self._apply_scores(proj, u.name, after[u.name], text=text)
+            return sorted(broken)
 
     def _source_mismatches(self, fp, unit, fn, rows):
         from ..source_lines import annotate, mismatches

@@ -100,6 +100,17 @@ class Dos(Console):
         manifest = fp.manifest or {}
         return (manifest.get("dos_compilers_map") or {}).get(source) or manifest.get("compiler") or "openwatcom-2.0"
 
+    def keeps_game_compiler(self, fp) -> str | None:
+        """A DOS game is one program from one compiler, which import identified from its library code (the manifest's
+        `compiler`, scratch.library_match). Helpers' try_compiler moved eleven of one game's files to OpenWatcom 2 or
+        Watcom 9.5 when one small function matched there, leaving the rest of each file on a compiler the game never
+        used, and matched neighbours drifted and reopened."""
+        manifest = fp.manifest or {}
+        game = manifest.get("compiler") if manifest.get("created") == "from scratch" else None
+        # (OpenWatcom 2 is import's default when the game's library code matched none of the Watcoms here: nothing
+        # was identified, so files stay free to find theirs)
+        return game if game and game != "openwatcom-2.0" else None
+
     def set_file_compiler(self, fp, source: str, compiler: str) -> str:
         if compiler not in {c.id for c in self.compilers}:
             from ...forks.project import ForkError
