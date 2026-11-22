@@ -275,6 +275,7 @@ class Search(Permuter):
         throughput = self.compile_pool.metrics.snapshot() if getattr(self, 'compile_pool', None) else {}
         return {**({'throughput':throughput} if throughput else {}), 'starting_score': self.starting_score, 'starting_percent': percent(self.starting_score),
                 'best_score': self.best, 'best_percent': percent(self.best), 'improvements': self.improvements,
+                'extensions': self.extensions, 'extension_max': EXTEND_MAX if self.extendable else 0,
                 'local_search': self.local_status, 'reviewed_seeds':self.reviewed_seed_result,
                 'allocation_trials':self.allocation_trials,
                 'allocation_diagnostic_compiles':self.allocation_diagnostic_compiles,
@@ -421,6 +422,27 @@ class Search(Permuter):
                  # a byte array's address added to an index in a nested loop's guarded block: the base set twice
                  # (so the loop pass leaves it) after the index (the lui/addiu where the target has it)
                  (L + 'loop_symbol_base_block.variants', (source, name)),
+                 # a float constant loop.c hoists out of a loop (a saved FP register, a bigger frame), kept where it is used by
+                 # one shared local assigned in place at every compare (decomprepair 0.5.624)
+                 (L + 'float_constant_loop_pin.variants', (source, name)),
+                 # a compare's literal routed through a local the next statement reassigns (decomprepair 0.5.628)
+                 (L + 'dead_local_constant_compare.variants', (source, name)),
+                 # a sub-expression held in a temporary (declared with the locals or at the block's head, one use or all) and
+                 # an associative chain grouped another way, only where the regrouping is the same value in C
+                 (L + 'temporary_hoist_repairs.variants', (source, name, header)),
+                 (L + 'reassociation_repairs.variants', (source, name, header)),
+                 # a loop's compared byte constant as an entry local, and a one-line temp written into the store reading it
+                 # (decomprepair 0.5.631)
+                 (L + 'entry_constant_local.variants', (source, name)),
+                 (L + 'store_temp_inline.variants', (source, name)),
+                 # a float sum's first add swapped and a one-shot scope inside the store run between its two adds
+                 (L + 'float_sum_store_fence.variants', (source, name)),
+                 # a loop's entry guard as the counter's compare (an unaccessed 8-byte spill slot) with each local merge as one child
+                 (L + 'loop_guard_counter_compare.variants', (source, name)),
+                 # a later phase's clamp variable, record pointer and product through the earlier phase's dead locals, one child
+                 (L + 'phase_donor_repairs.variants', (source, name)),
+                 (L + 'join_clamp_sum_repairs.variants', (source, name)),
+                 (L + 'crossing_scope_unwrap.variants', (source, name)),
                  # a switch case's temporaries split and its flag update folded in one child, and record
                  # field stores beside a scalar global's store written raw (MEM_IN_STRUCT_P keeps their order)
                  (L + 'case_split_combinations.variants', (source, name)),
@@ -466,6 +488,8 @@ class Search(Permuter):
                   (L + 'narrow_test_share_repairs.variants', (source, name)),
                   (L + 'declaration_scope_sink_repairs.variants', (source, name)),
                   (L + 'display_cursor_record_repairs.variants', (source, name)),
+                  (L + 'gbi_macro_commands.variants', (source, name)),
+                  (L + 'goto_loop_invariants.variants', (source, name)),
                   (L + 'shared_copy_local_split.variants', (source, name)),
                   (L + 'display_value_stage.variants', (source, name)),
                   (L + 'narrow_quotient_local.variants', (source, name)),
@@ -473,6 +497,7 @@ class Search(Permuter):
                   (L + 'triangle_arm_calls.variants', (source, name)),
                   (L + 'guarded_increment_sink.variants', (source, name)),  # decomp-repair 0.5.607: a counter's early sum back inside its guard as G++
                   (L + 'argument_weight_scope.variants', (source, name)),  # decomp-repair 0.5.603: a parameter's first call in a one-shot scope with the table pointer local written out
+                  (L + 'staged_sum_scope.variants', (source, name)),  # decomp-repair 0.5.626: a guarded copy block, and a quotient with its staged sum and test, in one-shot scopes
                   (L + 'arm_variable_share.variants', (source, name)),  # decomp-repair 0.5.601: the counters of sibling arms' loops and their derived indices as one variable
                   (L + 'member_alias_pair.variants', (source, name)),  # decomp-repair 0.5.613: a raw offset store as a structure member beside a global read as a one-member record (the scheduler's alias classes)
                   (L + 'ternary_clamp_split.variants', (source, name)),  # decomp-repair 0.5.612: a ?: clamp as a copy and a guarded default, the later reads on the copy
@@ -2345,6 +2370,21 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
         proj, fn = net.project_row(slug), net._function(name, slug)
         if fn['status'] == 'matched':
             reason = 'Matched'
+        if (reason not in ('Matched', 'Exact diagnostic needs ordinary review', PROFILE_LEAD) and not net.fork_slug(slug)
+                and slug not in net.links and (lane is None or lane.index == 0)):
+            # The first move: the saved C under the project's other compilers, so a function that already matches
+            # under one never spends its allowance on permutations.
+            if not search._hold(agent, fn, count_turn=False):
+                raise NetworkError('This function was claimed meanwhile; try again after it is released.')
+            try:
+                from . import deep_profile_sweep
+                if deep_profile_sweep.run(search, agent, proj, fn, _candidate_source(fn, fn['best_score'])):
+                    search.best = 0
+            finally:
+                search._let_go(agent, fn)
+            proj, fn = net.project_row(slug), net._function(name, slug)
+            if fn['status'] == 'matched':
+                reason = 'Matched'
         if reason not in ('Matched', 'Exact diagnostic needs ordinary review', PROFILE_LEAD):
             if not search._hold(agent, fn, count_turn=False):
                 raise NetworkError('This function was claimed meanwhile; try again after it is released.')

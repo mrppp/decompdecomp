@@ -81,3 +81,42 @@ void f(int *p, int a, int b)
     final, best, chain = prove_chain.prove(source, prove_chain.generator(judge, "f"), len, {"identical_arm_collapse"},
                                            steps=1, log=lambda _: None)
     assert chain and chain[0][0] == "identical_arm_collapse" and best < len(source)
+
+
+def test_a_source_saved_before_a_rename_is_proposed_under_the_current_name():
+    from types import SimpleNamespace
+
+    source = "void func_80001000(int *p, int a, int b)\n{\n  int x;\n  x = a + b;\n  if (a) { p[0] = x; } else { p[0] = x; }\n}\n"
+    judge = SimpleNamespace(arch="mips", asm="", compiler={"flags": ["-O2"]}, header="",
+                            request={"function": {"vram": 0x80001000}})
+    children = prove_chain.generator(judge, "storePair")(source)
+    assert children and all("void storePair(" in child for _, child in children)
+    assert prove_chain.current_name("void f(void) {}", "f", 0x80001000) == "void f(void) {}"
+
+
+def test_the_generator_passes_the_functions_jump_tables_and_context_to_the_repair_families(monkeypatch):
+    """Families such as switch_gap_goto read the tables; without them they never fired from this script."""
+    from types import SimpleNamespace
+
+    from decompnet.app import draft_repairs
+    seen = {}
+
+    def variants(source, name, arch, asm, flags, labels, **kwargs):
+        seen.update(kwargs)
+        labels["child"] = "switch_gap_goto"
+        return ["child"]
+    monkeypatch.setattr(draft_repairs, "variants", variants)
+    judge = SimpleNamespace(arch="mips", asm="", compiler={"flags": []}, header="h", request={},
+                            tables=[(1, [0x80000010])], callees="int g(void){return 0;}", entry_scope={"language": "c"})
+    assert prove_chain.generator(judge, "f")("int f(void){return 1;}") == [("switch_gap_goto", "child")]
+    assert seen["tables"] == [(1, [0x80000010])] and seen["callees"] == "int g(void){return 0;}"
+    assert seen["entry_scope"] == {"language": "c"} and seen["header"] == "h"
+
+
+def test_children_cut_off_by_the_cap_are_reported_and_a_larger_cap_scores_them():
+    lines = []
+    prove_chain.prove("xyz", generate, score, None, steps=1, children=1, log=lines.append)
+    assert any("cut off by --children 1" in line for line in lines)
+    lines.clear()
+    prove_chain.prove("xyz", generate, score, None, steps=1, children=50, log=lines.append)
+    assert not any("cut off" in line for line in lines)

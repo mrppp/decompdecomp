@@ -14,9 +14,12 @@ _current = ContextVar('trial_bookkeeping', default=None)
 
 class Batch:
     def __init__(self, maximum=False):
-        self.max_bytes = (4 if maximum else 1)*1024*1024
-        self.max_statements = 256 if maximum else 64
-        self.seconds = 1 if maximum else .5
+        # Advisory counters only (verified game work is never queued here), and a crash loses at most this window of
+        # them. Every flush is one transaction through the project's single writer, which a 12-lane search kept
+        # busy half the time (10,642 transactions of 18.7 ms in 6 minutes): memory is cheaper than writer time.
+        self.max_bytes = (64 if maximum else 8)*1024*1024
+        self.max_statements = 8192 if maximum else 512
+        self.seconds = 10 if maximum else 2
         self.owner = threading.get_ident()
         self.buffers = []  # Identity-based: test adapters need not be hashable.
         self.started = time.monotonic()
@@ -71,6 +74,17 @@ def lookup(store, key):
     if value is None:return None
     buffer=next((buffer for buffer in value.buffers if buffer['store'] is store),None)
     return buffer['values'].get(key) if buffer is not None else None
+
+
+def pending_counters(store, sql):
+    """The counter rows `count` has queued for `store` under this exact SQL and not yet written: {key arguments: the
+    queued arguments}. A reader that needs the totals can add these to the stored rows instead of flushing the batch,
+    which is a transaction through the project's single writer each time."""
+    value = current()
+    buffer = next((b for b in value.buffers if b['store'] is store), None) if value is not None else None
+    if buffer is None:
+        return {}
+    return {slot[1]: args for slot, args in buffer['counters'].items() if slot[0] == sql}
 
 
 def submit(store, statements, *, immediate=False, memo=None):

@@ -101,7 +101,9 @@ class Lanes:
         # Each lane's share of the machine: compiles mostly wait on the compiler, so about two in flight per core
         # keep every core busy. An equal slice of a large configured slot count (256 over 24 lanes) gave each lane
         # 10 compile threads and as many helper processes, hundreds in all on 18 cores, mostly idle.
-        share = max(2, -(-2 * usable_cores() // self.count))
+        # (Measured with two per core and a lookahead of two to four: the slots were 15% busy, the lanes waiting
+        # on each other's candidates; four per core lets a lane's window reach eight.)
+        share = max(4, -(-4 * usable_cores() // self.count))
         self.slots = max(2, min(256, share, slots // self.count if slots else share))
         self.idle = queue.Queue()
         self.started = 0
@@ -306,6 +308,10 @@ def child(db_path, workspace, background):
         from .workers import started_priority
         started_priority()
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+    from .. import thread_cpu
+    # Where a lane's CPU goes (logs/thread-cpu-lane-<pid>.log; `python -m decompnet.thread_cpu` adds the lanes up). The
+    # lanes are the heaviest Python of a deep search, and the only helper the report did not name.
+    sampler = thread_cpu.start_worker('lane')
     out = sys.stdout
     sys.stdout = sys.stderr  # nothing printed may corrupt the messages
     net = RomNetwork(db_path, Path(workspace))
@@ -448,6 +454,8 @@ def child(db_path, workspace, background):
             stop.set()
         for pool in pools.values():
             pool.close()
+        if sampler is not None:
+            sampler.close()  # (os._exit skips atexit: write the last figures now)
         os._exit(0)  # (daemon threads and compiler sessions end with the process)
 
 
