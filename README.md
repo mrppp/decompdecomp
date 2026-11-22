@@ -1378,8 +1378,22 @@ the host. Compiler-setting changes remain on the host. A disconnected or refusin
 host stops the affected search; its claims can expire normally if release cannot
 reach it. No AI tokens are used by these searches.
 
+In the project-wide Deep Permuter's **Settings**, **CPU constant ranking (experimental)**
+tries random edits with newly introduced constants closer to the target's MIPS `lui`/`ori` pairs
+earlier within each generated batch. It is off by default and saved per project when a pass
+starts. Switching it makes completed open-function passes eligible under the new order.
+Verified candidate history remains available. Functions without supported target evidence
+use the usual order, and every match still passes the ordinary judge.
+
 For a longer search of one function, open its drawer and expand **Deep permuter · this function**.
 Choose a time limit and maximum candidate compiles, then select **Run deep permuter**.
+
+Deep searches give targeted repairs most of the initial budget. A short random probe
+can earn more time and candidate trials by improving the score. If targeted repairs
+paused for that probe, the search gives them any remaining budget when it ends.
+The current diff prioritises relevant repair families and limits speculative
+storage, declaration order and global type trials.
+
 **Threads per function** runs independent candidate paths concurrently; targeted repairs are divided
 between workers and random paths use different seeds. The project pass also has **Functions at a time**
 (the former Parallel threads setting). For example, 2 functions × 4 threads uses up to 8 search workers.
@@ -1704,10 +1718,11 @@ compiled instructions; yellow lines have operand differences. Click a marked lin
 number to see the target and compiled instructions. Editing the source clears these
 marks until another comparison. Agent compile responses include bounded C-line evidence too.
 
-These are compiler debug locations from the exact compiled object. Optimization can
-associate several statements with one location, so the marks are advisory. No compiler
-flags are changed to manufacture a map. Missing target-only instructions have no
-compiled C location. ELF DWARF 1/2+ and ECOFF are supported; absent, ambiguous or
+These are compiler debug locations from the exact compiled object. When that object has
+none (the game was built without `-g`), a GCC build gets a second, `-g` compile of the same
+C, used only if its code for the function is byte-identical to the scored one; the judge and
+scores never see it. Optimization can associate several statements with one location, so
+the marks are advisory. Missing target-only instructions have no compiled C location. ELF DWARF 1/2+ and ECOFF are supported; absent, ambiguous or
 unsupported information is labelled unavailable, including COFF/CodeView for now.
 
 ### Investigate near misses before broad permutation

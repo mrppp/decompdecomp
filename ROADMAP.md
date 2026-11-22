@@ -5,6 +5,10 @@
   shared worker on a small machine; ours limits CPU through the shared compile pool and refuses a second
   search of one function, but any number of functions may each run one.
 
+- Done: the app repair dialog shows Codex messages as they arrive and accepts guidance for
+  the next turn in the same repair session. Reopen the conversation from the screen that
+  started it or from the App repairs list in Background work.
+
 - Done: single-toolchain metadata lookup avoids rebuilding the whole catalogue; macOS
   compiler watchdogs coalesce recent OS process scans while preserving per-tree limits.
 - Done: agent start/stop requests use reserved control workers; stopping one helper
@@ -836,6 +840,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Consumed-constant forward switch repair | ✓ proven C32 GCC ROM profiles | — real-profile validation planned | — invocation/validation planned | — | — | — invocation/validation planned | — | — external invocation proof planned | — external invocation proof planned | — | — external invocation proof planned | — external invocation proof planned | — |
 | Branch integer-one staging / measured loop combinations | ✓ proven C32 / known frame | — profile validation planned | — profile validation planned | — | — | — profile validation planned | — | — frame/invocation proof planned | — frame/invocation proof planned | — | — frame/invocation proof planned | MIPS known-frame lane; invocation/other frame proof planned | — |
 | Permuter on near misses | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Experimental CPU constant ranking in Deep Permuter | ✓ MIPS pairs | ✓ MIPS pairs | ✓ MIPS pairs | — | — | ✓ MIPS pairs | — | — | — | — | — | ✓ with MIPS target bytes | — |
 | Agents read compiler passes and allocation priorities (`compiler_passes`) | ✓ GCC (IDO —: no pass dumps) | — GCC unchecked | — GCC unchecked | — | — | — GCC unchecked | — | — Metrowerks prints none | — MSVC prints none | — | — | — own build | — |
 | Agents grid statement orders and edit combinations with the exact judge (`score_permutations`) | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — judge worker is ROM-only | — judge worker is ROM-only | — | — judge worker is ROM-only | — judge worker is ROM-only | — |
 | Hand-written assembly set aside | ✓ | ✓ | ✓ | ✓ (`sc` stubs) | — | ✓ | ✓ (`_call_via` helpers, `svc`/`swi` stubs) | ✓ | Visual C++'s exception-handling stubs (64-bit: the funclets its exception data names) | Visual C++'s exception-handling stubs | BIOS call stubs, pieces of functions | MIPS, PowerPC, ARM's BIOS stubs and pieces of functions | — agents' verdict only (Watcom's intrinsics and `#pragma aux` put any instruction in C) |
@@ -867,6 +872,8 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Struct layouts from loads and stores (`guess_struct`) | ✓ | ✓ | ✓ | — | — | ✓ | — | — | ✓ | ✓ | — | — | ✓ (Watcom's register arguments read as arguments) |
 | The game's own debug symbols: names, types, prototypes | — | — | ✓ symbol table, STABS, DWARF 1; the compiler of each object file | names (types and prototypes: —) | — | ✓ symbol table, DWARF 1 | — | — | ✓ PDB (Visual C++ 6.0's PDB 2.0, MSF 7.00), linker map, COFF symbols (64-bit games': untested) | — (an XBE has none) | — | — | — |
 | Twins across your games | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | ✓ (between project-mode games; not run on two GameCube games yet) | ✓ (between PC projects) | ✓ (as PC's; not run on two Xbox games yet) | ✓ (between project-mode games; not run on two DS games yet) | — | runs; not shown yet (no two games of one Watcom here) |
+| Cross-game C++ constructor entry replay | ✓ N64 overlays; — main ROM | — | — | — | — | — | — | — | — | — | — | — owned builds planned | — |
+| Cross-game switch-label recovery | ✓ N64 overlays; — main ROM | — | — | — | — | — | — | — | — | — | — | — owned builds planned | — |
 | Find imported donor code inside a merged function during manual search | ✓ MIPS ROM target | ✓ shared MIPS path | ✓ shared MIPS path | ✓ shared MIPS path | — separate owned build | ✓ shared MIPS path | — ARM/Thumb boundary reader planned | — separate owned build | — separate owned build | — separate owned build | — separate owned build | ✓ verified ELF donor to MIPS ROM | — |
 | Preview and add exact same-ROM donor code | ✓ mapped raw and USO text | — image adapter planned | — image adapter planned | — image adapter planned | — separate build | — image adapter planned | — image adapter planned | — separate build | — separate build | — separate build | — separate build | ✓ ELF donor for supported ROM destinations | — |
 | Named Claude accounts, assigned per helper; recorded usage per account | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
@@ -876,7 +883,9 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Bounded automatic reuse, tiny templates and local SDK C | ✓ (ROM) | ✓ (ROM) | ✓ (ROM) | — | — | ✓ (ROM) | — | — | — | — | — | — | — |
 | Shared knowledge (two models agree) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Tidy each source file once it's polished (shared types in one header, names, dead declarations) | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+| A later exact source replaces a matched one (previous kept in history) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Polish matched code (still matching) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (`make_readable`) |
+| Dead-looking code tagged, never rejected (matches a target instruction / steering only), in briefs and polishing | ✓ | ✓ shared path | ✓ shared path | ✓ shared path | — | ✓ shared path | ✓ shared path | in-session parents only | in-session parents only | in-session parents only | in-session parents only | in-session parents only | — |
 | Per-game portability checklist for polishing | ✓ | ✓ | ✓ | ✓ | — polishing support pending | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Small polish plans, prepared evidence and verified identical-helper reuse | ✓ shared path | ✓ shared path | ✓ shared path | — | — | ✓ shared path | — | ✓ shared path | ✓ shared path | — | ✓ shared path | ✓ shared path | — |
 | Real names for the game's symbols (`rename_symbol`) | ✓ | ✓ | ✓ | ✓ | ✓ functions | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | dtk and ds-decomp projects | ✓ |
@@ -916,6 +925,9 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Verified objdiff references for public Splat projects | — | — | — | — | — | — | — | — | — | — | — | ✓ N64 and PS1 simple code splits; — overlays and nested builds | — |
 | Find a game in a local library by declared SHA-1 | — | — | — | — | — | — | — | — | — | — | — | ✓ N64, including supported original ROM versions and byte orders; exact-file splat; — dtk, configure and whole-disc PS | — |
 | Rooms: decompile together | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
+
+Ranking currently reads adjacent MIPS `lui`/`ori` pairs. Validate match rates on real near-misses and add
+other processor readers where target constants can reliably guide candidate order.
 
 Git export sync stages additions and updates only files it owns, validates each C candidate and the full rebuilt image, then publishes commit-ready files. It preserves build scripts and existing hand-maintained source, lists skipped candidates, supports cancellation and detects concurrent checkout changes. The N64 adapter was exercised on a private racing-project copy; shared export and imported-mode behavior has synthetic Git/build coverage. Custom layouts, including the GBA exporter, need an adapter before they can use this action.
 
@@ -1136,6 +1148,11 @@ profiles. The destination judge verifies the resulting C.
 Project-mode similar-transfer support is planned: align target-object relocations and adapt file-local declarations before trying
 similar C through objdiff. Other processors need an instruction reader for this search.
 
+Cross-game C++ constructor entry replay currently covers N64 overlays with IDO. Main-ROM linking and owned-build
+projects need their own verified constructor-entry selection and export handling before this retry can reach them.
+Cross-game switch-label recovery currently uses verified N64 overlay tables. Other ROM and owned-build modes need
+equivalent target and compiled-table evidence before it can safely propose the same retry there.
+
 The Deep Permuter's two-move pass (`app/paired_moves.py`, judged through `app/judge_pool.py`: a pool of `decomp
 judge-worker` processes) runs for ROM projects, whose functions carry target bytes the worker judges exactly. Project
 mode (GameCube/Wii/PC/DS) has no standalone exact judge yet: objdiff judges there, so the pass is skipped. Planned: a
@@ -1144,6 +1161,13 @@ judge worker for project-mode units, then the same pass. It found nothing on the
 
 ## Recently done
 
+- **Scores weigh meaning; stalled bests restart from the draft.** A memory access at another offset, another
+  constant or another call costs 150, more than a reorder (scoring.PENALTY_MEANING, score version 2; open bests are
+  rescored once by Check again). An unmatched function's brief warns about a best that stores one place twice,
+  reads unset locals or makes a local volatile (advisory only: hardware and volatile stores are never flagged), and
+  offers the machine draft as a second start once the best has stalled; the Deep Permuter climbs from that draft too
+  (`draft_restart_pass`). ROM mode for the score and the permuter pass — fork projects keep objdiff's percentage and
+  their permuter doesn't take the draft chain yet (no `_judge_with` there); the brief's lines work everywhere.
 - **Agents & models controls.** Collapsible sections show installed agent apps, prompt templates, optional tool
   visibility and recorded usage, manual project-scoped MCP connections, and saved API endpoints. Global and
   per-helper prompt and tool choices take effect on new sessions; disabled tool calls are rejected immediately.
@@ -1383,8 +1407,10 @@ Left:
   both ways in a headless Chrome; what GL can't do the RDP's way (its edges, shade interpolated in floats, no dither,
   the two-cycle pipeline's next pixel, TMEM read past a tile, delta z) stays its own. Past the prompt the game loads its tracks and runs its demo race (cars, track, replay cameras,
   credits), and a race started from its menus (Arcade, car selection, the start line, driving). It plays in a browser
-  with the keyboard or a gamepad, and its sound (`PORT_LIVE`); its saves go to an EEPROM file; then the Controller Pak, the 16 Kbit EEPROM, SRAM and flash
-  saves other games use, the
+  with the keyboard or a gamepad, and its sound (`PORT_LIVE`); its saves go to an EEPROM file. SRAM through extended
+  PI DMA is supported; raw PI SRAM access, the Controller Pak, the 16 Kbit EEPROM and flash saves remain planned, as
+  does automatic detection of saved C that relies on adjacent stack objects. Cartridge CPU-write bus latching
+  clears at the next retrace; instruction-level PI busy timing remains planned. Also planned are the
   resampler's exact taps, and a run of the host and its live view on Windows (they compile for it, untried);
 - the 19 switches with wrong case labels corrected in the racing game's decomp (the judge now catches them: Check
   again unmatches them, and the port's overrides are the corrected C), then their overrides go;
@@ -2752,7 +2778,9 @@ framebuffer to RT64. A native graphics task captured in the reference emulator a
 still need live playthroughs. Raw cartridge DMA can now fill RAM and compatibility stack buffers, and local buffers
 retain the eight-byte alignment required by original loader code. Two retail boot paths still need work: one
 loads a relocated copy of libultra whose scheduler calls need to reach the host, and another calls its game entry
-through a TLB mapping after a boot helper returns. Next: verify more microcodes and games, support RT64 export,
+through a TLB mapping after a boot helper returns. Relative USO and UV analysis-bank functions and uncompressed USO
+text are left out of static port builds until their runtime addresses and relocations can be resolved; loaded code
+can still run through the interpreter. Next: support those banked C functions, verify more microcodes and games, support RT64 export,
 replace the compatibility scheduler and device services where ModernRuntime can take them over, and add other
 desktop builds.
 
@@ -3477,6 +3505,12 @@ remain planned: the initial browser toolchain has no matching build-context adap
 ### Compiled C line associations
 
 - Done: the C editor marks differing/extra/moved instructions red and operand changes yellow, with line-number buttons showing target/compiled instructions. Compile responses give agents bounded evidence from the same source map. Associations come from the exact scored object, with unchanged compiler flags; edits and function navigation invalidate editor highlights. Shared ELF DWARF 1/2+ and ECOFF readers serve ROM and imported projects; imported file lines are translated to the displayed function fragment and stale objects are rejected.
+- Done: a GCC object with no line table gets a `-g` twin compile of the same C, trusted only when its function code (and relocations) are byte-identical (`source_lines.neutral_object`, `Network.line_object`), so the editor marks and the agents' compile responses show C lines for games built without `-g` (the twin is only compiled for a miss). The Deep Permuter compiles the candidates that edit the marked C lines first (`app/deep_line_order.py`, chained after the constant-distance order); nothing is dropped, and a parent with no map keeps its order.
+- Done: IDO needs no twin (its plain objects carry ECOFF lines, checked on the real compiler; its `-g`/`-g2` switch the optimizer off and `-g3` changes the code), so the editor, agent responses and Deep Permuter line focus already work for it. CodeWarrior ROM builds (PS2, PSP) get a `-sym on` twin under the same byte-identical rule; the flag is not yet checked on a real CodeWarrior here (not installed), so a mismatch simply means no map.
+- Done: the Deep Permuter's local-repair search reads each near-miss source's line map lazily (`deep_line_order.locator`: its own compile and byte-identical twin, once per source), so the localised families (targeted storage, scan loads, loop shapes, layout, `repair_localisation.proposals`) work for GCC games built without `-g`, where they used to see no map.
+- Done: the generator keeps most rewrites on the marked C lines. The Deep Permuter sends the parent's marked lines as `focus_lines` (decomp-repair 0.5.578, `permuter_focus_lines.py`: decomp-permuter's own `Region`, so no change to it), writes twice the variants per compile slot (`permute.LINE_FOCUS_OVERGENERATION`) and thins each batch to the candidates that edit a marked line plus a quarter of the rest (`deep_line_order.thin`). Per-line partial progress needs no line map: the frontier already keeps candidates that fix target regions (`region_repairs`).
+- Done: more of the Deep Permuter reads the line map (`app/deep_line_order.py`). Candidates are compared by statements, not lines (the permuter reprints a function with its own layout, so a line diff called every line changed). (1) Telemetry: marked-line versus other candidates that improved, and rewrites that compiled to the parent's code, are counted and summarised in the search log every 25 batches. (2) Crossover: two frontier candidates that edit different lines of the best source are merged into one extra candidate per pair (`line_crossover`). (3) Blame propagation: after three batches from a parent with no improvement, the focus follows the variables on the marked lines back to where they are set (up to two definitions). (4) A rewrite that compiled to the parent's code three times on the same lines, without ever improving, is skipped there. (5) The statement's shape (`call+field`, `cond`, ...) is a second key, `kind@shape`, for the adaptive repair policy. (6) A sweep takes near misses (score per instruction, in buckets a factor of two apart) before far ones, where it used to be a plain shuffle. Not built: ordering by the number of marked lines (it needs a twin compile per function, so the sweep uses the stored score instead), and sharing shape outcomes across projects (the policy table is per project).
+- Planned: the twin for project mode (objdiff; GameCube, Wii, DS CodeWarrior units), and line focus for the plain permuter and for decomp-permuter's own site choice (a decomp-repair change).
 - Planned: CodeView/COFF, STABS and relocatable debug tables with overlapping executable sections. Unsupported or absent line information is shown explicitly; target-only instructions are never assigned a guessed C line. Optimized line associations are advisory, not causal proof.
 ### Expression recipes and bounded value proofs
 

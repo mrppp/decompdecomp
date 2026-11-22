@@ -89,6 +89,7 @@ class PortKit:
     # runs the game's translated C (threads, DMA, the hardware's registers), and the library's prototypes
     # (libultra.sigs: each a name, a return type and parameter types, tab-separated); None: no such build yet
     runtimes: tuple = ()  # PortRuntime each, the order the Porting runtime picker offers them
+    runtime_sdk_patterns: object = None  # (owned image bytes, hosted SDK names) -> verified runtime patterns
 
 
 class Console:
@@ -369,6 +370,10 @@ class Console:
     def separate_overlay_reference(self, binding, number):
         """Return a separate source name for the same loader binding, where supported."""
         return binding
+
+    def overlay_data_reference(self, binding, offset, number):
+        """Name a defined object at an offset within a loader binding, where supported."""
+        return None
 
     def overlay_cartridge_placement(self, fn, cfg):
         """Return loader metadata for a stored row with a verified placement."""

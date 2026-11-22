@@ -26,10 +26,12 @@ from decomprepair import (
     conditional_smoothing_gain,
     counted_switch_advance,
     direct_mapped_address,
+    direct_relocated_call_base,
     epsilon_predicate_order,
     field_copy_before_clear,
     field_snapshot_copies,
     fixed_blend_staging,
+    float_bit_argument_repairs,
     float_clamp_scale_stage,
     float_delta_load_order,
     float_intermediate_repairs,
@@ -48,6 +50,7 @@ from decomprepair import (
     loop_storage_shapes,
     masked_slot_dispatch,
     measured_address_repairs,
+    measured_adjacent_field_stores,
     measured_after_call_reload,
     measured_be16_cursor,
     measured_branch_byte_stores,
@@ -60,15 +63,18 @@ from decomprepair import (
     measured_byte_loop_key,
     measured_byte_search_loop,
     measured_byte_signature,
+    measured_call_slot_setup,
     measured_callback_loop,
     measured_callback_repairs,
     measured_carried_loop_test,
     measured_case_float_sign,
+    measured_child_slot_update,
     measured_command_record_cursor,
     measured_command_word_schedule,
     measured_conditional_call_stage,
     measured_conditional_flag_owner,
     measured_control_flow,
+    measured_coordinate_staging,
     measured_cursor_loop_tail,
     measured_cursor_publish,
     measured_cursor_schedule,
@@ -163,7 +169,9 @@ from decomprepair import (
     measured_list_key_search,
     measured_list_selection,
     measured_lookup_owner,
+    measured_loop_count_pointer,
     measured_loop_delta_snapshot,
+    measured_loop_key_copy,
     measured_loop_search_target,
     measured_magnitude_conversion,
     measured_masked_halfword_read,
@@ -194,6 +202,7 @@ from decomprepair import (
     measured_staged_float_order,
     measured_storage_shapes,
     measured_strided_halfword_copy,
+    measured_teardown_pointer_order,
     measured_temporary_repairs,
     measured_thread_addresses,
     measured_two_list_allocation,
@@ -201,12 +210,15 @@ from decomprepair import (
     measured_wide_division_stride,
     measured_word_byte_packing,
     measured_zero_record_pairs,
+    native_float_spill,
+    native_setup_call_zeros,
     natural_pointer_spill,
     ordered_halfword_updates,
     oscillator_phase_hold,
     packed_matrix_conversion,
     passthrough_argument_repairs,
     phase_projection_holders,
+    private_record_padding,
     projection_argument_before_store,
     projection_gain,
     quadratic_sign_holder,
@@ -220,6 +232,7 @@ from decomprepair import (
     scoped_phase_initializer,
     search_exit_loop_repairs,
     shared_projection_lifetime,
+    shared_reset_rebalance,
     shared_return_repairs,
     short_leaf_drafts,
     smoothing_call_before_read,
@@ -232,10 +245,12 @@ from decomprepair import (
     stored_float_zero_repairs,
     switch_pointer_calls,
     symbol_width_repairs,
+    target_call_arity_repairs,
     target_string_repairs,
     targeted_switch_labels,
     trig_axis_reuse,
     uncached_read_repairs,
+    unsigned_float_bias,
     vector_output_capture,
     wide_update_before_flags,
 )
@@ -381,9 +396,14 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
             if isinstance(row,(tuple,list)) and len(row)==3 and all(isinstance(field,str) for field in row)]
     if not any(marker != ' ' for marker,_,_ in rows):
         return result
+    result += measured_adjacent_field_stores.variants(source, name, header, rows)
     result += measured_lifetime_shapes.variants(source, name, header, toolchain, rows)
     result += measured_scalar_updates.variants(source, name, header, toolchain, rows, asm)
     if toolchain == 'gcc-2.7.2-kmc':
+        result += symbol_width_repairs.measured_halfword_update_variants(source, name, header, asm or '', rows)
+        result += guard_inversion_repairs.measured_null_return_variants(source, name, rows)
+        result += target_call_arity_repairs.measured_variants(source, name, asm, rows, header)
+        result += float_bit_argument_repairs.target_variants(source, name, header, arch, flags, rows)
         result += boolean_guard_operands.variants(source, name, rows, header)
         result += balanced_projection_scale.variants(source, name, rows, header=header)
         result += balanced_predicate_projection.variants(source, name, rows, header=header)
@@ -415,6 +435,7 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
         result += balanced_selector_zero.variants(source, name, rows, header=header, max_bytes=MAX_SOURCE_BYTES)
         result += phase_projection_holders.variants(source, name, rows, header=header, max_bytes=MAX_SOURCE_BYTES)
         result += scoped_phase_initializer.variants(source, name, rows, header=header, max_bytes=MAX_SOURCE_BYTES)
+        result += scoped_phase_initializer.shared_zero_variants(source, name, rows, header)
         result += balanced_inline_writeback.variants(source, name, rows, header=header, max_bytes=MAX_SOURCE_BYTES)
         result += balanced_reset_copy.variants(source, name, rows, header=header, max_bytes=MAX_SOURCE_BYTES)
         result += balanced_float_predicate_return.variants(source, name, rows, header=header)
@@ -542,6 +563,14 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
     result += target_memory_schedule_diff_repairs.proposals(source,name,header,toolchain,rows,target,candidate,asm,
                                                              big_endian=big_endian,flags=flags)
     if toolchain.startswith('gcc-2.7.2-kmc'):
+        result += unsigned_float_bias.variants(source, name, header, rows, read_data, big_endian)
+        result += direct_relocated_call_base.variants(source, name, header, rows)
+        result += measured_teardown_pointer_order.variants(source, name, header, rows, flags, resolve)
+        result += measured_loop_count_pointer.variants(source, name, header, rows, flags, resolve)
+        result += measured_loop_key_copy.variants(source, name, header, rows, flags)
+        result += measured_child_slot_update.variants(source, name, header, rows, flags, resolve)
+        result += measured_coordinate_staging.variants(source, name, header, rows)
+        result += measured_call_slot_setup.variants(source, name, header, rows, flags, resolve)
         result += measured_field_base_lifetimes.variants(source, name, header, rows)
         result += measured_indexed_setup.variants(source, name, header, rows, flags, resolve)
         result += measured_flag_count_loop.variants(source, name, header, rows, resolve)
@@ -570,6 +599,7 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
         result += measured_saved_pointer_copy.variants(source, name, header, rows)
         result += measured_forward_entry_pointer.variants(source, name, header, rows, asm)
         result += measured_frameless_padding.variants(source, name, header, rows)
+        result += private_record_padding.variants(source, name, rows, header)
         result += measured_packed_quad.variants(source, name, header, rows, flags, big_endian)
         result += measured_indexed_allocations.variants(source, name, header, rows)
         result += measured_byte_loop_key.variants(source, name, header, rows, flags, resolve)
@@ -605,6 +635,10 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
         result += measured_float_grid_stores.variants(source, name, rows)
         result += measured_staged_float_order.variants(source, name, rows, header)
         result += natural_pointer_spill.variants(source, name, rows, header)
+        result += native_float_spill.variants(source, name, rows, header, MAX_SOURCE_BYTES)
+        result += native_float_spill.setup_copy_variants(source, name, rows, header, MAX_SOURCE_BYTES)
+        result += native_setup_call_zeros.variants(source, name, rows, header, MAX_SOURCE_BYTES)
+        result += shared_reset_rebalance.variants(source, name, rows, header)
         result += measured_forwarded_pointer.variants(source, name, header, asm or '')
         result += float_intermediate_repairs.repeated_products(source, name, rows)
         result += measured_expression_repairs.variants(source,name,header,rows)

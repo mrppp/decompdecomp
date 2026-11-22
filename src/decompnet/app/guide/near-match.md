@@ -24,6 +24,12 @@ spelling. Stop writing variants:
    decides it, and that pass's input (a use count, a fall-through, a constant in a register) is the C to change.
 2. Read which stage the target's instructions come from: a `li; j` pair in a fall-through is jump-optimiser output,
    an extra move is register allocation, a nop or a moved instruction in a delay slot is delay-slot filling.
+3. Read that pass's source to learn which input it keys on. `compiler_passes` ends with where the compiler's source
+   is (`toolchains.source_for(compiler)`: the toolchains folder's `<id>-source`, downloaded with the compiler): the
+   passes are `jump.c`, `cse.c`, `loop.c`, `combine.c`, `local-alloc.c`/`global.c`, `sched.c`, `reorg.c` (in `gcc/`
+   from EGCS on). It is the nearest public release or a community reconstruction, as its line says; vendor builds
+   (KMC, PSY-Q, SN, Sony's EE and PSP) may differ. Proprietary compilers (IDO, Metrowerks, SN's own, Visual C++) have
+   none.
 
 ## Register-only rows: read the priorities
 
@@ -52,5 +58,5 @@ branch falls into. Write the condition so that arm is the one the compiler keeps
 - Base-relative stores stay relative only when the symbol's first address use is wrapped in `do { ... } while (0)`.
 
 `try_local_repairs` runs the repair families that encode these (`join_initializer_sink`, `branch_polarity`,
-`join_copy_sink`, `shared_result_copy`, `mask_operand_order`, `scheduling_scope`, `branch_slot_scope`, `chain_load_scope`, `halfword_countdown_shapes`, `guarded_offset_index`,
+`join_copy_sink`, `shared_result_copy`, `mask_operand_order`, `scheduling_scope`, `branch_slot_scope`, `chain_load_scope`, `halfword_countdown_shapes`, `retry_goto_scope`, `guarded_offset_index`,
 `compound_global_update_repairs`, `operand_order_pass`): run it on your best revision before hand-writing them.

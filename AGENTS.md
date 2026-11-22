@@ -216,10 +216,32 @@ holding a copy of `mupenre/`), as with any other experiment.
 
 ## Compiler matching evidence
 
-When a match reveals a reusable compiler behaviour, update `docs/COMPILER_MATCHING_LEARNINGS.md`.
+When a match reveals a reusable compiler behaviour, record it as its own file: `python tools/learnings.py new
+function|finding|experiment NAME --compiler "..."` writes `docs/learnings/<kind>/<name>.md` (format and kinds:
+`docs/learnings/README.md`; `learnings.py index [words]` searches them, and tests/test_learnings.py checks them).
+Never append to `docs/COMPILER_MATCHING_LEARNINGS.md`: one shared file made every pull request that recorded evidence
+conflict with the others, so it now keeps only the older entries that guides and comments cite by title.
 Record the exact compiler/flags, source change, measured result and evidence level. Include failed
 experiments that would otherwise be repeated. Keep game data private and distinguish controlled
 regression tests from new matches. Add a short version to the appropriate compiler guide when useful.
+
+## SDK code is SDK, not assembly
+
+Code that comes from a platform's SDK or runtime (libultra's cache and thread routines, libgcc helpers, a console's
+kernel stubs) is classified as SDK, never as plain hand-written assembly. A port replaces SDK code with its own,
+and a rebuild links the SDK's; a function filed as "assembly" is one somebody has to look at again later to find
+that out, and agents (three of them, in one game) spend attempts on it before giving a `not_c` verdict.
+- The classifier order is: the SDK's identity first (`app/sdk_assembly.py`: `known_proof`, library detection,
+  `verified_assembly` with kind `sdk`; the N64's digests are `consoles/n64/sdk_assembly.py`), the processor's
+  `asm_reason` (`arch/`, the decomp-repair library) only for what is not recognised, and an agent's `not_c` last.
+- When code that no compiler makes (a `cache` loop, `syscall`, coprocessor 0) shows up open or filed as assembly,
+  work out which SDK routine it is before adding an `asm_reason` rule. Another build of a known routine gets its
+  digest in the console's table (the full body's SHA-256, checked instruction by instruction against a build the
+  table already has: the same routine assembled with another scheduling is the usual difference); never a
+  relocation-normalised hash, which cannot prove linked equality.
+- `asm_reason` stays the fallback for code nobody recognises (the game's own assembly); the set-aside pass
+  (`twins._set_aside_rom_asm`) asks the SDK's identity first, so a routine is never filed as assembly while its
+  identity is known.
 
 ## Conventions
 
@@ -359,6 +381,9 @@ When the user explicitly requests deployment, in the checkout that app runs from
 `uv sync`, stop only that home's app gracefully (SIGTERM, then wait for it to exit), and launch it again
 persistently with the same `DECOMP_HOME`/`DECOMP_PORT` it had: `DECOMP_HOME=<home> <checkout>/.venv/bin/decomp`.
 Preserve all other branches and local changes, then verify it serves its port again and runs the new revision.
+A checkout's app also notices new code by itself (app/code_watch.py: its commit and the installed library versions):
+the sidebar shows a Restart button, which restarts it in place on the same port, and Settings can restart it when nothing is
+working. That is the user's own control; it is not authorization for an agent to restart their app.
 Experiments must still use isolated homes and must not mutate live projects.
 
 When a change requires clients to update, build a fresh shareable macOS app after testing

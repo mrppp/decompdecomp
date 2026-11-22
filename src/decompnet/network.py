@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import agent_notes, agents, claim_routing, routing_experiment, scoring
+from . import agent_notes, agents, claim_routing, routing_experiment, scoring, steering
 from .candidate_work import trial
 from .compiler import compile_source
 from .elfobj import FunctionObj, Reloc, extract_function
@@ -199,6 +199,11 @@ CLAIM_ORDERS = {
     "closest": "functions closest to matching first",
     "untried": "functions nobody has tried yet first, then the smallest",
 }
+
+
+def same_source(fn, source: str) -> bool:
+    """Whether `source` is the C the matched function already has (up to whitespace): a recheck, not a replacement."""
+    return " ".join(source.split()) == " ".join((fn["matched_source"] or "").split())
 
 
 class NetworkError(Exception):
@@ -1077,6 +1082,27 @@ class Network:
         result.effective_settings = {'compiler':cfg['compiler'], 'effective_command':list(invocation.cmd),
                                      'language':getattr(result,'language','unknown'), 'settings_source':'compile invocation snapshot'}
         return result
+
+    def line_object(self, proj, header: str, source: str, fn, result):
+        """The compiled object to read C lines from for `result` (source_lines.neutral_object): its own, or a -g
+        twin of the same C whose code is byte-identical. The judge and the scores never see the twin."""
+        from dataclasses import replace
+
+        from .source_lines import debug_twin_cmd, neutral_object
+        filename = "func.cpp" if getattr(result, "language", "c") == "c++" else "func.c"
+
+        def twin():
+            cfg, invocation = Network._invocation(proj, fn)
+            compiler = cfg['compiler'] if isinstance(cfg['compiler'], dict) else {}
+            cmd = debug_twin_cmd(list(invocation.cmd), compiler.get('toolchain', ''))
+            if cmd is None:
+                return None
+            try:
+                built = compile_source(replace(invocation, cmd=cmd, identity=None), header, source)
+            except Exception:  # (advice only: a twin that fails must never break the comparison it decorates)
+                return None
+            return built.obj if built.ok else None
+        return neutral_object(result.obj, fn['name'], filename, twin)
 
     def _compile_batch(self, proj, header: str, sources: list[str], fn):
         """[CompileResult or None] for several candidates of `fn` in one compiler run (batch_compile.py), None
@@ -2024,6 +2050,8 @@ class Network:
                 lines += ["", f"### Best attempt so far: score {fn['best_score']} by "
                               f"{self._agent_name(fn['best_agent_id'])} ({fn['attempts']} attempts total) — "
                               f"start from this", "```c", fn["best_source"].strip(), "```"]
+                from .app.best_warnings import brief_lines, draft_lines
+                lines += brief_lines(fn) + draft_lines(fn)
             elif fn["seed"]:
                 lines += ["", "### Machine draft (m2c): its control flow and arithmetic are usually right, its types "
                               "and names usually wrong. Start from it and fix those", "```c", fn["seed"].strip(), "```"]
@@ -2218,15 +2246,25 @@ class Network:
         d = self._score_candidate(fn, proj, cand, verdict)
         checks = self._candidate_checks(fn, proj, result.obj)
         matched_now = d.bytes_match and not scratch
+        # A matched function's new source that the judge verifies as exact replaces the saved one (a cleaner program
+        # for the same bytes); the same C again is only a recheck, and anything short of exact never replaces it.
+        rematch = bool(scratch and d.bytes_match and not same_source(fn, source))
         last = store.one("SELECT score FROM attempts WHERE function_id=? AND agent_id=? AND score IS NOT NULL "
                               "ORDER BY id DESC LIMIT 1", fn["id"], agent.id)
-        self._record(fn, agent, d.score, source, ctx["version"], matched=matched_now, effective_settings=getattr(result,"effective_settings",None), mismatch_rows=d.rows)
+        self._record(fn, agent, d.score, source, ctx["version"], matched=matched_now or rematch,
+                     effective_settings=getattr(result,"effective_settings",None), mismatch_rows=d.rows,
+                     **({"verified_replacement": True, "replacement": True} if rematch else {}))
         self.keep_diff(agent.id, fn["id"], self._search_rows(fn, proj, result.obj, d.rows))
         compiled_output = {'fingerprint': cand.fingerprint(), 'granularity': 'function'}
 
+        if rematch:
+            return {"text": f"✅ {fn['name']} was already matched, and this source is byte-identical too: it is the saved "
+                            "source now (the previous matching source stays in the function's history).",
+                    "score": 0, "matched": True, "exact": True, "new_match": False, "adopted": True,
+                    "replaced": True, "checks": checks, "compiled_output": compiled_output}
         if scratch:
             head = f"(scratch — {fn['name']} was already matched) score {d.score}"
-            if d.bytes_match:head += '; EXACT recheck; no new credit or source replacement'
+            if d.bytes_match:head += '; EXACT recheck of the saved source'
         elif d.bytes_match:
             return {"text": f"✅ MATCH! {fn['name']} is byte-identical to the target ({fn['n_insns']} instructions). "
                             f"Credited to {agent.name}; your claim is released. Call claim_function for the next one."
@@ -2255,7 +2293,9 @@ class Network:
             warn += "\nwhen linking your code at the function's address:\n" + "\n".join(f"- {p}" for p in problems)
         from .source_lines import mismatches as source_mismatches
         from .source_lines import render as render_source_lines
-        mapped = source_mismatches(result.obj, fn["name"], d.rows, source,
+        # (a -g twin only for a miss, and only when its code is byte-identical to this compile: source_lines.neutral_object)
+        lines_from = (self.line_object(proj, ctx["header"], source, fn, result) if any(r[0] != " " for r in d.rows) else None) or result.obj
+        mapped = source_mismatches(lines_from, fn["name"], d.rows, source,
                                    filename="func.cpp" if getattr(result,"language","c") == "c++" else "func.c",arch=proj['arch'])
         text = f"{head}\n{d.render()}{render_source_lines(mapped, source)}{warn}"
         if not scratch:
@@ -2421,14 +2461,17 @@ class Network:
                 compiled: bool | None = None, via: str = "agent", effective_settings=None,
                 prepared_header=None, prepared_inputs=None, prepared_compiler=None, before_record=None, restoring_exact=False, prepared_assembly=False, write_wait=None, exact_inputs=None,
                 best: bool = True, retain_match_credit: bool = False, mismatch_rows=(), handoff_inputs=None,
-                verified_replacement: bool = False):
+                verified_replacement: bool = False, replacement: bool = False):
         """An attempt. `best`: False for one whose code can't stay in the source (it breaks matched neighbours), so
         it never becomes the best that briefs offer and a release puts back.
-        Only explicit, verified source updates may publish over an existing match."""
+        Only explicit, verified source updates may publish over an existing match. `replacement`: that update is an
+        exact source for an already matched function: it becomes the saved source, the match's credit and date stay,
+        the previous source is kept in the attempts (history), and the function is no longer counted readable."""
         store = self.project_store(fn["project_id"])
         now = time.time()
         compiled = score is not None if compiled is None else compiled
         improved = False
+        steering = self._steering(fn, source, score, mismatch_rows, best=best)  # (compiles outside the writer)
         with store.tx(wait=write_wait) as db:
             if before_record is not None:
                 before_record()  # scoped callers can reject revoked or stale work before any writes
@@ -2514,15 +2557,18 @@ class Network:
             if (via == "agent" and not stale and current['status'] == 'open'
                     and current['abandons'] >= ESCALATE_AFTER and agent.name not in NON_MODEL_AGENTS):
                 claim_routing.tested(db, proj, current, agent, matched and score == 0 and not retain_match_credit)
-            if matched and not stale and not retain_match_credit:
+            if matched and not stale and replacement and already_matched and score == 0:
+                self._replace_match(db, current, agent, source)
+            elif matched and not stale and not retain_match_credit:
                 db.execute("UPDATE functions SET status='matched', matched_source=?, matched_agent_id=?, "
                            "matched_at=?, best_score=0, best_source=? WHERE id=?",
                            (source, agent.id, now, source, fn["id"]))
                 self._release_matched_claim(db,fn['id'],agent.id)
                 if not already_matched:
                     self._event(db, fn["project_id"], agent.id, "match", fn["name"])
-            db.execute('UPDATE attempts SET score_before=?,score_improved=? WHERE id=?',
-                       (current['best_score'], int(bool(improved or (matched and not stale and current['status'] != 'matched'))), attempt))
+            db.execute('UPDATE attempts SET score_before=?,score_improved=?,steering=? WHERE id=?',
+                       (current['best_score'], int(bool(improved or (matched and not stale and current['status'] != 'matched'))),
+                        steering, attempt))
 
         if stale:
             raise NetworkError("Compiler settings changed while this candidate was compiling. Your attempt is saved; compile it again with today's settings.")
@@ -2531,10 +2577,69 @@ class Network:
                 self.check_attempt_limit(agent, fn)
             except NetworkError:
                 pass  # the attempt itself still returns its diff; the next claim moves on
-        if matched and not retain_match_credit:
+        if matched and not retain_match_credit and not replacement:
             store.after_commit(lambda: self.on_match(store.one("SELECT * FROM projects WHERE id=?", fn["project_id"]), fn["id"], agent))
         elif improved:
             self.on_improvement(store.one("SELECT * FROM projects WHERE id=?", fn["project_id"]), fn["id"])
+
+    PARENT_ROWS_KEPT = 64
+
+    def _steering(self, fn, source: str, score: int | None, rows, *, best: bool = True) -> str | None:
+        """The steering tag of an attempt (steering.py): set only on a variant that beats the function's saved best
+        and adds dead-looking code, so most attempts cost nothing here. Never blocks or raises: a variant that can't be
+        classified is recorded untagged. Remembers the rows of every improving variant, the next one's parent."""
+        try:
+            if score is None or not rows or not best or fn["status"] == "matched":
+                return None
+            parent, parent_score = fn["best_source"], fn["best_score"]
+            improves = parent_score is None or score < parent_score
+            if improves:
+                kept = self.__dict__.setdefault("_parent_rows", {})
+                kept[fn["id"], hashlib.sha256(source.encode()).hexdigest()] = list(rows)
+                while len(kept) > self.PARENT_ROWS_KEPT:
+                    del kept[next(iter(kept))]
+            if not improves or not parent or parent == source or not steering.dead_looking(parent, source):
+                return None
+            return steering.encode(steering.classify(self.parent_rows(fn, parent), rows, parent, source))
+        except Exception:
+            logging.getLogger("decompdecomp").debug("steering tag skipped", exc_info=True)
+            return None
+
+    def parent_rows(self, fn, source: str):
+        """The judge's rows for `source` (a variant's parent) against the target: what this process judged most
+        recently, else compiled again in ROM mode. None: a project's build can't compile a second source beside the
+        one on disk, so a variant whose parent this process never judged goes untagged there."""
+        key = (fn["id"], hashlib.sha256(source.encode()).hexdigest())
+        found = getattr(self, "_parent_rows", {}).get(key)
+        if found is not None:
+            return found
+        store = self.project_store(fn["project_id"])
+        proj = store.one("SELECT * FROM projects WHERE id=?", fn["project_id"])
+        if not getattr(self, "is_rom", lambda _: False)(proj):
+            return None
+        ctx = self._context(proj["id"], fn["unit"])
+        result = self._attempt_compilation(proj, ctx["header"], source, fn)
+        if not result.ok:
+            return None
+        cand, verdict, _ = self._evaluate(fn, proj, result.obj)
+        return None if cand is None else self._score_candidate(fn, proj, cand, verdict).rows
+
+    def _replace_match(self, db, current, agent: Agent, source: str) -> None:
+        """An already matched function's new exact source (the judge verified it) is the saved one. The previous
+        matching source is kept as an exact attempt, so history has it whatever wrote it, and the function goes back
+        to unpolished: polishing's own path (RomPolish._readable) writes readable=1 afterwards."""
+        self.keep_matching_history(db, current, current['matched_source'])
+        db.execute("UPDATE functions SET matched_source=?, best_source=?, best_score=0, readable=0, "
+                   "unpolished_source=NULL WHERE id=?", (source, source, current['id']))
+        self._event(db, current['project_id'], agent.id, "rematch", current['name'])
+
+    def keep_matching_history(self, db, current, old: str | None) -> None:
+        """`old`, a source that matched, stays among the function's attempts (once), before a new one replaces it."""
+        if old and not db.execute("SELECT 1 FROM attempts WHERE function_id=? AND score=0 AND source=?",
+                                  (current['id'], old)).fetchone():
+            db.execute("INSERT INTO attempts(function_id,agent_id,score,compiled,context_version,source,created_at) "
+                       "VALUES(?,?,0,1,0,?,?)", (current['id'], current['matched_agent_id'] or 0, old,
+                                                 current['matched_at'] or time.time()))
 
     def _release_matched_claim(self, db, function_id, matching_agent_id=None):
         """The saved match owns the function; notify its displaced worker only after commit."""
