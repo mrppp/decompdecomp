@@ -11,6 +11,12 @@ A draft is written only when the code says what every byte is: each one a field 
 pointer to a known symbol, or zero padding before an aligned field. A datum read two ways, or with bytes nothing
 explains, is left to the data agents, with what the code does with it in their brief (`summary`). Every draft is
 judged like an agent's C (data_units.compile_data) and kept only if it holds the game's bytes.
+
+Text nothing reads by a field is written as a `char` array (`_text`): a string needs no guess about its type.
+
+.bss has no bytes, so its units are typed from the code's accesses alone (`typed_bss`): a datum the code touches by
+fields gets them (padding between), one it never touches a byte buffer. Nothing in the ROM can contradict that, so
+the agents are left only the .bss the code reads two ways.
 """
 
 from __future__ import annotations
@@ -85,6 +91,31 @@ def _literal(ctype: str, raw: bytes, order: str) -> str | None:
     return f"{value}{suffix}" if value >= 0 else f"{value}{suffix if suffix != 'ULL' else ''}"
 
 
+_ESCAPES = {ord("\n"): "\\n", ord("\t"): "\\t", ord("\r"): "\\r", ord('"'): '\\"', ord("\\"): "\\\\", ord("?"): "\\?"}
+
+
+def _text(raw: bytes) -> str | None:
+    """The C string literal for a datum that is text (printable ASCII, NUL-terminated, the zeros after it the
+    array's own padding), or None. Only for a datum the code never reads by a field: text is the one thing a
+    byte-for-byte reading of it can say without a guess. A run of zeros between strings is written `\\000` (three
+    digits, so the next character is never read as part of it)."""
+    body = raw.rstrip(b"\0")
+    # text starts with a character (a table of small numbers starts with zeros) and has more than a space or two
+    if len(body) < 2 or body[0] == 0 or len(body) == len(raw) or len(raw) > 4096 or len(body.replace(b" ", b"")) < 2:
+        return None
+    out = []
+    for byte in body:
+        if byte == 0:
+            out.append("\\000")
+        elif byte in _ESCAPES:
+            out.append(_ESCAPES[byte])
+        elif 0x20 <= byte < 0x7F:
+            out.append(chr(byte))
+        else:
+            return None
+    return '"' + "".join(out) + '"'
+
+
 def _align(n: int, to: int) -> int:
     return (n + to - 1) // to * to
 
@@ -107,7 +138,10 @@ def typed(net, proj, address: int, span: int, raw: bytes) -> tuple[str | None, s
     words = [int.from_bytes(raw[i:i + POINTER], order) for i in range(0, span - span % POINTER, POINTER)]
 
     if not fields:
-        # nothing the code reads directly: a table of pointers, if every word is one or empty
+        # nothing the code reads directly: text, if every byte is a printable character or the zeros that end it
+        if (text := _text(raw[:span])) is not None:
+            return f"char {name}[{span}] = {text};", ""
+        # or a table of pointers, if every word is one or empty
         if address % POINTER or span % POINTER or not words or not all(w == 0 or _pointee(
                 symbols, functions, w, low, high) for w in words) or not any(words):
             return None, "the code's accesses don't say what it is"
@@ -177,6 +211,52 @@ def typed(net, proj, address: int, span: int, raw: bytes) -> tuple[str | None, s
     return _source(declarator, body, pointer_words, symbols, functions, net, proj), ""
 
 
+def typed_bss(net, proj, address: int, span: int) -> tuple[str | None, str]:
+    """(C defining a .bss datum, "") from the code's accesses alone, or (None, why not).
+
+    .bss has no bytes to explain, so what the code reads or writes is all there is: the fields it touches, with the
+    bytes between and after them as `u8` padding, so the definition is exactly `span` bytes long (the judge wants the
+    whole datum). A datum the code never touches by a field (its address is handed to something) is a byte buffer."""
+    name = net.symbols(proj["id"]).name_at(address)[0]
+    fields = _layout(net, proj, address)
+    if fields is None:
+        return None, "this console's code isn't read for types yet"
+    if any(f.others for f in fields):
+        return None, "the code reads it two ways"
+    fields = sorted((f for f in fields if f.offset < span), key=lambda f: f.offset)
+    if not fields:
+        return f"u8 {name}[{span}];", ""
+    kinds = []
+    for f in fields:
+        pointer = f.points_to is not None and f.size == POINTER
+        if not pointer and (f.kind, f.size) not in TYPES:
+            return None, "a field of a kind drafts don't write (a vector)"
+        kinds.append("void *" if pointer else TYPES[(f.kind, f.size)])
+    end = max(f.offset + f.size for f in fields)
+    widest = min(max(f.size for f in fields), 8)
+    stride = _align(end, widest)
+    count = span // stride if span % stride == 0 else 1
+    if count == 1 and end > span:
+        return None, "its fields run past where the next datum starts"
+    if span % widest:
+        return None, "its size isn't a multiple of its widest field"
+    if len(fields) == 1 and fields[0].offset == 0 and stride == fields[0].size and (
+            count > 1 or span == fields[0].size):
+        return f"{kinds[0]} {name}" + (f"[{count}]" if count > 1 else "") + ";", ""
+    members, at = [], 0
+    for f, ctype in zip(fields, kinds):
+        if f.offset < at:
+            return None, f"fields overlap at +0x{f.offset:X}"
+        if f.offset > at:
+            members.append(f"u8 pad_{at:03X}[{f.offset - at}];")
+        members.append(f"{ctype}{'' if ctype.endswith('*') else ' '}f_{f.offset:03X};")
+        at = f.offset + f.size
+    each = stride if count > 1 else span  # a lone element is padded out to the whole datum
+    if each > at:
+        members.append(f"u8 pad_{at:03X}[{each - at}];")
+    return f"struct {{ {' '.join(members)} }} {name}" + (f"[{count}]" if count > 1 else "") + ";", ""
+
+
 def _source(declarator: str, body: str, words, symbols, functions, net, proj) -> str:
     """The definition, with declarations of the symbols its pointers name that the shared header doesn't."""
     context = net._context(proj["id"])
@@ -200,6 +280,7 @@ def run(net, slug: str, log=print) -> dict:
             "SELECT address FROM data_units WHERE project_id=? AND agent_id IS NOT NULL AND lease>?", proj["id"],
             time.time())}
     read = data_units.reader(net, proj)
+    bss = data_units.bss_start(net, proj)
     counts = {"matched": 0, "tried": 0, "skipped": 0, "reasons": {}}
     progress = getattr(log, "progress", None)
     for i, address in enumerate(order):
@@ -211,7 +292,12 @@ def run(net, slug: str, log=print) -> dict:
             info = data_units.unit(net, slug, net.symbols(proj["id"]).name_at(address)[0])
             span = info["span"]
             raw = read(address, span) if span else None
-            source, why = typed(net, proj, address, span, raw) if raw is not None else (None, "its end isn't known")
+            if raw is None and span and bss is not None and address >= bss:
+                source, why = typed_bss(net, proj, address, span)  # no bytes in the ROM: the code's accesses only
+            elif raw is not None:
+                source, why = typed(net, proj, address, span, raw)
+            else:
+                source, why = None, "its end isn't known"
         if source is None:
             counts["skipped"] += 1
             counts["reasons"][why] = counts["reasons"].get(why, 0) + 1

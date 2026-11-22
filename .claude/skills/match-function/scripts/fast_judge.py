@@ -24,6 +24,11 @@ import argparse
 import json
 import os
 import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import claimlost  # noqa: E402
 
 DEFAULT_HOME = "~/Decomp-RetroReversing-dev"
 DIFF_ROWS = 60  # rows --diff prints unless told otherwise; the worker counts what it leaves out
@@ -89,6 +94,12 @@ class Judge:
     def score(self, source):
         return self.judge(source).get("score")
 
+    def rows(self, source):
+        """(score, rows): the exact score and every row of the judge's diff, (marker, target, candidate) each; the
+        rows say which of the target's instructions differ (prove_chain.py's row-coverage combinations)."""
+        reply = self.ask(dict(self.request, source=source, raw_rows=True))
+        return reply.get("score"), [tuple(row) for row in reply.get("rows") or []]
+
     def close(self):
         if self.proc:
             self.proc.kill()
@@ -106,6 +117,7 @@ def main(argv=None):
     ap.add_argument("--vram", type=int, help="the address, when the name is shared by overlays")
     ap.add_argument("--home")
     a = ap.parse_args(argv)
+    claimlost.warn()  # a lost claim is said first, before minutes of scoring
     limit = rows_wanted(a.rows)
     judge = Judge(a.slug, a.function, vram=a.vram, home=a.home)
     try:
