@@ -2913,6 +2913,13 @@ $("deepSweepStart").onclick = () => {
 };
 async function startDeepSweep() {
   if ($("deepSweepStart").disabled || $("deepSweepSettings").disabled) return;
+  // A deep pass shares the project's builds with its helpers: started beside sixteen, their calls waited minutes
+  // each and the page slowed, twice in one day (once from a click meant for something else). Ask first, from the
+  // helpers the page already shows (S.sessions, the live poll's), so the button still answers at once.
+  const helpers = (S.sessions || []).filter(h => ["starting", "working", "waiting"].includes(h.state)).length;
+  if (helpers && !confirm(`${helpers} helper${helpers === 1 ? " is" : "s are"} working on this project. A deep pass `
+      + `shares its builds with them and will slow them down a lot (calls can wait minutes), and the app with them.\n\n`
+      + `It does best with the helpers stopped, overnight for example. Start the deep pass anyway?`)) return;
   $("deepSweepPanel").open = true;
   const slug = S.slug, log = $("deepSweepLog");
   deepSweepProjectVersion++; clearTimeout(deepSweepRetryTimer);

@@ -44,7 +44,17 @@ from ..forks import (
     unresolved,
 )
 from ..forks.objdiff import MappingConflict, ObjdiffError
-from ..forks.project import EDITABLE, GAME, PROGRAM, SCOPES, STATE, ForkError, ForkProject, project_macro
+from ..forks.project import (
+    EDITABLE,
+    GAME,
+    PROGRAM,
+    SCOPES,
+    STATE,
+    ForkError,
+    ForkProject,
+    project_macro,
+    write_manifest,
+)
 from ..hostenv import NO_WINDOW
 from ..network import (
     GAME_CODE,
@@ -63,6 +73,7 @@ from ..request_timing import build as timed_build
 from ..rom import RomError
 from ..scoring import percent_text
 from ..textedit import replace_once
+from . import trial_journal
 
 _REPO = re.compile(r"^(https://(github\.com|gitlab\.com|codeberg\.org|git\.[\w.-]+)/[\w.-]+/[\w.-]+?)(\.git)?/?$")
 # A match has to come from C/C++: no inline assembly, asm functions, asm includes or embedded binaries.
@@ -95,25 +106,29 @@ def _strip_comments(code: str) -> str:
 
 
 def _rewrite(path: Path, text: str) -> None:
-    """`path.write_text(text, encoding="utf-8")`, the same bytes, writing only from the first 4 KB block that differs.
-    A compile writes the agent's version of a unit's source and an undo writes the original back: a dtk unit can be
-    a megabyte, and only the part from the changed function on is new. An unchanged file is only touched, so a build
-    still sees it as new."""
+    """`path.write_text(text, encoding="utf-8")`, the same bytes, written whole and swapped in at once (a temporary
+    file beside it, then os.replace). A compile writes the agent's version of a unit's source and an undo writes the
+    original back. Written in place from the first 4 KB block that differed (seek, write, truncate), two writers of
+    one file at once (an attempt and a trial's restore) left a run of NUL bytes where one truncated the file and the
+    other then wrote past its new end: on a DOS game, ten files in an hour, each then not building and every
+    function in it reopened. Now a reader sees the whole old file or the whole new one. An unchanged file is only
+    touched, so a build still sees it as new."""
     data = text.replace("\n", os.linesep).encode("utf-8")  # as text mode writes it
     try:
-        with open(path, "r+b") as f:
-            old = f.read()
-            if old == data:
-                os.utime(path)
-                return
-            at = 0
-            while old[at:at + 4096] == data[at:at + 4096]:
-                at += 4096
-            f.seek(at)
-            f.write(data[at:])
-            f.truncate()
+        if path.read_bytes() == data:
+            os.utime(path)
+            return
+        mode = path.stat().st_mode & 0o7777
     except FileNotFoundError:
-        path.write_bytes(data)
+        mode = None
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _config_stamp(root: Path, globs: tuple[str, ...]) -> tuple | None:
@@ -576,6 +591,8 @@ _BEST_LEFT: contextvars.ContextVar[bool] = contextvars.ContextVar("best_left", d
 class ForkEngine:
     def __init__(self, net):
         self.net = net
+        self._stale_checked: dict[int, dict[str, tuple[int, int]]] = {}  # project id -> file -> (mtime, size) seen building
+        self.recover_trials()
         self._trees: dict[int, _TreeLock] = defaultdict(_TreeLock)  # project id -> its source tree's lock
         self._unit_locks: dict[tuple[int, str], threading.RLock] = defaultdict(threading.RLock)
         self._build_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)  # one build at a time per tree
@@ -1030,7 +1047,7 @@ class ForkEngine:
         with self._build_locks[proj["id"]]:  # not while an agent's compile builds in the same tree
             result = console.check_rebuild(fp, manifest["version"], log=log)
         manifest["rebuild"] = result | {"t": time.time()}
-        (fp.root / ".decomp.wtf.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        write_manifest(fp.root, manifest)
         return result
 
     def set_scope(self, slug: str, scope: str, log=print) -> dict:
@@ -1189,7 +1206,7 @@ class ForkEngine:
                     if checks:  # what the project shows (check_rom)
                         manifest = json.loads((fp.root / ".decomp.wtf.json").read_text(encoding="utf-8"))
                         manifest["rebuild"] = after | {"t": time.time()}
-                        (fp.root / ".decomp.wtf.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                        write_manifest(fp.root, manifest)
                     if added := paths + sorted(untracked() - there):  # (none: `git commit --` takes what's staged)
                         self._commit_paths(proj, fp, added, f"Analyse the game again: {said}\n\nBy decompdecomp.")
         if kept:
@@ -3312,6 +3329,107 @@ class ForkEngine:
                for r in rows]
         return "\n".join(out) or "none"
 
+    STALE_SECONDS = 30 * 60  # a file left not building this long, untouched, is put back (repair_stale_files)
+    STALE_CHECK_SECONDS = 15 * 60
+
+    def repair_stale_files(self, slug: str) -> list[str]:
+        """Put back the last commit of a source file that hasn't built for STALE_SECONDS, unchanged all that time,
+        where that commit builds. Returns the files put back.
+
+        A file left not building stops every function in it: each try reports "the file didn't build before your
+        change either". On one DOS game, a process stopped mid-trial (twice) and two writers at once (once) left
+        eleven, ten and four files like that, found by hand after one to two hours each time. The broken text is
+        kept under the home's .decomp/repaired/<project>/, with a line in its list.txt; nothing that matched is
+        lost (a match is committed). A file found building isn't built again until it changes."""
+        proj = self.net._project(slug)
+        if not self.is_fork(proj):
+            return []
+        fp = ForkProject(Path(proj["root"]))
+        checked = self._stale_checked.setdefault(proj["id"], {})
+        now, put_back = time.time(), []
+        for unit in fp.units():
+            if not unit.source:
+                continue
+            path = fp.root / unit.source
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            seen = (stat.st_mtime_ns, stat.st_size)
+            if checked.get(unit.source) == seen or now - stat.st_mtime < self.STALE_SECONDS:
+                continue
+            head = subprocess.run(["git", "show", f"HEAD:{unit.source}"], cwd=fp.root, capture_output=True,
+                                  creationflags=NO_WINDOW)
+            if head.returncode != 0:
+                checked[unit.source] = seen
+                continue
+            committed = head.stdout.decode("utf-8", errors="replace").replace("\r\n", "\n")
+            with self._tree(proj).exclusive():
+                try:
+                    if (path.stat().st_mtime_ns, path.stat().st_size) != seen:
+                        continue  # (changed while this waited: looked at again next time)
+                    current = path.read_text(errors="replace", encoding="utf-8")
+                except OSError:
+                    continue
+                if current == committed:
+                    checked[unit.source] = seen
+                    continue
+                os.utime(path)  # compiled again, not taken as built: a later object can be newer than its text
+                if self._build_unit(proj, fp, unit)[0]:
+                    st = path.stat()
+                    checked[unit.source] = (st.st_mtime_ns, st.st_size)
+                    continue
+                _rewrite(path, committed)
+                if not self._build_unit(proj, fp, unit)[0]:
+                    _rewrite(path, current)  # the commit doesn't build either: an agent's to fix
+                    self._build_unit(proj, fp, unit)
+                    st = path.stat()
+                    checked[unit.source] = (st.st_mtime_ns, st.st_size)
+                    continue
+            kept = Path(self.net.workspace) / ".decomp" / "repaired" / slug
+            kept.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            (kept / f"{Path(unit.source).name}.{stamp}").write_text(current, encoding="utf-8")
+            with (kept / "list.txt").open("a", encoding="utf-8") as listing:
+                listing.write(f"{stamp} {unit.source}: hadn't built for {int((now - stat.st_mtime) // 60)} minutes; "
+                              f"its last commit, which builds, put back\n")
+            logging.getLogger("decompdecomp").warning(
+                "%s: %s hadn't built for %d minutes, unchanged: put back its last commit, which builds (the broken "
+                "text is in .decomp/repaired)", slug, unit.source, (now - stat.st_mtime) // 60)
+            put_back.append(unit.source)
+        return put_back
+
+    def watch_stale_files(self, stop: threading.Event) -> None:
+        """repair_stale_files for every fork project, every STALE_CHECK_SECONDS, until `stop`."""
+        while not stop.wait(self.STALE_CHECK_SECONDS):
+            for row in self.net.store.all("SELECT slug FROM projects"):
+                if stop.is_set():
+                    return
+                try:
+                    self.repair_stale_files(row["slug"])
+                except Exception:  # noqa: BLE001  one project's trouble never stops the others' checks
+                    logging.getLogger("decompdecomp").exception("stale file check failed for %s", row["slug"])
+
+    def _trials_folder(self) -> Path | None:
+        workspace = getattr(self.net, "workspace", None)
+        return Path(workspace) / ".decomp" / "trials" if workspace is not None else None
+
+    def _note_trial(self, path: Path, before: str, after: str) -> None:
+        """A trial's text is in `path` until its call puts `before` back or keeps it (trial_journal)."""
+        if (folder := self._trials_folder()) is not None and before != after:
+            trial_journal.note(folder, path, before, after)
+
+    def recover_trials(self) -> list[Path]:
+        """Put back the files a process stopped mid-trial left with its trial in them (trial_journal.recover)."""
+        if (folder := self._trials_folder()) is None or not folder.is_dir():
+            return []
+        try:
+            return trial_journal.recover(folder, _rewrite)
+        except Exception:  # noqa: BLE001  recovery never stops the engine starting
+            logging.getLogger("decompdecomp").exception("trial journal recovery failed")
+            return []
+
+    @trial_journal.journaled
     def attempt(self, agent: Agent, slug: str, function: str, source: str, keep: bool = True, prelude: str = "",
                 quiet: int | None = None, comment: bool = False, *, background: bool = False) -> dict:
         if background and (keep or slug in self.net.links):
@@ -3558,6 +3676,7 @@ class ForkEngine:
 
             committed = [unit.source, *(p.relative_to(fp.root).as_posix() for p in renamed)]
             _rewrite(path, after)
+            self._note_trial(path, before, after)
 
             def remembered(text: str, score: int | None, kept: bool = True) -> str:
                 """A result as repeat_of gives it back later (agents' tries only), plus the note when this variant
@@ -4520,6 +4639,7 @@ class ForkEngine:
             return existed, text, replace_once(text, old, new, path)
         return existed, text, text.rstrip("\n") + ("\n" if text else "") + new.strip("\n") + "\n"
 
+    @trial_journal.journaled
     def _edit_source(self, agent: Agent, proj, fp: ForkProject, p: Path, rel: str, units: list, old: str, new: str,
                      message: str) -> str:
         """Edit a unit's source file: rebuild and measure just that unit, keep everything that matched before."""
@@ -4530,6 +4650,8 @@ class ForkEngine:
             bases = {u.name: self._baseline(proj, fp, u, text) for u in units}
             p.parent.mkdir(parents=True, exist_ok=True)
             _rewrite(p, updated)
+            if existed:
+                self._note_trial(p, text, updated)
 
             def undo() -> None:
                 if existed:
@@ -4584,6 +4706,7 @@ class ForkEngine:
         done = "".join(self._file_done(proj["slug"], proj, fp, u, after[u.name] or {}, agent) for u in units[:1])
         return f"✅ {rel} updated; every matched function still matches.{done}"
 
+    @trial_journal.journaled
     def _edit_shared(self, agent: Agent, proj, fp: ForkProject, slug: str, p: Path, rel: str, old: str, new: str,
                      message: str) -> str:
         """Edit a header (or any file several units may use): rebuild and measure the whole project."""
@@ -4597,6 +4720,8 @@ class ForkEngine:
                 "SELECT unit, meta FROM functions WHERE project_id=? AND status='matched'", proj["id"])}
             p.parent.mkdir(parents=True, exist_ok=True)
             _rewrite(p, updated)
+            if existed:
+                self._note_trial(p, text, updated)
 
             def undo() -> None:
                 if existed:
@@ -4955,6 +5080,7 @@ class ForkEngine:
             pass
         return annotate(rows, [], [], source), source
 
+    @trial_journal.journaled
     def _best_diff(self, proj, fp: ForkProject, fn) -> dict:
         """objdiff's diff of a function's best attempt: written into its file like a try, built, and undone, so
         neither the source nor the object it built stays changed. Cached by what it was built from."""
@@ -4977,6 +5103,7 @@ class ForkEngine:
                 if key in self._best_diffs:
                     return dict(self._best_diffs[key])
                 _rewrite(path, after)
+                self._note_trial(path, before, after)
                 try:
                     ok, log = self._build_unit(proj, fp, unit)
                     if not ok:
