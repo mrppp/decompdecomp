@@ -21,7 +21,7 @@ from decompnet.app.engine import RomNetwork
 from decompnet.app.server import build
 
 # the tests that import the demo ROM (the rest, such as the GUI's security, run anywhere)
-needs_demo = pytest.mark.skipif(toolchains.installed("gcc-2.7.2-kmc") is None or not shutil.which("ld.lld"),
+needs_demo = pytest.mark.skipif(toolchains.installed("gcc-2.7.2-kmc") is None or not shutil.which("ld.lld") or not shutil.which("llvm-objcopy"),
                                 reason="needs gcc-2.7.2-kmc")
 PORT, SECRET = 6499, "s3cret-for-tests"
 
@@ -1935,9 +1935,9 @@ def test_deep_sweep_routes_validate_start_stop_and_status(app, monkeypatch):
     monkeypatch.setattr(net.deep_sweeps, 'reset_metrics', lambda slug: {'reset':slug})
     assert client.post('/api/permuter/pass', json={'slug':'example','action':'reset-metrics'}, headers={'X-Decomp':'1'}).json() == {'reset':'example'}
     response = client.post('/api/permuter/pass', json={'slug':'example','minutes':7,'max_variants':99,'repeat':True}, headers={'X-Decomp':'1'})
-    assert response.json()['job'] == 'sweep' and calls == [('example',7,99,True,0,1,False,1,False,0)]
-    client.post('/api/permuter/pass', json={'slug':'example','threads':2,'threads_per_function':4}, headers={'X-Decomp':'1'})
-    assert calls[-1] == ('example',5,10000,False,2,1,False,4,False,0)
+    assert response.json()['job'] == 'sweep' and calls == [('example',7,99,True,0,1,False,1,False,0,False)]
+    client.post('/api/permuter/pass', json={'slug':'example','threads':2,'threads_per_function':4,'rank_candidates':True}, headers={'X-Decomp':'1'})
+    assert calls[-1] == ('example',5,10000,False,2,1,False,4,False,0,True)
     assert not client.post('/api/permuter/pass', json={'slug':'example','action':'stop'}, headers={'X-Decomp':'1'}).json()['enabled']
     assert client.post('/api/permuter/pass', json={'slug':'example','repeat':'yes'}, headers={'X-Decomp':'1'}).status_code == 400
     assert client.post('/api/permuter/pass', json={'slug':'example','action':'unknown'}, headers={'X-Decomp':'1'}).status_code == 400
@@ -2757,15 +2757,49 @@ def test_room_retry_all_processes_snapshot_beyond_five_and_continues_errors(app,
     assert job['state']=='done' and calls==[rows[0]['key']]
 
 
-def test_background_work_routes_are_guarded(app):
+def test_background_work_routes_are_guarded(app, monkeypatch):
+    from decompnet.app.routes import state
+
     client, *_=app
+    monkeypatch.setattr(state, "repair_available", lambda: False)
     endpoint='/api/background-work'
     assert client.get(endpoint, headers={'User-Agent':'external'}).status_code==401
     assert client.get(endpoint).status_code==200
     snapshot=client.get(endpoint).json()
     assert 'cpu_note' in snapshot and 'threads' in snapshot
+    assert "app_repairs" not in snapshot
+    monkeypatch.setattr(state, "repair_available", lambda: True)
+    repair = {"source": "failed-build", "task": "build", "started": 1, "state": "done"}
+    monkeypatch.setattr(state, "recent_repairs", lambda jobs: [repair])
+    assert client.get(endpoint).json()["app_repairs"] == [repair]
     assert client.post(endpoint,json={'kind':'service','key':'x'}).status_code==403
     assert client.post(endpoint,json={'kind':'service','key':'x'},headers={'X-Decomp':'1'}).status_code==400
+
+
+def test_app_repair_screen_lookup_and_start_share_scope(app, monkeypatch):
+    from decompnet.app.routes import life
+
+    client, *_ = app
+    calls = []
+    repair = {"source": "failed-build", "task": "build", "started": 1, "state": "running"}
+    screen = "#/p/game/settings"
+
+    def start(self, source, diagnostics, screen):
+        calls.append((source, diagnostics, screen))
+        return "repair-job"
+
+    def lookup(jobs, *, screen):
+        calls.append(screen)
+        return [repair]
+
+    monkeypatch.setattr(life.AppRepair, "start", start)
+    monkeypatch.setattr(life, "recent_repairs", lookup)
+    endpoint = "/api/app-repair"
+    assert client.post(endpoint, headers={"X-Decomp": "1"}, json={
+        "action": "start", "id": "failed-build", "log": "Reviewed diagnostics", "screen": screen,
+    }).json() == {"job": "repair-job"}
+    assert client.get(endpoint, params={"screen": screen}).json() == {"repairs": [repair]}
+    assert calls == [("failed-build", "Reviewed diagnostics", screen), screen]
 
 
 def test_brief_project_list_skips_progress_summaries(app, monkeypatch, tmp_path):
@@ -4254,3 +4288,27 @@ def test_deep_permuter_tab_accepts_the_older_routes_field_names(app, monkeypatch
     assert response.status_code == 200, response.text
     assert done.wait(2)
     assert calls == [("g", 3, 3000)]
+
+
+def test_code_change_status_and_restart_are_guarded(app, monkeypatch):
+    from decompnet.app import updates
+    client, *_ = app
+    assert client.get('/api/code-change', headers={'User-Agent': 'external'}).status_code == 401
+    status = client.get('/api/code-change').json()
+    assert set(status) >= {'enabled', 'changed', 'what', 'settled', 'auto', 'restarting'}
+    restarts = []
+    monkeypatch.setattr(updates.Updater, 'restart_now', lambda self: restarts.append(1) or True)
+    assert client.post('/api/code-change', json={'action': 'restart'}).status_code == 403
+    assert client.post('/api/code-change', json={'action': 'other'}, headers={'X-Decomp': '1'}).status_code == 400
+    answer = client.post('/api/code-change', json={'action': 'restart'}, headers={'X-Decomp': '1'})
+    assert (answer.status_code, restarts) == ((200, [1]) if status['enabled'] else (400, []))
+
+
+def test_restarting_for_new_code_by_itself_is_a_saved_setting_and_off_by_default(app):
+    client, *_ = app
+    assert client.post('/api/settings', json={}, headers={'X-Decomp': '1'}).json()['auto_restart_on_code_change'] is False
+    on = client.post('/api/settings', json={'auto_restart_on_code_change': True}, headers={'X-Decomp': '1'})
+    assert on.json()['auto_restart_on_code_change'] is True
+    assert client.get('/api/code-change').json()['auto'] is True
+    client.post('/api/settings', json={'auto_restart_on_code_change': False}, headers={'X-Decomp': '1'})
+    assert client.get('/api/code-change').json()['auto'] is False

@@ -13,8 +13,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from ...network import NetworkError
-from .. import updates, window
-from ..app_repair import AppRepair, desktop
+from .. import code_watch, updates, window
+from ..app_repair import AppRepair, desktop, recent_repairs
 from . import App
 
 page_log = logging.getLogger("decompdecomp.page")
@@ -96,15 +96,20 @@ def register(app: App) -> None:
             return fail(NetworkError("Open the desktop window to repair app source."), 403)
         try:
             if request.method == "GET":
+                if (screen := request.query_params.get("screen")) is not None:
+                    return JSONResponse({"repairs": await call(lambda: recent_repairs(app.jobs, screen=screen))})
                 return JSONResponse(await call(repair.preview, request.query_params.get("id", "")))
             data = await body(request)
             jid = str(data.get("id") or "")
             if data.get("action") == "start":
-                return JSONResponse({"job": await call(repair.start, jid, data.get("log"))})
+                return JSONResponse({"job": await call(repair.start, jid, data.get("log"), data.get("screen"))})
             if data.get("action") == "apply":
                 await call(repair.apply, jid)
                 return JSONResponse({"applied": True})
-            raise NetworkError("Choose Start repair or Apply patch.")
+            if data.get("action") == "message":
+                await call(repair.message, jid, data.get("message"))
+                return JSONResponse({"queued": True})
+            raise NetworkError("Choose Start repair, Send message or Apply patch.")
         except (NetworkError, ValueError, OSError, subprocess.SubprocessError) as error:
             return fail(error)
 
@@ -184,4 +189,37 @@ def register(app: App) -> None:
         threading.Thread(target=app.quit_app, daemon=True).start()
         return JSONResponse({"ok": True})
 
+    code = code_watch.Watch()
+    AUTO = "auto_restart_on_code_change"
+
+    @mcp.custom_route("/api/code-change", methods=["GET", "POST"])
+    async def api_code_change(request: Request) -> Response:
+        """Is the checkout's code on disk newer than what runs (git pull, uv sync)? POST {"action": "restart"}: restart now."""
+        if (bad := guard(request, write=request.method == "POST")):
+            return bad
+        if request.method == "POST":
+            if (await body(request)).get("action") != "restart":
+                return fail(ValueError("Choose Restart."))
+            if not code.enabled:
+                return fail(ValueError("Only a source checkout restarts for new code; an installed copy updates from Settings."))
+            started = await call(updater.restart_now)
+            return JSONResponse({"restarting": started, **await call(code.check)})
+        return JSONResponse({**await call(code.check), "auto": bool(settings.data.get(AUTO)),
+                             "restarting": updater.job["state"] == "restarting", "error": updater.job.get("error")})
+
+    def watch_code() -> None:
+        """Restart into new code by itself, when the user asked: once it has stopped changing and nothing is working."""
+        time.sleep(FIRST_CHECK_SECONDS)
+        while True:
+            time.sleep(code_watch.CHECK_SECONDS)
+            try:
+                status = code.check()
+                if (status["settled"] and settings.data.get(AUTO) and not app.busy()
+                        and runtime.job["state"] not in ACTIVE and updater.job["state"] not in ("installing", "restarting", "error")):
+                    updater.restart_now()
+            except (ValueError, OSError, subprocess.SubprocessError):
+                pass
+
+    if code.enabled:
+        threading.Thread(target=watch_code, daemon=True, name="code-watch").start()
     threading.Thread(target=watch_updates, daemon=True, name="updates").start()

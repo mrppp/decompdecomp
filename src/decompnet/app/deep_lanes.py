@@ -216,6 +216,9 @@ class Lanes:
                     if metrics is not None:
                         for key, value in message['values'].items():
                             metrics.add(key, value)
+                        metrics.set_remote(ident, message.get('live'))
+                        if refresh := getattr(function_log, 'refresh_metrics', None):
+                            refresh()
                 elif kind == 'reply':
                     keep = True
                     if cancelled is not None:
@@ -226,6 +229,10 @@ class Lanes:
                         raise RuntimeError(message['error'])
                     return message['result']
         finally:
+            if metrics is not None:
+                metrics.set_remote(ident, None)
+                if refresh := getattr(function_log, 'refresh_metrics', None):
+                    refresh()
             if keep and lane.alive() and not self.closed:
                 lane.idle_since = time.monotonic()
                 self.idle.put(lane)
@@ -312,10 +319,11 @@ def child(db_path, workspace, background):
         return pools[(slots, maximum)]
 
     def run(message):
+        from .deep_throughput import LIVE_WORKER_COUNTERS, RANK_COUNTERS
         ident = message['ident']
         stop = cancels[ident]
         pool = pool_for(message['slots'], message['maximum'])
-        sent = dict(pool.metrics.values)
+        sent = pool.metrics.counts()
         finished = threading.Event()
         latest = {'sent': 0.0, 'value': None}
 
@@ -327,17 +335,20 @@ def child(db_path, workspace, background):
 
         def counters():
             nonlocal sent
-            current = dict(pool.metrics.values)
-            delta = {key: current.get(key, 0) - sent.get(key, 0) for key in COUNTERS
+            current = pool.metrics.counts()
+            delta = {key: current.get(key, 0) - sent.get(key, 0) for key in (*COUNTERS, *RANK_COUNTERS)
                      if current.get(key, 0) != sent.get(key, 0)}
+            live = {key: current.get(key, 0) for key in LIVE_WORKER_COUNTERS}
+            live_changed = any(value != sent.get(key, 0) for key, value in live.items())
             sent = current
-            if delta:
-                emit({'kind': 'metrics', 'ident': ident, 'values': delta})
+            if delta or live_changed:
+                emit({'kind': 'metrics', 'ident': ident, 'values': delta, 'live': live})
 
         def report():
             while not finished.wait(METRIC_SECONDS):
                 counters()
-        threading.Thread(target=report, daemon=True, name='deep-lane-metrics').start()
+        reporter = threading.Thread(target=report, daemon=True, name='deep-lane-metrics')
+        reporter.start()
 
         class Log:
             compile_pool = pool
@@ -361,15 +372,17 @@ def child(db_path, workspace, background):
                 if stop.is_set():
                     raise _Cancelled('Deep pass stopped')
         try:
-            options = {key: message[key] for key in ('compiler_profiles', 'threads_per_function', 'expanded_budget') if key in message}
+            options = {key: message[key] for key in ('compiler_profiles', 'threads_per_function', 'expanded_budget', 'rank_candidates') if key in message}
             result = deep_permuter.run(net, message['slug'], message['name'], message['minutes'], message['variants'],
                                        Log(), **options)
             finished.set()
+            reporter.join()
             counters()
             last_progress()
             emit({'kind': 'reply', 'ident': ident, 'result': result})
         except BaseException as error:
             finished.set()
+            reporter.join()
             counters()
             last_progress()
             if not isinstance(error, (_Cancelled, NetworkError)):

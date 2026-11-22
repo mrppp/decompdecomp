@@ -290,21 +290,28 @@ def test_the_cartridge_reads_as_the_rom(tmp_path):
 #define IO_SCRATCH 0x000A0000u
 #define IO_FAR(a) (a)
 static uint8_t M[0xA0010], rom[0x1000]; static size_t rom_size = sizeof rom;
+static uint32_t cart_io_last; static int cart_io_busy;
 static void wbe32(uint32_t a, uint32_t v) { M[a] = v >> 24; M[a + 1] = v >> 16; M[a + 2] = v >> 8; M[a + 3] = v; }
 static int port_ai_register(uint32_t a, int w, uint32_t v, uint32_t *r) { (void)a; (void)w; (void)v; (void)r; return 0; }
 static int si_register(uint32_t a, int w, uint32_t v, uint32_t *r) { (void)a; (void)w; (void)v; (void)r; return 0; }
 static int pi_register(uint32_t a, int w, uint32_t v, uint32_t *r) { (void)a; (void)w; (void)v; (void)r; return 0; }
-""" + _function(HOST.read_text(), "rom32") + "\n" + _function(HOST.read_text(), "port_io_load") + """
+""" + _function(HOST.read_text(), "rom32") + "\n" + _function(HOST.read_text(), "port_io_load") + "\n" + _function(HOST.read_text(), "port_io_store") + """
 int main(void) {
     rom[0x578] = 0x34; rom[0x579] = 0x21; rom[0x57A] = 0x89; rom[0x57B] = 0x65;
     uint64_t w = port_io_load(0xB0000578u), h = port_io_load(0xB000057Au), b = port_io_load(0xB0000579u);
     printf("%02X%02X%02X%02X %02X%02X %02X\\n", M[w], M[w + 1], M[w + 2], M[w + 3], M[h], M[h + 1], M[b]);
+    port_io_store(0xB0000580u, 0xE4CD7BFDu);
+    w = port_io_load(0xB0000578u);
+    printf("%02X%02X%02X%02X ", M[w], M[w+1], M[w+2], M[w+3]);
+    cart_io_busy = 0;
+    w = port_io_load(0xB0000578u);
+    printf("%02X%02X%02X%02X\\n", M[w], M[w+1], M[w+2], M[w+3]);
     return 0;
 }
 """)
     subprocess.run([cc, "-o", str(tmp_path / "t"), str(source)], check=True, capture_output=True)
     done = subprocess.run([str(tmp_path / "t")], capture_output=True, text=True, check=True)
-    assert done.stdout.split() == ["34218965", "8965", "21"]
+    assert done.stdout.split() == ["34218965", "8965", "21", "E4CD7BFD", "34218965"]
 
 
 def test_the_host_names_no_one_games_functions(tmp_path):
@@ -559,20 +566,30 @@ static uint8_t *M = memory, *rom = cartridge;
 static size_t rom_size = sizeof cartridge;
 #define LOG(...) ((void)0)
 static unsigned long dmas;
-static void port_trace(void) {}
+static int traces;
+static void port_trace(void) { traces++; }
+#define SHADOW_STACKS 0x10000000u
+#define SHADOW_SIZE 0x100000u
+#define BOOT_STACK_SIZE 0x10000u
+#define BOOT_STACK_BUS 0x15000000u
 static int put(u32 mq, u32 msg, int flag, int jam) {
     (void)flag;
     (void)jam;
     assert(mq == 32 && msg == 64);
     return 0;
 }
-""" + _function(HOST.read_text(), "wbe32") + "\n"
+""" + _function(HOST.read_text(), "wbe32") + "\n" + _function(HOST.read_text(), "stack_end") + "\n"
         + _function(HOST.read_text(), "w2c_env_osPiStartDma") + r"""
 int main(void) {
     w2c_env_osPiStartDma(NULL, 64, 0, 0, 1, 0, 2, 32);
     w2c_env_osPiStartDma(NULL, 64, 0, 0, 0xB0000001, 2, 2, 32);
     assert(memcmp(memory, "\x20\x30\x20\x30", 4) == 0);
     assert(memcmp(memory + 76, "\xB0\x00\x00\x01", 4) == 0);
+    int invalid = traces;
+    w2c_env_osPiStartDma(NULL, 0, 0, 1, 0, 0x1400FFF0u, 8, 0);
+    assert(traces == invalid);
+    w2c_env_osPiStartDma(NULL, 0, 0, 1, 0, 0x14FFFFFCu, 8, 0);
+    assert(traces == invalid + 1);
     return 0;
 }
 """)
@@ -593,6 +610,7 @@ def test_raw_pi_reads_rom_into_console_ram_and_compatibility_stack(tmp_path):
 static uint8_t *M;
 static uint8_t rom[] = {0, 1, 2, 3, 4, 5};
 static size_t rom_size = sizeof rom;
+static int cart_io_busy;
 static int interrupts;
 enum { EV_PI = 8 };
 static void post_event(int event) { assert(event == EV_PI); interrupts++; }
@@ -615,6 +633,9 @@ int main(void) {
     assert(pi_register(0xA460000Cu, 1, 4, NULL));
     assert(M[0x1403FE94u] == 0);
     assert(pi_register(0xA4600010u, 0, 0, &read) && read == 0);
+    cart_io_busy = 1;
+    assert(pi_register(0xA4600010u, 0, 0, &read) && read == 2);
+    cart_io_busy = 0;
     assert(pi_register(0xA4600000u, 1, port_stack_bus(0xFF00u), NULL));
     assert(pi_register(0xA460000Cu, 1, 3, NULL));
     assert(!memcmp(M + 0xFF00u, rom + 2, 4));
@@ -660,3 +681,45 @@ int main() {
     subprocess.run(["c++", "-std=c++17", "-I", str(KIT / "rt64"), str(source), "-o", str(program)],
                    check=True, capture_output=True, timeout=60)
     subprocess.run([str(program)], check=True, capture_output=True, timeout=30)
+
+
+def test_extended_pi_routes_only_sram_handles_to_the_save_device(tmp_path):
+    cc = shutil.which('cc') or shutil.which('clang') or shutil.which('gcc')
+    if not cc:
+        pytest.skip('no C compiler')
+    function = _function(HOST.read_text(), 'w2c_env_osEPiStartDma')
+    source = tmp_path / 'test.c'
+    source.write_text(r'''
+#include <stdint.h>
+#include <stdio.h>
+typedef uint32_t u32;
+struct w2c_env;
+static uint8_t memory[1024], *M = memory;
+static int sram_calls, pi_calls, messages;
+static uint32_t fields[32];
+static uint32_t be32(uint32_t a) { return fields[a / 4]; }
+static uint32_t stack_end(uint32_t a) { return a >= 0x1000 && a < 0x2000 ? 0x2000 : 0; }
+static void put(uint32_t q, uint32_t msg, int a, int b) { (void)q; (void)msg; (void)a; (void)b; messages++; }
+int port_sram_dma(uint32_t dram, uint32_t offset, uint32_t size, uint32_t write) {
+    sram_calls++; return !(dram == 0x1800 && offset == 0x123 && size == 4 && write == 1);
+}
+u32 w2c_env_osPiStartDma(struct w2c_env *e, u32 mb, u32 pri, u32 dir, u32 dev, u32 dram, u32 size, u32 mq) {
+    (void)e; (void)mb; (void)pri; (void)dir; (void)dev; (void)dram; (void)size; (void)mq; pi_calls++; return 0;
+}
+''' + function + r'''
+int main(void) {
+    fields[(64 + 4) / 4] = 20; fields[(64 + 8) / 4] = 0x1800;
+    fields[(64 + 12) / 4] = 0x08000123; fields[(64 + 16) / 4] = 4;
+    memory[36] = 3; if (w2c_env_osEPiStartDma(0, 32, 64, 1)) return 2;
+    memory[36] = 8; if (w2c_env_osEPiStartDma(0, 32, 64, 1)) return 3;
+    fields[(64 + 8) / 4] = 0x1fff; memory[36] = 3;
+    if (w2c_env_osEPiStartDma(0, 32, 64, 1) != (u32)-1) return 4;
+    printf("%d %d %d\n", sram_calls, pi_calls, messages);
+    return 0;
+}
+''')
+    binary = tmp_path / 'test'
+    built = subprocess.run([cc, '-O1', '-o', str(binary), str(source)], capture_output=True, text=True, timeout=60)
+    assert built.returncode == 0, built.stderr
+    result = subprocess.run([str(binary)], capture_output=True, text=True, check=True, timeout=30)
+    assert result.stdout.strip() == '1 1 1'

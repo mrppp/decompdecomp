@@ -19,6 +19,54 @@ from .agents import _which
 KIND = "app-repair"
 LOG_LIMIT = 16000
 PATCH_LIMIT = 250000
+MESSAGE_LIMIT = 4000
+
+
+class RepairConversation:
+    """Hold one follow-up at a time so patch review cannot race with an accepted message."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = None
+        self.accepting = False
+        self.transcript = []
+
+    def publish(self, log, phase):
+        log.progress({"phase": phase, "repair_messages": self.transcript.copy(),
+                      "repair_accepting": self.accepting, "repair_pending": bool(self.pending)})
+
+    def add(self, log, speaker, message):
+        self.transcript = [*self.transcript[-29:], f"{speaker}: {message[-LOG_LIMIT:]}"]
+        self.publish(log, "Codex is working in the repair worktree…")
+
+    def agent_message(self, log, message):
+        with self.lock:
+            self.add(log, "Codex", message)
+
+    def queue(self, message, job):
+        with self.lock:
+            if not self.accepting or self.pending:
+                raise NetworkError("Codex cannot accept another message right now.")
+            self.pending = message
+            job["progress"] = {**job["progress"], "repair_pending": True}
+
+    def next_prompt(self, log):
+        with self.lock:
+            message, self.pending = self.pending, None
+            if message:
+                self.add(log, "You", message)
+            else:
+                self.accepting = False
+                self.publish(log, "Preparing patch for review…")
+            return message
+
+    def close(self, log):
+        with self.lock:
+            self.accepting = False
+            if self.pending:
+                self.add(log, "Undelivered message", self.pending)
+                self.pending = None
+            self.publish(log, "Preparing patch for review…")
 
 
 def git(root, *args, patch=None):
@@ -41,6 +89,24 @@ def desktop(request, app):
     return secrets.compare_digest(window.request_token(request), app.secret)
 
 
+def recent_repairs(jobs, *, screen=None):
+    """Expose the latest repair for each failed job without loading its transcript or patch."""
+    with jobs._lock:
+        repairs = {}
+        for job in reversed(jobs.jobs.values()):
+            source = job.get("repair_source")
+            if not source or job["kind"] != KIND or source in repairs:
+                continue
+            if screen is not None and job.get("repair_screen") != screen:
+                continue
+            repairs[source] = {
+                "source": source, "task": jobs.jobs[source]["kind"], "started": job["t"],
+                "state": "stopping" if job["state"] == "running" and jobs.cancel_events[job["id"]].is_set()
+                else job["state"],
+            }
+        return list(repairs.values())
+
+
 def checkout():
     if not available():
         raise NetworkError("Run decompdecomp from a Git checkout to propose an app repair.")
@@ -54,6 +120,7 @@ class AppRepair:
     def __init__(self, jobs):
         self.jobs = jobs
         self.apply_lock = threading.Lock()
+        self.conversations = {}
 
     def preview(self, source):
         checkout()
@@ -69,7 +136,7 @@ class AppRepair:
         return {"log": log, "repair": next((job["id"] for job in reversed(self.jobs.jobs.copy().values())
                                           if job.get("repair_source") == source), None)}
 
-    def start(self, source, diagnostics):
+    def start(self, source, diagnostics, screen=None):
         from ..agents import get
 
         root = checkout()
@@ -79,16 +146,36 @@ class AppRepair:
             raise NetworkError("Install and sign in to Codex CLI to repair app source.")
         if not isinstance(diagnostics, str) or not diagnostics.strip() or len(diagnostics) > LOG_LIMIT:
             raise NetworkError("Enter a diagnostic excerpt of up to 16,000 characters.")
+        if screen is not None and (not isinstance(screen, str) or not screen.startswith("#/") or len(screen) > 512):
+            raise NetworkError("The screen for this repair is invalid. Reopen the repair dialog and try again.")
         self.preview(source)  # Validate the failed job and check the checkout before reserving work.
         with self.jobs._lock:
             existing = next((job["id"] for job in reversed(self.jobs.jobs.values())
                              if job.get("repair_source") == source), None)
-            if existing and self.jobs.jobs[existing]["state"] in {"running", "done"}:
-                return existing
-            jid = self.jobs.start(KIND, lambda log: propose(root, connector, exe, diagnostics, log),
-                                  cancel_message="App repair cancelled.")
-            self.jobs.jobs[jid]["repair_source"] = source
+            if existing:
+                previous = self.jobs.jobs[existing]
+                screen = previous.get("repair_screen") or screen
+                if previous["state"] in {"running", "done"}:
+                    previous["repair_screen"] = screen
+                    return existing
+            conversation = RepairConversation()
+            jid = self.jobs.start(
+                KIND, lambda log: propose(root, connector, exe, diagnostics, log, conversation),
+                include_recent_log=False, cancel_message="App repair cancelled.",
+            )
+            self.conversations[jid] = conversation
+            self.jobs.jobs[jid].update(repair_source=source, repair_screen=screen)
             return jid
+
+    def message(self, jid, message):
+        if not isinstance(message, str) or not message.strip() or len(message) > MESSAGE_LIMIT:
+            raise NetworkError("Enter a message of up to 4,000 characters.")
+        with self.jobs._lock:
+            job = self.jobs.jobs.get(jid)
+            conversation = self.conversations.get(jid)
+            if not conversation or job["state"] != "running" or self.jobs.cancel_events[jid].is_set():
+                raise NetworkError("This repair is no longer taking messages.")
+            conversation.queue(message.strip(), job)
 
     def apply(self, jid):
         root = checkout()
@@ -108,7 +195,7 @@ class AppRepair:
             result["applied"] = True
 
 
-def propose(root, connector, exe, diagnostics, log):
+def propose(root, connector, exe, diagnostics, log, conversation):
     log("Preparing a separate worktree from the app revision…")
     base = git(root, "rev-parse", "HEAD").decode().strip()
     with tempfile.TemporaryDirectory(prefix="decomp-app-repair-") as folder:
@@ -121,7 +208,17 @@ def propose(root, connector, exe, diagnostics, log):
         home.mkdir()
         prepare_tests(worktree, log)
         log("Codex is investigating, patching and testing in the worktree…")
-        summary = connector.repair_source(exe, worktree, home, diagnostics, log.cancel_event)
+        with conversation.lock:
+            conversation.accepting = True
+            conversation.publish(log, "Codex is working in the repair worktree…")
+        try:
+            summary = connector.repair_source(
+                exe, worktree, home, diagnostics, log.cancel_event,
+                lambda message: conversation.agent_message(log, message),
+                lambda: conversation.next_prompt(log),
+            )
+        finally:
+            conversation.close(log)
         log.check_cancel()
         git(worktree, "add", "--all", "--", ".", ":(exclude).repair-test-home", ":(exclude).repair-test-home/**")
         raw = git(worktree, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--full-index",

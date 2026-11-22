@@ -502,6 +502,8 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
         copied_overlays,
         dma_overlays,
         indexed_overlays,
+        indexed_runtime_code,
+        level_overlay_table,
         named_dma,
         overlays,
         raw_slots,
@@ -516,6 +518,8 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
     rom = (workdir / image).read_bytes()
     original_rom = rom
     taken = split.code_ranges(config)
+    if taken and (result := indexed_runtime_code.add(config,workdir,image,rom,taken,log)):
+        return result
     if taken and (result := resident_deflate.add(config,workdir,image,rom,taken,log)):
         return result
     if taken and not skip_replacing_boot and boot_brs.find(rom, taken):
@@ -532,6 +536,12 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
     if taken and (slots := raw_slots.registered(rom, taken)):
         recovered = raw_slots.recover_registered(rom, slots, taken, log)
         if raw_slots.add(config, rom, recovered, slots, log):
+            return original
+    if taken and (slots := level_overlay_table.read(rom, taken)):
+        recovered = raw_slots.recover_registered(rom, slots, taken, log)
+        if helper := level_overlay_table.companion(rom, taken, slots):
+            recovered += raw_slots.recover_registered(rom, [helper], taken, log)
+        if raw_slots.add(config, rom, recovered, slots, log, preserve_gaps=True):
             return original
     packed = unpack_code(rom)
     locations = []
@@ -735,7 +745,10 @@ def insert_segments(config: Path, cfg: dict, found, size: int) -> None:
             bss_ends[seg.rom_start] = seg.vram + seg.rom_end - seg.rom_start + raw["bss_size"]
 
     starts = {st for st, _, _ in found}
-    segs = [s for s in cfg["segments"] if not (isinstance(s, dict) and s.get("type") == "bin" and start_of(s) in starts)
+    # A discovered code span can straddle an old bin marker created by splat.
+    # Keeping it would cut the verified span and truncate an otherwise complete function.
+    segs = [s for s in cfg["segments"] if not (isinstance(s, dict) and s.get("type") == "bin"
+            and start_of(s) is not None and any(st <= start_of(s) < en for st, en, _ in found))
             and not isinstance(s, list)]  # the end marker comes back at the image's end
     for st, en, vram in found:
         duplicate = sum(base == vram for _, _, base in found) > 1

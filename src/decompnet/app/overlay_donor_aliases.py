@@ -74,7 +74,7 @@ def named_bindings(source, header, candidate, aliases):
     return externalize(source), externalize(header)
 
 
-def local_functions(source, header, name, obj, candidate, target):
+def local_functions(source, header, name, obj, candidate, target, *, preserve_context=False):
     """Externalize direct calls to identifiable functions in the donor text section."""
     if target.arch != 'mips' or not target.linker_relocs or not comparable_overlay_code(candidate, target):
         return None
@@ -89,6 +89,27 @@ def local_functions(source, header, name, obj, candidate, target):
             return None
         if aliases.setdefault(original, destination) != destination:
             return None
+
+    if preserve_context:
+        texts = [source, header]
+        for symbol in aliases:
+            definitions = [(index, span) for index, text in enumerate(texts) if (span := csource.find(text, symbol))]
+            if len(definitions) != 1:
+                return None
+            index, (start, end) = definitions[0]
+            definition = texts[index][start:end]
+            definition = re.sub(r'^\s*static\s+', 'extern ', definition, count=1)
+            prototype = _external_prototype(definition, symbol)
+            if not prototype:
+                return None
+            texts[index] = texts[index][:start] + prototype + texts[index][end:]
+            pattern = r'\bstatic\s+[^;{}=]*\b' + re.escape(symbol) + r'\s*\([^;{}]*\)\s*;'
+            for index, text in enumerate(texts):
+                matches = list(re.finditer(pattern, csource._blank(text)))
+                for match in reversed(matches):
+                    text = text[:match.start()] + 'extern' + text[match.start() + len('static'):]
+                texts[index] = text
+        return rename(texts[0], aliases), rename(texts[1], aliases)
 
     try:
         body, context = donor_sources.compact(header + '\n' + source, name)
@@ -119,6 +140,141 @@ def local_functions(source, header, name, obj, candidate, target):
     if prototyped != aliases.keys():
         return None
     return rename(body, aliases), rename('\n'.join(declarations), aliases)
+
+
+def cpp_methods(source, header, name, candidate, target, separate):
+    """Try explicit this arguments for unresolved, non-virtual C++ method calls.
+
+    The compiler's mangled references identify the methods and the target's
+    relocation sites identify their loader bindings. The ordinary compiler and
+    exact judge still decide whether this ABI-preserving rewrite is valid.
+    """
+    if candidate is None or target.arch != 'mips' or not comparable_overlay_code(candidate, target):
+        return None
+    span = csource.find(source, name)
+    if not span:
+        return None
+    expected = {(r.offset, r.type): r for r in target.relocs}
+    methods = defaultdict(set)
+    for reloc in candidate.relocs:
+        match = re.fullmatch(r'([A-Za-z_]\w*)__\d+[A-Za-z_]\w*F\w*', reloc.symbol)
+        wanted = expected.get((reloc.offset, reloc.type))
+        if match and reloc.type == JUMP and not reloc.addend and wanted and not wanted.addend:
+            methods[match[1]].add((reloc.symbol, wanted.symbol))
+    body = source[slice(*span)]
+    clean = csource._blank(body)
+    edits, declarations, used = [], [], set()
+    for method, bindings in methods.items():
+        if len(bindings) != 1:
+            continue
+        _, destination = next(iter(bindings))
+        if not re.fullmatch(r'[A-Za-z_]\w*', destination):
+            continue
+        occurrences = list(re.finditer(r'(?<![\w.>:])' + re.escape(method) + r'\s*\(', clean))
+        if not occurrences:
+            continue
+        alias = next((alias for i in range(1, 1000)
+                      if (alias := separate(destination, i)) != destination and alias not in used
+                      and not re.search(r'\b' + re.escape(alias) + r'\b', source + header)), None)
+        if not alias:
+            continue
+        used.add(alias)
+        declarations.append(f'extern "C" int {alias}(void *, ...);')
+        for occurrence in occurrences:
+            # A call with no explicit arguments must not leave a trailing comma.
+            rest = clean[occurrence.end():].lstrip()
+            edits.append((occurrence.start(), occurrence.end(), alias + '(this' + ('' if rest.startswith(')') else ', ')))
+    if not edits:
+        return None
+    for start, end, text in sorted(edits, reverse=True):
+        body = body[:start] + text + body[end:]
+    return source[:span[0]] + body + source[span[1]:], header + '\n' + '\n'.join(declarations) + '\n'
+
+
+def explicit_symbol_bindings(source, header, candidate, target, separate):
+    """Declare unambiguous loader bindings without changing donor expressions."""
+    if (candidate is None or target.arch != 'mips'
+            or not comparable_overlay_code(candidate, target, masked=_data_fields(target))):
+        return None
+    expected = {(r.offset, r.type): r for r in target.relocs}
+    grouped = defaultdict(list)
+    for reloc in candidate.relocs:
+        if not re.fullmatch(r'[A-Za-z_]\w*', reloc.symbol):
+            continue
+        wanted = expected.get((reloc.offset, reloc.type))
+        if wanted is None:
+            return None
+        grouped[reloc.symbol].append((reloc, wanted))
+    if not grouped:
+        return None
+    clean = csource._blank(source + '\n' + header)
+    additions = []
+    for number, (symbol, sites) in enumerate(sorted(grouped.items()), 1):
+        targets = {wanted.symbol for _, wanted in sites}
+        if len(targets) != 1:
+            continue
+        binding, = targets
+        offset = 0
+        if any(reloc.type in (HIGH, LOW) and reloc.addend != wanted.addend for reloc, wanted in sites):
+            if any(reloc.type not in (HIGH, LOW) for reloc, _ in sites):
+                continue
+            offset = _offset_delta([reloc for reloc, _ in sites], expected)
+            if offset is None or not -(1 << 31) <= offset < (1 << 31):
+                continue
+        if not offset and (symbol == binding or re.fullmatch(re.escape(binding) + r'__ref[1-9][0-9]*', symbol)):
+            continue
+        marker = 'decomp_overlay_bind_' + symbol
+        if re.search(r'\b' + re.escape(marker) + r'\b', clean):
+            continue
+        ref = next((ref for i in range(number, number + 512)
+                    if (ref := separate(binding, i)) != binding
+                    and not re.search(r'\b' + re.escape(ref) + r'\b', clean)), None)
+        if not ref:
+            continue
+        clean += '\n' + ref
+        address = f'{ref} + ({offset})' if offset else ref
+        additions.append(f'extern unsigned char {ref}[];\nvoid *{marker} = {address};')
+    if not additions:
+        return None
+    linkage = '#ifdef __cplusplus\nextern "C" {\n#endif\n'
+    end_linkage = '\n#ifdef __cplusplus\n}\n#endif\n'
+    return source, header + '\n' + linkage + '\n'.join(additions) + end_linkage
+
+
+def constructor_entry(source, header, obj, name, target, probe):
+    """Identify one emitted C++ constructor as the target entry by its instructions."""
+    from elftools.common.exceptions import ELFError
+    from elftools.elf.elffile import ELFFile
+
+    from ..candidate_work import elf as candidate_elf
+    from ..elfobj import _function_symbols
+
+    if target.arch != 'mips' or not re.fullmatch(r'[A-Za-z_]\w*', name):
+        return None
+    constructors = re.findall(r'\b([A-Za-z_]\w*)::\1\s*\([^;{}]*\)\s*\{', csource._blank(source))
+    if len(constructors) != 1:
+        return None
+    owner, = constructors
+    prefix = '__ct__' + str(len(owner)) + owner + 'F'
+    marker = 'decomp_overlay_entry'
+    if re.search(r'\b' + re.escape(marker) + r'\b', csource._blank(source + header)):
+        return None
+    try:
+        functions = _function_symbols(candidate_elf(obj, ELFFile))
+    except (ELFError, ValueError, TypeError, IndexError):
+        return None
+    eligible = []
+    for symbol, (_, _, size) in functions.items():
+        if not symbol.startswith(prefix) or size != len(target.code) or not re.fullmatch(r'[A-Za-z_]\w*', symbol):
+            continue
+        candidate = probe(symbol)
+        if comparable_overlay_code(candidate, target, masked=_data_fields(target)):
+            eligible.append(symbol)
+    if len(eligible) != 1:
+        return None
+    symbol, = eligible
+    addition = f'extern "C" unsigned char {symbol}[];\nvoid *{marker} = {symbol};\n'
+    return source, header + '\n' + addition, f'{owner}::{owner}'
 
 
 def retry(source, header, name, candidate, target, measure, stop, *, separate=None):
@@ -163,7 +319,11 @@ def retry(source, header, name, candidate, target, measure, stop, *, separate=No
     for symbol, names in replacements.items():
         if names == {symbol} and symbol not in data_changes:
             continue
-        if not all(re.fullmatch(r'[A-Za-z_]\w*', word) for word in {symbol, *names}):
+        # Anonymous compiler sections cannot be renamed in source. Leave their
+        # bindings to the pool/local-data judge and still probe named uses.
+        if not re.fullmatch(r'[A-Za-z_]\w*', symbol):
+            continue
+        if not all(re.fullmatch(r'[A-Za-z_]\w*', word) for word in names):
             return None
         if len(names) == 1 and symbol not in data_changes:
             direct[symbol] = next(iter(names))
@@ -265,6 +425,112 @@ def retry(source, header, name, candidate, target, measure, stop, *, separate=No
 _DATA = re.compile(
     r'extern\s+([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)\s+(\**\s*)([A-Za-z_]\w*)'
     r'\s*((?:\[\s*\d*\s*\]\s*)*)\s*;')
+
+
+def _top_level_starts(clean, matches, *, unconditional=True):
+    directives = list(re.finditer(r'(?m)^[ \t]*\#[^\n]*(?:\\\n[^\n]*)*', clean))
+    events = sorted([(match.start(), False, match) for match in matches]
+                    + [(directive.start(), True, directive) for directive in directives], key=lambda item: item[0])
+    cursor = depth = conditional = 0
+    result = set()
+    for start, directive, match in events:
+        if start < cursor:
+            continue
+        segment = clean[cursor:start]
+        depth += segment.count('{') - segment.count('}')
+        if directive:
+            kind = re.match(r'\s*\#\s*(\w+)', match[0])
+            if kind and kind[1] in ('if', 'ifdef', 'ifndef'):
+                conditional += 1
+            elif kind and kind[1] == 'endif':
+                conditional = max(0, conditional - 1)
+            cursor = match.end()
+        elif depth == 0 and (conditional == 0 or not unconditional):
+            result.add(start)
+            cursor = start
+        else:
+            cursor = start
+    return result
+
+
+def _zero_data_types(clean):
+    """Find scalar and plain aggregate typedefs that need no C++ initialization."""
+    types = {'char', 'short', 'int', 'long', 'signed', 'unsigned', 'float', 'double'}
+    scalar = re.compile(r'\btypedef\s+([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)\s+([A-Za-z_]\w*)\s*;')
+    aggregate = re.compile(r'\btypedef\s+struct(?:\s+[A-Za-z_]\w*)?\s*\{([^{}]*)\}\s*([A-Za-z_]\w*)\s*;')
+    field = re.compile(r'([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)\s+[A-Za-z_]\w*(?:\s*\[\s*\d+\s*\])*')
+    scalars, aggregates = list(scalar.finditer(clean)), list(aggregate.finditer(clean))
+    top_level = _top_level_starts(clean, [*scalars, *aggregates])
+    macros = set(re.findall(r'(?m)^[ \t]*\#[ \t]*(?:define|undef)[ \t]+([A-Za-z_]\w*)', clean))
+
+    while True:
+        found = set()
+        for match in scalars:
+            if match.start() in top_level and set(match[1].split()) <= types:
+                found.add(match[2])
+        for match in aggregates:
+            fields = match[1].split(';')
+            if match.start() not in top_level or fields[-1].strip():
+                continue
+            parsed = [field.fullmatch(value.strip()) for value in fields[:-1]]
+            if parsed and all(item and set(item[1].split()) <= types for item in parsed):
+                found.add(match[2])
+        found -= macros
+        if found <= types:
+            return types
+        types.update(found)
+
+
+def globalize_zero_data(header, candidate, target):
+    """Expose simple private zero-initialized objects for a measured binding retry."""
+    if (candidate is None or not any(r.symbol in ('.bss', '.sbss') for r in candidate.relocs)
+            or not comparable_overlay_code(candidate, target, masked=_data_fields(target))):
+        return None
+    changes, names = [], set()
+    clean = csource._blank(header)
+    scalar = '(?:' + '|'.join(map(re.escape, sorted(_zero_data_types(clean)))) + ')'
+    pattern = r'\bstatic\s+(?:' + scalar + r'\s+)+([A-Za-z_]\w*)\s*(?:\[\s*\d+\s*\]\s*)*;'
+    matches = list(re.finditer(pattern, clean))
+    top_level = _top_level_starts(clean, matches, unconditional=False)
+    for match in matches:
+        line = clean[clean.rfind('\n', 0, match.start()) + 1:match.start()]
+        if match.start() not in top_level or line.lstrip().startswith('#'):
+            continue
+        names.add(match[1])
+        changes.append((match.start(), match.start() + len('static ')))
+    if not names:
+        return None
+    for start, end in reversed(changes):
+        header = header[:start] + header[end:]
+    return header, names
+
+
+def defined_data_bindings(source, header, candidate, target, names, separate, data_reference):
+    """Name globalized objects using the aligned loader symbol and measured offset."""
+    from .source_symbol_recovery import overlay_bindings
+
+    aliases = overlay_bindings(candidate, target, masked=_data_fields(target))
+    if not aliases:
+        return None
+    expected = {(r.offset, r.type): r for r in target.relocs}
+    groups = defaultdict(list)
+    for reloc in candidate.relocs:
+        if reloc.symbol in names:
+            groups[reloc.symbol].append(reloc)
+    if not groups:
+        return None
+    bound = {}
+    for number, (name, sites) in enumerate(sorted(groups.items()), 1):
+        if any(r.type not in (HIGH, LOW) for r in sites):
+            return None
+        offset = _offset_delta(sites, expected)
+        if offset is None or (reference := data_reference(aliases[name], offset, number)) is None:
+            return None
+        if re.search(r'\b' + re.escape(reference) + r'\b', csource._blank(source + header)):
+            return None
+        bound[name] = reference
+    direct = separate({old: new for old, new in aliases.items() if old not in bound})
+    return named_bindings(source, header, candidate, direct | bound)
 
 
 def _data_fields(target):
