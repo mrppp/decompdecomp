@@ -824,6 +824,8 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Drafts from a close matched look-alike (`twin_drafts`) | ✓ | ✓ not run yet | ✓ not run yet | — | — | ✓ not run yet | — | — project-mode alignment planned | — project-mode alignment planned | — | — project-mode alignment planned | — |
 | Draft result type from the exits and callers (`draft_return_type`, on: the callers decide where the exits cannot; 5 better / 7 worse of 20 fires, 2 exact) | ✓ reader | ✓ reader | ✓ reader | — PPC reader planned | — | ✓ reader | — ARM reader planned | — PPC reader planned | — x86 reader planned | — x86 reader planned | — ARM reader planned | — |
 | Callers and the result type they show (`get_callers`, the brief's line, `callers.py`) | ✓ stored callees | ✓ not run yet | ✓ not run yet | — | — | ✓ not run yet | — ARM reader planned | — project callees not stored | — project callees not stored | — | — project callees not stored | — |
+| Row-coverage ranking of combinations (`prove_chain.py --combine`, `pair_row_coverage`, off: measured no gain) | ✓ ROM | ✓ not run yet | ✓ not run yet | — | — | ✓ not run yet | — | — judge rows exist; project judge worker planned | — | — | — | — |
+| Emulator call hints (`get_call_hints`, the brief's recorded-calls lines; draft candidates `draft_call_hints` off: measured no gain) | ✓ MIPS reader | — no emulator yet | — no emulator yet | — | — | — no emulator yet | — | — no emulator yet | — | — | — | — |
 | Compile-tested draft refresh and saved diagnostics | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ m2c | ✓ Ghidra | — | — draft generator planned | ✓ supported draft generators |
 | Initial callback, forwarded-argument and overlapping-frame recovery | ✓ bounded MIPS | ✓ bounded MIPS | ✓ bounded MIPS | — | — | ✓ bounded MIPS | — | — processor reader planned | — processor reader planned | — | — processor reader planned | ✓ MIPS C; other readers planned |
 | Autopilot: free matches from drafts | ✓ | ✓ | ✓ | twins only | — | ✓ | ✓ (demo: 34 matches) | ✓ | ✓ exact drafts of tiny shapes (32-bit); Ghidra's made compilable | ✓ as PC | twins only (no drafts yet) | — |
@@ -896,6 +898,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Per-game portability checklist for polishing | ✓ | ✓ | ✓ | ✓ | — polishing support pending | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Small polish plans, prepared evidence and verified identical-helper reuse | ✓ shared path | ✓ shared path | ✓ shared path | — | — | ✓ shared path | — | ✓ shared path | ✓ shared path | — | ✓ shared path | ✓ shared path |
 | Real names for the game's symbols (`rename_symbol`) | ✓ | ✓ | ✓ | ✓ | ✓ functions | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | dtk and ds-decomp projects |
+| Globals tab: the game's data symbols beside their `D_` address names | ✓ | ✓ shared path | ✓ shared path | — | — | ✓ shared path | ✓ shared path | — | — | — | — | — |
 | Save and restore (`progress/`, Open a saved project); remember each project's save destination | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | partly: the project's git, best attempts saved; a new copy starts without them | partly: the project's git, best attempts saved; a new copy starts without them | the project's git; best attempts saved; the PE view made again from your XBE or disc | partly: the project's git, best attempts saved; a new copy starts without them | the project's git; best attempts saved |
 | Pause and resume automatic rechecks of saved matches | ✓ ROM | ✓ ROM | ✓ ROM | ✓ ROM | — | ✓ ROM | ✓ ROM | — uses project build | — uses project build | — uses project build | — uses project build | — uses project build |
 | Saved README preserves notes, with completion bar and function map | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -1183,6 +1186,13 @@ measured the exits alone gained nothing; the callers decide where they cannot, a
 (docs/learnings/finding/return-type-from-callers.md). Project mode stores no callees, so it has no `get_callers` yet.
 
 ## Recently done
+
+- **Scores follow the flow, not the instruction count (score version 3).** On a large function one instruction added
+  or removed shifted every later branch (and jump to the function's own symbol), and each one cost 10 or, for a
+  relocated jump, 150 as another call: a candidate that fixed a whole loop scored 2,175 against a best of 340. A branch
+  whose target is the instruction its counterpart's target pairs in the diff's alignment now costs nothing
+  (`scoring._Alignment`; MIPS, PowerPC, x86, ARM and Thumb forms; a match is still byte-identical). Open bests are
+  rescored once by Check again after the update; ROM mode only (fork projects keep objdiff's percentage).
 
 - **Scores weigh meaning; stalled bests restart from the draft.** A memory access at another offset, another
   constant or another call costs 150, more than a reorder (scoring.PENALTY_MEANING, score version 2; open bests are
@@ -2088,6 +2098,9 @@ reuse the saved map. See [ROM Explorer](docs/ROM_EXPLORER.md) for support and li
   installations show a labelled work bar beside their logs. The bar clears on completion or failure; saved-project
   cancellation clears it too. Each action says when it starts and finishes, or why it stopped. Upload percentages
   still measure bytes transferred.
+- **Globals tab in project mode.** The Globals tab lists a ROM project's data symbols from its symbols table; a
+  project-mode game (GameCube, Wii, Windows PC, DS, Xbox) keeps its data in the project's own files, so its tab says so
+  and lists nothing yet. It needs a reader for dtk's and ds-decomp's symbols and for the PC project's data.
 - **Names in project mode.** rename_symbol renames a function or a global in a project too: in the game's symbols
   (DS: ds-decomp's symbols.txt; GameCube, Wii: dtk's) and in every source and header file, kept only when the game
   still rebuilds byte for byte and every match holds. Polishing's names were local only before (func_0205d0f4,

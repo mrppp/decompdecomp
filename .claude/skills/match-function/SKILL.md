@@ -80,6 +80,17 @@ app's verdict. Use it for every submit and confirmation; do not write your own g
 in a session (its claim belongs to the connection, so it answers HTTP 400). `judge.py try` is for a claim made with
 `judge.py claim` only.
 
+**Check the claim: `setup.py check <holder>`** (also `status`) asks the app now whether this session still holds its function
+and exits 1 when it does not. Run it **every 20 minutes** and **before any long isolated work** (a `grid.py` or
+`prove_chain.py` run, a long `fast_judge` search): a claim lapses when the app is slow, another session then claims and
+matches the function, and isolated scoring never notices. The renewal retries a failed renewal within seconds and, when
+the app says someone else holds the function (or it is matched), writes a `LOST` file in the session folder; from then on
+every `setup.py` command, `fast_judge.py`, `prove_chain.py` and `grid.py` print a boxed **CLAIM LOST** warning, and
+`setup.py try` refuses to submit. **On a lost claim stop working on that function**: if `check` says it is free,
+`setup.py reclaim <holder> FUNC` (reread the saved best first: someone may have changed it); if someone else holds it or
+it is matched, `release` your notes through `add_note`, then `setup.py release <holder>` and `setup.py reclaim <holder>`
+for another function. Never keep working "in the isolated judge" on a function you no longer hold.
+
 **Any other MCP tool: `mcp.py <holder> <tool> ['{"json":"args"}']`** (`get_function`, `get_candidate`, `get_assembly`,
 `last_diff`, `report_repair`, `add_note`, ...) over the same connection, printing the result. `mcp.py <holder> --list` lists
 the tools; `mcp.py <holder> <tool> --help` shows a tool's arguments with their allowed values (for `report_repair`, the valid
@@ -336,6 +347,11 @@ says the fix and the library families it names; try those families with `prove_c
 - **`local_flow` declined on any `volatile` in the text** until 0.5.604, so a saved best with `*(volatile T *)&global`
   reads had no variants from the ~40 flow-based families. Only a volatile local still declines; check
   `local_flow.analyze(source, name)` is not None before concluding the permuter has nothing.
+- **A saved best full of search scaffolding (union around a pointer and an integer, `if (x) { S } else { S }`, identity
+  inline, copies of one cast, word locals every use truncates) is a dead end for a greedy chain**: each removal is neutral or
+  worse alone (145 -> 240 on a 129-instruction list insertion, then 240 -> 0 with a loop key copy). decomp-repair
+  `scaffold_strip` writes them out together and offers the child with `loop_invariant_key_copy` (`scaffold_strip_key_copy`);
+  if `prove_chain` finds nothing on such a best, check that family fires first, then rewrite by hand and chain from there.
 - **Several changes that are each no better alone** are the normal shape of a late match. Offer the combination as
   one child, and keep non-improving children for a second step (`operand_order_pass`'s combined step).
 - **A copy that lands in the wrong register (`$v1` for `$v0`) beside a `goto blockN` join.** m2c writes `v = s;`
@@ -390,6 +406,17 @@ says the fix and the library families it names; try those families with `prove_c
 - **A struct of `volatile` fields in an m2c draft** is usually just spilled registers: make them plain locals.
 - **Frame size: use loops, not scratch arrays.** Each pre-test `for` loop keeps 8 extra frame bytes in KMC GCC 2.7.2
   (hypothesis).
+- **Leaf functions: temporaries in `$v0`/`$v1`/`$a0..`, decided by two allocators.** Pseudos that live in one basic block
+  and die once go to local-alloc.c (by `floor_log2(refs) * refs * size / life`, a copy to `$v0` first), and it *ties* the
+  output of an insn to a first operand that dies there (`and`'s result takes its first operand's register); pseudos that
+  cross a block, or die twice, go to global.c (priority as in the `-dl -dg` table). A register exchange between two locals
+  with no loops: count weighted references from the source (a reference is 1 plus its loop depth; the table agrees to the
+  digit) and wrap the statements that name one and not the other in `do { } while (0);` (one more reference each),
+  deeper until the order flips: decomp-repair `call_weight_ladder`, `local_weight_ladder` (85 -> 15 on a heap
+  allocator). A complement (`~mask`) computed before a two-arm branch that only one arm reads is a global pseudo; sunk
+  into the arm as its first statement in a scope it is a local that heads the arm and fills the branch's delay slot
+  (`arm_invariant_sink`, 115 -> 85). Reusing one variable for a sum and its result gives it two deaths (global) and
+  breaks the tie. The delay slot takes an arm's first one-word insn, or one from above the branch, never a later one.
 - **Flag words and widths:** bit-field structs for flag words; `u8`/`u16` widths keep or drop masks; overwrite a
   parameter after copying it (`arg = arg_in; arg_in = 0;`).
 
