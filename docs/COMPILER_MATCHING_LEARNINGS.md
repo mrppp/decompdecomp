@@ -18046,3 +18046,139 @@ w1; } Gfx;` (670 alone), `extern s32 D_8010A4D8;` as `extern W D_8010A4D8;` with
 (`tail`'s) scored 60. Controlled (one function, exact judge, same compiler); the mechanism is read from sched.c and the dump.
 Family: decomp-repair `member_alias_pair` (0.5.613), which emits the store and the global as a one-member record, alone and
 together; two of its eight children from the saved best were exact (60 -> 0).
+
+## A text renderer written with libultra macros: 9335 -> 0 (565 instructions, KMC GCC 2.7.2, `-G0 -mips3 -mgp32 -mfp32 -O2`, scoring 2)
+
+An N64 menu-text function (a character loop with a `switch` of control codes, a kerning table lookup, and a
+`gDPLoadTextureBlock_4b` + one `gSPTextureRectangle` per glyph), saved best 9335 with a `volatile` cursor, `__repair_*`
+record casts and a `volatile u64` frame pad. Edit list (scores are the app's judge on the work-in-progress source; the
+last rows are controlled in the sense that each was measured alone against the row before):
+
+| # | edit | score |
+|---|---|---|
+| 1 | rewritten as the SDK's own macros, `pkt = cursor++` on a plain (non-volatile) `Gfx *` global, `Gfx` a union with a `u32 words` pair | 21920 -> 3770 |
+| 2 | the 4-bit block load as `gDPLoadTextureBlock_4b(pkt, tex, 4, ENT.w + 1, ENT.h + 1, ...)` with `ENT` the table entry spelled out at each use | (in 1) |
+| 3 | `s`/`t` of the rectangle's RDPHALF_1 in named locals computed before the `hires` branch | 3770 |
+| 4 | `ya`, `xl` not named: the macro arguments spelled out | 3460 -> 3205 |
+| 5 | colour word and glyph index one `u32` variable (disjoint arms) | 3015 -> 2965 (the colour word's `$a2` -> `$t2`, 24 rows) |
+| 6 | newline `y += 3 + font->gt->lh` in one statement | 2965 -> 2035 |
+| 7 | the kerning search a plain `for (k = 0; k < kern[prev].n; k++)` over `font->kern` and `(ch & 0xFF)` written in the body | 1870 -> 5 |
+| 8 | `k * 2 + pairs` operand order | 5 -> 0 |
+
+Compiler facts (read in cse.c, loop.c and global.c of the installed source; each checked against the dumps):
+- A store through a structure member (`_g->words.w0 = ..`) calls `invalidate_memory` with `nonscalar`, which removes every
+  table entry that is `in_struct` or has a varying address, but not a scalar global: `pkt = glistp++` evaluated three
+  times (`gSPTextureRectangle` names `pkt` three times) becomes one load and three `lui $at; sw` stores, while the loads
+  through the font and table pointers are repeated after the stores. A `volatile` cursor (the saved best) gets the repeated
+  loads for the wrong reason and then also repeats the cursor read; the label of the divide's branch ends the extended
+  basic block, which is why the second group of macros reads the cursor again.
+- `MAX(1, x)` as the divisor of `CALC_DXT_4b`: fold distributes `n / (c ? 1 : x)` into the arms, so the arm with the
+  constant divides by nothing (the target's `blezl ... andi`); m2c's three-way `if` is this.
+- `(s << 16) | t` where the shifts' operands are named `u16` locals gets `(subreg:SI t)` first in combine and swaps the
+  operands; with `s32` locals and `_SHIFTL` masks cse cannot fold `(x << 5) << 16` into `x << 21` across the arms (the mask
+  is between them) and combine drops the mask afterwards from `nonzero_bits`.
+- A `for` loop's test is duplicated before the loop (the pre-test `beqz` of the target) and loop.c scans from that test,
+  so `loop_reg_used_before_p` is true for the loop's address register: the entry address stays inside the loop. The
+  invariant `font->kern` load and `ch & 0xFF` in the body are hoisted by loop.c as new loads and cse2 turns them into the
+  `move $t0,$v1` / `move $a3,$a1` copies. Caching them in locals before the loop (or a `volatile` cast on the read) loses
+  both. The pre-test `for` loop also is what keeps the frame's extra 8 bytes: with it the `volatile u64` pad was not needed.
+- Hard registers of a global pseudo come from global.c's first free choice after the ones local-alloc took: sharing one
+  variable between disjoint roles gives it the sum of the uses and a longer range (`disjoint_local_merge`).
+Scaffolding the match relies on: the case-9 arm written twice (`if (ox) { x = ((x >> 4) + 1) << 4; break; } else { the
+same }`), an identical-arms duplicate that only adds references to `x` so its priority passes the parameter's (without it
+225, `$s1`/`$s2` swapped). Everything else is plausible source. Family: decomp-repair `disjoint_local_merge` now pairs a
+`u32` and an `s32` local and pairs inside one loop body that are assigned before they are read (it took the saved
+draft's newline temporary and the colour word to 2617 from 3037 on the work-in-progress source). Steps 1-4 and 7 are not
+families yet: a recogniser for m2c's raw display-list stores as SDK macros, and un-caching a loop's invariants, are the gaps.
+
+### KMC GCC 2.7.2: a volatile read-back local pins an argument move; the plain read in the call does not
+
+Compiler and flags: `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2` (default cpu r4000). One private N64 effect-spawning
+function (88 instructions) sat at 60 for several agents: every opcode and register right, only `move $a0,$s0` (the first
+call argument) two slots too early. The saved best held a read-back of a halfword it had just stored (`f = 0;` then the
+call's second argument) in a local through a volatile cast, `frame = *(volatile u16 *)((char *)p + 0x2C);`, because a plain
+read directly after the store is folded to the stored constant (`move $a1,$zero`, score 205). Hours of statement-order grids
+(24,000 orders), `do { } while (0)` regions around the tail (60,000 shapes) and local types changed nothing.
+
+The edit that matched (exact, the app's judge): delete the local and write the read, plain, in the call's argument list:
+`effectSetAnimFrame(obj, *(u16 *)((char *)p + 0x2C), animation, p);`. Measured on the same function: volatile local 60; volatile
+read in the argument list 60; plain read in the argument list 0; plain read as the statement just before the call 0; plain read
+as a statement right after the store 205 (folded). Controlled for this one function only.
+
+Why (read from the 2.7.2 sched.c, one function's evidence, so a hypothesis for other shapes): the second scheduler runs
+backwards and picks the highest depth first; an argument move that reads a saved register has no producer in the block, so it
+has the lowest priority and only fills a stall slot. The argument move for a volatile halfword load is a `(set a1 (subreg a1))`
+that stays in the scheduler's list until the end of the pass (flow deletes only true self-moves), has the load's priority plus
+its latency and fills the first stall slot, so the other move takes the next one, two slots earlier than the target. With the
+plain read the load is an ordinary combined `lhu $a1` and that phantom move is gone. Failed attempts, for the record: volatile
+stores to the byte fields (they only reorder volatile stores), types of the locals, a three-argument prototype (the fourth
+register is not an argument), per-function `-mcpu`.
+
+decomp-repair 0.5.617 `volatile_read_inline` proposes it (volatile local assigned once, used once as a call argument, only
+non-overlapping stores of the same object between); wired through `draft_repairs`, so the Deep Permuter's beam runs it too.
+
+### KMC GCC 2.7.2: a literal compared with `==`/`!=` in several places wants a local of its own
+
+Compiler and flags: `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. One private N64 voice-allocation function (a loop over
+12-byte records, four compares against `-1`, nine callee-saved registers all needed) sat near 3300 with the right structure
+and a wrong allocation: cse shared one `-1` pseudo between the compare before a call and the compare after it, so that
+pseudo (3 references, 38 insns long) won a saved register from the loop's lowest-priority variable, which spilled
+(frame 8 bytes larger, a `sw`/`lw` pair in the loop). The target has `addiu $t1,$zero,-1` right before each `bne`.
+
+Edit list (isolated judge, scores on the same function): literal `-1` compares 3312; one function-scope local set once to -1
+used by the compares 2965 (the pseudo now carries a REG_EQUIV note, loses the allocation and is rematerialised before each use,
+no slot, no saved register); two locals, one for the compare that ends an `||` chain and one for the rest, 2773 (with one
+local jump threading folded the second compare into a dead `bne $v0,$v0`; with two it stays a real compare as in the target);
+the same family run from the saved form of the function: 3312 -> 2315. Controlled for this one function; the REG_EQUIV
+explanation is read from local-alloc.c/reload1.c `alter_reg`, so a hypothesis for other shapes.
+
+decomp-repair 0.5.618 `sentinel_local_repairs` (`sentinel_constant_local`, `sentinel_constant_split`) proposes it for any nonzero
+literal compared with `==`/`!=` at least twice; wired through `draft_repairs`, so the Deep Permuter's beam runs it too.
+Other things this function taught that are not families yet: a clamp written `x = c ? a : b;` on the variable itself (the
+temp-then-copy shape) rather than an if/else; masking a parameter in place and weighting it with a `do { } while (0)` to put it
+between two loop variables in the allocation order (the priorities were read from `-dl -dg`: refs, live length); a `u8`
+local for a division result so the shift is `srl` and the mask lands at the call.
+
+### KMC GCC 2.7.2: a record field read as a struct member, the loop over the global it was stored to, and the header order: 85 -> 0
+
+Compiler and flags: `gcc-2.7.2-kmc -G0 -mips3 -mgp32 -mfp32 -O2`. One private N64 map-table setup function (160
+instructions, a `do` search over 32-byte records, then two walks of the 8-byte entries the match stored to a global) sat at
+85 for a dozen agents: every instruction right, 17 register rows. In the header block the target put the record's size in
+`$v0` and the entry count in `$v1` (the saved best had them swapped), loaded the entry pointer into `$a0` and copied it to
+`$a2` for the first walk (a `move $a2,$a0` after the count test), and kept the walk's flag temporary in `$a0`.
+
+Edit list (the app's judge; `-` = unchanged), from the saved best at 85, the match at 0:
+- record size read as a member, `((Field_u16 *) (((u8 *) (&D_800C02D8)) + offset))->v`, for every access of that symbol
+  instead of `*((u16 *) ...)`: 455 alone (`field_struct_view_printed`, the one-member struct typedef)
+- the first walk reads the global the entries were stored to into a loop-scoped local, tests it first and forms the entry
+  pointer through the one-argument cast helper the source already had for the second walk
+  (`MapEntry *base = D_800BFF04; if (base == NULL) break; entry = inline_fn((i * 8) + (u8 *) base);`): 85 -> 85 alone,
+  50 with the member read (`loop_global_base`)
+- the header's statements in the order entry pointer, record address store, pointer store, count, size, size store
+  (an existing family finds it from the 50 state): 50 -> 0
+Pairs: member read + reorder 420, reorder + loop 400, reorder alone 820. A hand version written as `table[idx].field` (a
+struct array with a 32-byte stride instead of byte offsets) also scored 0; it is the same thing as the member read. No
+scaffolding: no dead code, no phantom locals.
+
+Why (hypotheses, `cc1 -dl -dg -dS` dumps, not confirmed in the compiler source beyond the first): the member form's `MEM`
+is in a struct, so the first scheduler may move its load above a store to a scalar global (already the explanation
+behind `field_struct_view`). The size/count swap is `local-alloc`'s order: both are block-local halfwords and the one with
+the larger `floor_log2(refs) * refs / length` takes `$v0` first; in the block the count's priority was 12/5 against the
+size's 8/4, and the member read and the header order made the count's range one instruction longer (the target's order).
+The walk's pointer copy exists only when the loop reads the global (a load the loop pass hoists, which the second cse turns
+into a copy of the stored register) and the register left for it is `$a2`.
+
+Failed experiments, for the record (all on the saved best at 85, none changed the register rows or made them worse):
+every permutation of the eight header statements (5,040; a few swap the two halfword registers but change the store
+order, 240 at best), declaration order (400 orders), the types of count, size and counter, `volatile`, a pointer copy
+before the loop (490: the copy is coalesced into the load's register, so the walk loses its `move`), the same copy with the
+original reassigned (cse keeps it, but the allocator ties the two again), an explicit `if (count)` guard around the loop (555,
+two compares), a `do { } while` form (810), loop-bound copies and the global as the bound (all 85), a second load of the
+count (regs right, one load too many: 800), the flag sweep (`-fno-strength-reduce`, `-fno-schedule-insns`, `-O1`, `-O3`,
+...: none better) and the other gcc 2.x toolchains.
+
+decomp-repair `loop_global_base` (new) and the widened `field_struct_view_printed` regex (the `u8` byte cast, a symbol's
+`(&sym)` as the base, a variable offset, a bare `((&sym) + offset)`) propose the first two; both are wired through
+`draft_repairs`, so drafts and the Deep Permuter's neutral plateau pass (which keeps the 85 -> 85 step) run them. One
+function's evidence: the chain best -> `loop_global_base` (85) -> `field_struct_view_printed` (50) -> the existing families
+(0) was run from the saved best with the library calls alone.

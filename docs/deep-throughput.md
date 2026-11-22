@@ -76,3 +76,73 @@ seconds with four while regression tests were also running. These are compile-st
 measurements, not a claim that every complete deep search is 2–3 times faster. Generation,
 linking, diagnostics, function size, compiler runtime and other active work affect the
 complete result. No user game or database was used or modified.
+
+## Measured on a 12-lane maximum-throughput pass (18 cores)
+
+Six minutes in: 61,639 compiles (165 a second), but the 24 compile slots were 15% busy and each lane process used
+30-60% of a core. The search waited on its own serial loop, not on the machine. Per compile, summed over threads:
+compiler 21.6 ms, local proposals 5.4 ms, history writes 3.2 ms (10,642 transactions of 18.7 ms through the single
+writer), link 1.6 ms, setup 0.8 ms; `DirEntry.stat` from header staging was 8-12% of a lane's CPU samples.
+
+What changed:
+- **Headers** are re-read and re-staged at most every `compile_sessions.RECHECK_SECONDS` (0.5 s) instead of for
+  every candidate. 300 headers: 9.0 ms to 0.04 ms per compile; 19 headers: 0.84 to 0.33 ms. Each result is keyed by
+  the exact bytes it was built with, so an edit only reaches candidates half a second later.
+- **History batches** hold up to 64 MiB / 8,192 statements / 10 s in a maximum pass (8 MiB / 512 / 2 s otherwise),
+  so a lane commits a few times a minute instead of several times a second. They are advisory counters, and a
+  crash loses at most that window of them.
+- **Parallelism**: a lane's lookahead window starts at three and grows to eight (it was two to four, and a lane
+  had only two compile slots, so deeper windows could not help). With no slot count set, a maximum pass gives each
+  lane `max(4, ceil(4 * cores / lanes))` slots, sizes the pool at two slots per core and, with no function count
+  set, runs one and a half lanes per core. A number set in the form is still respected.
+
+## SQLite readers in a lane
+
+Sampling a running 32-lane pass (8.5 CPU-seconds of one lane in 10 s) put SQLite at 17% of the lane, and under it
+`sqlite3Init` / `sqlite3InitOne` (parsing the whole database schema) at about a fifth of all lane CPU. A new reading
+connection parses the schema before its first query: 2.2 ms for a new reader against 0.003 ms for the same query on
+a kept one. `Store` kept eight idle readers and closed the rest, and a lane with many compile threads went past
+eight at once all the time, so it opened and closed connections continuously. It now keeps 64 (`READERS_KEPT`) and
+every connection keeps 512 prepared statements (`STATEMENT_CACHE`, Python's default is 128).
+
+## Tried and not adopted
+
+- **RAM disk with `.fseventsd/no_log` for compiler scratch (macOS).** `fseventsd` used 168% CPU on the running pass
+  and the idea was that a volume that is not logged and not indexed would remove it. Measured with six processes
+  creating and deleting files for 8 s: `fseventsd` used the same CPU on the RAM disk as on an ordinary folder, even after
+  remounting with the marker in place, and still delivered events to a watcher. `no_log` stops the history it writes,
+  not the work of receiving the events.
+- **Piping cpp, cc1 and as into each other** (no `func.i` / `func.s`, the three programs running together). The object
+  is byte-identical (KMC GCC 2.7.2) and wall time per compile is lower on an idle machine, but the one-command form
+  needs `bash`, whose start-up cost 4.5 ms of CPU per compile: 12.4 ms of child CPU per compile against 7.9 ms, and the
+  machine was out of CPU, not wall time. A pipeline started from Python without a shell would avoid that but has to
+  carry the watchdog, process tracking and cancellation for three processes.
+
+## Finding where a pass's CPU goes
+
+Every helper process samples its own threads' kernel CPU every two seconds and charges it to the code the thread is in
+(thread_cpu.py: logs/thread-cpu-<role>-<pid>.log and .json). The deep-search lanes, the heaviest Python of a pass, were
+the one helper not named in it; they now write `thread-cpu-lane-<pid>`. Add every process up with
+
+    python -m decompnet.thread_cpu <home>/.decomp/logs --minutes 30
+
+`DECOMP_THREAD_CPU_STACKS=3` (set before starting the app; its helpers inherit it) names the three callers of each
+location, `app/x.py:f < app/y.py:g < app/z.py:h`, to read the report as call paths. `DECOMP_THREAD_CPU=0` turns the
+sampler off. It reads kernel CPU time, so a thread waiting on a lock or a pipe is not charged: only code that
+used the processor appears.
+
+## Where an 18-lane pass spends its Python CPU (measured, steady state)
+
+Two snapshots of the helpers' CPU reports (thread_cpu) two and a half minutes apart, processes alive in both: the lanes
+used 4.2 cores, the proposal workers 0.6 (1.5 before counted_loop_shapes was fixed). Largest lane entries:
+the per-candidate compile bookkeeping (`network._attempt_compilation`, `deep_compilation.work`,
+`compiler._exec_driver`, about 33% together); `search_evidence._remember_fingerprint` inside the writer gate (11%: it
+read, rewrote and committed a function's output history for every candidate that missed; it now updates that list in
+memory and queues one row per function per batch, so the gate is taken once a batch); `adaptive_repairs.factors`
+(3%) and `experiment_evidence.factors` (2%), which flush the batch before every policy read, which still costs a
+transaction per read.
+
+`adaptive_repairs.factors` and `experiment_evidence.factors` no longer flush the batch before reading: they add the
+counters this search has queued (`trial_bookkeeping.pending_counters`) to the stored rows, in the table's order, which
+is what a flush followed by the read returned. Before, the policy read before each batch of candidates forced a
+writer transaction each time, so the batch never batched (the 3% and 2% entries above, in the writer gate).

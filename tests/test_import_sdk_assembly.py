@@ -97,7 +97,8 @@ def test_builtin_pack_metadata_has_complete_body_sizes():
         'guMtxF2L', 'guMtxL2F', '__osPopThread',
         'osInvalDCache', 'osInvalICache', 'osWritebackDCache', 'bcopy', 'guScaleF',
     }
-    assert {entry[1] for entry in pack.KNOWN.values()} | {size for size, _ in pack._MTX_CAT_ASM} == set(pack.SIZES)
+    assert ({entry[1] for entry in pack.KNOWN.values()} | {size for size, _ in pack._MTX_CAT_ASM}
+            | {entry[1] for entry in pack.KNOWN_C.values()}) == set(pack.SIZES)
     assert all(len(digest)==64 and int(digest,16)>=0 and row[1]%4==0 for digest,row in pack.KNOWN.items())
 
 
@@ -249,7 +250,11 @@ def test_builtin_register_helpers_are_scoped_to_their_linked_image():
              '__osGetSR', '__osSetCompare', '__osSetSR', '__osSetWatchLo'}
     entries = sdk_linked._LIBULTRA[sdk_linked._LINKED_IMAGE]
     assert names <= {name for name, _, _, _ in entries.values()}
-    assert names.isdisjoint(name for name, _, _, _ in pack.KNOWN.values())
+    # The SDK's own libultra builds (2.0I to 2.0L) give some of these accessors' bodies too, so those are known in
+    # every game; the linked-image entries stay for the bodies the archives don't have.
+    for digest, (name, *_rest) in entries.items():
+        if digest in pack.KNOWN:  # the same body, found in the SDK's archives too: the two sources agree on its name
+            assert pack.KNOWN[digest][0] == name
     for name, size, from_c, _ in entries.values():
         if name in names:
             assert size in N64.sdk_linked_sizes and not from_c
@@ -312,6 +317,8 @@ def test_deep_search_labels_the_entry_stub_as_sdk_code(monkeypatch, tmp_path):
         return split.SplitResult([fn], [], [split.Segment('code', 0, len(body), 0x80000400)], {}, 0, '', '', '')
     monkeypatch.setattr(N64, 'split_game', fake_split)
     monkeypatch.setattr(N64, 'debug_info', lambda *a: None)
+    # (a body of this size is in the table now, so an import names it; a project imported before is what's tested)
+    monkeypatch.setattr(N64, 'sdk_assembly_sizes', tuple(size for size in pack.SIZES if size != len(body)))
     info = {'title': 'Toy', 'size': len(body), 'game_code': 'TEST', 'region': 'US', 'compiler_guess': 'KMC', 'sha1': 'toy',
             'entrypoint': 0x80000400}
     slug = net.import_split(N64, Picked('n64', body, 'toy.z64', info, True), toolchain='gcc-2.7.2-kmc', flags=['-O2'], log=lambda s: None)
@@ -343,3 +350,53 @@ def test_other_libultra_builds_of_the_cache_routines_are_in_the_table():
         assert name in names
     assert len(table.KNOWN['713e7b78373df6fbf3d030b5237e9c1e2148c9443cbfdf938f2e8ffdf8e2d326'][0]) and 40 in table.SIZES
     assert table.identify(bytes(116)) is None and table.identify(bytes(40)) is None
+
+
+def test_sdk_archive_fingerprints_are_unambiguous_and_cover_every_build():
+    """The table read from the SDK's libultra archives (2.0I to 2.0L): one name per body, and the routines every
+    port replaces (cache, coprocessor 0 and TLB accessors, the interrupt mask pair, the MGU matrix helpers)."""
+    names = {row[0] for row in pack.KNOWN.values()}
+    assert names >= {'osGetCount', '__osGetSR', '__osSetSR', '__osDisableInt', '__osRestoreInt', '__osProbeTLB',
+                     'osMapTLB', 'osUnmapTLBAll', 'guMtxIdent', 'guTranslate', 'guScale', 'guNormalize', 'sqrtf',
+                     'bzero', 'bcmp', 'osDelay'}
+    assert all(not name.startswith('_b') or name.startswith('__') for name in names)  # _bcopy/_bzero are bcopy/bzero
+    assert all(row[1] in pack.SIZES and row[3].endswith('.s') for row in pack.KNOWN.values())
+
+
+def test_library_c_bodies_are_identified_as_c_and_follow_the_library_setting(monkeypatch):
+    from decompnet.app.sdk_assembly import SETTING, known_identity
+
+    code = bytes.fromhex('24020001') * 10  # synthetic body, no SDK bytes
+    digest = hashlib.sha256(code).hexdigest()
+    monkeypatch.setattr(pack, 'KNOWN_C', {digest: ('alToy', 40, 'libultra 2.0I')})
+    monkeypatch.setattr(pack, 'SIZES', (*pack.SIZES, 40))
+    monkeypatch.setattr(N64, 'sdk_assembly_sizes', pack.SIZES)
+    found = known_identity(N64, {'kind': 'rom'}, code)
+    assert found['name'] == 'alToy' and found['from_c'] and found['corpus'] == 'libultra C library'
+    assert known_identity(N64, {'kind': 'rom', SETTING: False}, code) is None  # the project asked for C matching
+    assert known_identity(N64, {'kind': 'rom'}, code, has_relocs=True) is None
+    assert known_identity(N64, {'kind': 'rom'}, code + bytes(4)) is None
+    # (assembly is not C: the setting never hides it)
+    asm = bytes.fromhex('24020001') * 11
+    monkeypatch.setattr(pack, 'KNOWN', {hashlib.sha256(asm).hexdigest(): ('asmToy', 44, 'test', 'toy.s')})
+    monkeypatch.setattr(pack, 'SIZES', (*pack.SIZES, 44))
+    monkeypatch.setattr(N64, 'sdk_assembly_sizes', pack.SIZES)
+    assert known_identity(N64, {'kind': 'rom', SETTING: False}, asm)['name'] == 'asmToy'
+
+
+def test_the_library_c_table_is_complete_functions_with_one_name_each():
+    assert len(pack.KNOWN_C) > 150
+    names = {name for name, _, _ in pack.KNOWN_C.values()}
+    assert {'__ll_mod', '__ull_divremi', '__osDequeueThread', 'alUnlink', 'alHeapInit', '__osSumcalc'} <= names
+    assert not set(pack.KNOWN_C) & set(pack.KNOWN)
+    for digest, (name, size, variant) in pack.KNOWN_C.items():
+        assert len(digest) == 64 and int(digest, 16) >= 0 and size % 4 == 0 and size >= 32 and size in pack.SIZES
+        assert name and '.' not in name and variant.startswith('libultra 2.0')
+
+
+def test_the_2_0h_archives_and_branch_ending_routines_are_in_the_tables():
+    names = {name for name, *_ in pack.KNOWN.values()}
+    assert {'bcopy', '__rmonStepRCP'} <= names
+    assert sum(1 for name, size, *_ in pack.KNOWN.values() if name == 'bcopy' and size in (772, 856)) == 2
+    assert any('2.0H' in variant for _, _, variant, _ in pack.KNOWN.values())
+    assert any('2.0H' in variant for _, _, variant in pack.KNOWN_C.values())
