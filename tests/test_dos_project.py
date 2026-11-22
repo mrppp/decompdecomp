@@ -329,3 +329,47 @@ def test_background_passes_dont_move_a_file_off_the_games_compiler(monkeypatch):
     engine.set_compiler_ranges("game", [[0x10, 0x20]], "watcom-9.5", by_user=True)  # the user's choice
     engine.set_compiler_ranges("game", [[0x10, 0x20]], None)  # back to the game's own: always allowed
     assert switched == [("src/auto/a.c", "watcom-9.5"), ("src/auto/a.c", "watcom-10.0a")]
+
+
+def test_drafts_get_the_projects_typed_globals(tmp_path):
+    """draft_types: the project's headers for Ghidra, and each `#pragma aux name "symbol"` + `extern T *name;` as a
+    typed symbol, so Ghidra reads its fields by name and drafts write the typed name."""
+    inc = tmp_path / "include"
+    inc.mkdir()
+    (inc / "common.h").write_text("#ifndef C\n#define C\ntypedef unsigned char u8;\n#include \"g.h\"\n#endif\n")
+    (inc / "t.h").write_text("#pragma pack(1)\ntypedef struct { u8 a_0x00; } Thing;\n#pragma pack()\n"
+                             "typedef char check[sizeof(Thing) == 1 ? 1 : -1];\n")
+    (inc / "g.h").write_text('#pragma aux the_thing "_D_000ADF6C"\nextern Thing *the_thing;\n'
+                             '#pragma aux things "_D_000943DA"\nextern Thing things[14];\n')
+    (inc / "ghidra.h").write_text("typedef int undefined4;\n")
+
+    class Fp:
+        root = tmp_path
+        manifest = None
+    typed = DOS.draft_types(Fp())
+    assert typed["data"] == {"_D_000ADF6C": "Thing *", "_D_000943DA": "Thing[14]"}
+    assert typed["names"] == {"D_000ADF6C": "the_thing", "D_000943DA": "things"}
+    assert "typedef struct { u8 a_0x00; } Thing;" in typed["header"]
+    assert "#pragma" not in typed["header"] and "check[" not in typed["header"] and "extern" not in typed["header"]
+    assert "undefined4" not in typed["header"]  # (ghidra.h is Ghidra's own names: not given back to it)
+    (inc / "g.h").write_text("")
+    assert DOS.draft_types(Fp()) is None  # (no typed globals: drafts as before)
+
+
+def test_ghidra_is_given_the_types_and_its_cache_tells_them_apart(tmp_path, monkeypatch):
+    from decompnet.forks import ghidra
+    obj = tmp_path / "a.o"
+    obj.write_bytes(b"\x7fELF object")
+    given = []
+
+    def run(binary, script, timeout, *, extra=()):
+        given.append([Path(p).read_text() for p in extra])
+        return [{"name": "func_00010000", "c": f"int f(void) {{ return {len(given)}; }}"}]
+    monkeypatch.setattr(ghidra, "_run_script", run)
+    monkeypatch.setattr(ghidra, "available", lambda: True)
+    plain = ghidra.decompile_object(obj, tmp_path / "cache")
+    typed = ghidra.decompile_object(obj, tmp_path / "cache", types=("typedef int T;", {"_D_000ADF6C": "T *"}))
+    assert given == [[], ["typedef int T;", "_D_000ADF6C\tT *\n"]]
+    assert plain != typed  # (the types are part of the cache key: a draft without them isn't reused)
+    assert ghidra.decompile_object(obj, tmp_path / "cache", types=("typedef int T;", {"_D_000ADF6C": "T *"})) == typed
+    assert len(given) == 2

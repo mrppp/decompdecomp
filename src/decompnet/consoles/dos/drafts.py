@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 
 GHIDRA_HEADER = "ghidra.h"
-GHIDRA_H = """/* ghidra.h 3. Ghidra's names for the types and operations it can't tell yet, so its machine drafts compile as they are:
+GHIDRA_H = """/* ghidra.h 4. Ghidra's names for the types and operations it can't tell yet, so its machine drafts compile as they are:
  * autopilot tries them (`#include "ghidra.h"`). The game's own types are better: agents write those in common.h. */
 #ifndef GHIDRA_H
 #define GHIDRA_H
@@ -41,6 +41,7 @@ typedef unsigned short ushort;
 typedef unsigned short word;
 typedef unsigned int uint;
 typedef unsigned int uint3;
+typedef int int3;  /* (CONCAT31((int3)x, y): its 3-byte signed part, as an int) */
 typedef unsigned long ulong;
 typedef unsigned int dword;
 typedef long double float10;

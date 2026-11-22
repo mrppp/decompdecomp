@@ -621,6 +621,11 @@ class Console:
         its own: then try_compiler can switch it. None: the project's build decides alone."""
         return None
 
+    def draft_types(self, fp) -> dict | None:
+        """The project's own types for its Ghidra drafts, or None: {"header": C Ghidra parses, "data": {symbol: type},
+        "names": {a name drafts would write: the typed name to write instead}} (forkengine._draft)."""
+        return None
+
     def keeps_game_compiler(self, fp) -> str | None:
         """The one compiler the whole game was built with, when that is known: try_compiler then only tests another
         compiler on a file and never switches it (a match there is reported, for the user to decide). None: files may

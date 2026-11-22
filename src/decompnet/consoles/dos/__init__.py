@@ -100,6 +100,40 @@ class Dos(Console):
         manifest = fp.manifest or {}
         return (manifest.get("dos_compilers_map") or {}).get(source) or manifest.get("compiler") or "openwatcom-2.0"
 
+    def draft_types(self, fp) -> dict | None:
+        """The project's headers (include/, not ghidra.h) for Ghidra, and the globals they give typed names: a
+        `#pragma aux name "symbol"` beside `extern T *name;` or `extern T name[n];` (remc1_globals.h). Ghidra then
+        reads those globals' fields by name, and infers the types of what they hand out (an entity from the state's
+        entities); drafts write the typed name (mc1_state) where they had the symbol (D_000ADF6C)."""
+        import re
+        include = Path(fp.root) / "include"
+        if not include.is_dir():
+            return None
+        header, data, names = [], {}, {}
+        texts = {}
+        for path in sorted(include.glob("*.h")):
+            if path.name == "ghidra.h":
+                continue
+            try:
+                texts[path.name] = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        # common.h first (its typedefs), then the rest
+        for name in sorted(texts, key=lambda n: (n != "common.h", n)):
+            text = re.sub(r"^\s*#\s*(pragma|include|ifndef|ifdef|define|endif|else|undef)\b.*$", "", texts[name], flags=re.M)
+            text = re.sub(r"^\s*typedef\s+char\s+\w+\s*\[.*\]\s*;\s*$", "", text, flags=re.M)  # (size checks)
+            text = re.sub(r"^\s*extern\b[^;]*;", "", text, flags=re.M)  # (declarations: types only)
+            header.append(text)
+            for alias, symbol in re.findall(r'#pragma\s+aux\s+(\w+)\s+"(\w+)"', texts[name]):
+                m = re.search(rf"^\s*extern\s+(\w+)\s*(\*?)\s*{alias}\s*(\[\s*\d+\s*\])?\s*;", texts[name], re.M)
+                if not m or not symbol.startswith("_D_"):
+                    continue
+                data[symbol] = m.group(1) + (" *" if m.group(2) else "") + (m.group(3).replace(" ", "") if m.group(3) else "")
+                names[symbol[1:]] = alias  # (drafts write _D_000ADF6C as D_000ADF6C: drafts.adapt)
+        if not data:
+            return None
+        return {"header": "\n".join(header), "data": data, "names": names}
+
     def keeps_game_compiler(self, fp) -> str | None:
         """A DOS game is one program from one compiler, which import identified from its library code (the manifest's
         `compiler`, scratch.library_match). Helpers' try_compiler moved eleven of one game's files to OpenWatcom 2 or
