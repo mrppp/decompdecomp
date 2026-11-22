@@ -202,5 +202,8 @@ def quiet_crashes(wine: str, where: Path) -> None:
             subprocess.run([wine, "reg", "add", r"HKCU\Software\Wine\WineDbg", "/v", "ShowCrashDialog",
                             "/t", "REG_DWORD", "/d", "0", "/f"], env=environment(where), stdin=subprocess.DEVNULL,
                            stdout=said, stderr=said, timeout=120, creationflags=NO_WINDOW)
+            if (ws := server(wine)) is not None:  # (its server stops, as prepare's does: nothing left running)
+                subprocess.run([ws, "-w"], env=environment(where), stdin=subprocess.DEVNULL, stdout=said, stderr=said,
+                               timeout=60, creationflags=NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired):
         pass  # (dialogs, not failures: compiles work either way)
