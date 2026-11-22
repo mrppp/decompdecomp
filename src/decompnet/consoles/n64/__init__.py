@@ -11,7 +11,7 @@
 - indexed_overlays.py: shared RAM slots and DMA bounds recovered from loader arrays and cache calls.
 - inferred_overlays.py: overlapping code-bank mappings supported by independently called local entries.
 - inline_data.py: verified constants and alignment bytes embedded among code.
-- boot_gzip.py: programs in paired gzip members placed at addresses supplied by the boot loader.
+- boot_gzip.py, boot_raw_deflate.py, boot_brs.py: compressed programs placed at addresses supplied by the boot loader.
 - boot_mapping.py: returning TLB boot stubs separated from code with a strongly supported later load mapping.
 - sdk_assembly.py: exact self-contained libultra body fingerprints, classified before C claims.
 - port.py: its port kit, libultraship and Torch: what they replace and which graphics microcode they render.
@@ -238,22 +238,42 @@ class Nintendo64(Console):
         info = getattr(fn, 'uso', None)
         return {'uso': info} if info is not None else {}
 
-    def target_from_row(self, fn, cfg):
+    def separate_overlay_reference(self, binding, number):
+        from .uso_match import separate_reference
+
+        return separate_reference(binding, number)
+
+    def overlay_cartridge_placement(self, fn, cfg):
         import json
 
+        row = dict(fn)
+        offset = row.get('rom_offset')
+        if offset is None:
+            return None
+        info = json.loads(row.get('meta') or '{}').get('uso', {})
+        section, start = info.get('section'), info.get('start')
+        if not isinstance(section, int) or not isinstance(start, int) or start < 0 or info.get('size') != row['size']:
+            return None
+        if info.get('native'):
+            if offset == section + start:
+                return info
+        elif (start == row['vram']
+              and (cfg.get('donor_overlays') or {}).get(str(section)) == offset - start):
+            return info
+        return None
+
+    def target_from_row(self, fn, cfg):
         from .uso_match import Target
 
         target = super().target_from_row(fn, cfg)
-        row = dict(fn)
-        offset = row.get('rom_offset')
+        if info := self.overlay_cartridge_placement(fn, cfg):
+            if info.get('size') == len(target.code):
+                return Target(**vars(target), uso=info)
+        offset = dict(fn).get('rom_offset')
         banks = cfg.get('donor_overlays') or {}
-        if not banks or offset is None or offset < min(banks.values()):
-            return target
-        info = json.loads(row.get('meta') or '{}').get('uso', {})
-        if (banks.get(str(info.get('section'))) != offset - target.vram
-                or info.get('start') != target.vram or info.get('size') != len(target.code)):
-            info = {'section': None, 'relocs': None}
-        return Target(**vars(target), uso=info)
+        if banks and offset is not None and offset >= min(banks.values()):
+            return Target(**vars(target), uso={'section': None, 'relocs': None})
+        return target
 
     def target_object(self, fn, cfg, symbols):
         from ...rom.match import canonical_target
@@ -274,6 +294,11 @@ class Nintendo64(Console):
 
         return target.uso if isinstance(target, Target) and target.uso['relocs'] is not None else None
 
+    def overlay_metadata_updates(self, image, cfg, rows):
+        from .uso import metadata_updates
+
+        return metadata_updates(image, cfg['donor_overlays'], rows)
+
     def rebuild_overlays(self, image, entries):
         from .uso import rebuild
 
@@ -284,20 +309,23 @@ class Nintendo64(Console):
 
         import rabbitizer
 
-        from .uso_match import alias
+        from .uso_match import alias, local_alias
 
         info = getattr(fn, 'uso', None)
         if not info or not info['relocs']:
             return super().function_asm(fn)
         lines = list(fn.lines)
+        local_calls = {(at, index): offset for at, index, offset in info.get('local_calls', ())}
         for at, kind, index in info['relocs']:
             line = lines[at // 4]
-            name = alias(info['section'], index)
+            offset = local_calls.get((at, index)) if kind == 4 else None
+            name = (local_alias(info['section'], index, offset) if offset is not None
+                    else alias(info['section'], index))
             if kind in (4, 5, 6):
                 field = line.word & (0x3ffffff if kind == 4 else 0xffff)
                 mask = {4: '', 5: '%hi', 6: '%lo'}[kind]
                 immediate = name if not mask else f'{mask}({name})'
-                if field:
+                if field and offset is None:
                     # Keep the encoded addend visible when it is more than a symbol reference.
                     immediate = f'{immediate} /* encoded addend 0x{field:X} */'
                 insn = rabbitizer.Instruction(line.word, line.vram)

@@ -248,7 +248,8 @@ def test_manual_search_finds_imported_code_inside_a_merged_rom_function(built, t
     assert not any(original['target'][head['size']:-recovered['size']])  # alignment padding
 
 
-def test_manual_search_tries_donor_when_relocation_layouts_differ(built, tmp_path, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize('lead', ['relaxed', 'ambiguous', 'raw'])
+def test_manual_search_tries_donor_when_relocation_layouts_differ(built, tmp_path, monkeypatch, lead):  # noqa: F811
     from decompnet.app.twins import Job, Print, _key
     from decompnet.elfobj import Reloc, mask_relocs
 
@@ -269,15 +270,37 @@ def test_manual_search_tries_donor_when_relocation_layouts_differ(built, tmp_pat
     fingerprint = Print(_key(code, layout), ['donor_symbol'], len(code), layout=layout)
     mine = net.twins.prints(proj)
     assert mine[b['id']].key != fingerprint.key
-    monkeypatch.setattr(net.forks, 'get', lambda _: (donor, object(), {'platform': 'n64'}))
+    source = 'int func_800007D0(void) { return 123; }'
+    if lead == 'raw':
+        from decompnet.app import donor_relocations
+
+        fingerprint.raw_digest = mine[b['id']].raw_digest
+        assert fingerprint.raw_digest
+        monkeypatch.setattr(donor_relocations, 'candidates', lambda *_: {})
+    if lead == 'ambiguous':
+        from types import SimpleNamespace
+
+        from decompnet.app import donor_build, donor_relocations, donor_sources
+        from decompnet.project import compiler_for
+
+        unit = SimpleNamespace(name=a['unit'], base=None, target=None)
+        fork = SimpleNamespace(root=tmp_path, units=lambda: [unit])
+        settings = compiler_for(net.cfg(proj), b['vram'], b)
+        monkeypatch.setattr(donor_build.Settings, 'for_unit', lambda *_: settings)
+        monkeypatch.setattr(donor_relocations, 'donor_refs', lambda *_:
+                            Print(fingerprint.key, ['.local_section'], len(code)))
+        monkeypatch.setattr(donor_sources, 'imported', lambda *_: [(source, '', '')])
+    else:
+        fork = object()
+    monkeypatch.setattr(net.forks, 'get', lambda _: (donor, fork, {'platform': 'n64'}))
     monkeypatch.setattr(net.forks, 'is_asm', lambda *_: False)
     monkeypatch.setattr(net.twins, '_fork_prints', lambda _, **kwargs: {a['id']: fingerprint})
     job = Job()
     job.cross_exhaustive = True
-    monkeypatch.setattr(net.forks, '_current_source', lambda *_: 'int func_800007D0(void) { return 123; }')
+    monkeypatch.setattr(net.forks, '_current_source', lambda *_: source)
     assert net.twins._fork_to_rom(agent, proj, donor, {}, mine, job) == 0
     assert net._function(b['name'], slug)['status'] == 'open'
-    monkeypatch.setattr(net.forks, '_current_source', lambda *_: CLAMP)
+    source = CLAMP
     assert net.twins._fork_to_rom(agent, proj, donor, {}, mine, job) == 1
     matched = net._function(b['name'], slug)
     assert matched['status'] == 'matched'
@@ -315,9 +338,11 @@ def test_donor_build_retains_profile_and_header_only_after_exact_verdict(built, 
     assert matched['status'] == 'matched'
 
 
-def test_saved_whole_donor_unit_reverifies_and_exports_only_its_entry(built, tmp_path):  # noqa: F811
-    from decompnet.app import donor_build, saves
+@pytest.mark.parametrize('macro_type', [False, True])
+def test_saved_whole_donor_unit_reverifies_and_exports_only_its_entry(built, tmp_path, monkeypatch, macro_type):  # noqa: F811
+    from decompnet.app import donor_build, donor_unit, saves
     from decompnet.app.twins import Job
+    from decompnet.forks.project import ForkProject
     from decompnet.project import compiler_for
 
     net = RomNetwork(tmp_path / 'decomp.db', tmp_path)
@@ -335,16 +360,38 @@ def test_saved_whole_donor_unit_reverifies_and_exports_only_its_entry(built, tmp
              "// The donor's preprocessing must preserve the next definition. \\\n"
              "this is still part of the line comment\n"
              'int other_body(int x) { return x + 31; }\n' + CLAMP)
+    if macro_type:
+        whole = '#define RET(T) T\n' + whole.replace('s32 func_800007D0(', 'RET(s32) func_800007D0(')
+        assert 'RET(s32) func_800007D0(' in whole
     (root / 'unit.c').write_text(whole)
     (root / 'build/unit.c').write_text(whole)
     (root / 'objdiff.json').write_text(json.dumps({'units': [
         {'name': 'unit', 'base_path': 'build/unit.c.o', 'metadata': {'source_path': 'unit.c'}}
     ]}))
     donor = {'name': fn['name'], 'unit': 'unit', 'meta': None}
+    unit = ForkProject(root).unit('unit')
+    assert donor_unit.has_owned_definition(root, unit, fn['name'])
+    assert not donor_unit.has_owned_definition(root, unit, 'missing')
+    if macro_type:
+        assert net.forks._current_source(ForkProject(root), donor) is None
     settings = {'toolchain': own['toolchain'], 'flags': own['flags']}
-    status, reason = donor_build.verify(net, proj, fn, {'root': str(root)}, donor, {}, settings, agent, Job(), {})
-    assert status == 'match', reason
-    assert reason == 'Verified from a saved donor translation unit.'
+    if macro_type:
+        copy_project(net, slug, 'macro-donor')
+        other = dict(net._project('macro-donor')) | {'root': str(root)}
+        imported = net._function(fn['name'], 'macro-donor')
+        with net.project_store(other['id']).tx() as db:
+            db.execute("UPDATE functions SET status='matched',unit='unit' WHERE id=?", (imported['id'],))
+        mono = net.twins.prints(proj)
+        monkeypatch.setattr(net.forks, 'get', lambda _: (other, ForkProject(root), {'platform': 'n64'}))
+        monkeypatch.setattr(donor_build.Settings, 'for_unit', lambda *args: settings)
+        monkeypatch.setattr(net.twins, '_fork_prints', lambda *args, **kwargs: {imported['id']: mono[fn['id']]})
+        job = Job()
+        job.cross_exhaustive = True
+        assert net.twins._fork_to_rom(agent, proj, other, {}, mono, job) == 1
+    else:
+        status, reason = donor_build.verify(net, proj, fn, {'root': str(root)}, donor, {}, settings, agent, Job(), {})
+        assert status == 'match', reason
+        assert reason == 'Verified from a saved donor translation unit.'
     saved = net._function(fn['name'], slug)
     assert 'other_body' in net._context(proj['id'], saved['unit'])['header']
     assert 'other_body' not in saved['matched_source']
@@ -365,3 +412,204 @@ def test_saved_whole_donor_unit_reverifies_and_exports_only_its_entry(built, tmp
     manifest = json.loads((Path(out['path']) / 'build.json').read_text())
     entry = next(row for row in manifest['functions'] if row['vram'] == fn['vram'])
     assert entry['entry_only']
+
+
+@pytest.mark.parametrize('diagnostic', [
+    None,
+    'Incompatible function return type for this function.',
+    "The number of arguments doesn't agree with the number in the declaration.",
+    'The number of parameters for function is different from the previous declaration.',
+])
+def test_donor_replay_uses_original_declarations_after_alias_collision(built, tmp_path, monkeypatch, diagnostic):  # noqa: F811
+    from decompnet.app import donor_build, donor_sources
+    from decompnet.app.twins import Job
+    from decompnet.project import compiler_for
+
+    net = RomNetwork(tmp_path / 'decomp.db', tmp_path)
+    slug = net.import_rom(ROM, confirmed=True, log=lambda *_: None)
+    agent, _ = net.local_agent('autopilot')
+    net.split_function(agent, slug, 'func_800007C4', '0x800007D0')
+    proj = net._project(slug)
+    fn = net._function('func_800007D0', slug)
+    root = tmp_path / 'donor'
+    root.mkdir()
+    header = 'typedef int s32;\nextern void first(int *);\nextern void second(float *);\n'
+    (root / 'unit.c').write_text(header + CLAMP)
+    (root / 'objdiff.json').write_text(json.dumps({'units': [
+        {'name': 'unit', 'metadata': {'source_path': 'unit.c'}}
+    ]}))
+    donor = {'name': fn['name'], 'unit': 'unit', 'meta': None}
+    profile = compiler_for(net.cfg(proj), fn['vram'], fn)
+    monkeypatch.setattr(donor_sources, 'imported', lambda *_: [])
+    if diagnostic:
+        from dataclasses import replace
+
+        compile_candidate = net._compile
+
+        def compile_with_diagnostic(project, context, source, function):
+            result = compile_candidate(project, context, source, function)
+            return result if result.ok else replace(result, log='cfe: Error: ' + diagnostic)
+
+        monkeypatch.setattr(net, '_compile', compile_with_diagnostic)
+    result = donor_build.verify(net, proj, fn, {'root': str(root)}, donor,
+                                {'first': 'common', 'second': 'common'}, profile, agent, Job(), {})
+    assert result == ('match', 'Verified using compiled donor bindings.')
+    saved = net._function(fn['name'], slug)
+    saved_header = net._context(proj['id'], saved['unit'])['header']
+    assert 'first(int *);' in saved_header and 'second(float *);' in saved_header
+
+
+def test_imported_donor_with_different_literal_is_verified_in_the_rom(built, tmp_path, monkeypatch):  # noqa: F811
+    from dataclasses import replace
+
+    from decompnet.app.twins import Job
+    from decompnet.compiler import compile_source
+    from decompnet.elfobj import extract_function
+    from decompnet.forks.project import ForkProject
+    from decompnet.project import compiler_for
+
+    net = RomNetwork(tmp_path / 'decomp.db', tmp_path)
+    slug = net.import_rom(ROM, confirmed=True, log=lambda *_: None)
+    agent, _ = net.local_agent('autopilot')
+    net.split_function(agent, slug, 'func_800007C4', '0x800007D0')
+    dest = net._project(slug)
+    entry = net._function('func_800007D0', slug)
+    own = compiler_for(net.cfg(dest), entry['vram'], entry)
+    _, invocation = net._invocation(dest, entry)
+    source = """int donor(int x, int *out) {
+        if (x < 37) {
+            out[0] = x;
+            out[1] = x + 17;
+            return 6;
+        }
+        out[2] = x;
+        return 98;
+    }"""
+    donor_obj = compile_source(invocation, '', source)
+    newer = source.replace('donor', entry['name']).replace('37', '42')
+    target_obj = compile_source(invocation, '', newer)
+    assert donor_obj.ok, donor_obj.log
+    assert target_obj.ok, target_obj.log
+    raw = extract_function(donor_obj.obj, 'donor').code
+    unlinked = extract_function(target_obj.obj, entry['name']).code
+    rom_target = replace(net._rom_target(entry), code=unlinked, relocs=[])
+    linked = net.console(dest).link_function(target_obj.obj, entry['name'], rom_target,
+                                            net.symbols(dest['id']), net.reader(dest, entry))
+    assert not linked.problems
+    target = linked.linked_code
+    assert len(raw) == len(target) and target != raw and len(target) >= 32
+    with net.project_store(dest['id']).tx() as db:
+        db.execute("UPDATE functions SET target=?,size=?,n_insns=?,relocs='[]' WHERE id=?",
+                   (target, len(target), len(target) // 4, entry['id']))
+
+    copy_project(net, slug, 'imported-library')
+    other = net._project('imported-library')
+    donor = net._function(entry['name'], other['slug'])
+    with net.project_store(other['id']).tx() as db:
+        db.execute("UPDATE functions SET name='donor',unit='unit',status='matched' WHERE id=?", (donor['id'],))
+    root = tmp_path / 'donor'
+    root.mkdir()
+    (root / 'unit.c').write_text('typedef int Word;\n' + source)
+    (root / 'target.o').write_bytes(donor_obj.obj)
+    (root / 'objdiff.json').write_text(json.dumps({'units': [{
+        'name': 'unit', 'target_path': 'target.o', 'metadata': {
+            'source_path': 'unit.c',
+        }, 'scratch': {'compiler': own['toolchain'], 'c_flags': ' '.join(own['flags'])}}]}))
+    project = ForkProject(root)
+    other = dict(other) | {'root': str(root)}
+    monkeypatch.setattr(net.forks, 'get', lambda _: (other, project, {'platform': 'n64'}))
+    monkeypatch.setattr(net.forks, 'is_asm', lambda *_: False)
+    job = Job()
+    job.cross_exhaustive = True
+    result = net.twins._fork_to_rom(agent, dest, other, {}, net.twins.prints(dest), job)
+    attempts = [tuple(row) for row in net.project_store(dest['id']).all(
+        'SELECT outcome,reason FROM cross_game_attempts WHERE function_id=?', entry['id'])]
+    assert result == 1, (own, attempts)
+    saved = net._function(entry['name'], slug)
+    assert saved['status'] == 'matched' and 'x < 42' in saved['matched_source']
+    assert saved['target'] == target
+
+
+@pytest.mark.parametrize('case', ['profile', 'literal', 'optimization'])
+def test_similar_imported_object_rebuilds_with_the_destination_compiler_profile(built, tmp_path, monkeypatch, case):  # noqa: F811
+    from decompnet import similarity, toolchains
+    from decompnet.app.twins import Job
+    from decompnet.compiler import compile_source
+    from decompnet.elfobj import extract_function
+    from decompnet.forks.project import ForkProject
+    from decompnet.project import compiler_config
+
+    if not toolchains.installed('ido-7.1'):
+        pytest.skip('needs IDO 7.1')
+    net = RomNetwork(tmp_path / 'decomp.db', tmp_path)
+    slug = net.import_rom(ROM, confirmed=True, log=lambda *_: None)
+    agent, _ = net.local_agent('autopilot')
+    net.split_function(agent, slug, 'func_800007C4', '0x800007D0')
+    copy_project(net, slug, 'imported-library')
+    proj, other = net._project(slug), net._project('imported-library')
+    fn = net._function('func_800007D0', slug)
+    donor = net._function(fn['name'], other['slug'])
+    profile = {'toolchain': 'ido-7.1', 'flags': ['-O2', '-G', '0', '-non_shared', '-mips2']}
+    donor_profile = profile | {'flags': [*profile['flags'], '-DEXTRA_WRITE=1']}
+    if case == 'optimization':
+        donor_profile = profile
+        profile = profile | {'flags': ['-O0', *profile['flags'][1:]]}
+    source = """
+void donor(volatile int *out, int n) {
+    out[0] = n;
+    out[1] = n + 2;
+    out[2] = n + 4;
+    out[3] = n + 3;
+    out[4] = n - 5;
+    out[5] = n - 6;
+#if EXTRA_WRITE
+    out[6] = n + 7;
+#endif
+    out[7] = n + 8;
+}
+"""
+    root = tmp_path / 'imported'
+    root.mkdir()
+    object_profile = profile if case == 'optimization' else donor_profile
+    base = compile_source(compiler_config(root, {'compiler': object_profile}), '', source)
+    dest_source = source.replace('donor', fn['name'])
+    expected = compile_source(compiler_config(root, {'compiler': profile}), '', dest_source)
+    assert base.ok and expected.ok, (base.log, expected.log)
+    left = extract_function(base.obj, 'donor').code
+    right = extract_function(expected.obj, fn['name']).code
+    if case == 'optimization':
+        assert left == right
+    else:
+        assert len(left) != len(right)
+        assert similarity.score(similarity.mips_mnemonics(left), similarity.mips_mnemonics(right)) >= .84
+
+    with net.project_store(proj['id']).tx() as db:
+        db.execute('UPDATE projects SET config=? WHERE id=?',
+                   (json.dumps(net.cfg(proj) | {'compiler': profile}), proj['id']))
+        db.execute("UPDATE functions SET target=?,size=?,n_insns=?,relocs='[]' WHERE id=?",
+                   (right, len(right), len(right) // 4, fn['id']))
+    proj = net.project_store(proj['id']).one('SELECT * FROM projects WHERE id=?', proj['id'])
+    with net.project_store(other['id']).tx() as db:
+        db.execute("UPDATE functions SET name='donor',unit='unit',status='matched' WHERE id=?", (donor['id'],))
+    (root / 'target.o').write_bytes(base.obj)
+    (root / 'objdiff.json').write_text(json.dumps({'units': [{
+        'name': 'unit', 'target_path': 'target.o', 'metadata': {'source_path': 'unit.c'},
+        'scratch': {'compiler': 'ido-7.1', 'c_flags': ' '.join(donor_profile['flags'])},
+    }]}))
+    other = dict(other) | {'root': str(root)}
+    fork = ForkProject(root)
+    monkeypatch.setattr(net.forks, 'get', lambda _: (other, fork, {'platform': 'n64'}))
+    monkeypatch.setattr(net.forks, 'is_asm', lambda *_: False)
+    job = Job()
+    job.cross_exhaustive = True
+    (root / 'unit.c').write_text(source.replace('n + 8', 'n ^ 9'))
+    assert net.twins._fork_to_rom(agent, proj, other, {}, net.twins.prints(proj), job) == 0
+    assert net._function(fn['name'], slug)['status'] == 'open'
+    (root / 'unit.c').write_text(source.replace('n + 8', 'n + 9') if case == 'literal' else source)
+    assert net.twins._fork_to_rom(agent, proj, other, {}, net.twins.prints(proj), job) == 1
+    saved = net._function(fn['name'], slug)
+    assert saved['status'] == 'matched' and saved['target'] == right
+    assert 'n + 8' in saved['matched_source']
+    attempt = net.project_store(proj['id']).one(
+        "SELECT reason FROM cross_game_attempts WHERE function_id=? AND outcome='match'", fn['id'])
+    assert attempt['reason'].startswith('Similar imported source:') == (case != 'optimization')

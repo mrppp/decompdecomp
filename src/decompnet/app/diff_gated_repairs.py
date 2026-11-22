@@ -5,84 +5,215 @@ import re
 from decomprepair import (
     aligned_allocator_request,
     aligned_stack_read,
+    allocation_repairs,
+    balanced_clamp_argument_stage,
+    balanced_clamp_predicates,
+    balanced_float_predicate_return,
+    balanced_predicate_projection,
+    balanced_projection_scale,
+    balanced_selector_zero,
+    balanced_sign_field_clamp,
+    balanced_signed_selector_increment,
+    boolean_guard_operands,
+    branch_tail_distribution,
     byte_cursor_postincrements,
+    clamp_return_local,
+    clamp_saved_argument_lifetime,
+    clamped_field_reload,
+    conditional_field_subtract,
+    conditional_smoothing_gain,
+    counted_switch_advance,
     direct_mapped_address,
+    epsilon_predicate_order,
+    field_copy_before_clear,
     field_snapshot_copies,
+    float_clamp_scale_stage,
+    float_delta_load_order,
     float_intermediate_repairs,
     float_matrix_identity,
     global_pointer_local_repairs,
     guard_inversion_repairs,
+    guard_load_order,
     guard_reset_scheduling,
+    halfword_before_float_store,
     indexed_field_cursor,
     kmc_cast_repairs,
     likely_branch_cursor,
+    local_inline_repairs,
     loop_counter_roles_repairs,
     loop_sentinel_repairs,
     loop_storage_shapes,
     masked_slot_dispatch,
     measured_address_repairs,
+    measured_after_call_reload,
+    measured_be16_cursor,
+    measured_branch_byte_stores,
+    measured_branch_halfword_store,
+    measured_byte_clamp,
+    measured_byte_clear_base,
+    measured_byte_fallback_return,
+    measured_byte_global_branch,
+    measured_byte_search_loop,
+    measured_byte_signature,
     measured_callback_loop,
     measured_callback_repairs,
+    measured_carried_loop_test,
+    measured_command_record_cursor,
+    measured_command_word_schedule,
+    measured_conditional_call_stage,
+    measured_conditional_flag_owner,
     measured_control_flow,
     measured_cursor_loop_tail,
     measured_cursor_publish,
     measured_cursor_schedule,
+    measured_event_frame_capture,
     measured_expression_repairs,
+    measured_flag_reload,
+    measured_float_argument_pair,
     measured_float_grid_stores,
+    measured_forwarded_counter,
+    measured_forwarded_pointer,
+    measured_global_offset_reuse,
     measured_global_rebase,
+    measured_guarded_flag_value,
+    measured_guarded_index,
+    measured_halfword_index,
     measured_halfword_stores,
     measured_halfword_switch,
+    measured_ido_byte_cursor,
+    measured_ido_callback_offset,
+    measured_ido_index_update,
     measured_immediate_repairs,
+    measured_indexed_clear,
+    measured_indexed_mode_tail,
+    measured_indexed_record_layout,
+    measured_indirect_command_records,
+    measured_indirect_self_call,
+    measured_interpolation_calls,
     measured_kmc_addresses,
+    measured_kmc_boolean_loop_flag,
     measured_kmc_branch_pointer,
     measured_kmc_byte_and_message,
+    measured_kmc_byte_cursor_return,
+    measured_kmc_byte_global_pointer,
+    measured_kmc_byte_index_local,
     measured_kmc_byte_operations,
+    measured_kmc_byte_or,
     measured_kmc_byte_stride,
+    measured_kmc_call_counter,
     measured_kmc_call_setup,
     measured_kmc_call_stores,
     measured_kmc_carriers,
     measured_kmc_command,
     measured_kmc_cursor_switch,
+    measured_kmc_event_field_order,
+    measured_kmc_event_record,
+    measured_kmc_event_timestamp,
+    measured_kmc_field_pointer,
     measured_kmc_flag_update,
     measured_kmc_flow,
+    measured_kmc_global_stores,
+    measured_kmc_halfword_count_loop,
+    measured_kmc_halfword_flag_table,
+    measured_kmc_indexed_byte_table,
+    measured_kmc_indirect_byte_table,
+    measured_kmc_inferred_table_widths,
     measured_kmc_input,
+    measured_kmc_invariant_row,
     measured_kmc_lifetimes,
+    measured_kmc_list_append,
+    measured_kmc_list_count,
+    measured_kmc_masked_rank_counter,
+    measured_kmc_message_thread,
+    measured_kmc_null_table_loop,
     measured_kmc_packed_bits,
+    measured_kmc_pointer_table_guard,
     measured_kmc_record_reads,
+    measured_kmc_relocated_fields,
+    measured_kmc_relocated_pool,
     measured_kmc_repeated_reads,
     measured_kmc_scalar_shapes,
+    measured_kmc_second_call_argument,
+    measured_kmc_split_table_index,
     measured_kmc_stack_and_call,
+    measured_kmc_stack_pointer,
+    measured_kmc_two_byte_reader,
+    measured_kmc_unsigned_indexed_byte,
+    measured_kmc_varbyte_accumulator,
+    measured_kmc_varbyte_initialization,
+    measured_kmc_variable_byte_cursor,
     measured_kmc_vector_square,
     measured_kmc_wrappers,
     measured_lifetime_shapes,
+    measured_list_head_insert,
+    measured_list_selection,
+    measured_lookup_owner,
+    measured_loop_delta_snapshot,
+    measured_loop_search_target,
+    measured_magnitude_conversion,
+    measured_masked_halfword_read,
+    measured_matrix_products,
     measured_memory_order,
     measured_mmio_polling,
     measured_narrow_use,
+    measured_nibble_tables,
     measured_null_iteration_store,
+    measured_packing_stage,
+    measured_parameter_clock_load,
+    measured_pointer_displacement,
     measured_pointer_scale,
+    measured_record_byte_offset,
+    measured_record_pointer_update,
+    measured_record_ramp,
+    measured_region_search,
+    measured_reset_loops,
+    measured_ring_global_capture,
+    measured_saved_global,
     measured_scalar_updates,
+    measured_signed_offset_helper,
+    measured_slot_flip_copy,
+    measured_square_loads,
     measured_stack_records,
     measured_storage_shapes,
     measured_temporary_repairs,
     measured_thread_addresses,
+    measured_two_list_allocation,
+    measured_varbyte_lookup,
+    measured_wide_division_stride,
+    measured_zero_record_pairs,
     ordered_halfword_updates,
+    oscillator_phase_hold,
     packed_matrix_conversion,
     passthrough_argument_repairs,
+    projection_argument_before_store,
+    projection_gain,
+    quadratic_sign_holder,
+    rejected_branch_default,
     relocated_byte_table,
     relocated_global_update,
+    relocated_pointer_reloads,
+    sampled_phase_axis_stage,
+    saved_range_probe,
+    scaled_blend_input,
     search_exit_loop_repairs,
+    shared_projection_lifetime,
     shared_return_repairs,
     short_leaf_drafts,
+    smoothing_call_before_read,
     split_dispatch_zero_case,
     stack_byte_init_repairs,
     stack_fill_drafts,
     stack_header_buffer,
     stack_read_retry,
+    stored_float_zero_repairs,
     switch_pointer_calls,
     symbol_width_repairs,
     target_string_repairs,
     targeted_switch_labels,
+    trig_axis_reuse,
     uncached_read_repairs,
+    vector_output_capture,
+    wide_update_before_flags,
 )
 from decomprepair import (
     observed_arithmetic_repairs as arithmetic,
@@ -94,6 +225,7 @@ from decomprepair import (
     observed_storage_repairs as storage,
 )
 
+from ..compiler import MAX_SOURCE_BYTES
 from . import (
     allocation_evidence,
     allocation_search,
@@ -228,33 +360,149 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
     result += measured_lifetime_shapes.variants(source, name, header, toolchain, rows)
     result += measured_scalar_updates.variants(source, name, header, toolchain, rows, asm)
     if toolchain == 'gcc-2.7.2-kmc':
+        result += boolean_guard_operands.variants(source, name, rows, header)
+        result += balanced_projection_scale.variants(source, name, rows, header=header)
+        result += balanced_predicate_projection.variants(source, name, rows, header=header)
+        result += epsilon_predicate_order.staged_variants(source, name, rows, header=header)
+        result += conditional_field_subtract.variants(source, name, rows, header=header)
+        result += sampled_phase_axis_stage.variants(source, name, rows, header=header)
+        result += sampled_phase_axis_stage.staged_variants(source, name, rows, header=header)
+        result += shared_projection_lifetime.variants(source, name, rows, header=header)
+        result += allocation_repairs.measured_slot_orders(source, name, rows, header)
+        result += allocation_repairs.measured_array_orders(source, name, rows, header)
+        result += guard_load_order.variants(source, name, rows, header)
+        result += branch_tail_distribution.measured_state_store_arms(source, name, rows, header)
+        result += global_pointer_local_repairs.measured_table_compare_pointer(source, name, rows, header)
+        result += local_inline_repairs.measured_record_copy_inline(source, name, rows, header)
+        result += clamp_saved_argument_lifetime.variants(source, name, rows, header=header)
+        result += balanced_clamp_argument_stage.variants(source, name, rows, header=header)
+        result += balanced_clamp_predicates.variants(source, name, rows, header=header, max_bytes=MAX_SOURCE_BYTES)
+        result += balanced_sign_field_clamp.variants(source, name, rows, header=header, max_bytes=MAX_SOURCE_BYTES)
+        result += balanced_clamp_predicates.split_register_variants(source, name, rows, header=header)
+        result += trig_axis_reuse.variants(source, name, rows, header=header)
+        result += projection_gain.variants(source, name, rows, header=header)
+        result += quadratic_sign_holder.variants(source, name, rows, header=header)
+        result += quadratic_sign_holder.arm_variants(source, name, rows, header=header)
+        result += smoothing_call_before_read.variants(source, name, rows, header=header)
+        result += conditional_smoothing_gain.variants(source, name, rows, header=header)
+        result += scaled_blend_input.variants(source, name, rows, header=header)
+        result += projection_argument_before_store.variants(source, name, rows, header=header)
+        result += balanced_signed_selector_increment.variants(source, name, rows, header=header)
+        result += balanced_selector_zero.variants(source, name, rows, header=header, max_bytes=MAX_SOURCE_BYTES)
+        result += balanced_float_predicate_return.variants(source, name, rows, header=header)
+        result += clamped_field_reload.variants(source, name, rows, header=header)
+        result += saved_range_probe.variants(source, name, rows, header=header)
+        result += float_clamp_scale_stage.variants(source, name, rows, header=header)
+        result += wide_update_before_flags.variants(source, name, rows, header=header)
+        result += field_copy_before_clear.variants(source, name, rows, header=header)
+        result += clamp_return_local.variants(source, name, rows, header=header)
+        result += float_delta_load_order.variants(source, name, rows, header=header)
+        result += vector_output_capture.ordered_snapshot_variants(source, name, rows)
+        result += stored_float_zero_repairs.stack_word_variants(source, name, rows, header=header, max_bytes=MAX_SOURCE_BYTES)
+        result += stored_float_zero_repairs.distinct_tail_variants(source, name, rows, header=header, max_bytes=MAX_SOURCE_BYTES)
+        result += counted_switch_advance.variants(source, name, rows, header=header)
+        result += oscillator_phase_hold.variants(source, name, rows, header=header)
+        result += oscillator_phase_hold.product_variants(source, name, rows, header=header)
+        result += halfword_before_float_store.variants(source, name, rows, header=header)
+        result += rejected_branch_default.variants(source, name, rows, header=header)
+        result += measured_kmc_stack_pointer.variants(source, name, rows)
         result += measured_cursor_schedule.variants(source, name, header, rows, asm or '')
         result += measured_thread_addresses.variants(source, name, header, rows, resolve)
         result += measured_kmc_addresses.variants(source, name, header, rows, flags)
         result += measured_kmc_byte_stride.variants(source, name, header, rows)
         result += measured_kmc_branch_pointer.variants(source, name, header, rows)
         result += measured_kmc_byte_and_message.variants(source, name, header, rows)
+        result += measured_kmc_byte_global_pointer.variants(source, name, header, rows)
+        result += measured_kmc_byte_index_local.variants(source, name, header, rows)
         result += measured_kmc_byte_operations.variants(source, name, header, rows, resolve=resolve)
+        result += measured_kmc_call_counter.variants(source, name, header, rows)
         result += measured_kmc_call_setup.variants(source, name, header, rows)
         result += measured_kmc_call_stores.variants(source, name, header, rows, resolve)
+        result += measured_carried_loop_test.variants(source, name, header, rows)
+        result += measured_byte_clamp.variants(source, name, header, rows)
+        result += measured_varbyte_lookup.variants(source, name, header, rows, asm or '')
+        result += measured_indexed_clear.variants(source, name, header, rows)
+        result += measured_global_offset_reuse.variants(source, name, header, rows, asm or '')
+        result += measured_list_selection.variants(source, name, header, rows)
+        result += measured_signed_offset_helper.variants(source, name, header, rows)
+        result += measured_indirect_command_records.variants(source, name, header, rows)
+        result += measured_event_frame_capture.variants(source, name, header, rows)
+        result += measured_command_record_cursor.variants(source, name, header, rows)
+        result += measured_ring_global_capture.variants(source, name, header, rows)
+        result += measured_nibble_tables.variants(source, name, header, rows)
+        result += measured_indexed_record_layout.variants(source, name, header, rows)
+        result += measured_record_byte_offset.variants(source, name, header, rows)
+        result += measured_list_head_insert.variants(source, name, header, rows)
+        result += measured_be16_cursor.variants(source, name, header, rows)
+        result += measured_forwarded_counter.variants(source, name, header, rows, asm or '')
+        result += measured_flag_reload.variants(source, name, header, rows)
+        result += measured_guarded_flag_value.variants(source, name, header, rows)
+        result += measured_byte_global_branch.variants(source, name, header, rows)
+        result += measured_byte_clear_base.variants(source, name, header, rows)
+        result += measured_float_argument_pair.variants(source, name, header, rows)
+        result += measured_guarded_index.variants(source, name, header, rows)
+        result += measured_reset_loops.variants(source, name, header, rows)
+        result += measured_interpolation_calls.variants(source, name, header, rows)
+        result += measured_matrix_products.variants(source, name, header, rows)
+        result += measured_after_call_reload.variants(source, name, header, asm or '', resolve)
+        result += measured_indirect_self_call.variants(source, name, header, rows, asm or '', resolve)
         result += measured_kmc_command.variants(source, name, header, rows)
         result += measured_kmc_carriers.variants(source, name, header, rows)
         result += measured_kmc_cursor_switch.variants(source, name, header, rows)
+        result += measured_kmc_field_pointer.variants(source, name, header, rows)
+        result += measured_masked_halfword_read.variants(source, name, header, rows)
+        result += measured_branch_halfword_store.variants(source, name, header, rows)
+        result += measured_kmc_event_field_order.variants(source, name, header, rows)
+        result += measured_kmc_event_timestamp.variants(source, name, header, rows)
+        result += measured_kmc_halfword_flag_table.variants(source, name, header, rows)
+        result += measured_kmc_halfword_count_loop.variants(source, name, header, rows)
+        result += measured_kmc_indexed_byte_table.variants(source, name, header, rows)
+        result += measured_kmc_inferred_table_widths.variants(source, name, header, rows)
+        result += measured_kmc_indirect_byte_table.variants(source, name, header, rows)
+        result += measured_kmc_invariant_row.variants(source, name, header, rows)
+        result += measured_kmc_list_count.variants(source, name, header, rows)
+        result += measured_square_loads.variants(source, name, header, rows)
+        result += measured_kmc_list_append.variants(source, name, header, rows)
+        result += measured_kmc_null_table_loop.variants(source, name, header, rows)
+        result += measured_kmc_byte_cursor_return.variants(source, name, header, rows)
+        result += measured_kmc_varbyte_accumulator.variants(source, name, header, rows)
+        result += measured_kmc_varbyte_initialization.variants(source, name, header, rows)
+        result += measured_kmc_boolean_loop_flag.variants(source, name, header, rows)
+        result += measured_kmc_masked_rank_counter.variants(source, name, header, rows)
+        result += measured_kmc_unsigned_indexed_byte.variants(source, name, header, rows, asm)
+        result += measured_kmc_event_record.variants(source, name, header, rows)
         result += measured_kmc_flag_update.variants(source, name, header, rows)
+        result += measured_kmc_global_stores.variants(source, name, header, rows, resolve)
         result += measured_kmc_flow.variants(source, name, header, rows)
         result += measured_kmc_input.variants(source, name, header, rows, resolve)
         result += measured_halfword_switch.variants(source, name, header, rows)
+        result += measured_halfword_index.variants(source, name, header, rows, asm)
         result += measured_halfword_stores.variants(source, name, rows, resolve)
         result += measured_kmc_repeated_reads.variants(source, name, header, rows, resolve)
         result += measured_kmc_record_reads.variants(source, name, header, rows, resolve)
+        result += measured_kmc_relocated_pool.variants(source, name, header, rows, resolve)
+        result += measured_kmc_relocated_fields.variants(source, name, header, rows, resolve)
+        result += measured_kmc_split_table_index.variants(source, name, header, rows)
         result += measured_kmc_stack_and_call.variants(source, name, header, rows, resolve)
         result += measured_kmc_scalar_shapes.variants(source, name, header, rows, resolve=resolve, flags=flags)
+        result += measured_kmc_second_call_argument.variants(source, name, header, rows)
         result += measured_kmc_lifetimes.variants(source, name, header, rows)
+        result += measured_kmc_message_thread.variants(source, name, header, rows)
         result += measured_kmc_packed_bits.variants(source, name, header, rows)
+        result += measured_kmc_pointer_table_guard.variants(source, name, header, rows)
+        result += measured_kmc_two_byte_reader.variants(source, name, header, rows)
+        result += measured_kmc_variable_byte_cursor.variants(source, name, header, rows)
+        result += measured_kmc_byte_or.variants(source, name, header, rows)
         result += measured_kmc_vector_square.variants(source, name, header, rows)
         result += measured_kmc_wrappers.variants(source, name, header, rows)
         result += measured_stack_records.variants(source, name, header, rows)
     if toolchain.startswith('ido-7.1'):
+        result += measured_ido_byte_cursor.variants(source, name, header, rows)
+        result += measured_ido_index_update.variants(source, name, header, rows)
+        result += measured_ido_callback_offset.variants(source, name, header, rows)
+        # IDO 7.1 keeps the word of a local nothing reads: the frame's growth says how many, its declaration where
+        # (measured on a bit-stream reader; ido-5.3 is left out until a match there shows the same)
+        result += stack_padding_repairs.frame_word_candidates(source, name, arch, rows)
         return result
     target, candidate = (_instructions(rows, side) for side in (1,2))
     if toolchain.startswith('gcc-egcs'):
@@ -283,11 +531,34 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
         result += guard_reset_scheduling.variants(source, name, header, rows)
         result += global_pointer_local_repairs.scoped_field_reads(source, name, rows)
         result += measured_global_rebase.variants(source, name, header, rows, resolve=resolve)
+        result += measured_two_list_allocation.variants(source, name, header, rows)
+        result += measured_record_pointer_update.variants(source, name, header, rows)
+        result += measured_record_ramp.variants(source, name, header, rows)
+        result += measured_region_search.variants(source, name, header, rows)
+        result += measured_loop_delta_snapshot.variants(source, name, header, rows)
+        result += measured_magnitude_conversion.variants(source, name, header, rows)
+        result += measured_command_word_schedule.variants(source, name, header, rows)
+        result += measured_parameter_clock_load.variants(source, name, header, rows)
+        result += measured_byte_search_loop.variants(source, name, header, rows)
+        result += measured_byte_signature.variants(source, name, header, rows, resolve=resolve)
+        result += measured_indexed_mode_tail.variants(source, name, header, rows)
+        result += measured_byte_fallback_return.variants(source, name, header, rows)
+        result += measured_conditional_call_stage.variants(source, name, header, rows, resolve=resolve)
+        result += measured_lookup_owner.variants(source, name, header, rows)
+        result += measured_branch_byte_stores.variants(source, name, header, rows)
+        result += measured_wide_division_stride.variants(source, name, header, rows)
+        result += measured_slot_flip_copy.variants(source, name, header, rows, resolve=resolve)
+        result += measured_conditional_flag_owner.variants(source, name, header, rows, resolve=resolve)
+        result += measured_zero_record_pairs.variants(source, name, header, rows, resolve=resolve)
+        result += measured_packing_stage.variants(source, name, header, rows)
+        result += measured_loop_search_target.variants(source, name, header, rows)
+        result += measured_saved_global.variants(source, name, header, rows, resolve=resolve)
         result += measured_memory_order.variants(source,name,rows,resolve=resolve,header=header)
         result += measured_memory_order.staged_field_masks(source, name, rows, header)
         result += search_exit_loop_repairs.sentinel_byte_guard_variants(source, name, rows)
         result += loop_counter_roles_repairs.guarded_reuse_variants(source, name, rows)
         result += measured_float_grid_stores.variants(source, name, rows)
+        result += measured_forwarded_pointer.variants(source, name, header, asm or '')
         result += float_intermediate_repairs.repeated_products(source, name, rows)
         result += measured_expression_repairs.variants(source,name,header,rows)
         result += stack_byte_init_repairs.variants(source, name, header, rows)
@@ -307,6 +578,11 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
                 result.append(('relocated_branch_byte', candidate_source))
         if candidate_source := relocated_global_update.rewrite_countdown(source, name, asm or '', header, resolve):
             result.append(('relocated_countdown', candidate_source))
+        if candidate_source := relocated_global_update.rewrite_increment(source, name, asm or '', header, resolve):
+            result.append(('relocated_global_increment', candidate_source))
+        if candidate_source := relocated_global_update.rewrite_hoisted_word_read(source, name, rows, asm or '', header, resolve):
+            result.append(('relocated_hoisted_word_read', candidate_source))
+        result += relocated_pointer_reloads.variants(source, name, header, rows, asm or '', resolve, flags)
         if candidate_source := stack_fill_drafts.rewrite(source, name, asm or '', header):
             result.append(('descending_stack_fill', candidate_source))
         if candidate_source := stack_fill_drafts.rewrite_ascending(source, name, asm or '', header):
@@ -359,11 +635,14 @@ def proposals(source, name, header, arch, toolchain, rows, asm, jump_tables=(), 
         if candidate_source := measured_address_repairs.rewrite_byte_offsets(source, name, asm or '', header):
             result.append(('byte_scaled_global_offset', candidate_source))
         result += measured_address_repairs.variants(source,name,header,rows,symbols)
+        result += measured_pointer_displacement.variants(source,name,header,rows)
         result += measured_pointer_scale.variants(source,name,header,rows)
         result += target_string_repairs.verified_variants(source, name, header, rows, read_data)
         result += measured_immediate_repairs.variants(source,name,rows)
         result += measured_narrow_use.variants(source, name, rows)
         result += symbol_width_repairs.signed_halfword_load_variants(source, name, rows)
+        if big_endian:
+            result += symbol_width_repairs.signed_byte_base_variants(source, name, rows, header)
         result += measured_narrow_use.boolean_byte_carriers(source, name, rows)
         result += measured_narrow_use.byte_backedge_variants(source, name, rows)
         result += measured_narrow_use.shared_halfword_index_variants(source, name, rows)

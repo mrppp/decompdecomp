@@ -360,6 +360,18 @@ class Console:
         """Return the checked cartridge placement for an independently loaded function."""
         return None
 
+    def separate_overlay_reference(self, binding, number):
+        """Return a separate source name for the same loader binding, where supported."""
+        return binding
+
+    def overlay_cartridge_placement(self, fn, cfg):
+        """Return loader metadata for a stored row with a verified placement."""
+        return None
+
+    def overlay_metadata_updates(self, image, cfg, rows):
+        """Yield fresh metadata for existing functions after checking the original loader records."""
+        return ()
+
     def rebuild_overlays(self, image, entries):
         """Put compiled overlay text back in the cartridge using its loader format."""
         if entries:

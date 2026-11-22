@@ -34,6 +34,24 @@ def test_rebuild_uso_checks_text_and_symbol_binding(tmp_path, compressed):
     result = uso_match.link(wrong.obj, 'test_entry', code, info)
     assert result.instructions_exact and not result.exact
     assert any(binding in problem for problem in result.problems)
+    from types import SimpleNamespace
+
+    from decompnet.app.donor_relocations import overlay_names
+    from decompnet.app.source_symbol_recovery import rename
+    from decompnet.app.twins import Print
+
+    target = uso_match.Target('test_entry', 4, code, [], uso=info)
+    net = SimpleNamespace(console=lambda _: SimpleNamespace(export_overlay=lambda t: t.uso),
+                          _rom_target=lambda _: target,
+                          _target_obj=lambda *_: uso_match.symbolic_target(target))
+    wrong_symbol = uso_match.alias(region.offset, 2)
+    donor = Print('fingerprint', [wrong_symbol], len(code), layout=[(8, 4)])
+    mapping = overlay_names(net, {}, {'name': 'test_entry'}, donor, 'original_entry')
+    assert mapping == {'original_entry': 'test_entry', wrong_symbol: binding}
+    donor_source = source.replace(binding, wrong_symbol).replace('test_entry', 'original_entry')
+    rebound = compile_source(cfg, '', rename(donor_source, mapping))
+    assert rebound.ok, rebound.log
+    assert uso_match.link(rebound.obj, 'test_entry', code, info).exact
     with pytest.raises(ValueError, match='no longer matches'):
         uso.rebuild(cartridge, [('test_entry', info, wrong.obj)])
     with pytest.raises(ValueError, match='placement'):
@@ -57,3 +75,686 @@ def test_yay0_rebuild_uses_literals_and_verifies_back_references():
     assert result != compressed
     assert uso._yay0(result) == changed
     assert uso._yay0(compressed, changed[:-1] + b'q') is None
+
+
+@pytest.mark.parametrize("cpp", [False, True])
+def test_overlay_replays_distinct_loader_calls_from_one_donor_placeholder(tmp_path, cpp):
+    import threading
+    from unittest.mock import Mock
+
+    from decompnet.app.overlay_donor_aliases import retry
+
+    toolchain = 'ido-7.1-ncc' if cpp else 'ido-5.3'
+    if toolchains.installed(toolchain) is None:
+        pytest.skip(f'needs {toolchain}')
+    flags = ['-O2', '-G', '0', '-non_shared', '-mips2', '-32'] if cpp else toolchains.get(toolchain).flags
+    cfg = compiler_config(tmp_path, {'compiler': {'toolchain': toolchain, 'flags': flags}})
+    source = 'void example(void) { placeholder(1); placeholder(2); }'
+    header = 'extern void placeholder(int);'
+    if cpp:
+        header = 'extern "C" { void placeholder(int); }\ninline void first_call() { placeholder(1); }'
+        source = 'extern "C" void example() { first_call(); placeholder(2); }'
+    section = 64
+    first, second = uso_match.alias(section, 1), uso_match.alias(section, 2)
+    original = compile_source(cfg, header, source)
+    assert original.ok, original.log
+    from decompnet.elfobj import extract_function
+    raw = extract_function(original.obj, 'example')
+    sites = [(r.offset, r.type, i) for i, r in enumerate(raw.relocs, 1)]
+    assert len(sites) == 2
+    info = {'section': section, 'start': 0, 'size': len(raw.code), 'relocs': sites}
+    target = uso_match.symbolic_target(uso_match.Target('example', 0, raw.code, [], uso=info))
+    baseline = uso_match.link(original.obj, 'example', raw.code, info)
+    assert baseline.instructions_exact and not baseline.exact
+
+    def measure(text, context):
+        build = compile_source(cfg, context, text)
+        assert build.ok, build.log
+        return uso_match.link(build.obj, 'example', raw.code, info).candidate
+
+    stopped = threading.Event()
+    stopped.set()
+    forbidden = Mock(side_effect=AssertionError('stopped probe ran'))
+    assert retry(source, header, 'example', baseline.candidate, target, forbidden, stopped) is None
+    rewritten, context = retry(source, header, 'example', baseline.candidate, target, measure, threading.Event())
+    assert f'{first}(1)' in (context if cpp else rewritten) and f'{second}(2)' in rewritten
+    result = compile_source(cfg, context, rewritten)
+    assert result.ok, result.log
+    assert uso_match.link(result.obj, 'example', raw.code, info).exact
+
+
+def test_local_overlay_calls_link_and_rebuild_with_distinct_offsets(tmp_path):
+    from threading import Event
+
+    from decompnet.app.overlay_donor_aliases import retry
+    from decompnet.elfobj import extract_function
+
+    if toolchains.installed('ido-5.3') is None:
+        pytest.skip('needs IDO 5.3')
+    cfg = compiler_config(tmp_path, {'compiler': {'toolchain': 'ido-5.3', 'flags': toolchains.get('ido-5.3').flags}})
+    source = 'void example(void) { placeholder(1); placeholder(2); }'
+    header = 'void placeholder(int);'
+    baseline = compile_source(cfg, header, source)
+    assert baseline.ok, baseline.log
+    body = extract_function(baseline.obj, 'example')
+    assert len(body.relocs) == 2
+    offsets = (0x60, 0x70)
+    assert len(body.code) + 4 < min(offsets)
+    code = bytearray(body.code)
+    records = []
+    for reloc, offset in zip(body.relocs, offsets, strict=True):
+        assert reloc.type == 4
+        code[reloc.offset:reloc.offset + 4] = (0x0c000000 | offset >> 2).to_bytes(4, 'big')
+        records.append(struct.pack('>III', 0x11, 4 + reloc.offset, 0))
+    code = bytes(code)
+    text = (bytes(4) + code).ljust(0x80, b'\0')
+    cartridge = bytes(64) + _module(text, relocations=b''.join(records), text_base=True)
+    region, = uso.read(cartridge)
+    relocs = uso.function_relocations(region, 4, len(code))
+    calls = uso.function_local_calls(region, 4, len(code), relocs)
+    assert calls == [[r.offset, 1, offset] for r, offset in zip(body.relocs, offsets, strict=True)]
+    info = {'section': region.offset, 'start': 4, 'size': len(code), 'relocs': relocs, 'local_calls': calls}
+    import json
+
+    legacy = dict(info)
+    legacy.pop('local_calls')
+    row = {'id': 17, 'meta': json.dumps({'uso': legacy}), 'target': code, 'rom_offset': 256 + 4}
+    banks = {str(region.offset): 256}
+    updated, = uso.metadata_updates(cartridge, banks, [row])
+    assert updated[0] == row['id'] and json.loads(updated[1])['uso'] == info
+    assert list(uso.metadata_updates(cartridge, banks, [row | {'target': bytes(len(code))}])) == []
+    assert list(uso.metadata_updates(cartridge, banks, [row | {'rom_offset': 4}])) == []
+
+    original = uso_match.link(baseline.obj, 'example', code, info)
+    assert not original.exact
+    target = uso_match.symbolic_target(uso_match.Target('example', 4, code, [], uso=info))
+
+    def measure(text, context):
+        built = compile_source(cfg, context, text)
+        assert built.ok, built.log
+        return uso_match.link(built.obj, 'example', code, info).candidate
+
+    rebound, context = retry(source, header, 'example', original.candidate, target, measure, Event())
+    built = compile_source(cfg, context, rebound)
+    assert built.ok, built.log
+    linked = uso_match.link(built.obj, 'example', code, info)
+    assert linked.exact and linked.linked_code == code
+    assert uso.rebuild(cartridge, [('example', info, built.obj)]) == cartridge
+    assert not uso_match.link(built.obj, 'example', code, info | {'local_calls': []}).exact
+    wrong = compile_source(cfg, context, rebound.replace(target.relocs[0].symbol, target.relocs[1].symbol))
+    assert wrong.ok, wrong.log
+    assert not uso_match.link(wrong.obj, 'example', code, info).exact
+    with pytest.raises(ValueError, match='local call metadata'):
+        uso.rebuild(cartridge, [('example', info | {'local_calls': calls[:1]}, built.obj)])
+
+
+@pytest.mark.parametrize('start,end', [(2, 9), (9, 2), (8190, 8193)])
+def test_overlay_data_rebase_preserves_compiler_relocations_and_exact_bytes(tmp_path, start, end):
+    from decompnet.app.overlay_donor_aliases import offset_retry
+    from decompnet.elfobj import extract_function
+
+    if not toolchains.installed('ido-5.3'):
+        pytest.skip('needs IDO 5.3')
+    cfg = compiler_config(tmp_path, {'compiler': {'toolchain': 'ido-5.3', 'flags': toolchains.get('ido-5.3').flags}})
+    binding = uso_match.alias(64, 1)
+    header = '/* donor declaration */ extern int donor_data[];'
+    source = f'int example(void) {{ return donor_data[{start}]; }}'
+    original = compile_source(cfg, header, source)
+    expected = compile_source(cfg, f'extern int {binding}[16384];',
+                              f'int example(void) {{ return {binding}[{end}]; }}')
+    assert original.ok, original.log
+    assert expected.ok, expected.log
+    a = extract_function(original.obj, 'example')
+    b = extract_function(expected.obj, 'example')
+    info = {'section': 64, 'relocs': [(r.offset, r.type, 1) for r in b.relocs]}
+    baseline = uso_match.link(original.obj, 'example', b.code, info)
+    assert not baseline.exact and a.code != b.code
+    target = uso_match.symbolic_target(uso_match.Target('example', 0, b.code, [], uso=info))
+    changed, context = offset_retry(source, header, 'example', baseline.candidate, target)
+    rebuilt = compile_source(cfg, context, changed)
+    assert rebuilt.ok, rebuilt.log
+    verified = uso_match.link(rebuilt.obj, 'example', b.code, info)
+    assert verified.exact
+    delta = 4 * (end - start)
+    assert f'+ ({delta})' in changed
+    wrong = compile_source(cfg, context, changed.replace(f'+ ({delta})', f'+ ({delta + 4})'))
+    assert wrong.ok, wrong.log
+    assert not uso_match.link(wrong.obj, 'example', b.code, info).exact
+
+
+@pytest.mark.parametrize('changed_offsets,shared_binding', [(False, False), (True, False), (True, True)])
+def test_overlay_probes_a_c_linkage_data_declaration_in_cpp(tmp_path, changed_offsets, shared_binding):
+    from threading import Event
+
+    from decompnet.app.overlay_donor_aliases import retry
+    from decompnet.elfobj import extract_function
+
+    toolchain = 'ido-7.1-ncc'
+    if not toolchains.installed(toolchain):
+        pytest.skip('needs IDO 7.1 NCC')
+    cfg = compiler_config(tmp_path, {'compiler': {'toolchain': toolchain, 'flags': ['-O2', '-mips2', '-G', '0', '-non_shared']}})
+    header = 'extern "C" { extern volatile int data_word[64]; void consume(int); }'
+    donor = 'extern "C" int example() { consume(data_word[2]); return data_word[3]; }'
+    section = 64
+    first, second, call = (uso_match.alias(section, i) for i in (1, 2, 3))
+    if shared_binding:
+        second = first
+        donor = donor.replace('data_word', first)
+        header = header.replace('data_word', first)
+    baseline = compile_source(cfg, header, donor)
+    assert baseline.ok, baseline.log
+    expected_header = f'extern "C" {{ extern volatile int {first}[64]; extern volatile int {second}[64]; void {call}(int); }}'
+    i, j = (9, 11) if changed_offsets else (2, 3)
+    expected_c = f'extern "C" int example() {{ {call}({first}[{i}]); return {second}[{j}]; }}'
+    expected = compile_source(cfg, expected_header, expected_c)
+    assert expected.ok, expected.log
+    wanted = extract_function(expected.obj, 'example')
+    indices = {second: 2, first: 1, call: 3}
+    info = {'section': section, 'relocs': [[r.offset, r.type, indices[r.symbol]] for r in wanted.relocs]}
+    original = uso_match.link(baseline.obj, 'example', wanted.code, info)
+    assert not original.exact
+    target = uso_match.symbolic_target(uso_match.Target('example', 0, wanted.code, [], uso=info))
+
+    def measure(text, context):
+        built = compile_source(cfg, context, text)
+        assert built.ok, built.log
+        return uso_match.link(built.obj, 'example', wanted.code, info).candidate
+
+    source, header = retry(donor, header, 'example', original.candidate, target, measure, Event())
+    built = compile_source(cfg, header, source)
+    assert built.ok, built.log
+    assert uso_match.link(built.obj, 'example', wanted.code, info).exact
+    assert 'decomp_donor_probe_' not in source + header
+    if changed_offsets:
+        assert '+ (28)' in source
+        wrong = compile_source(cfg, header, source.replace('+ (28)', '+ (24)'))
+        assert wrong.ok, wrong.log
+        assert not uso_match.link(wrong.obj, 'example', wanted.code, info).exact
+
+
+def test_donor_local_text_calls_bind_to_an_independently_linked_overlay(tmp_path):
+    from decompnet.app.overlay_donor_aliases import local_functions
+    from decompnet.elfobj import extract_function
+
+    if toolchains.installed('ido-7.1') is None:
+        pytest.skip('needs IDO 7.1')
+    cfg = compiler_config(tmp_path, {'compiler': {
+        'toolchain': 'ido-7.1', 'flags': ['-O2', '-G', '0', '-non_shared', '-mips2'],
+    }})
+    header = """
+        extern volatile int counter;
+        static void helper_a(int x) { counter = x; }
+        static void helper_b(int x) { counter += x; }
+    """
+    source = 'void entry(int x) { helper_a(x); helper_b(x + 1); }'
+    original = compile_source(cfg, header, source)
+    assert original.ok, original.log
+    body = extract_function(original.obj, 'entry')
+    assert [(r.type, r.symbol) for r in body.relocs] == [(4, 'helper_a'), (4, 'helper_b')]
+    offsets = (0x80, 0xA0)
+    code = bytearray(body.code)
+    calls = []
+    for reloc, offset in zip(body.relocs, offsets, strict=True):
+        code[reloc.offset:reloc.offset + 4] = (0x0c000000 | offset >> 2).to_bytes(4, 'big')
+        calls.append([reloc.offset, 1, offset])
+    info = {'section': 32, 'start': 0, 'size': len(code), 'relocs': [[at, 4, index] for at, index, _ in calls],
+            'local_calls': calls}
+    expected = uso_match.symbolic_target(uso_match.Target('entry', 0, bytes(code), [], uso=info))
+    initial = uso_match.link(original.obj, 'entry', bytes(code), info)
+    assert not initial.exact
+    assert [(r.type, r.symbol) for r in initial.candidate.relocs] == [(4, '.text'), (4, '.text')]
+    assert [r.addend for r in initial.candidate.relocs] != [offset // 4 for offset in offsets]
+    rebound, context = local_functions(source, header, 'entry', original.obj, initial.candidate, expected)
+    assert 'static' not in context and 'counter' not in context
+    for reloc in expected.relocs:
+        assert reloc.symbol in context and reloc.symbol in rebound
+    compiled = compile_source(cfg, context, rebound)
+    assert compiled.ok, compiled.log
+    assert uso_match.link(compiled.obj, 'entry', bytes(code), info).exact
+    first, second = (r.symbol for r in expected.relocs)
+    wrong = compile_source(cfg, context, rebound.replace(second, first))
+    assert wrong.ok, wrong.log
+    assert not uso_match.link(wrong.obj, 'entry', bytes(code), info).exact
+
+
+def test_recovers_loader_metadata_for_raw_functions_with_an_existing_runtime_address(tmp_path):
+    import json
+
+    from decompnet import consoles
+
+    code = bytes.fromhex('27bdffe8 afbf0014 0c000000 00000000 8fbf0014 27bd0018 03e00008 00000000')
+    records = struct.pack('>III', 0x11, 12, 1)
+    cartridge = bytes(64) + _module(bytes(4) + code, compressed=False, relocations=records)
+    region, = uso.read(cartridge)
+    row = {'id': 1, 'name': 'entry', 'vram': 0x80010000, 'rom_offset': region.offset + 4,
+           'size': len(code), 'target': code, 'relocs': '[]', 'meta': None}
+    good, = uso.metadata_updates(cartridge, {}, [row])
+    assert good[0] == 1
+    info = json.loads(good[1])['uso']
+    assert info == {'section': region.offset, 'start': 4, 'size': len(code), 'relocs': [[8, 4, 1]], 'native': True}
+    assert not list(uso.metadata_updates(cartridge, {}, [row | {'rom_offset': region.offset},
+                                                         row | {'target': b'\0' * len(code)}]))
+    compressed = bytes(64) + _module(bytes(4) + code, compressed=True, relocations=records)
+    assert not list(uso.metadata_updates(compressed, {}, [row]))
+
+    cfg = {'platform': 'n64'}
+    console = consoles.of(cfg)
+    recovered = row | {'meta': good[1]}
+    target = console.target_from_row(recovered, cfg)
+    assert target.vram == row['vram'] and target.code == code and console.export_overlay(target) == info
+    misplaced = recovered | {'rom_offset': row['rom_offset'] + 4}
+    assert console.export_overlay(console.target_from_row(misplaced, cfg)) is None
+
+    if toolchains.installed('ido-5.3') is None:
+        pytest.skip('needs IDO 5.3')
+    compiler = compiler_config(tmp_path, {'compiler': {'toolchain': 'ido-5.3', 'flags': toolchains.get('ido-5.3').flags}})
+    alias = uso_match.alias(region.offset, 1)
+    source = f'extern void {alias}(void); void entry(void) {{ {alias}(); }}'
+    built = compile_source(compiler, '', source)
+    assert built.ok, built.log
+    assert console.link_function(built.obj, 'entry', target, None, None).exact
+    assert console.rebuild_overlays(cartridge, [('entry', info, built.obj)]) == cartridge
+
+
+
+def test_split_keeps_a_raw_overlay_function_identity_and_records_its_loader_relocations(tmp_path):
+    from decompnet.rom.split import SplitResult, function_from_bytes
+
+    code = bytes.fromhex('27bdffe8 afbf0014 0c000000 00000000 8fbf0014 27bd0018 03e00008 00000000')
+    records = struct.pack('>III', 0x11, 12, 1)
+    cartridge = bytes(64) + _module(bytes(4) + code, compressed=False, relocations=records)
+    region, = uso.read(cartridge)
+    fn = function_from_bytes('entry', code, region.offset + 4, 0x80010000, 'main')
+    result = SplitResult([fn], [], [], {}, tmp_path / 'game.yaml', 'IDO', '', image='game.z64')
+    (tmp_path / result.image).write_bytes(cartridge)
+    uso.add_to_split(result, tmp_path, cartridge, lambda *_: None)
+    assert result.functions == [fn]
+    assert (fn.name, fn.vram, fn.rom) == ('entry', 0x80010000, region.offset + 4)
+    assert fn.uso['native'] is True and fn.uso['relocs'] == [[8, 4, 1]]
+
+
+def test_distinct_donor_references_preserve_two_relocations_to_one_loader_binding(tmp_path):
+    from decompnet import consoles
+    from decompnet.app.donor_relocations import separate_overlay_references
+    from decompnet.app.source_symbol_recovery import rename
+    from decompnet.elfobj import extract_function
+
+    if toolchains.installed('ido-7.1') is None:
+        pytest.skip('needs IDO 7.1')
+    cfg = compiler_config(tmp_path, {'compiler': {
+        'toolchain': 'ido-7.1', 'flags': ['-O2', '-G', '0', '-non_shared', '-mips2'],
+    }})
+    header = 'extern char first[]; extern char second[]; extern void step(int);'
+    source = '''void entry(void) {
+        int a = (int)first;
+        int b = (int)second;
+        *(int *)(a + 0x214) = 1;
+        step(0);
+        *(char *)(b + 0x378) = 0;
+    }'''
+    donor = compile_source(cfg, header, source)
+    assert donor.ok, donor.log
+    body = extract_function(donor.obj, 'entry')
+    indices = {'first': 1, 'second': 1, 'step': 2}
+    info = {'section': 64, 'start': 0, 'size': len(body.code),
+            'relocs': [[r.offset, r.type, indices[r.symbol]] for r in body.relocs]}
+    aliases = {name: uso_match.alias(64, index) for name, index in indices.items()}
+    collapsed = compile_source(cfg, rename(header, aliases), rename(source, aliases))
+    assert collapsed.ok, collapsed.log
+    assert not uso_match.link(collapsed.obj, 'entry', body.code, info).exact
+
+    distinct = separate_overlay_references(consoles.of({'platform': 'n64'}), aliases)
+    assert distinct['first'] != distinct['second']
+    verified = compile_source(cfg, rename(header, distinct), rename(source, distinct))
+    assert verified.ok, verified.log
+    assert uso_match.link(verified.obj, 'entry', body.code, info).exact
+    wrong = distinct | {'second': uso_match.separate_reference(uso_match.alias(64, 3), 2)}
+    compiled = compile_source(cfg, rename(header, wrong), rename(source, wrong))
+    assert compiled.ok, compiled.log
+    result = uso_match.link(compiled.obj, 'entry', body.code, info)
+    assert result.instructions_exact and not result.exact
+
+
+def test_fixed_offset_recovery_declines_a_partially_supported_rebase(tmp_path):
+    from decompnet.app.overlay_donor_aliases import offset_retry
+    from decompnet.elfobj import extract_function
+
+    if not toolchains.installed('ido-7.1'):
+        pytest.skip('needs IDO 7.1')
+    cfg = compiler_config(tmp_path, {'compiler': {
+        'toolchain': 'ido-7.1', 'flags': ['-O2', '-G', '0', '-non_shared', '-mips2'],
+    }})
+    header = 'extern volatile int mixed[128]; extern volatile int separate[128]; extern void consume(int);'
+    source = 'int entry(void) { consume(mixed[2]); consume(separate[1]); return mixed[3]; }'
+    baseline = compile_source(cfg, header, source)
+    assert baseline.ok, baseline.log
+    desired = compile_source(cfg, header, source.replace('mixed[2]', 'mixed[9]').replace(
+        'mixed[3]', 'mixed[11]').replace('separate[1]', 'separate[2]'))
+    assert desired.ok, desired.log
+    out = extract_function(desired.obj, 'entry')
+    indices = {'mixed': 1, 'separate': 2, 'consume': 3}
+    info = {'section': 64, 'relocs': [[r.offset, r.type, indices[r.symbol]] for r in out.relocs]}
+    expected = uso_match.symbolic_target(uso_match.Target('entry', 0, out.code, [], uso=info))
+    original = uso_match.link(baseline.obj, 'entry', out.code, info).candidate
+    assert offset_retry(source, header, 'entry', original, expected) is None
+
+
+@pytest.mark.parametrize('definition', [
+    '',  # An implicit C89 call still emits an ordinary external relocation.
+    'placeholder() { }',
+    'int placeholder(int value) { return value + 3; }',
+    'int placeholder(value) short value; { return value + 3; }',
+])
+def test_overlay_probes_calls_to_a_defined_donor_helper(tmp_path, definition):
+    from threading import Event
+
+    from decompnet.app.overlay_donor_aliases import retry
+    from decompnet.elfobj import extract_function
+
+    if not toolchains.installed('ido-7.1'):
+        pytest.skip('needs IDO 7.1')
+    cfg = compiler_config(tmp_path, {'compiler': {
+        'toolchain': 'ido-7.1', 'flags': ['-O2', '-G', '0', '-non_shared', '-mips2'],
+    }})
+    header = definition + '\n'
+    source = 'int entry(int value) { placeholder(value); return placeholder(value + 1); }'
+    original = compile_source(cfg, header, source)
+    assert original.ok, original.log
+    body = extract_function(original.obj, 'entry')
+    assert len(body.relocs) == 2
+    info = {'section': 64, 'relocs': [[r.offset, r.type, i] for i, r in enumerate(body.relocs, 1)]}
+    expected = uso_match.symbolic_target(uso_match.Target('entry', 0, body.code, [], uso=info))
+    baseline = uso_match.link(original.obj, 'entry', body.code, info)
+    assert not baseline.exact
+
+    def measure(text, context):
+        built = compile_source(cfg, context, text)
+        assert built.ok, built.log
+        return uso_match.link(built.obj, 'entry', body.code, info).candidate
+
+    rewritten, context = retry(source, header, 'entry', baseline.candidate, expected, measure, Event())
+    rebuilt = compile_source(cfg, context, rewritten)
+    assert rebuilt.ok, rebuilt.log
+    assert uso_match.link(rebuilt.obj, 'entry', body.code, info).exact
+    wrong = compile_source(cfg, context, rewritten.replace(uso_match.alias(64, 2), uso_match.alias(64, 1)))
+    assert wrong.ok, wrong.log
+    assert not uso_match.link(wrong.obj, 'entry', body.code, info).exact
+
+
+@pytest.mark.parametrize(('ctype', 'suffix', 'fmt', 'opcode'), [
+    ('float', 'f', '>f', 0x31),
+    ('double', '', '>d', 0x35),
+])
+def test_anonymous_object_pool_requires_cartridge_bytes_and_original_loader_sites(tmp_path, ctype, suffix, fmt, opcode):
+    import json
+
+    from decompnet.elfobj import extract_function
+
+    if not toolchains.installed('ido-7.1'):
+        pytest.skip('needs IDO 7.1')
+    cfg = compiler_config(tmp_path, {'compiler': {
+        'toolchain': 'ido-7.1', 'flags': ['-O2', '-G', '0', '-non_shared', '-mips2'],
+    }})
+    obj = compile_source(cfg, '', f'{ctype} entry(void) {{ return 0.4{suffix}; }}')
+    assert obj.ok, obj.log
+    fn = extract_function(obj.obj, 'entry')
+    assert [r.type for r in fn.relocs] == [5, 6]
+    code = bytearray(fn.code)
+    load = fn.relocs[1].offset
+    assert code[load] >> 2 == opcode
+    code[load+2:load+4] = (32).to_bytes(2, 'big')
+
+    def record(kind, body):
+        return struct.pack('>III', kind, len(body), 0x10000000) + body
+
+    def cartridge(value, rodata_relocs=b''):
+        symbols = struct.pack('>6I', 0x520000, 4, 0, 0x740000, 0, 0)
+        relocs = b''.join(struct.pack('>III', 0x13 if r.type == 5 else 0x12, r.offset + 4, 0) for r in fn.relocs)
+        return (bytes(64) + struct.pack('>III', 0x12345678, 1, 1) + b'pool.uso\0'
+                + struct.pack('>IIII', 0x12345678, 0, 0, 0)
+                + record(1, symbols) + record(2, relocs) + record(4, rodata_relocs)
+                + record(5, bytes(4) + bytes(code)) + record(7, bytes(32) + struct.pack(fmt, value))
+                + record(11, b''))
+
+    def placement(image):
+        region, = uso.read(image)
+        relocs = uso.function_relocations(region, 4, len(code))
+        return {'section': region.offset, 'start': 4, 'size': len(code), 'relocs': relocs,
+                'pool_loads': uso.function_pool_loads(region, 4, len(code), relocs)}
+
+    image = cartridge(0.4)
+    info = placement(image)
+    assert info['pool_loads'] == [[load, 1, struct.pack(fmt, 0.4).hex()]]
+    older = {key: value for key, value in info.items() if key != 'pool_loads'}
+    row = {'id': 1, 'rom_offset': info['section'] + 4, 'target': bytes(code),
+           'meta': json.dumps({'uso': older | {'native': True}})}
+    update, = uso.metadata_updates(image, {}, [row])
+    assert json.loads(update[1])['uso'] == info | {'native': True}
+    assert not uso_match.link(obj.obj, 'entry', bytes(code), info | {'pool_loads': []}).exact
+    assert uso_match.link(obj.obj, 'entry', bytes(code), info).exact
+    assert uso.rebuild(image, [('entry', info, obj.obj)]) == image
+    wrong = cartridge(0.4000000000000001 if ctype == 'double' else 0.7)
+    assert not uso_match.link(obj.obj, 'entry', bytes(code), placement(wrong)).exact
+    with pytest.raises(ValueError, match='constant pool metadata'):
+        uso.rebuild(wrong, [('entry', info, obj.obj)])
+    relocated = cartridge(0.4, struct.pack('>III', 0x14, 32 + struct.calcsize(fmt) - 4, 0))
+    assert placement(relocated)['pool_loads'] == []
+
+
+def test_refresh_adds_wider_pool_read_to_existing_metadata(monkeypatch):
+    import json
+
+    code = struct.pack('>III', 0x3C020000, 0xC4400000, 0xD4420008)
+    region = uso.Text('pool.uso', 128, code, False, relocations=((0, 5, 1), (4, 6, 1), (8, 6, 1)),
+                      rodata=bytes(range(16)), rodata_bases=(1,), rodata_relocations=())
+    monkeypatch.setattr(uso, 'read', lambda image: [region])
+    old_load = [4, 1, '00010203']
+    info = {'section': 128, 'start': 0, 'size': len(code), 'native': True,
+            'relocs': [[0, 5, 1], [4, 6, 1], [8, 6, 1]], 'pool_loads': [old_load]}
+    row = {'id': 1, 'rom_offset': 128, 'target': code, 'meta': json.dumps({'uso': info})}
+    _, refreshed = next(uso.metadata_updates(b'', {}, [row]))
+    assert json.loads(refreshed)['uso']['pool_loads'] == [old_load, [8, 1, '08090a0b0c0d0e0f']]
+    stale = info | {'pool_loads': [[4, 1, '00010204']]}
+    assert list(uso.metadata_updates(b'', {}, [row | {'meta': json.dumps({'uso': stale})}])) == []
+
+
+@pytest.mark.parametrize('definition', [
+    'placeholder() { }',
+    'int placeholder(int value) { return value + 3; }',
+    'int placeholder(value) short value; { return value + 3; }',
+])
+def test_overlay_named_binding_externalizes_only_referenced_direct_calls(tmp_path, definition):
+    from decompnet.app.overlay_donor_aliases import named_bindings
+    from decompnet.app.source_symbol_recovery import relocation_aliases
+    from decompnet.elfobj import extract_function
+
+    if not toolchains.installed('ido-7.1'):
+        pytest.skip('needs IDO 7.1')
+    cfg = compiler_config(tmp_path, {'compiler': {
+        'toolchain': 'ido-7.1', 'flags': ['-O2', '-G', '0', '-non_shared', '-mips2'],
+    }})
+    header = definition + '\nint real(void) { return 9; }\n'
+    source = 'int entry(int value) { return placeholder(value); }'
+    built = compile_source(cfg, header, source)
+    assert built.ok, built.log
+    body = extract_function(built.obj, 'entry')
+    reloc, = body.relocs
+    info = {'section': 64, 'relocs': [[reloc.offset, reloc.type, 1]]}
+    target = uso_match.symbolic_target(uso_match.Target('entry', 0, body.code, [], uso=info))
+    baseline = uso_match.link(built.obj, 'entry', body.code, info)
+    aliases = relocation_aliases(baseline.candidate, target)
+    assert aliases == {'placeholder': uso_match.alias(64, 1)}
+    renamed = compile_source(cfg, header.replace('placeholder', aliases['placeholder']),
+                             source.replace('placeholder', aliases['placeholder']))
+    assert renamed.ok, renamed.log
+    assert not uso_match.link(renamed.obj, 'entry', body.code, info).exact
+
+    rewritten, context = named_bindings(source, header, baseline.candidate, aliases)
+    assert 'int real(void) { return 9; }' in context
+    rebuilt = compile_source(cfg, context, rewritten)
+    assert rebuilt.ok, rebuilt.log
+    assert uso_match.link(rebuilt.obj, 'entry', body.code, info).exact
+
+    _, context = named_bindings(source, 'static int placeholder(void) { return 9; }', baseline.candidate, aliases)
+    assert '{ return 9; }' in context
+
+
+def test_overlay_probes_preserve_conflicting_types_for_one_loader_symbol(tmp_path):
+    from threading import Event
+
+    from decompnet import consoles
+    from decompnet.app.donor_relocations import separate_overlay_references
+    from decompnet.app.overlay_donor_aliases import retry
+    from decompnet.elfobj import extract_function
+
+    if not toolchains.installed('ido-7.1'):
+        pytest.skip('needs IDO 7.1')
+    cfg = compiler_config(tmp_path, {'compiler': {
+        'toolchain': 'ido-7.1', 'flags': ['-O2', '-G', '0', '-non_shared', '-mips2'],
+    }})
+    header = 'extern int first[];\nextern unsigned char second;\nextern void placeholder(int);'
+    source = 'void entry(void) { placeholder(first[0]); placeholder(second); }'
+    built = compile_source(cfg, header, source)
+    assert built.ok, built.log
+    body = extract_function(built.obj, 'entry')
+    calls = iter((2, 3))
+    info = {'section': 64, 'relocs': [[r.offset, r.type, next(calls) if r.type == 4 else 1] for r in body.relocs]}
+    target = uso_match.symbolic_target(uso_match.Target('entry', 0, body.code, [], uso=info))
+    original = uso_match.link(built.obj, 'entry', body.code, info).candidate
+
+    def measure(text, context):
+        trial = compile_source(cfg, context, text)
+        assert trial.ok, trial.log
+        return uso_match.link(trial.obj, 'entry', body.code, info).candidate
+
+    text, context = retry(source, header, 'entry', original, target, measure, Event())
+    assert not compile_source(cfg, context, text).ok
+
+    console = consoles.of({'platform': 'n64'})
+    text, context = retry(source, header, 'entry', original, target, measure, Event(),
+                          separate=lambda bindings: separate_overlay_references(console, bindings))
+    rebuilt = compile_source(cfg, context, text)
+    assert rebuilt.ok, rebuilt.log
+    assert uso_match.link(rebuilt.obj, 'entry', body.code, info).exact
+    assert not uso_match.link(rebuilt.obj, 'entry', body.code,
+                              info | {'relocs': [[at, kind, 4 if index == 1 else index]
+                                                for at, kind, index in info['relocs']]}).exact
+
+
+def test_overlay_probes_cover_a_larger_aligned_caller(tmp_path):
+    from threading import Event
+
+    from decompnet.app.overlay_donor_aliases import retry
+    from decompnet.elfobj import extract_function
+
+    if not toolchains.installed('ido-7.1'):
+        pytest.skip('needs IDO 7.1')
+    cfg = compiler_config(tmp_path, {'compiler': {
+        'toolchain': 'ido-7.1', 'flags': ['-O2', '-G', '0', '-non_shared', '-mips2'],
+    }})
+    header = 'extern void placeholder(int);'
+    calls = '\n'.join(f'placeholder({i});' for i in range(24))
+    source = f'void entry(void) {{\n{calls}\n}}'
+    built = compile_source(cfg, header, source)
+    assert built.ok, built.log
+    body = extract_function(built.obj, 'entry')
+    assert len(body.relocs) == 24
+    info = {'section': 64, 'relocs': [[r.offset, r.type, i] for i, r in enumerate(body.relocs, 1)]}
+    target = uso_match.symbolic_target(uso_match.Target('entry', 0, body.code, [], uso=info))
+    original = uso_match.link(built.obj, 'entry', body.code, info).candidate
+    stop = Event()
+    probes = 0
+
+    def measure(text, context):
+        nonlocal probes
+        probes += 1
+        trial = compile_source(cfg, context, text)
+        assert trial.ok, trial.log
+        return uso_match.link(trial.obj, 'entry', body.code, info).candidate
+
+    stop.set()
+    assert retry(source, header, 'entry', original, target, measure, stop) is None
+    assert probes == 0
+    stop.clear()
+    text, context = retry(source, header, 'entry', original, target, measure, stop)
+    assert probes == 24
+    rebuilt = compile_source(cfg, context, text)
+    assert rebuilt.ok, rebuilt.log
+    assert uso_match.link(rebuilt.obj, 'entry', body.code, info).exact
+
+
+def test_overlay_relocates_bounded_compiler_jump_table(tmp_path):
+    import json
+
+    from elftools.elf.elffile import ELFFile
+    from elftools.elf.relocation import RelocationSection
+
+    from decompnet.candidate_work import elf as candidate_elf
+    from decompnet.elfobj import _function_symbols, extract_function
+
+    if not toolchains.installed('ido-7.1'):
+        pytest.skip('needs IDO 7.1')
+    cfg = compiler_config(tmp_path, {'compiler': {
+        'toolchain': 'ido-7.1', 'flags': ['-O2', '-G', '0', '-non_shared', '-mips2'],
+    }})
+    body = """switch (index) {
+    case 0: *out = 5; break;
+    case 1: *out += 3; break;
+    case 2: *out &= 7; break;
+    case 3: *out = *out * 2; break;
+    case 4: *out -= 19; break;
+    case 5: *out |= 128; break;
+    default: break;
+    }"""
+    built = compile_source(cfg, '', 'void entry(int index, volatile int *out) { ' + body + ' }')
+    assert built.ok, built.log
+    compiler = candidate_elf(built.obj, ELFFile)
+    _, entry, _ = _function_symbols(compiler)['entry']
+    fn = extract_function(built.obj, 'entry')
+    high, low = fn.relocs
+    assert (high.type, low.type) == (5, 6)
+    rodata = compiler.get_section_by_name('.rodata')
+    pointers = next(section for section in compiler.iter_sections()
+                    if isinstance(section, RelocationSection) and section.name == '.rel.rodata')
+    locations = [r['r_offset'] for r in pointers.iter_relocations()]
+    offsets = [int.from_bytes(rodata.data()[at:at + 4], 'big') - entry for at in locations]
+    assert len(offsets) == 6
+    start, table_offset = 144, 64
+    target = fn.code[:low.offset + 2] + table_offset.to_bytes(2, 'big') + fn.code[low.offset + 4:]
+
+    def record(kind, content):
+        return struct.pack('>III', kind, len(content), 0x10000000) + content
+
+    def cartridge(cases, missing=False):
+        symbols = struct.pack('>9I', 0x520000, start, 0, 0x740000, 0, 0, 0x540000, 0, 0)
+        shifts = struct.pack('>6I', 0x13, start + high.offset, 0, 0x12, start + low.offset, 0)
+        links = b''.join(struct.pack('>III', 0x24, table_offset + i * 4, 0)
+                         for i in range(len(cases) - missing))
+        data = bytes(table_offset) + b''.join(struct.pack('>I', start + offset) for offset in cases)
+        return (bytes(64) + struct.pack('>III', 0x12345678, 1, 1) + b'table.uso\0'
+                + struct.pack('>IIII', 0x12345678, 0, 0, 0)
+                + record(1, symbols) + record(2, shifts) + record(4, links)
+                + record(5, bytes(start) + target) + record(7, data) + record(11, b''))
+
+    image = cartridge(offsets)
+    region, = uso.read(image)
+    relocs = uso.function_relocations(region, start, len(target))
+    info = {'section': region.offset, 'start': start, 'size': len(target), 'relocs': relocs, 'native': True}
+    row = {'id': 1, 'rom_offset': region.offset + start, 'target': target, 'meta': json.dumps({'uso': info})}
+    _, updated = next(uso.metadata_updates(image, {}, [row]))
+    refreshed = json.loads(updated)['uso']
+    assert refreshed['jump_tables'] == [[low.offset, 1, offsets]]
+    assert not uso_match.link(built.obj, 'entry', target, info).exact
+    assert uso_match.link(built.obj, 'entry', target, refreshed).exact
+    assert uso.rebuild(image, [('entry', refreshed, built.obj)]) == image
+
+    changed = [offsets[1], offsets[0], *offsets[2:]]
+    wrong_image = cartridge(changed)
+    wrong_region, = uso.read(wrong_image)
+    assert not uso_match.link(built.obj, 'entry', target, refreshed | {
+        'jump_tables': uso.function_jump_tables(wrong_region, start, len(target), relocs),
+    }).exact
+    with pytest.raises(ValueError, match='jump table metadata'):
+        uso.rebuild(wrong_image, [('entry', refreshed, built.obj)])
+    incomplete, = uso.read(cartridge(offsets, missing=True))
+    assert not uso.function_jump_tables(incomplete, start, len(target), relocs)

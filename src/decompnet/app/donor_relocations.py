@@ -1,22 +1,36 @@
 """Find full-size donor candidates when ELF and ROM relocation inference differs."""
 
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from ..elfobj import Reloc, mask_relocs
 from .cross_game_progress import report
-from .twins import ACROSS_MIN_BYTES, Print, _key
+from .twins import Print, _key, renames, transfer_min_bytes
 
 
 def _layout(row):
     return sorted((entry[0], entry[1], entry[2]) for entry in json.loads(row['relocs'] or '[]') if len(entry) >= 3)
 
 
+def identical_targets(targets, donors, job):
+    """Index unmasked bytes as a search lead, never as a linked verdict."""
+    minimum = transfer_min_bytes(job)
+    digests = {donor.raw_digest for donor in donors
+               if donor.raw_digest and donor.size >= minimum and not donor.asm}
+    matches = defaultdict(set)
+    for function_id, target in targets.items():
+        if job.stop.is_set():
+            return {}
+        if target.raw_digest in digests:
+            matches[target.raw_digest].add(function_id)
+    return matches
+
+
 def candidates(net, proj, donors, job):
     """Mask the ROM bytes with the donor's own relocation positions before comparing."""
     by_size = defaultdict(dict)
     for donor in donors:
-        if donor.size >= ACROSS_MIN_BYTES and donor.layout is not None and not donor.asm:
+        if donor.size >= transfer_min_bytes(job) and donor.layout is not None and not donor.asm:
             layout = tuple(map(tuple, donor.layout))
             by_size[donor.size].setdefault(layout, {})[donor.key] = donor.prefix
     if not by_size:
@@ -79,3 +93,27 @@ def donor_refs(donor, row, label):
     refs = [label(actual[tuple(pair)]) if tuple(pair) in actual else ref
             for pair, ref in zip(donor.layout, donor.refs, strict=True)]
     return Print(donor.key, refs, donor.size)
+
+
+def separate_overlay_references(console, aliases):
+    """Preserve distinct declarations when multiple donor names need one loader binding."""
+    counts = Counter(aliases.values())
+    return {old: console.separate_overlay_reference(new, index) if counts[new] > 1 else new
+            for index, (old, new) in enumerate(sorted(aliases.items()), 1)}
+
+
+def overlay_names(net, proj, row, donor, donor_name):
+    """Map object references to verified loader symbols before compiling private C."""
+    if not donor.layout:
+        return None
+    console = net.console(proj)
+    if console.export_overlay(net._rom_target(row)) is None:
+        return None
+    expected = net._target_obj(row, proj)
+    refs = {(r.offset, r.type): r.symbol for r in expected.relocs}
+    sites = [tuple(pair) for pair in donor.layout]
+    if len(refs) != len(expected.relocs) or len(refs) != len(sites) or set(refs) != set(sites):
+        return None
+    target = Print(donor.key, [refs[site] for site in sites], donor.size)
+    names = renames(donor, target, donor_name, row['name'])
+    return separate_overlay_references(console, names) if names else names

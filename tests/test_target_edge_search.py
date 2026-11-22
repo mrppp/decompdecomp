@@ -209,6 +209,16 @@ def test_measured_stack_reservation_ignores_volatile_in_neighboring_source():
 
 
 
+
+def test_measured_frame_word_removal_reaches_diff_dispatch():
+    source = 'void f(void) { volatile u64 scratch; work(); }'
+    target = 'addiu $sp, $sp, -48|sw $ra, 40($sp)|move $a0, $s0|jal work|nop|lw $ra, 40($sp)|jr $ra|addiu $sp, $sp, 48'
+    current = 'addiu $sp, $sp, -56|sw $ra, 48($sp)|move $a1, $s0|jal work|nop|lw $ra, 48($sp)|jr $ra|addiu $sp, $sp, 56'
+    rows = [(' ' if a == b else 'r' if a.startswith('move') else 's', a, b)
+            for a, b in zip(target.split('|'), current.split('|'))]
+    assert dict(route(source, rows, ''))['measured_unused_frame_word'] == source.replace('volatile u64 scratch;', '')
+
+
 def test_measured_frame_growth_extends_an_existing_array_despite_register_differences():
     source = 'void f(void) { char padding[8]; work(); }'
     target = 'addiu $sp, $sp, -80|sw $ra, 76($sp)|move $a0, $s0|jal work|nop|lw $ra, 76($sp)|jr $ra|addiu $sp, $sp, 80'
@@ -818,3 +828,117 @@ def test_ido_routes_a_measured_global_byte_decrement():
     fixed = dict(route(source, rows, asm, compiler='ido-5.3'))
     assert '__repair_byte_value -= 8;' in fixed['staged_global_byte_decrement']
     assert 'staged_global_byte_decrement' not in dict(route(source, rows, asm, compiler='ido-7.1'))
+
+
+def test_ido_frame_growth_reaches_unused_word_proposals_even_when_the_spill_slots_moved():
+    """An IDO draft with arrays whose frame is a word short: the saved-register rows moved too (no uniform delta)."""
+    source = '''s32 f(Reader *p) {
+    s16 head[8];
+    s16 table[4][13];
+    s32 pos;
+    u32 w;
+    s32 flag;
+    s32 i;
+    pos = p->pos;
+    for (i = 0; i < 4; i++) {
+        table[i][0] = w;
+    }
+    return 0;
+}
+'''
+    target = ('addiu $sp, $sp, -0xf8|sw $s0, 0x28($sp)|sw $v1, 0x58($sp)|lw $v1, 0x58($sp)|lw $s0, 0x28($sp)|'
+              'addiu $sp, $sp, 0xf8')
+    draft = ('addiu $sp, $sp, -0xf0|sw $s0, 0x28($sp)|sw $v1, 0x4c($sp)|lw $v1, 0x4c($sp)|lw $s0, 0x28($sp)|'
+             'addiu $sp, $sp, 0xf0')
+    rows = [(' ' if a == b else 's', a, b) for a, b in zip(target.split('|'), draft.split('|'))]
+    found = [text for family, text in route(source, rows, '', compiler='ido-7.1') if family == 'inferred_frame_reservation']
+    assert found and all('__repair_unused_frame_0' in text for text in found)
+    assert found[0].index('s16 table[4][13];') < found[0].index('__repair_unused_frame_0') < found[0].index('s32 pos;')
+    assert 'inferred_frame_reservation' not in dict(route(source, rows, '', compiler='ido-5.3'))
+    assert not [1 for family, _ in route(source, [(' ', a, a) for _, a, _ in rows], '', compiler='ido-7.1')
+                if family == 'inferred_frame_reservation']
+
+
+def test_relocated_increment_reaches_kmc_proposals(monkeypatch):
+    from decomprepair import relocated_global_update
+
+    monkeypatch.setattr(relocated_global_update, 'rewrite_increment', lambda *args: 'direct increment')
+    rows = [('r', 'lui $v0, %hi(state)', 'lui $a0, %hi(state)')]
+    assert ('relocated_global_increment', 'direct increment') in route('void f(void) {}', rows, 'asm')
+    assert 'relocated_global_increment' not in dict(route('void f(void) {}', rows, 'asm', compiler='ido-5.3'))
+
+
+def test_halfword_count_loop_reaches_kmc_proposals(monkeypatch):
+    from decomprepair import measured_kmc_halfword_count_loop
+
+    monkeypatch.setattr(measured_kmc_halfword_count_loop, 'variants', lambda *args: [('recover_halfword_count_loop', 'fixed')])
+    rows = [('r', 'sll $v0, $v0, 1', 'sll $v0, $v0, 3')]
+    assert ('recover_halfword_count_loop', 'fixed') in route('void f(void) {}', rows, 'asm')
+    assert 'recover_halfword_count_loop' not in dict(route('void f(void) {}', rows, 'asm', compiler='ido-5.3'))
+
+
+def test_indirect_self_call_hypothesis_reaches_kmc_proposals(monkeypatch):
+    from decomprepair import measured_indirect_self_call
+
+    monkeypatch.setattr(measured_indirect_self_call, 'variants',
+                        lambda *args: [('indirect_self_call_void_hypothesis', 'fixed')])
+    rows = [('|', 'nop', 'move $a0, $v1')]
+    assert ('indirect_self_call_void_hypothesis', 'fixed') in route('void f(void) {}', rows, 'asm')
+    assert 'indirect_self_call_void_hypothesis' not in dict(route('void f(void) {}', rows, 'asm', compiler='ido-5.3'))
+
+
+def test_forwarded_pointer_hypothesis_reaches_kmc_proposals(monkeypatch):
+    from decomprepair import measured_forwarded_pointer
+
+    monkeypatch.setattr(measured_forwarded_pointer, 'variants',
+                        lambda *args: [('forward_entry_pointer_hypothesis', 'fixed')])
+    rows = [('r', 'lhu $a2, 0x8a($a0)', 'lhu $v0, 0x8a($a0)')]
+    assert ('forward_entry_pointer_hypothesis', 'fixed') in route('void f(void) {}', rows, 'asm')
+    assert 'forward_entry_pointer_hypothesis' not in dict(route('void f(void) {}', rows, 'asm', compiler='ido-5.3'))
+
+
+def test_hoisted_word_read_reaches_kmc_proposals(monkeypatch):
+    from decomprepair import relocated_global_update
+
+    monkeypatch.setattr(relocated_global_update, 'rewrite_hoisted_word_read', lambda *args: 'direct word')
+    rows = [('r', 'lw $v0, %lo(value)($v0)', 'lw $v0, ($t0)')]
+    assert ('relocated_hoisted_word_read', 'direct word') in route('void f(void) {}', rows, 'asm')
+    assert 'relocated_hoisted_word_read' not in dict(route('void f(void) {}', rows, 'asm', compiler='ido-5.3'))
+
+
+def test_relocated_pointer_reloads_reach_kmc_proposals(monkeypatch):
+    from decomprepair import relocated_pointer_reloads
+
+    monkeypatch.setattr(relocated_pointer_reloads, 'variants', lambda *args: [('direct_pointer_reloads', 'fixed')])
+    rows = [('r', 'lw $v0, %lo(value)($v0)', 'lw $v0, ($s0)')]
+    assert ('direct_pointer_reloads', 'fixed') in route('void f(void) {}', rows, 'asm')
+    assert 'direct_pointer_reloads' not in dict(route('void f(void) {}', rows, 'asm', compiler='ido-5.3'))
+
+
+def test_call_then_pointer_reload_reaches_kmc_proposals(monkeypatch):
+    from decomprepair import measured_after_call_reload
+
+    monkeypatch.setattr(measured_after_call_reload, 'variants',
+                        lambda *args: [('target_call_then_pointer_reload', 'fixed')])
+    rows = [('o', 'jal unlink', ''), ('o', '', 'jal unlink')]
+    assert ('target_call_then_pointer_reload', 'fixed') in route('void f(void) {}', rows, 'asm')
+    assert 'target_call_then_pointer_reload' not in dict(route('void f(void) {}', rows, 'asm', compiler='ido-5.3'))
+
+
+def test_invariant_row_offset_reaches_kmc_proposals(monkeypatch):
+    from decomprepair import measured_kmc_invariant_row
+
+    monkeypatch.setattr(measured_kmc_invariant_row, 'variants', lambda *args: [('invariant_row_offset', 'fixed')])
+    rows = [('r', 'sll $t1, $t0, 2', 'sll $v0, $t0, 2')]
+    assert ('invariant_row_offset', 'fixed') in route('void f(void) {}', rows, 'asm')
+    assert 'invariant_row_offset' not in dict(route('void f(void) {}', rows, 'asm', compiler='ido-5.3'))
+
+
+def test_carried_first_iteration_test_reaches_kmc_proposals(monkeypatch):
+    from decomprepair import measured_carried_loop_test
+
+    monkeypatch.setattr(measured_carried_loop_test, 'variants',
+                        lambda *args: [('carried_first_iteration_test', 'fixed')])
+    rows = [('r', 'sltiu $v0, $s0, 2', 'addiu $v1, $zero, 1')]
+    assert ('carried_first_iteration_test', 'fixed') in route('void f(void) {}', rows, 'asm')
+    assert 'carried_first_iteration_test' not in dict(route('void f(void) {}', rows, 'asm', compiler='ido-5.3'))

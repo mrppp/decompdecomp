@@ -9,6 +9,82 @@ _MIN_CALLS = 32
 _MAX_PAIRS = 1_000_000
 
 
+def _entry_mapping(image, lo, hi, vram, callers, taken, check):
+    """Find a nearby aligned mapping when many calls name complete return-separated entries."""
+    old = vram-lo
+    if old % 16 == 0 or hi-lo < 4096:
+        return None
+    words = struct.unpack_from(f'>{(hi-lo)//4}I', image, lo)
+    entries = set()
+    for i in range(2, len(words)-3):
+        a,b,c = words[i:i+3]
+        reg = (a >> 16) & 31
+        if (words[i-2] == JR_RA and a >> 26 == 15 and reg
+                and b >> 26 == 9 and (b >> 21) & 31 == reg and (b >> 16) & 31 == reg
+                and c >> 26 == 35 and (c >> 21) & 31 == reg and (c >> 16) & 31):
+            entries.add(lo+4*i)
+    if len(entries) < 8:
+        return None
+    targets = [set(), set()]
+    for start,end,base in callers:
+        check()
+        code = struct.unpack_from(f'>{(end-start)//4}I', image, start)
+        targets[start == lo and end == hi].update(
+            0x80000000 | ((word & 0x03ffffff) << 2) for word in code if word >> 26 == 3)
+    previous = sum(len(group & {at+old for at in entries}) for group in targets)
+    choices = []
+    for delta in range(-15, 16):
+        mapping = old+delta
+        address = lo+mapping
+        if (mapping % 16 or not 0x80000400 <= address < address+hi-lo <= 0x80800000
+                or any(base < address+hi-lo and address < base+end-start for start,end,base in taken)):
+            continue
+        matches = {at+mapping for at in entries}
+        outside, inside = (len(group & matches) for group in targets)
+        if inside >= 8 and outside >= 1 and inside+outside >= 4*max(1,previous):
+            choices.append(address)
+    return choices[0] if len(choices) == 1 else None
+
+
+def _called_mapping(image, lo, hi, vram, callers, taken, check):
+    """Correct a nearby alignment only when independent calls reach closed framed functions."""
+    from ...arch.mips_code_recovery import called_extent
+
+    old = vram-lo
+    if old%16 == 0 or hi-lo < 4096:
+        return None
+    groups = [set(),set()]
+    for start,end,base in callers:
+        check()
+        if start < 0 or end > len(image) or start >= end or (start|end)%4:
+            continue
+        words = struct.unpack_from(f'>{(end-start)//4}I',image,start)
+        groups[start == lo and end == hi].update(
+            0x80000000 | ((word&0x3ffffff)<<2) for word in words if word>>26 == 3)
+    def score(mapping):
+        counts = []
+        for targets in groups:
+            total = 0
+            for target in targets:
+                at = target-mapping
+                if lo <= at < hi-8 and called_extent(image,at,hi,target,cpu='vr4300'):
+                    total += 1
+            counts.append(total)
+        return counts
+    prior = score(old)
+    choices = []
+    for delta in range(-15,16):
+        mapping = old+delta
+        address = lo+mapping
+        if (mapping%16 or not 0x80000400 <= address < address+hi-lo <= 0x80800000
+                or any(base < address+hi-lo and address < base+end-start for start,end,base in taken)):
+            continue
+        outside,inside = score(mapping)
+        if inside >= 8 and outside >= 3 and inside+outside >= 4*max(1,sum(prior)):
+            choices.append(address)
+    return choices[0] if len(choices) == 1 else None
+
+
 def recover(image, found, taken=(), check=lambda: None, *, changed=()):
     """Return corrected inferred ranges and the starts needing independent splat scopes."""
     result = list(found)
@@ -16,6 +92,11 @@ def recover(image, found, taken=(), check=lambda: None, *, changed=()):
     for index, (lo, hi, vram) in enumerate(found):
         check()
         if lo < 0 or hi - lo < 4096 or hi > len(image) or (lo | hi) % 4:
+            continue
+        if corrected := (_entry_mapping(image, lo, hi, vram, (*taken, *found), taken, check)
+                         or _called_mapping(image, lo, hi, vram, (*taken, *found), taken, check)):
+            result[index] = (lo, hi, corrected)
+            changed.add(lo)
             continue
         words = struct.unpack_from(f'>{(hi-lo)//4}I', image, lo)
         targets = {0x80000000 | ((word & 0x03ffffff) << 2) for word in words if word >> 26 == 3}
@@ -101,6 +182,26 @@ def runtime_mappings(image, found, ranges, taken=()):
     return result, changed
 
 
+def scopes_fit(found, scoped, taken):
+    """Splat's global range spans the gaps between all unscoped code segments."""
+    global_ranges = [(base, base + end - start) for start, end, base in taken]
+    global_ranges += [(base, base + end - start) for start, end, base in found if start not in scoped]
+    if not global_ranges:
+        return True
+    low = min(start for start, _ in global_ranges)
+    high = max(end for _, end in global_ranges)
+    return all(not (base < high and low < base + end - start)
+               for start, end, base in found if start in scoped)
+
+
+def safe_scopes(found, scoped, taken):
+    """Scope inferred code on both sides of the global range when necessary."""
+    if not scoped or scopes_fit(found, scoped, taken):
+        return scoped
+    all_inferred = {start for start, _, _ in found}
+    return all_inferred if scopes_fit(found, all_inferred, taken) else None
+
+
 def scope(config, found, scoped):
     """Put each overlapping connected set into one exclusive address space."""
     if not scoped:
@@ -126,3 +227,114 @@ def scope(config, found, scoped):
             name = segment['name']
             segment.update(exclusive_ram_id=ident, symbol_name_format=f'$VRAM_{name}',
                            symbol_name_format_no_rom=f'$VRAM_{name}')
+
+
+def drop_pointer_fragments(image, found, taken=()):
+    """Leave a terminated pointer table outside text when discovery split it into one-word scopes."""
+    ordered = sorted(found)
+    remove = set()
+    for i in range(1, len(ordered)-2):
+        prev = ordered[i-1]
+        group = ordered[i:i+3]
+        if (any(end-start != 4 for start,end,_ in group)
+                or prev[1] != group[0][0]
+                or group[0][1] != group[1][0] or group[1][1] != group[2][0]
+                or group[1][2] != group[0][2]+4 or group[2][2] != group[0][2]+8):
+            continue
+        first, second, zero = struct.unpack_from('>3I', image, group[0][0])
+        if (zero or first % 4 or second % 4 or first == second
+                or not all(prev[2] <= v < prev[2]+prev[1]-prev[0] for v in (first, second))):
+            continue
+        targets = {v for _,_,v in group}
+        referenced = False
+        for start,end,base in (*taken, *found):
+            for at in range(start, end, 4):
+                word = struct.unpack_from('>I', image, at)[0]
+                op = word >> 26
+                if op in (2,3):
+                    dest = ((base+at-start+4) & 0xf0000000) | ((word & 0x3ffffff) << 2)
+                elif op in (1,4,5,6,7,20,21,22,23) or op == 17 and (word >> 21) & 31 == 8:
+                    imm = (word & 0xffff) ^ 0x8000
+                    dest = base+at-start+4+(imm-0x8000)*4
+                else:
+                    continue
+                if dest in targets:
+                    referenced = True
+                    break
+            if referenced:
+                break
+        if not referenced:
+            remove.update(start for start,_,_ in group)
+    return [segment for segment in found if segment[0] not in remove]
+
+
+def split_concatenated(image, found, check=lambda: None):
+    """Split adjacent banks when two called entries share an address and a data gap."""
+    from ...arch.mips_code_recovery import called_extent
+
+    result, changed = [], set()
+    for lo, hi, vram in found:
+        check()
+        if lo < 0 or hi > len(image) or hi-lo < 8192 or (lo | hi) % 4:
+            result.append((lo, hi, vram))
+            continue
+        words = struct.unpack_from(f'>{(hi-lo)//4}I', image, lo)
+        targets = {0x80000000 | ((word & 0x3ffffff) << 2) for word in words if word >> 26 == 3}
+        entries = [lo+i*4 for i, word in enumerate(words)
+                   if is_frame(word) or i >= 2 and words[i-2] == JR_RA]
+        candidates = []
+        for target in targets:
+            delta = target - vram
+            boundary = lo + delta
+            if delta < 4096 or boundary + 4096 > hi or delta % 16:
+                continue
+            if not called_extent(image, lo, hi, target, cpu='vr4300'):
+                continue
+            stops = [at+8 for at in range(max(lo, boundary-0x2000), boundary-72, 4)
+                     if image[at:at+4] == b'\x03\xe0\x00\x08' and not any(image[at+8:at+72])]
+            if not stops:
+                continue
+            end = stops[-1]
+            if end <= lo or boundary - end < 64:
+                continue
+            early = [at for at in entries if at < end]
+            late = [at for at in entries if at >= boundary]
+            new_shift, old_shift = target-lo, vram-lo
+            first_words = struct.unpack_from(f'>{(end-lo)//4}I', image, lo)
+            second_words = struct.unpack_from(f'>{(hi-boundary)//4}I', image, boundary)
+            first_calls = {0x80000000 | ((word & 0x3ffffff) << 2) for word in first_words if word >> 26 == 3}
+            second_calls = {0x80000000 | ((word & 0x3ffffff) << 2) for word in second_words if word >> 26 == 3}
+            before = sum(at + new_shift in first_calls for at in early)
+            before_old = sum(at + old_shift in first_calls for at in early)
+            after = sum(at + old_shift in second_calls for at in late)
+            if before >= 8 and before >= 4*max(1, before_old) and after >= 8:
+                candidates.append((end, boundary, target))
+        if len(candidates) != 1:
+            result.append((lo, hi, vram))
+            continue
+        end, boundary, target = candidates[0]
+        result.extend(((lo, end, target), (boundary, hi, vram + boundary-lo)))
+        changed.update((lo, boundary))
+    return sorted(result), changed
+
+
+def extend_adjacent_frame(image, found):
+    """Extend an inferred bank through a closed frame cut at its tail."""
+    from ...arch.mips_code_recovery import called_extent
+
+    result = list(sorted(found))
+    for index, (lo, hi, vram) in enumerate(result[:-1]):
+        next_start = result[index + 1][0]
+        if not hi < next_start <= len(image) or (hi | next_start) % 4:
+            continue
+        candidates = []
+        for at in range(max(lo + 8, hi - 32), hi, 4):
+            if (int.from_bytes(image[at-8:at-4], 'big') != JR_RA
+                    or not is_frame(int.from_bytes(image[at:at+4], 'big'))):
+                continue
+            length = called_extent(image, at, next_start, vram + at-lo, cpu='vr4300')
+            if length and at + length == next_start:
+                candidates.append(at)
+        if len(candidates) == 1:
+            result[index] = (lo, next_start, vram)
+    return result

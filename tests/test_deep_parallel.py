@@ -56,6 +56,7 @@ def test_preparation_precedes_other_paths_and_credentials_are_distinct(monkeypat
         return 40, 0
     monkeypatch.setattr(deep_permuter.Search, '_baseline', baseline)
     monkeypatch.setattr(deep_permuter.Search, 'local_repairs', lambda *a, **k: (40, 'x'))
+    monkeypatch.setattr(deep_permuter.Search, 'neutral_plateau_pass', lambda self, agent, proj, fn, best, fork: best)
     def permute(self, agent, proj, fn, state):
         # The random phase must not mutate compiler settings underneath another path.
         self._compiler_preflight(proj, fn, state, self.deadline)
@@ -914,3 +915,78 @@ def test_loop_symbol_base_block_runs_in_the_bounded_local_lane(monkeypatch):
 
     assert search.operand_order_pass(AGENT, proj, fn, 180, None) == 20
     assert tried == [child]
+
+
+def test_initialized_float_guard_is_offered_for_register_differences(monkeypatch):
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    source = ('void f(f32 x) { f64 wide; wide = (f64) x; '
+              'do { if (x) { work(); } else { work(); } } while (more()); }')
+    fn = {**net.function(), 'name': 'f', 'asm': '', 'best_source': source}
+    search = deep_permuter.Search(net, 1, 6, Log())
+    rows = [('r', 'mul.d $f28, $f22, $f0', 'mul.d $f30, $f22, $f0')]
+    proposals, _ = search._local_proposals(source, proj, fn, rows)
+    assert any(family == 'initialized_identical_float_guard' and 'if (wide)' in child
+               for family, child in proposals)
+
+
+def test_nested_float_guard_is_offered_for_register_differences(monkeypatch):
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    source = ('void f(f32 x) { f64 wide; f32 scale; wide = (f64) x; scale = x * 0.2f; '
+              'do { if (wide) { work(scale); } else { work(scale); } } while (more()); }')
+    fn = {**net.function(), 'name': 'f', 'asm': '', 'best_source': source}
+    search = deep_permuter.Search(net, 1, 6, Log())
+    rows = [('r', 'mul.d $f30, $f22, $f0', 'mul.d $f28, $f22, $f0')]
+    proposals, _ = search._local_proposals(source, proj, fn, rows)
+    assert any(family == 'initialized_nested_float_guard' and 'if (scale)' in child
+               for family, child in proposals)
+
+
+def test_table_loop_chain_is_offered_to_the_deep_permuter(monkeypatch):
+    """A poll loop's byte-offset, record-field and one-step spellings (decomp-repair 0.5.363) reach the local lane."""
+    net = setup(monkeypatch)
+    proj = net.project_row('game')
+    source = ('extern s16 D_80100004;\nextern s16 D_80100006;\nvoid f(void)\n{\n  s32 off;\n  s32 i;\n  off = 0;\n  i = 0;\n'
+              '  do\n  {\n    *((&D_80100004) + off) = 1;\n    *((&D_80100006) + off) = 2;\n    off += 8;\n    i++;\n  }\n'
+              '  while (i < 4);\n}\n')
+    asm = ('lui $at, %hi(D_80100004)\naddu $at, $at, $s4\nsh $v0, %lo(D_80100004)($at)\n'
+           'lui $at, %hi(D_80100006)\naddu $at, $at, $s4\nsh $v0, %lo(D_80100006)($at)\naddiu $s4, $s4, 0x8\n')
+    fn = {**net.function(), 'name': 'f', 'asm': asm, 'best_source': source}
+    search = deep_permuter.Search(net, 1, 6, Log())
+    proposals, _ = search._local_proposals(source, proj, fn, [])
+    families = [family for family, _ in proposals]
+    assert 'byte_offset_table_index' in families
+    first = next(child for family, child in proposals if family == 'byte_offset_table_index')
+    assert '((s16 *) (((s8 *) (&D_80100004)) + off))' in first
+
+
+def test_loop_cursor_pass_scores_fixed_index_through_advancing_cursor(monkeypatch):
+    from tests.test_permute import AGENT
+
+    net = setup(monkeypatch)
+    source = """int f(u8 *records, u8 n) {
+    u8 *cursor = records;
+    u8 *anchor;
+    u8 limit;
+    u32 index;
+    int sum;
+    limit = n;
+    index = 0;
+    sum = 0;
+    anchor = cursor + 2;
+    do {
+        sum += anchor[((s32) (index * 3)) - 1] + anchor[index * 3];
+        cursor += 3;
+        index += 1;
+    } while (index < limit);
+    return sum;
+}
+"""
+    fn = {**net.function(), 'name': 'f', 'best_source': source}
+    search = deep_permuter.Search(net, 1, 1, Log())
+    tried = []
+    monkeypatch.setattr(search, '_score', lambda agent, proj, fn, candidate, best, fork: tried.append(candidate) or 15)
+
+    assert search.loop_cursor_pass(AGENT, net.project_row('game'), fn, 35, None) == 15
+    assert any('sum += cursor[1] + cursor[2];' in candidate for candidate in tried)

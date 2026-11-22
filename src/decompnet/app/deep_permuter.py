@@ -84,6 +84,10 @@ def validate_limits(minutes, max_variants):
 
 def validate(net, slug, name, minutes, max_variants):
     validate_limits(minutes, max_variants)
+    return validate_function(net, slug, name)
+
+
+def validate_function(net, slug, name):
     from . import library_skew
     library_skew.ensure(force=True)
     proj = net.project_row(slug)
@@ -106,7 +110,8 @@ def _candidate_source(fn, best):
             or row['status'] != 'matched' and (row['status'] != 'open' or best is None or row.get('best_score') is None)):
         from .progress import ProgressMoved
         raise ProgressMoved('Saved candidate changed during deep search. Wait for synchronization, then retry with its current C and score.')
-    return source
+    from .function_names import canonical_source
+    return canonical_source(fn, source)
 
 
 # a deep pass that found C exact only under another compiler profile (profile_climb): the suggestion waits for review
@@ -394,6 +399,16 @@ class Search(Permuter):
             current_asm = rename(proj, asm) if rename else asm
             calls += [(L + 'load_store_order_repairs.component_before_resets', (source, name, current_asm, header)),
                       (L + 'global_store_repairs.scoped_byte_updates', (source, name, current_asm, header))]
+            # a poll loop's chain: words named at the target's halfword width, element-indexed addresses written as
+            # byte offsets, neighbouring symbols as fields of one record, m2c's goto join collapsed to one pointer
+            # step, a sign test, a repeated load, call results stored directly, the loop's base address in a local
+            # and the registers initialized in the target's order (decomp-repair 0.5.363). Each is a tie or a loss
+            # alone under the default profile; see matching_preflight for the profile that makes them gains.
+            calls += [(L + 'strided_table_loop.' + family, (source, name, arch, current_asm))
+                      for family in ('narrow_symbol_variants', 'byte_offset_variants', 'record_field_variants',
+                                     'join_increment_variants', 'sign_test_variants', 'repeated_load_variants',
+                                     'call_result_direct_variants', 'loop_base_pointer_variants',
+                                     'loop_init_order_variants')]
             zero_bound = len(calls)
             calls += [(L + 'targeted_switch_labels.zero_bound_variants', (source, name, current_asm)),
                       (L + 'symbol_width_repairs.guarded_indexed_variants', (source, name, current_asm))]
@@ -405,6 +420,7 @@ class Search(Permuter):
                 calls.append((L + 'scoped_byte_read_call.variants', (source, alias, arch, asm, header)))
         register = permuter_focus.classify(rows, arch) == 'register'
         if register:
+            calls.append((L + 'identical_float_guard.variants', (source, name, header, arch)))
             calls += [(L + 'near_match_repairs.bitwise_operand_order', (source, name, header)),
                       (L + 'near_match_repairs.float_update_order', (source, name, header)),
                       (L + 'near_match_repairs.variants', (source, name)),
@@ -414,7 +430,10 @@ class Search(Permuter):
         shapes = register or permuter_focus.register_dominant(rows)
         if shapes:
             calls.insert(0, (L + 'block_register_repairs.variants', (source, name)))
+        calls.append((L + 'reused_temp_split_repairs.variants', (source, name)))
         results = [generation_calls.pairs(result) for result in generation_calls.library(calls)]
+        from decomprepair.reused_temp_split_repairs import RESTORE_FAMILY
+        restored = [(family, child) for family, child in results.pop() if family == RESTORE_FAMILY]
         loop_shapes = results.pop(0) if shapes else []
         if register:
             results[-2] = [(family, child) for family, child in results[-2] if family == 'arithmetic_operand_order']
@@ -424,7 +443,7 @@ class Search(Permuter):
                 proposals = result + proposals  # linked-case zero-bound labels go before the rest
             else:
                 proposals += result
-        proposals = loop_shapes + proposals
+        proposals = restored + loop_shapes + proposals
         return proposals, loop_shapes
 
     def operand_order_pass(self, agent, proj, fn, best, fork):
@@ -502,6 +521,7 @@ class Search(Permuter):
         from . import generation_calls
 
         source = _candidate_source(fn, best)
+        header = self.net._context(proj['id'], fn['unit'])['header']
         # Interleaving two runs of statements took about 600 compiles to find by beam on a large function, so this
         # pass may spend more of the budget than the other targeted ones; it stops at the first exact match.
         budget = min(96, max(0, (self.limit - self.tested) // 2))
@@ -511,15 +531,25 @@ class Search(Permuter):
             for _, parent in frontier:
                 proposals = [pair for result in generation_calls.library([
                     ('decomprepair.loop_vector_shapes.variants', (parent, fn['name'], proj['arch'])),
-                    ('decomprepair.statement_interleave.variants', (parent, fn['name'], proj['arch'])),
+                    ('decomprepair.statement_interleave.variants', (parent, fn['name'], proj['arch']), {'header': header}),
                     # a do { } while (0) boundary in the last straight-line run (decomp-repair 0.5.187): a display
                     # list function stuck at 60 under every source order matched once split, only with its call's
                     # global hoisted first, so the proposals are the pair, not two steps a beam would drop
                     ('decomprepair.scheduling_scope.variants', (parent, fn['name'], proj['arch'])),
+                    # Keep an initialized zero distinct through allocation (decomp-repair 0.5.339).
+                    ('decomprepair.zero_conversion_scope.variants', (parent, fn['name'], proj['arch'])),
                     # a guard body's constant initializer hoisted before the guard in its own one-shot scope, with
                     # the copies that preceded the guard sunk into the body (decomp-repair 0.5.284): 10 -> 0 as one
                     # child, 60 and 120 as its halves
-                    ('decomprepair.branch_slot_scope.variants', (parent, fn['name'], proj['arch']))])
+                    ('decomprepair.branch_slot_scope.variants', (parent, fn['name'], proj['arch'])),
+                    # a pointer-chain load pinned behind the branch operand's load in a one-shot scope, with m2c's
+                    # identical if/else arms written once (decomp-repair 0.5.340): 210 -> 0 as one child, 220 for
+                    # the arms alone and 235 for the others alone, so the beam has to keep the weaker ones
+                    ('decomprepair.chain_load_scope.variants', (parent, fn['name'], proj['arch'])),
+                    # a halfword countdown timer's guarded loop: the unsigned entry test kept, the masked word
+                    # counter a u16, the field countdown a compound decrement (decomp-repair 0.5.348): 310 -> 0 as
+                    # one child, 314, 310 and 455 as its parts, so the beam has to keep the weaker ones
+                    ('decomprepair.halfword_countdown_shapes.variants', (parent, fn['name'], proj['arch']))])
                     for pair in generation_calls.pairs(result)]
                 for family, child in proposals:
                     if child in seen or budget <= 0:
@@ -673,8 +703,13 @@ class Search(Permuter):
         return best
 
     def measured_winner(self, fn, source):
-        return (self.winner_diff is not None and self.winner_source == source
-                and self.winner_scope == agent_tokens.target_scope(self.net, {**dict(fn), 'best_source':source}, ''))
+        if self.winner_diff is None or self.winner_source is None:
+            return False
+        from .function_names import canonical_source
+        if self.winner_source != source and canonical_source(fn, self.winner_source) != source:
+            return False
+        return self.winner_scope == agent_tokens.target_scope(
+            self.net, {**dict(fn), 'best_source': self.winner_source}, '')
 
     def linked_case_diff(self, fn, source):
         return self.winner_jump_tables if self.winner_jump_tables and self.measured_winner(fn, source) else ()
@@ -860,11 +895,70 @@ class Search(Permuter):
             break
         return measured
 
+    def repair_saved_drafts(self, agent, proj, fn, state, best):
+        """A worse saved draft can expose compiler evidence that the winner lacks."""
+        from .. import candidate_quality
+        from . import deep_source_recovery, generation_calls, source_preparation
+        from .function_names import canonical_source
+
+        allowance = min(12, max(0, (self.limit - self.tested) // 3))
+        if proj['arch'] != 'mips' or allowance < 2 or not hasattr(self.net, '_judge_with'):
+            return best
+        store = self.net.project_store(proj['id'])
+        attempts = deep_source_recovery.saved_attempts(store, fn['id'])
+        if not attempts:
+            return best
+        header = self.net._context(proj['id'], fn['unit'])['header']
+        profile = compiler_for(self.net.cfg(proj), fn['vram'], fn)
+        snapshot = None
+        seen = {canonical_source(fn, fn['best_source'])}
+        stop = self.tested + allowance
+        for historical in deep_source_recovery.saved_sources(store, attempts):
+            if self.tested + 1 >= stop:
+                break
+            source = canonical_source(fn, historical)
+            if source in seen or candidate_quality.reported_source(self.net, fn, source):
+                continue
+            if snapshot is None:
+                snapshot = source_preparation.inputs(self.net, proj, fn)
+            self.check()
+            seen.add(source)
+            self.tested += 1
+            self.report()
+            exact, diff, problems = self.net._judge_with(proj, fn, profile['toolchain'], profile['flags'], source)
+            if problems or diff is None:
+                continue
+            choices = ([('rechecked_saved_attempt', source)] if exact else generation_calls.generate(
+                'diff_gated_repairs.proposals',
+                (source, fn['name'], header, proj['arch'], profile['toolchain'], diff.rows, fn['asm']),
+                dict(flags=profile['flags'], big_endian=bool(proj['big_endian']))))
+            for family, child in choices[:2]:
+                if self.tested >= stop:
+                    return best
+                if (child != source and child in seen) or candidate_quality.reported_source(self.net, fn, child):
+                    continue
+                seen.add(child)
+                self.check()
+                current = self.net._function(fn['name'], proj['slug'])
+                project = self.net.project_row(proj['slug'])
+                if (current['status'] != 'open' or current['best_score'] != fn['best_score']
+                        or source_preparation.inputs(self.net, project, current) != snapshot):
+                    return best
+                state.add(variants=1, repairs=1)
+                with repair_trial({'kind': 'deep local repair', 'family': family}):
+                    score = self._score_current(agent, project, current, child, best, None)
+                if score is not None and score < best:
+                    updated = self.net._function(fn['name'], proj['slug'])
+                    if updated['best_source'] == child or updated['status'] == 'matched':
+                        self.log(f'Repaired a saved draft: {best:,} → {score:,}.')
+                        return score
+        return best
+
     def near_register_pass(self, agent, proj, fn, state, best, fork):
         rows = self.winner_diff[0] if self.winner_diff else ()
         if not allocation_search.near_registers(rows, proj['arch']):
             return best
-        source = fn['best_source']
+        source = _candidate_source(fn, best)
         ctx = self.net._context(proj['id'], fn['unit'])
         header = self.net.forks.permuter_header(fork, fn['name']) if fork else ctx['header']
         choices = allocation_search.near_proposals(source, fn['name'], header, rows, proj['arch'])
@@ -1010,7 +1104,6 @@ class Search(Permuter):
         trials = 0
         detours_used = set()
         alternatives = search_frontier.Frontier()
-        source = fn['best_source']
         context = self.net._context(proj['id'],fn['unit'])
         header = self.net.forks.permuter_header(fork,fn['name']) if fork else (context['header'] if context else '')
         best = self._repair_preflight(agent, proj, fn, best, fork)
@@ -1144,7 +1237,8 @@ class Search(Permuter):
                     if child not in self.local_seen]
             from . import residual_trials
             if not fork and proj['arch'] == 'mips' and self.measured_winner(fn, source):
-                targeted = residual_trials.proposals(source,fn['name'],header,rows,net=self.net,proj=proj,fn=fn)
+                targeted = residual_trials.proposals(source, fn['name'], header, rows,
+                                                    net=self.net, proj=proj, fn=fn, profile=settings)
                 observed_choices = [(family,child) for family,child in targeted
                                     if child not in self.local_seen] + observed_choices
             observed_order = {child:index for index,(_,child) in enumerate(observed_choices)}
@@ -1459,7 +1553,7 @@ class Search(Permuter):
                         # All inverses were measured/cache-checked. Resume the broad page once;
                         # do not treat a failed cleanup as exhaustion of ordinary repair families.
                         continue
-                    if resume_base == fn['best_source'] and resume_base not in expanded:
+                    if resume_base not in expanded and resume_base == _candidate_source(fn, best):
                         source = resume_base
                         continue
                     detour = next((node for node in alternatives.nodes
@@ -1802,12 +1896,13 @@ def run(net, slug, name, minutes, max_variants, log, *args, **kwargs):
     return result
 
 
-def _full_run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, threads_per_function=1, maximum_throughput=False, compile_slots=0):
+def _full_run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, threads_per_function=1, maximum_throughput=False, compile_slots=0, *, expanded_budget=False):
     from .deep_profiles import validate as validate_profiles
     from .deep_sweep import looking
 
     validate_profiles(compiler_profiles)
-    validate_limits(minutes, max_variants)
+    if not expanded_budget:
+        validate_limits(minutes, max_variants)
     deep_throughput.options(maximum_throughput, compile_slots)
     if maximum_throughput and getattr(log, 'compile_pool', None) is None and threads_per_function == 1:threads_per_function = min(max_variants, deep_throughput.width(True, compile_slots))
     from .deep_parallel import validate_threads
@@ -1903,7 +1998,7 @@ def _full_run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, 
 @claim_stalls.snapshot_rules  # one function's search is one operation: its lane fingerprints the repair code once
 def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, lane=None):
     """Visit the supported local repairs, then spend the remaining budget on random permutations."""
-    proj, fn = validate(net, slug, name, minutes, max_variants)
+    proj, fn = validate_function(net, slug, name)
     sweeps = getattr(net, 'deep_sweeps', None) if lane is None else None
     if sweeps:
         from ..candidate_scope import key
@@ -2001,6 +2096,9 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
                 fn = net._function(name, slug)
                 if baseline and not fork and (lane is None or lane.index == 0):
                     baseline = search.better_saved_baseline(agent, proj, fn, state, baseline)
+                    fn = net._function(name, slug)
+                if baseline and not fork and (lane is None or lane.index == 0):
+                    baseline = search.repair_saved_drafts(agent, proj, fn, state, baseline)
                     fn = net._function(name, slug)
                 measured_baseline = baseline
                 relabel = baseline and not fork and search.can_relabel_switch(fn)
