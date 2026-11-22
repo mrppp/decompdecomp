@@ -3,6 +3,7 @@ synthetic project: no game, no compiler."""
 
 import importlib.util
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -259,6 +260,21 @@ def test_a_source_file_keeps_a_compiler_of_its_own():
     assert DOS.file_compiler(fp, "src/auto/a.c") == "watcom-10.6"
     DOS.set_file_compiler(fp, "src/auto/a.c", "openwatcom-2.0")  # back to the project's: no entry of its own
     assert fp.manifest["dos_compilers_map"] == {}
+
+
+def test_a_compile_doesnt_wait_for_what_it_left_running(tmp_path):
+    """Wine's background programs, started by the first compile of a session, kept the compile's output open: the
+    compile waited for them (forever, with a persistent wineserver) though the compiler itself had finished."""
+    import time
+
+    compile_tool = _tool("compile")
+    leaves_one_running = (
+        "import subprocess, sys; print('compiled'); sys.stdout.flush(); "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True)")
+    started = time.monotonic()
+    done = compile_tool._run_limited([sys.executable, "-c", leaves_one_running], {**os.environ})
+    assert time.monotonic() - started < 10, "the compile waited for the process its compiler left behind"
+    assert done.returncode == 0 and done.stdout.strip() == "compiled"
 
 
 def test_a_game_built_with_one_identified_watcom_keeps_it():

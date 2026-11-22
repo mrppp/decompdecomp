@@ -28,19 +28,31 @@ COMPILE_SECONDS = 60
 
 
 def _run_limited(cmd: list[str], env: dict) -> subprocess.CompletedProcess:
-    """The compiler run, stopped (its whole process group: wine's too) after COMPILE_SECONDS."""
-    proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, start_new_session=True)
-    try:
-        out, err = proc.communicate(timeout=COMPILE_SECONDS)
-    except subprocess.TimeoutExpired:
+    """The compiler run, stopped (its whole process group: wine's too) after COMPILE_SECONDS.
+
+    Its output goes to files, not pipes, and the wait is for the compiler's own process: when no Wine session was
+    running, the first compile's Wine started its background programs (services.exe, winedevice, rpcss, a wineserver),
+    they kept the compile's pipes open, and reading them to the end waited for as long as they lived, also after
+    the time limit killed the compiler. Every compile of a project's files hung that way with the app stopped."""
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                start_new_session=True)
         try:
-            os.killpg(proc.pid, 9)
-        except OSError:
-            proc.kill()
-        proc.communicate()
-        raise
-    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+            proc.wait(timeout=COMPILE_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, 9)
+            except OSError:
+                proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+        out.seek(0)
+        err.seek(0)
+        return subprocess.CompletedProcess(cmd, proc.returncode, out.read().decode(errors="replace"),
+                                           err.read().decode(errors="replace"))
 
 
 # how long wine's server stays after the last compile: Watcom under wine takes 0.8 s a file started cold and 0.02 s
