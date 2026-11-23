@@ -468,3 +468,17 @@ def test_a_room_members_copy_is_placed_only_by_dos_and_only_as_orig_exe(tmp_path
     assert dos.prepare_fork_game(other, tmp_path / "orig" / "game.exe", None) is False
     assert dos.prepare_fork_game(other, tmp_path / "data" / "game.bin", None) is False
     assert not (tmp_path / "orig").exists()
+
+
+def test_placing_a_room_members_copy_again_keeps_the_copy_already_there(tmp_path, monkeypatch):
+    """A second join (or setup) found the game already linked in place, and copying it onto itself raised."""
+    from decompnet.consoles.dos import scratch
+    game = tmp_path / "game.exe"
+    game.write_bytes(b"MZ" + bytes(100))
+    dest = tmp_path / "proj" / "orig" / "game.exe"
+    dest.parent.mkdir(parents=True)
+    os.link(game, dest)
+    monkeypatch.setattr(scratch.le, "parse", lambda data: type("M", (), {"relocated": lambda self: None})())
+    monkeypatch.setattr(scratch, "_main_object", lambda mod: type("O", (), {"data": b"code"})())
+    assert scratch.place_copy(game, dest) and (dest.parent / "game.code.bin").read_bytes() == b"code"
+    assert dest.read_bytes() == game.read_bytes()

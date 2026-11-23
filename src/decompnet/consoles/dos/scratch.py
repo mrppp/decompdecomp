@@ -291,7 +291,10 @@ def place_copy(game: Path, dest: Path, sha1: str | None = None, *, move: bool = 
     if sha1 and hashlib.sha1(game.read_bytes()).hexdigest() != sha1:
         raise ForkError(f"{game.name} isn't the copy of the game this project was made from")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if game.resolve() != dest.resolve():
+    if dest.exists() and os.path.samefile(game, dest):
+        pass  # (placed before: the same file, linked)
+    elif game.resolve() != dest.resolve():
+        dest.unlink(missing_ok=True)
         if move:
             shutil.move(game, dest)
         else:
