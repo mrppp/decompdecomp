@@ -319,6 +319,15 @@ class Dos(Console):
         return net.forks.reanalyse(slug, lambda fp: scratch.reanalyse(Path(fp.root), version, matched, log=log),
                                    log=log)
 
+    def prepare_fork_game(self, src: Path, dest: Path, sha1: str | None, *, move: bool = False) -> bool:
+        """A room member's copy put where a project this console made expects it: orig/VERSION.exe, and beside it the
+        code object as loaded (orig/VERSION.code.bin), which tools/delink.py cuts the targets from. Only creating a
+        project wrote that image, so a member's build failed on every file. True when this console placed it."""
+        from . import scratch
+        if dest.parent.name != "orig" or dest.suffix.lower() != ".exe":
+            return False
+        return scratch.place_copy(Path(src), dest, sha1, move=move)
+
     def check_rebuild(self, fp, version: str, log=print) -> dict:
         """The game's code rebuilt from what the project builds now (scratch.check_code)."""
         from . import scratch

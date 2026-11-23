@@ -293,7 +293,10 @@ class ForkProject:
         """The named console, or each console's file preparation when a public project's platform is unknown."""
         from .. import consoles
 
-        return [consoles.get(self.platform)] if self.platform else consoles.startable()
+        # (nothing sets self.platform: joining a room for a project decompdecomp made failed here with
+        # AttributeError. The manifest's or Splat config's console, as _n64 below reads it.)
+        named = getattr(self, "platform", None) or self.detect_platform()
+        return [consoles.get(named)] if named else consoles.startable()
 
     # ------------------------------------------------------------------ what is it
 

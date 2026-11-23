@@ -456,3 +456,15 @@ def test_watcom_instruction_body_pragmas_are_inline_assembly_and_calling_convent
               '#pragma aux f parm [eax] value [edx] modify [ecx]', '#pragma aux (__cdecl) f',
               'int x; /* #pragma aux f = "nop" */', 'if (a == b) x = 1;'):
         assert not _CHEAT.search(_strip_comments(c)), c
+
+
+def test_a_room_members_copy_is_placed_only_by_dos_and_only_as_orig_exe(tmp_path):
+    """A member's join placed the game but not the code image (orig/VERSION.code.bin) only project creation wrote, and
+    every file then failed to delink; the DOS console now places both. It leaves other files to other consoles."""
+    from decompnet.consoles import get
+    dos = get("dos")
+    other = tmp_path / "not-a-dos-game.bin"
+    other.write_bytes(b"\x7fELF" + bytes(200))
+    assert dos.prepare_fork_game(other, tmp_path / "orig" / "game.exe", None) is False
+    assert dos.prepare_fork_game(other, tmp_path / "data" / "game.bin", None) is False
+    assert not (tmp_path / "orig").exists()

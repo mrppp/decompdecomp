@@ -270,6 +270,39 @@ def check_code(root: Path, version: str, log=print) -> dict:
             "what": "The game's code, rebuilt from the project,"}
 
 
+def place_copy(game: Path, dest: Path, sha1: str | None = None, *, move: bool = False) -> bool:
+    """The user's copy of a game this console reads, as orig/VERSION.exe (`dest`) and its code object as loaded
+    (orig/VERSION.code.bin), checked against the project's own record of that code (config/VERSION/functions.json's
+    sha1) when there is one. False when it isn't a game this console reads (another console may place it)."""
+    try:
+        mod = le.parse(game.read_bytes())
+        mod.relocated()
+        main = _main_object(mod)
+    except Exception:
+        return False
+    data = main.data
+    root, version = dest.parent.parent, dest.stem
+    try:
+        recorded = json.loads((root / "config" / version / "functions.json").read_text(encoding="utf-8")).get("sha1")
+    except (OSError, ValueError):
+        recorded = None
+    if recorded and hashlib.sha1(data).hexdigest() != recorded:
+        raise ForkError(f"{game.name} isn't the copy of the game this project was made from (its code differs)")
+    if sha1 and hashlib.sha1(game.read_bytes()).hexdigest() != sha1:
+        raise ForkError(f"{game.name} isn't the copy of the game this project was made from")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if game.resolve() != dest.resolve():
+        if move:
+            shutil.move(game, dest)
+        else:
+            try:
+                os.link(game, dest)
+            except OSError:
+                shutil.copyfile(game, dest)
+    (dest.parent / f"{version}.code.bin").write_bytes(data)
+    return True
+
+
 def _entry(f) -> dict:
     """A function as functions.json keeps it."""
     return {"name": f.name, "symbol": f.symbol, "convention": f.convention, **({"pops": f.pops} if f.pops else {}),
