@@ -4,6 +4,7 @@ synthetic project: no game, no compiler."""
 import importlib.util
 import json
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -441,4 +442,4 @@ def test_drafts_write_c89_for_old_watcoms_and_respect_void_callees():
     assert "  func_0001C860((int)(1));" in definition  # (a call that is a statement stays one)
     assert "(func_0001C860((int)(param_2)), 0)" in definition
     assert "(int)(uVar1) % 0xb" in definition
-    assert "bool" not in drafts.GHIDRA_H.split("#define true")[0].split("*/", 1)[1]  # (ghidra.h declares none)
+    assert not re.search(r"typedef[^;]*\bbool\s*;", drafts.GHIDRA_H)  # (ghidra.h declares none)
