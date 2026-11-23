@@ -33,6 +33,7 @@ def test_the_worker_describes_a_function_so_a_search_needs_only_its_name(tmp_pat
     assert hosted_judge.function_info(net, {"slug": "game", "name": "f16"})["compiler"] == {"toolchain": "ido-7.1", "flags": ["-O1"]}
     # the context the app's draft path gives draft_repairs.variants travels with it (prove_chain.py passes it on)
     assert {"tables", "callees", "entry_scope"} <= set(info) and isinstance(info["tables"], list)
+    assert isinstance(info["big_endian"], bool)
     assert "no project" in hosted_judge.function_info(net, {"slug": "nope", "name": "f3"})["error"]
     assert "0 functions" in hosted_judge.function_info(net, {"slug": "game", "name": "missing"})["error"]
     assert "0 functions" in hosted_judge.function_info(net, {"slug": "game", "name": "f3", "vram": 1})["error"]
@@ -146,3 +147,48 @@ def test_fast_judge_prints_the_score_and_then_the_differing_rows(tmp_path, monke
     assert out[0] == "30" and "1 row differs" in out[1]
     fast.main([str(source), "--slug", "game", "--function", "f1", "--header"])
     assert capsys.readouterr().out.strip() == "typedef int s32;"
+
+
+def test_prove_chain_offers_the_diff_gated_children_the_permuter_would(monkeypatch):
+    """draft_repairs.variants never sees the judge's rows, so a family that reads them (boolean_guard_operands' sink)
+    was invisible to a chain even though the Deep Permuter offers it."""
+    from decompnet.app import diff_gated_repairs, draft_repairs
+    prove = load("prove_chain")
+    seen = {}
+    monkeypatch.setattr(draft_repairs, "variants", lambda source, *a, **k: [source + "// plain"])
+    monkeypatch.setattr(diff_gated_repairs, "proposals", lambda *a, **k: seen.update(args=a, kw=k) or [
+        ("gated", a[0] + "// gated"), ("dup", a[0] + "// plain")])
+    judge = SimpleNamespace(arch="mips", asm="asm", header="h", compiler={"toolchain": "gcc-2.7.2-kmc", "flags": ["-O2"]},
+                            big_endian=False, rows=lambda source: (5, [("r", "a", "b")]))
+    out = prove.generator(judge, "f")("void f(void){}")
+    assert [family for family, _ in out] == ["unlabelled", "gated"]
+    assert seen["args"][5] == [("r", "a", "b")] and seen["kw"]["big_endian"] is False
+
+
+STUB_FLAGS = textwrap.dedent("""\
+    #!{python}
+    import json, sys
+    for line in sys.stdin:
+        r = json.loads(line)
+        if r["op"] == "function":
+            out = {{"name": r["name"], "vram": 4096, "target": "03e00008", "header": "",
+                   "compiler": {{"toolchain": "t", "flags": ["-O2"]}}}}
+        else:
+            out = {{"score": 30, "detail": "", "diff": "flags=%s" % " ".join(r["compiler"]["flags"])}}
+        print(json.dumps(out), flush=True)
+""")
+
+
+def test_fast_judge_flags_adds_to_the_functions_own_without_replacing_them(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "decomp"
+    path.write_text(STUB_FLAGS.format(python=sys.executable))
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("DECOMP_BIN", str(path))
+    fast = load("fast_judge")
+    source = tmp_path / "c.c"
+    source.write_text("int f1(void){return 1;}")
+    base = [str(source), "--slug", "game", "--function", "f1", "--diff"]
+    fast.main(base)
+    assert "flags=-O2\n" in capsys.readouterr().out
+    fast.main(base + ["--flags", "-fno-strength-reduce -fno-schedule-insns"])
+    assert "flags=-O2 -fno-strength-reduce -fno-schedule-insns" in capsys.readouterr().out
