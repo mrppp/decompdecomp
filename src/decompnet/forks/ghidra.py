@@ -56,7 +56,7 @@ def _headless() -> Path:
 
 
 def _run_script(binary: Path, script: str, timeout: float, *, analyse: bool = True,
-                said: list[str] | None = None) -> list[dict]:
+                said: list[str] | None = None, extra: tuple[str, ...] = ()) -> list[dict]:
     """Import `binary` into a throwaway Ghidra project, run one of our post-scripts on it and return the JSON objects
     it wrote, one per line ([] when it took longer than `timeout`). A Ghidra that didn't get to run the script says
     why (ForkError): that was "found no functions" before, which sent the user after packers and DRM. `said`, when
@@ -70,7 +70,7 @@ def _run_script(binary: Path, script: str, timeout: float, *, analyse: bool = Tr
         target = Path(tmp) / binary.name
         shutil.copyfile(binary, target)
         argv = [str(_headless()), tmp, "decompwtf", "-import", str(target), "-scriptPath", str(scripts),
-                "-postScript", script, str(out), "-deleteProject", *([] if analyse else ["-noanalysis"])]
+                "-postScript", script, str(out), *extra, "-deleteProject", *([] if analyse else ["-noanalysis"])]
         try:
             # (stop_all: a decompiler process killed at the cap is Ghidra's to replace, not the end of the analysis)
             res = subprocess.run(capped(argv, stop_all=False), capture_output=True, text=True, timeout=timeout, env=_env(),
@@ -109,9 +109,15 @@ _RUNS = threading.Semaphore(2)
 _OBJECTS: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 
-def decompile_object(obj: Path, cache_dir: Path, timeout: float = 900) -> dict[str, str]:
-    """name -> decompiled C for every function in an object file (cached by the object's content)."""
-    key = hashlib.sha1(obj.read_bytes()).hexdigest()[:16]
+def decompile_object(obj: Path, cache_dir: Path, timeout: float = 900,
+                     types: tuple[str, dict[str, str]] | None = None) -> dict[str, str]:
+    """name -> decompiled C for every function in an object file (cached by the object's content, and the types).
+    `types`: (a C header of the project's types, {symbol: type}) given to Ghidra first (DecompWtfExport), so the C
+    reads those symbols' fields by name; a type is a name, a pointer to it ("T *") or an array of it ("T[14]")."""
+    digest = hashlib.sha1(obj.read_bytes())
+    if types:
+        digest.update(json.dumps([types[0], sorted(types[1].items())]).encode())
+    key = digest.hexdigest()[:16]
     cache = cache_dir / f"{obj.stem}-{key}.json"
     with _OBJECTS[str(cache)]:
         if cache.exists():
@@ -119,8 +125,14 @@ def decompile_object(obj: Path, cache_dir: Path, timeout: float = 900) -> dict[s
         if not available():
             return {}
         try:
-            with _RUNS:
-                result = {row["name"]: row["c"] for row in _run_script(obj, "DecompWtfExport.java", timeout)}
+            with _RUNS, tempfile.TemporaryDirectory(prefix="decompwtf-types-") as given:
+                extra: tuple[str, ...] = ()
+                if types:
+                    header, data = Path(given) / "types.h", Path(given) / "data.tsv"
+                    header.write_text(types[0], encoding="utf-8")
+                    data.write_text("".join(f"{sym}\t{t}\n" for sym, t in sorted(types[1].items())), encoding="utf-8")
+                    extra = (str(header), str(data))
+                result = {row["name"]: row["c"] for row in _run_script(obj, "DecompWtfExport.java", timeout, extra=extra)}
         except ForkError:  # a draft is optional: none this time, and nothing cached, so it's tried again
             return {}
         cache_dir.mkdir(parents=True, exist_ok=True)

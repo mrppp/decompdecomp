@@ -621,6 +621,11 @@ class Console:
         its own: then try_compiler can switch it. None: the project's build decides alone."""
         return None
 
+    def draft_types(self, fp) -> dict | None:
+        """The project's own types for its Ghidra drafts, or None: {"header": C Ghidra parses, "data": {symbol: type},
+        "names": {a name drafts would write: the typed name to write instead}} (forkengine._draft)."""
+        return None
+
     # what file_compiler and file_ranges read (globs in the project): the overview, asked every second, reads them
     # again only when one changed (forkengine._file_parts). None named: read again every time
     compiler_config: tuple[str, ...] = ()

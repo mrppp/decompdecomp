@@ -3061,10 +3061,16 @@ class ForkEngine:
                                 unit.source, compiler_hint=hint)
             text = text and "/* m2c */\n" + text
             if not text and unit.target is not None and unit.target.exists() and ghidra.available():
-                found = ghidra.decompile_object(unit.target, fp.root / STATE / "ghidra")
+                console = consoles.get(cfg.get("platform") or "")
+                typed = console.draft_types(fp)  # (the project's own types for Ghidra: field names, not offsets)
+                found = ghidra.decompile_object(unit.target, fp.root / STATE / "ghidra",
+                                                types=(typed["header"], typed["data"]) if typed else None)
                 names = [meta.get("symbol") or fn["name"], *self._names(meta, fn)]
                 body = next((found[n] for n in names if n in found), None)
-                text = body and "/* Ghidra */\n" + consoles.get(cfg.get("platform") or "").adapt_draft(body.strip())
+                text = body and console.adapt_draft(body.strip())
+                for symbol, alias in ((typed or {}).get("names") or {}).items():
+                    text = text and re.sub(rf"\b{re.escape(symbol)}\b", alias, text)
+                text = text and "/* Ghidra */\n" + text
         except OSError:
             text = None
         with self.net.project_store(proj['id']).tx() as db:
