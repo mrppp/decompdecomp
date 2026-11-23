@@ -135,10 +135,14 @@ class FunctionDiff:
     renamed: list[tuple[str, str]] = field(default_factory=list)
     literals: list = field(default_factory=list)  # literals.Mismatch: constants that differ although the code matches
     refs: list[str] = field(default_factory=list)  # the symbols the original's relocations name, in order
+    # the `#pragma aux NAME = ...` instruction bodies (hand-written assembly) the function is or calls: never a match
+    # (ForkProject.diff caps such a function's score below 100)
+    asm_bodies: list[str] = field(default_factory=list)
 
     @property
     def matched(self) -> bool:
-        return self.match_percent is not None and self.match_percent >= 100.0 and not self.literals
+        return (self.match_percent is not None and self.match_percent >= 100.0 and not self.literals
+                and not self.asm_bodies)
 
     def why_not(self) -> str:
         """Why a function every instruction of which matches isn't a match, in a few words."""
@@ -147,6 +151,11 @@ class FunctionDiff:
         return "every instruction matches, but loaded constants differ"
 
     def literals_note(self) -> str:
+        if self.asm_bodies:
+            names = ", ".join(self.asm_bodies[:6])
+            return (f"NOT A MATCH: this function is or calls hand-written assembly (#pragma aux {names} = ...), which "
+                    "doesn't count, however its bytes come out. Write it in C and remove those pragma bodies (a "
+                    "#pragma aux without `=`, for a calling convention, is fine).")
         if not self.literals:
             return ""
         if all(isinstance(m, MappingConflict) for m in self.literals):  # an LTCG unit's address and data checks

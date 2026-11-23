@@ -482,3 +482,32 @@ def test_placing_a_room_members_copy_again_keeps_the_copy_already_there(tmp_path
     monkeypatch.setattr(scratch, "_main_object", lambda mod: type("O", (), {"data": b"code"})())
     assert scratch.place_copy(game, dest) and (dest.parent / "game.code.bin").read_bytes() == b"code"
     assert dest.read_bytes() == game.read_bytes()
+
+
+def test_functions_built_on_watcom_instruction_bodies_never_match():
+    """A function that is or calls a `#pragma aux NAME = ...` body (hand-written assembly) is capped below 100: their
+    hard-coded jumps matched for one arrangement of the file and not the next, 54 reopenings an hour in one file."""
+    from decompnet.forks import objdiff
+    from decompnet.forks.project import ForkProject, Unit, asm_bodied
+    text = ('#pragma aux helper_aux = "push ebp" "mov ebp,esp" parm caller [] modify [eax];\n'
+            '#pragma aux func_00000300 = "ret";\n#pragma aux func_00000400 frame;\n'
+            'int func_00000100(int a)\n{\n  helper_aux();\n  return a;\n}\n'
+            'int func_00000200(int a)\n{\n  /* helper_aux(); */\n  return a + 1;\n}\n')
+    found = asm_bodied(text)
+    assert found["func_00000100"] == {"helper_aux"} and found["func_00000300"] == {"func_00000300"}
+    assert "func_00000200" not in found and "func_00000400" not in found
+
+    class Fake(ForkProject):
+        def __init__(self, root):
+            self.root = root
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "a.c").write_text(text)
+        unit = Unit("a", None, None, "a.c", True, None)
+        d = objdiff.FunctionDiff("func_00000100", 100.0, [], 0,
+                                 {"func_00000100": 100.0, "func_00000200": 100.0, "func_00000300": 100.0}, [], {})
+        d = Fake(Path(tmp))._without_asm_bodies(unit, d)
+    assert not d.matched and d.match_percent < 100 and d.asm_bodies == ["helper_aux"]
+    assert d.unit_scores == {"func_00000100": 99.9, "func_00000200": 100.0, "func_00000300": 99.9}
+    assert "hand-written assembly" in d.literals_note()

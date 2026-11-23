@@ -283,6 +283,33 @@ def write_manifest(root: Path, manifest: dict) -> None:
         tmp.unlink(missing_ok=True)
 
 
+_ASM_BODY = re.compile(r"^[ \t]*#[ \t]*pragma[ \t]+aux[ \t]+(?:\([ \t]*\w+[ \t]*\)[ \t]*)?(\w+)[ \t]*=", re.M)
+_DEFINITION = re.compile(r"^[A-Za-z_][\w \t\*]*?\b(\w+)[ \t]*\([^;{}()]*(?:\([^()]*\)[^;{}()]*)*\)[ \s]*\{", re.M)
+
+
+def asm_bodied(text: str) -> dict[str, set[str]]:
+    """{function: the `#pragma aux NAME = ...` instruction bodies it is or calls} for the C in `text` (comments and
+    strings aside). A body named after a function makes that function one."""
+    import re as _re
+    clean = _re.sub(r"//[^\n]*|/\*.*?\*/", lambda m: " " * len(m.group(0)), text, flags=_re.S)
+    bodies = set(_ASM_BODY.findall(clean))
+    if not bodies:
+        return {}
+    found: dict[str, set[str]] = {name: {name} for name in bodies}
+    pattern = _re.compile(r"\b(" + "|".join(map(_re.escape, sorted(bodies))) + r")\b")
+    for m in _DEFINITION.finditer(clean):
+        name, depth, i = m.group(1), 0, m.end() - 1
+        for j in range(i, len(clean)):
+            depth += clean[j] == "{"
+            depth -= clean[j] == "}"
+            if depth == 0:
+                used = set(pattern.findall(clean[i:j + 1]))
+                if used:
+                    found.setdefault(name, set()).update(used)
+                break
+    return found
+
+
 class ForkProject:
     def __init__(self, root: Path, *, create_state: bool = True):
         self.root = Path(root)
@@ -1360,8 +1387,32 @@ class ForkProject:
         from .linkedimages import stale
         entry = next((u for u in self.objdiff_config().get("units", []) if u.get("name") == unit.name), {})
         base = None if stale(self.root, entry, {}) else unit.base
-        return objdiff.diff(unit.target, base, symbol, cwd=self.root, options=self.diff_options(unit),
-                            project=self.root if unit.mappings else None, unit=unit.name)
+        d = objdiff.diff(unit.target, base, symbol, cwd=self.root, options=self.diff_options(unit),
+                         project=self.root if unit.mappings else None, unit=unit.name)
+        return self._without_asm_bodies(unit, d)
+
+    ASM_CAPPED = 99.9  # the score a function made of hand-written assembly gets at best (never a match)
+
+    def _without_asm_bodies(self, unit: Unit, d: objdiff.FunctionDiff) -> objdiff.FunctionDiff:
+        """`d` with every function that is or calls a `#pragma aux NAME = ...` instruction body (Watcom's inline
+        assembly) scored below 100: such a body's hard-coded jumps came out right for one arrangement of the file and
+        not the next, so its functions matched and reopened over and over (54 times an hour in one file), and its
+        bytes are hand-written, not decompiled."""
+        try:
+            text = (self.root / unit.source).read_text(errors="replace", encoding="utf-8") if unit.source else ""
+        except OSError:
+            return d
+        bodied = asm_bodied(text)
+        if not bodied:
+            return d
+        for name in bodied:
+            if (score := d.unit_scores.get(name)) is not None and score >= 100:
+                d.unit_scores[name] = self.ASM_CAPPED
+        if d.symbol in bodied:
+            d.asm_bodies = sorted(bodied[d.symbol])
+            if d.match_percent is not None and d.match_percent >= 100:
+                d.match_percent = self.ASM_CAPPED
+        return d
 
     # ------------------------------------------------------------------ linking (dtk-template projects)
     # A file whose code and data match is linked into the game: configure.py marks it Matching, the build then
