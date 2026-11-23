@@ -62,4 +62,5 @@ def test_live_poll_does_not_request_fresh_room_statistics(tmp_path, monkeypatch)
     monkeypatch.setattr(net, 'overview', lambda slug, **kwargs: seen.append(kwargs) or {})
     with net.progress.view():
         net.live('game')
-    assert seen == [{'room_members': False}]
+    # (the fork paints a first poll with the cheap overview, quick=True, and builds the full one in the background)
+    assert seen and all(call.get('room_members') is False for call in seen), seen

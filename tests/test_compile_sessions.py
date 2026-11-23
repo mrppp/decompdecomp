@@ -127,7 +127,7 @@ def test_cache_bound_and_thread_ownership(builds):
 @pytest.mark.parametrize('value,expected', [('1',1), ('4',4), ('1000',256), ('bad',None), ('0',None), ('-1',None)])
 def test_concurrency_override_is_bounded(monkeypatch,value,expected):
     monkeypatch.setenv('DECOMP_COMPILER_THREADS', value)
-    assert compiler.concurrency_limit() == (expected or max(2, (os.cpu_count() or 4)-1))
+    assert compiler.concurrency_limit() == (expected or max(2, compiler.usable_cores()-1))
 
 
 @pytest.mark.parametrize('source', ['#define JOIN(a,b) a##b\nint entry(){return JOIN(__TI,ME__)[0];}',

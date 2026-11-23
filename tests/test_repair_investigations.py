@@ -8,6 +8,7 @@ import pytest
 
 from decompnet import agents
 from decompnet.app import repair_investigations as investigations
+from decompnet.app import updates
 from decompnet.network import NetworkError
 
 
@@ -46,7 +47,7 @@ def test_launch_is_private_and_keeps_evidence_outside_checkout(tmp_path, monkeyp
     assert not any('dangerously' in part or 'bypass' in part for part in data['argv'])
     assert not any('DECOMP_TOKEN' in part for part in data['argv'])
     assert calls[0][1:5] == ['clone', '--depth', '1', '--']
-    assert 'RetroReversing/decompdecomp.git' in calls[0][-2]
+    assert f'{updates.REPO}.git' in calls[0][-2]
     assert len(opened) == 1
 
 
