@@ -8,6 +8,13 @@ from decompnet.network import NetworkError
 from tests.test_claims import _game
 
 
+@pytest.fixture(autouse=True)
+def _count_each_call_at_once(monkeypatch):
+    """The fork batches tool-call counts every 30 s (tool_policy.FLUSH_SECONDS); these tests read them after each call."""
+    from decompnet.app import tool_policy as _tool_policy
+    monkeypatch.setattr(_tool_policy, "FLUSH_SECONDS", 0.0)
+
+
 def test_tool_lists_and_dispatch_obey_global_and_per_agent_policy(tmp_path, monkeypatch):
     net, _ = _game(tmp_path, [('f', 10, 'open')])
     a, _ = net.local_agent('one')
