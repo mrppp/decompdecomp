@@ -1,12 +1,23 @@
 """Try a few local repairs after an agent releases its lease, before another agent edits the draft."""
 import hashlib
 import logging
+import os
 import threading
 import time
 
 from .permute import Permuter, State
 
 log = logging.getLogger('decompdecomp')
+
+# The least time between two handoffs' starts on a project. One slot already ran them one at a time, but helpers
+# release every few seconds: on one game the slot was never free, 181 jobs in an hour back to back, and the helpers'
+# own compiles (and claims) queued behind them for up to 19 minutes a call. A release inside the gap leaves its work to
+# the next deep pass, as a full queue does. DECOMP_HANDOFF_GAP_SECONDS=0 runs them as before.
+def gap_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get('DECOMP_HANDOFF_GAP_SECONDS', '60')))
+    except ValueError:
+        return 60.0
 
 
 def run(net, slug, fn, *, stop=None, budget=6, seconds=8):
@@ -51,6 +62,11 @@ def handoff(net, slug, fn, *, plateau=False):
             return '\nCPU handoff already queued for this function; no duplicate work started.'
         if len(pending)>=8:
             return '\nCPU handoff queue is full. Saved C and remaining proposals are retained for the next deep pass.'
+        started=net.__dict__.setdefault('_repair_handoff_started',{})
+        gap=gap_seconds()
+        if gap and time.monotonic()-started.get(slug,float('-inf'))<gap:
+            return '\nCPU handoff skipped: one ran on this project under a minute ago (their compiles queue the helpers\' own). Saved C and remaining proposals are retained for the next deep pass.'
+        started[slug]=time.monotonic()
         pending[fn['id']]=scope
         def work(log):
             entered=False
