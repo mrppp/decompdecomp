@@ -153,3 +153,40 @@ def test_a_stuck_local_proposal_worker_cannot_block_the_event_loop(monkeypatch):
             draft_repairs.variants(SOURCE, 'func_80001000', 'mips')
 
     asyncio.run(check())
+
+
+NESTED = r"""
+import re, signal, sys
+sys.path[:0] = [{path!r}]
+from decompnet.app import repair_generation
+repair_generation.FAMILY_SECONDS = 0.2
+
+
+def outer_fired(*_):
+    raise SystemExit('the outer timer fired during the family')
+
+
+def stuck(source, name):
+    re.match(r'(a+)+b', 'a'*60)
+    return ['never']
+
+
+signal.signal(signal.SIGALRM, outer_fired)
+signal.setitimer(signal.ITIMER_REAL, 30)  # (pytest-timeout's, say)
+assert repair_generation.call(stuck, 'int f(void){}', 'f') == []
+assert repair_generation.cut_off() == [('__main__.stuck', 'f')]
+left = signal.getitimer(signal.ITIMER_REAL)[0]
+assert 29 < left <= 30, left
+assert signal.getsignal(signal.SIGALRM) is outer_fired
+print('ok')
+"""
+
+
+@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="requires the Unix family timer")
+def test_the_cut_off_works_inside_an_outer_timer_and_gives_it_back():
+    """Under pytest-timeout's own timer the cut-off stood aside, and slow families ran to the test's 20-minute
+    limit: four tests did in every full run, which then waited at 99% for them."""
+    from pathlib import Path
+    code = NESTED.replace('{path!r}', repr(str(Path(repair_generation.__file__).parents[2])))
+    run = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0 and run.stdout.strip() == 'ok', run.stderr
