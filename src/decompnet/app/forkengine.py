@@ -4237,6 +4237,27 @@ class ForkEngine:
         return counts
 
     @without_capture()
+    def _unit_builds_now(self, proj, fp: ForkProject, unit) -> bool:
+        """Whether a unit's source file builds as it is, remembered for that version of the file (its time and size).
+        Autopilot tried every function of a file a helper had left not building, and each draft failed with "the file
+        didn't build before your change either": over a third of one game's tries, each holding the builds helpers
+        wait for. Such a file is skipped until it changes."""
+        try:
+            st = (fp.root / unit.source).stat()
+        except OSError:
+            return True
+        seen = (st.st_mtime_ns, st.st_size)
+        checked = self.__dict__.setdefault("_autopilot_unit_builds", {})
+        key = (proj["id"], unit.name)
+        if (hit := checked.get(key)) is not None and hit[0] == seen:
+            return hit[1]
+        ok = bool(self._build_unit(proj, fp, unit)[0])
+        checked[key] = (seen, ok)
+        if not ok:
+            logging.getLogger("decompdecomp").info("autopilot: %s doesn't build as it is: its functions wait until it does",
+                                                   unit.source)
+        return ok
+
     def autopilot_one(self, agent: Agent, proj, fid: int, *, retry_draft=False) -> str:
         """match | near | far | fail | skip, for one function's drafts, each built and diffed like an agent's, until
         one matches. A draft autopilot already judged as it is now is skipped: autopilot tries a function again when
@@ -4256,6 +4277,8 @@ class ForkEngine:
             unit = fp.unit(fn["unit"])
             if not unit.source:
                 return "skip"
+            if not self._unit_builds_now(proj, fp, unit):
+                return "skip"  # (not judged: tried again once the file builds, by a helper's fix or the stale-file watch)
             names = self._names(self._meta(fn), fn)
             from . import draft_reports
             inputs = (self._draft_key(cfg, unit, fp.root),cfg.get('draft_generation',0))

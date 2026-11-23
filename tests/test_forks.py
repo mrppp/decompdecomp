@@ -1890,3 +1890,29 @@ def test_a_file_left_broken_is_put_back_from_its_last_commit(fork):
     assert "src/game.c" in (kept / "list.txt").read_text()
     os.utime(path, (old, old))
     assert net.forks.repair_stale_files(slug) == [], "a file that builds is left alone"
+
+
+@needs_tools
+def test_autopilot_waits_for_a_file_that_doesnt_build(fork, monkeypatch):
+    """Over a third of one game's autopilot tries went into files a helper had left not building: every draft
+    failed. Such a file's functions are skipped, unjudged, until the file changes and builds."""
+    net, slug, _ = fork
+    proj = net.project_row(slug)
+    root = Path(proj["root"])
+    path = root / "src" / "game.c"
+    good = path.read_text()
+    fn = next(r for r in net.function_map(slug) if r["status"] == "open")
+    fid = net.project_store(slug).one("SELECT id FROM functions WHERE name=?", fn["name"])["id"]
+    agent, _ = net.local_agent("autopilot")
+    tried = []
+    real = net.forks.attempt
+    monkeypatch.setattr(net.forks, "attempt", lambda *a, **k: (tried.append(1), real(*a, **k))[1])
+    try:
+        path.write_text(good + "\nint half_a_function(\n")
+        assert net.forks.autopilot_one(agent, proj, fid) == "skip" and not tried
+        assert net.forks.autopilot_one(agent, proj, fid) == "skip"  # (remembered: no second build of the same file)
+        path.write_text(good)
+        net.forks.autopilot_one(agent, proj, fid, retry_draft=True)
+        assert net.forks._autopilot_unit_builds[(proj["id"], "game")][1] is True
+    finally:
+        path.write_text(good)
