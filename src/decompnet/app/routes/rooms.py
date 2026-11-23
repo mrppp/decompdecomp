@@ -53,8 +53,11 @@ def register(app: App) -> None:
                 port = sock.getsockname()[1]
         # The Windows app runs under pythonw, where stdout is None; Uvicorn's default formatter calls stdout.isatty().
         # The app's file logger already records room-server errors, so this server needs no terminal logging.
+        # ws="none", as the app's own server (cli.server_config): the room serves no websockets, and uvicorn's look for
+        # a websockets library found the system's old one (no websockets.server.ServerProtocol) while the tray had
+        # the system's packages on the path, so every room failed to open, reported as its port being in use.
         server = uvicorn.Server(uvicorn.Config(collab.host_app(net, net.rooms), host=host, port=port, log_level="warning",
-                                               log_config=None, access_log=False))
+                                               log_config=None, access_log=False, ws="none"))
         threading.Thread(target=server.run, daemon=True, name=f"collab-{port}").start()
         for _ in range(100):
             if server.started:
@@ -63,7 +66,8 @@ def register(app: App) -> None:
                 break
             time.sleep(0.05)
         if not server.started:
-            raise NetworkError(f"couldn't open port {port} for the room (is something else using it?)")
+            raise NetworkError(f"couldn't start the room's server on port {port} (another program using the port, or "
+                               "an error starting it: the app's log says which)")
         share["servers"][key] = (server, port)
         return port
 

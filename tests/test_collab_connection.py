@@ -340,3 +340,14 @@ def test_a_guest_with_nothing_to_claim_says_what_the_host_says(connection, fork,
     assert said == why["why"]
     why = {}  # (an older host)
     assert link.claim(agent, None, "easiest") == (None, "")
+
+
+def test_the_rooms_server_never_looks_for_a_websockets_library():
+    """The room's uvicorn found the system's old websockets (no websockets.server.ServerProtocol) and every room
+    failed to open, reported as its port being in use; the app's own server already passed ws="none"."""
+    import inspect
+
+    from decompnet.app.routes import rooms
+    source = inspect.getsource(rooms)
+    config = source[source.index("uvicorn.Config(collab.host_app"):]
+    assert 'ws="none"' in config[:config.index("))") + 2]
