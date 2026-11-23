@@ -124,7 +124,7 @@ def test_packaged_mac_app_keeps_its_own_bundle(monkeypatch, tmp_path):
     monkeypatch.setenv("DECOMP_PACKAGE", "macos")
     assert "already available" in launcher.install_launcher()
     assert not (tmp_path / "Applications").exists()
-    assert updates.can_apply() == (False, "this decompdecomp was installed as a macOS app: download the new one from https://github.com/RetroReversing/decompdecomp/releases")
+    assert updates.can_apply() == (False, f"this decompdecomp was installed as a macOS app: download the new one from https://github.com/{updates.REPO}/releases")
 
 
 def test_mac_chooser_uses_the_apps_python_and_cancellation_is_empty(monkeypatch):
