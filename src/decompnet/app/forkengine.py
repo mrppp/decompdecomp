@@ -85,7 +85,11 @@ def _path_glob(glob: str) -> str:
     return re.sub(r"\*\*(?=[^/])", "**/*", glob)
 
 
-_CHEAT = re.compile(r"\b(__asm__|__asm|asm|_asm)\b|INCLUDE_ASM|GLOBAL_ASM|INCLUDE_RODATA|\.incbin|#\s*include\s*[\"<][^\">]*\.(s|S|asm|bin|inc\.c)[\">]")
+# (Watcom's `#pragma aux name = "push ebp" ...` is a function body of hand-written instructions or bytes: helpers
+# matched hundreds of DOS functions that way, and one such body that didn't build took a whole file's matches with
+# it. A `#pragma aux` without `=` -- calling convention, frame, parm/value registers, a "*_alias" name -- is C.)
+_CHEAT = re.compile(r"\b(__asm__|__asm|asm|_asm)\b|INCLUDE_ASM|GLOBAL_ASM|INCLUDE_RODATA|\.incbin|#\s*include\s*[\"<][^\">]*\.(s|S|asm|bin|inc\.c)[\">]"
+                    r"|^\s*#\s*pragma\s+aux\s+(?:\(\s*\w+\s*\)\s*)?\w+\s*=", re.M)
 
 
 # `register int x asm("r4");` binds a variable to a register: an accepted matching technique (pret's GBA
@@ -3635,7 +3639,9 @@ class ForkEngine:
         if len(source) > 64 * 1024:
             raise NetworkError("source too large")
         if _CHEAT.search(_strip_comments(source)):
-            raise NetworkError("inline assembly, asm functions and asm includes aren't allowed: a match has to come from C/C++")
+            raise NetworkError("inline assembly, asm functions and asm includes aren't allowed (nor a Watcom "
+                               "`#pragma aux name = ...` instruction body): a match has to come from C/C++. A #pragma "
+                               "aux without `=` for the calling convention is fine")
         names = self._names(meta, fn)
         _, span = self._find(source, names)
         console = consoles.get(cfg.get("platform"))
@@ -4767,7 +4773,9 @@ class ForkEngine:
         p = fp.safe_path(path, write=True)
         self.net.bump_generation(proj["id"])  # (a header or shared file: compiles may come out differently now)
         if _CHEAT.search(_strip_comments(new)):
-            raise NetworkError("inline assembly, asm functions and asm includes aren't allowed")
+            raise NetworkError("inline assembly, asm functions and asm includes aren't allowed (nor a Watcom "
+                               "`#pragma aux name = ...` instruction body: write the function in C; a #pragma aux "
+                               "without `=` for its calling convention is fine)")
         rel = Path(os.path.relpath(p, fp.root)).as_posix()
         units = [u for u in fp.units_for(rel) if u.base is not None]
         if units:  # a unit's own source file: only that unit can change

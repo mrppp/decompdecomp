@@ -443,3 +443,16 @@ def test_drafts_write_c89_for_old_watcoms_and_respect_void_callees():
     assert "(func_0001C860((int)(param_2)), 0)" in definition
     assert "(int)(uVar1) % 0xb" in definition
     assert not re.search(r"typedef[^;]*\bbool\s*;", drafts.GHIDRA_H)  # (ghidra.h declares none)
+
+
+def test_watcom_instruction_body_pragmas_are_inline_assembly_and_calling_conventions_are_not():
+    """`#pragma aux f = "push ebp" ...` is hand-written code (helpers matched hundreds of DOS functions that way, and
+    one such body that didn't build took a file's matches with it); a #pragma aux without `=` is C."""
+    from decompnet.app.forkengine import _CHEAT, _strip_comments
+    for body in ('#pragma aux func_0006733A_ret_aux = "push esi" "mov eax,0"',
+                 '#pragma aux f_aux = \\\n    "push ebx" "pop ebx"', '#pragma aux (cdecl) f = 0x90 0xc3'):
+        assert _CHEAT.search(_strip_comments(body)), body
+    for c in ('#pragma aux func_00067B63 frame', '#pragma aux mc1_state "*_D_000ADF6C"',
+              '#pragma aux f parm [eax] value [edx] modify [ecx]', '#pragma aux (__cdecl) f',
+              'int x; /* #pragma aux f = "nop" */', 'if (a == b) x = 1;'):
+        assert not _CHEAT.search(_strip_comments(c)), c
