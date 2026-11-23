@@ -161,6 +161,13 @@ The gateway deduplicates pending calls by connection, tool and arguments.
 - If the gateway replies **still running**, repeat the identical tool call with the same arguments and
   connection to collect its result. Keep other experiments local while a claim or compile is pending.
   If it replies **accepted** and says not to repeat, let the app finish and read the notice on the next reply.
+- `setup.py` and `mcp.py` do that waiting for you (up to 30 minutes per call, `DD_CALL_WAIT_SECONDS`; progress goes to
+  stderr; a dropped connection or 503 from an overloaded app is repeated too). A slow claim at start never tears the
+  session down: if the app is still busy when the wait ends, `setup.py` keeps the worktree, venv and connection and
+  tells you to run the same command again (same `--holder`), which collects the claim instead of claiming twice. Do
+  not re-run setup without `--holder`, and do not `stop` a session just because a claim was slow. `setup.py try`
+  keeps a submission that is still in flight (`try-pending.json`) and, on the next `try` with a different source,
+  collects the earlier verdict first: a second source is never sent while one is running.
 - If the client loses the response without a gateway receipt, recover with `get_claims` for a claim
   or the recorded verdict and history for a submission before retrying. Keep the canonical name and
   current claim token, and wait for the claim to be confirmed before submitting.
@@ -347,11 +354,29 @@ says the fix and the library families it names; try those families with `prove_c
 - **`local_flow` declined on any `volatile` in the text** until 0.5.604, so a saved best with `*(volatile T *)&global`
   reads had no variants from the ~40 flow-based families. Only a volatile local still declines; check
   `local_flow.analyze(source, name)` is not None before concluding the permuter has nothing.
+- **A scratch local assigned in every arm of a switch (registers only differ, `packet`/word pairs in `$a0`/`$v1` swapped
+  in all of them).** One top-level name for the cursor and the command words is one global pseudo with a huge reference
+  count, allocated before the short per-arm pseudos the target has; one local per arm gets the target's registers, but
+  each arm alone is worse (its tail stops cross-jumping with the others'), so all 24 webs go at once (365 -> 0).
+  decomp-repair `local_web_split` offers it as one child; a chain of one-arm children never finds it
+  (docs/learnings/function/display-list-arm-locals.md).
+- **A copy `move rX,rA; addu rX,rX,rIdx` in a loop that every spelling of the store folds into one `addu`** (about 400
+  tried: casts, helpers, pointer locals): cse leaves `q = base` but combine folds it into its add only inside one basic
+  block (flow.c's LOG_LINK) and cross-jumping runs after allocation, so write the add in both arms of an identical-arm
+  `if (g) { q += i; } else { q += i; }` on a long-lived local the loop does not assign: the copy stays and jump2 merges the
+  arms. A guard on a pointer the loop increments lifts its priority and swaps registers (30); a long-lived one gave 0
+  (230 -> 0 on a 300-instruction text-entry handler). decomp-repair `store_copy_arm_split`; `fast_judge.py --flags` probes
+  a profile (`-fno-strength-reduce`) without changing the function's.
 - **A saved best full of search scaffolding (union around a pointer and an integer, `if (x) { S } else { S }`, identity
   inline, copies of one cast, word locals every use truncates) is a dead end for a greedy chain**: each removal is neutral or
   worse alone (145 -> 240 on a 129-instruction list insertion, then 240 -> 0 with a loop key copy). decomp-repair
   `scaffold_strip` writes them out together and offers the child with `loop_invariant_key_copy` (`scaffold_strip_key_copy`);
   if `prove_chain` finds nothing on such a best, check that family fires first, then rewrite by hand and chain from there.
+- **Frame slots: an address-taken scalar is allocated at its first `&`, an array when its scope opens.** Five `s` rows
+  with the scalar's slot below the arrays' in the target mean the arrays belonged to a block after the call: declare
+  them in a block opened after it, in the target's order (no `volatile` needed). decomp-repair `late_aggregate_scope`;
+  the m2c `(flag = p != NULL, a) || (flag = p != NULL, b)` then `flag && q` guard sinks with `boolean_guard_operands`
+  (220 -> 5 -> 0 on a 418-instruction function; docs/learnings/finding/address-taken-scalar-slot-after-block-arrays.md).
 - **Several changes that are each no better alone** are the normal shape of a late match. Offer the combination as
   one child, and keep non-improving children for a second step (`operand_order_pass`'s combined step).
 - **A copy that lands in the wrong register (`$v1` for `$v0`) beside a `goto blockN` join.** m2c writes `v = s;`
@@ -417,8 +442,51 @@ says the fix and the library families it names; try those families with `prove_c
   into the arm as its first statement in a scope it is a local that heads the arm and fills the branch's delay slot
   (`arm_invariant_sink`, 115 -> 85). Reusing one variable for a sum and its result gives it two deaths (global) and
   breaks the tie. The delay slot takes an arm's first one-word insn, or one from above the branch, never a later one.
+  Correction (same allocator, 15 -> 0): reorg does take a later insn when nothing it skips is a `volatile` load; the
+  complement after the sum keeps the mask live into the sum (no shared register), and a sum variable shared with a
+  disjoint local of another block is global, so the `and` ties to the complement instead (`complement_late_plain_reads`,
+  `disjoint_local_merge_swap`; docs/learnings/function/heap-bump-arm-complement-tie.md).
+- **Identical arms the target keeps apart, and a shared pointer that swaps registers** (a tile lookup, KMC 2.7.2, 6175 -> 0;
+  docs/learnings/finding/tile-lookup-arm-chains-and-crossjump.md). The final `jump_optimize` cross-jumps two jumps to one
+  label whose preceding insns match (commutative ops in either operand order, same hard registers) all the way back to the
+  conditional jump, *unless the label was made during that pass* (`jump_chain` partners are searched only for labels older
+  than the pass): give each arm its own copy of the shared tail and the first tail merge makes the new label, so the arms'
+  chains are never compared (`label_run_copy`). A pointer set in several arms (`goto L; L: return *p << 7;`) is a global
+  pseudo, coloured after every arm's local quantities, which swaps `$v0`/`$v1` and also changes reorg's delay-slot choice
+  for the `return 0` test (`bnel` with a private pointer, `bne` shared: `shared_return_split`). Make the index term the
+  pointer operand (`(u8 *)(i * K) + (int)bank`) to tie the sum to it, put a `do { } while (0);` around the row product to
+  outrank the index chain, and read a masked parameter through a `u8` copy (`tile_arm_chains`).
+- **A byte copied into a scratch that cse then merges back (`temp = kind;` both `s32`), a counter incremented inside its own
+  test, a loop bound that becomes `move $t0,$a2`, a narrow comparand's extension that comes out after the bound's load**
+  (KMC 2.7.2, 655 -> 0 on a 154-instruction save-slot handler, docs/learnings/function/narrow-copy-web-save-slot-rank.md).
+  A copy kept in a local of the byte's own type is another machine mode, so cse leaves it (`narrow_copy_web`); `if
+  (temp++ != i) {..}` becomes `if (temp != i) {..} temp++;` so there is no copy of the old value
+  (`postincrement_after_test`); a bound the target loads as `lw $t0,-0xc($t0)` off the register that holds another global's
+  address is `limit = ((s32 *) &H)[-3];` as the do body's first statement (`sibling_symbol_offset_read`, evidence from the asm);
+  and `idx = index;` before it puts loop.c's movables in the target's order (`loop_body_key_copy`).
+- **m2c's join copy (`joined: check: near = force;`) that cse folds away, kept by an arm that copies for itself** (KMC 2.7.2, 640 -> 0
+  on a 148-instruction object handler): a copy whose destination is first referenced at the join is deleted (`make_regs_eqv`); copy it
+  in the arm that jumps to `check` (`near = force; goto check;`, `check:` after the join's copy) and put each arm's `force = 1;`
+  after its early-`return` guard. Each alone is worse (700, 1150); decomp-repair `join_copy_arm_anchor_sink` offers the combination
+  (docs/learnings/finding/join-copy-arm-anchor-and-flag-store-order.md).
 - **Flag words and widths:** bit-field structs for flag words; `u8`/`u16` widths keep or drop masks; overwrite a
   parameter after copying it (`arg = arg_in; arg_in = 0;`).
+- **A second pointer written beside the first (`q = p + 2`, `q[-1]`, `q[0]`, `q += 3` beside `p += 3`, or `q[i * 3 - 1]` for the
+  loop counter) is the loop pass's own work, not the game's.** loop.c reduces every `p[k]` (constant `k`) to a pointer of
+  its own and combines the offsets, and puts that pointer's increment just before the biv's; a user cursor orders its own
+  steps differently and costs a register order. Write plain `p[1]`, `p[2]` with one `p += 3` where the cursor's step was.
+  An opcode byte tested in a loop and switched on wants one `u8 op` local (`lbu $a0; andi $v1, $a0, 0xff` before the
+  compare). A switch arm with a dead reload followed by an overwrite is unfaithful: give each loaded value a block-scoped
+  `u8` local. decomp-repair `cursor_lockstep_fold`, `dispatch_byte_local`, `arm_reload_restore`
+  (docs/learnings/function/interpreter-derived-cursors-and-opcode-local.md: 550 -> 0, seven chained steps).
+
+- **A table walk whose per-iteration pointers (flag, name, code, raw record) are locals set at the top of the loop body: the
+  preheader and increment order is the reverse of the order loop.c meets the givs.** A match at 195 with only those rows and
+  three registers left was 0 once the pointer locals were written into each arm as the expression (`gTable[i].name`) and a
+  one-use local was set right before each constant-offset store (`p[16] = 0`: `express_from` needs a literal additive part, so
+  only a replaceable local is addressed `0x10($s1)`). The record typedef matters (`(char *) sym + K + i * 24` spellings were
+  far worse). decomp-repair `loop_giv_local_arm_inline`
+  (docs/learnings/finding/giv-locals-set-at-loop-top-vs-in-the-arms.md); `cc1 -dL` prints the giv list in emission order.
 
 ## 3b. Out of hand-written shapes? Trace the compiler instead of guessing
 
@@ -478,7 +546,7 @@ priorities and preferences, `-dS -dR` scheduling), and run the recent repair fam
    and land the fix in step 5. When results plateau, read the diff and choose a new hypothesis.
 
 `prove_chain.py --slug S --function F [SOURCE.c] --families a,b|all` applies the best-scoring child of those families
-step by step (bounded: one judge, capped children and steps; `--list` shows which families produce children) and prints
+(including the diff-gated ones the Deep Permuter calls with the judge's rows) step by step (bounded: one judge, capped children and steps; `--list` shows which families produce children) and prints
 each step's family and score: the cheap answer to "would the library have reached this from here". When edits are each
 worse alone, `--combine 10` merges a stalled step's 10 best children in pairs and triples (off by default: it found
 none on three three-edit functions, whose edits ranked far below the 10 best; narrow `--families` first).

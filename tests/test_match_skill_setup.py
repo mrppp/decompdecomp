@@ -25,11 +25,17 @@ def load(name):
     return module
 
 
+SLOW = ("{0} is still running (30 s so far): decompdecomp is still working on it. Nothing was lost and it will not run "
+        "twice: repeat exactly the same {0} call (same arguments) to wait for its result.")
+
+
 class FakeApp:
     """The app's window API (function status, connection create/revoke) and its MCP gateway, on two local ports."""
 
     def __init__(self, home):
         self.claims, self.revokes, self.status, self.creates, self.busy = [], [], "open", [], 0
+        self.busy_is_error = False
+        self.drops = 0  # the next N tools/call requests get HTTP 503 (an overloaded app)
         self.owner = ""  # when set, claim_function refuses: someone else holds the function
         self.calls, self.answers = [], ["ok"]  # the other tools' calls, and what they answer (the last repeats)
         self.tools = [
@@ -76,6 +82,9 @@ class FakeApp:
                 if body["method"] == "tools/list":
                     return self.reply({"jsonrpc": "2.0", "id": body["id"], "result": {"tools": outer.tools}})
                 args = body["params"]["arguments"]
+                if outer.drops:
+                    outer.drops -= 1
+                    return self.reply({"error": "overloaded"}, 503)
                 if body["params"]["name"] != "claim_function":
                     outer.calls.append((body["params"]["name"], args))
                     text = outer.answers.pop(0) if len(outer.answers) > 1 else outer.answers[0]
@@ -88,6 +97,9 @@ class FakeApp:
                 if outer.busy:
                     outer.busy -= 1
                     text = "claim_function is still running; repeat exactly the same call"
+                    if outer.busy_is_error:  # the real gateway answers "still running" as an error result
+                        return self.reply({"jsonrpc": "2.0", "id": body["id"], "result": {
+                            "isError": True, "content": [{"type": "text", "text": text}]}})
                 else:
                     text = f"## CLAIMED: demo/{args.get('function') or 'func_8001'}\nclaim_token: abc123\n"
                 self.reply({"jsonrpc": "2.0", "id": body["id"], "result": {"content": [{"type": "text", "text": text}]}})
@@ -193,6 +205,17 @@ def test_a_still_running_answer_repeats_the_identical_call(world, monkeypatch):
         assert app.claims[:3] == [{"strategy": "nearest", "max_insns": 800}] * 3
     finally:
         setup.main(["stop", "claude-t6"])
+
+
+def test_a_still_running_answer_marked_as_an_error_result_is_repeated_too(world, monkeypatch):
+    setup, app, home, primary = world
+    monkeypatch.setattr(setup.time, "sleep", lambda _: None)
+    app.busy, app.busy_is_error = 2, True
+    assert start(setup, home, primary, "--holder", "claude-t6e") == 0
+    try:
+        assert app.claims[:3] == [{"strategy": "nearest", "max_insns": 800}] * 3
+    finally:
+        setup.main(["stop", "claude-t6e"])
 
 
 def test_the_renewal_ends_by_itself_once_the_function_matches(world):
@@ -589,3 +612,180 @@ def test_the_long_helpers_warn_when_the_session_marker_exists(world, capsys, mon
         assert sys.modules["claimlost"].warn() and "claude-other" in capsys.readouterr().err
     finally:
         setup.main(["stop", "claude-l5"])
+
+
+def test_an_unchanged_claim_reply_counts_as_still_held_not_as_a_failed_renewal():
+    """The app answers a renewal that changes nothing with "You still hold the unchanged claim", not "## CLAIMED"; the
+    renewal took it for a failure and wrote a LOST warning for a function the session still held."""
+    setup = load("setup")
+
+    class Gateway:
+        def __init__(self, text):
+            self.text = text
+
+        def call(self, tool, arguments):
+            return self.text
+
+    assert setup.claim(Gateway("You still hold the unchanged claim: demo/func_8001. No new functions were claimed.\nx"), "func_8001") == "func_8001"
+    assert setup.claim(Gateway("## CLAIMED: demo/func_8002\nclaim_token: a\n"), "func_8002") == "func_8002"
+    with pytest.raises(setup.McpError, match="didn't claim anything"):
+        setup.claim(Gateway("nothing"), "func_8001")
+    with pytest.raises(setup.McpError, match="didn't claim anything"):  # a claim by strategy has no function to keep
+        setup.claim(Gateway("You still hold the unchanged claim: demo/func_8001. x"), "", "nearest")
+
+
+
+
+def test_a_claim_that_stays_still_running_for_long_is_waited_for_not_given_up_after_60_repeats(world, monkeypatch, capsys):
+    setup, app, home, primary = world
+    monkeypatch.setattr(setup.time, "sleep", lambda _: None)
+    app.busy = 130
+    assert start(setup, home, primary, "--holder", "claude-w1") == 0
+    try:
+        assert len(app.claims) == 131 and set(map(str, app.claims)) == {str({"strategy": "nearest", "max_insns": 800})}
+        assert "claim_function: still running in the app" in capsys.readouterr().err  # progress is printed
+    finally:
+        setup.main(["stop", "claude-w1"])
+
+
+def test_a_claim_the_app_never_finishes_in_time_keeps_the_built_session_and_a_rerun_reuses_it(world, monkeypatch):
+    setup, app, home, primary = world
+    monkeypatch.setattr(setup.time, "sleep", lambda _: None)
+    monkeypatch.setattr(setup, "CALL_WAIT_SECONDS", 0)
+    app.busy = 10**6
+    with pytest.raises(SystemExit, match="run the same command again"):
+        start(setup, home, primary, "--holder", "claude-w2")
+    root = setup.session_dir("claude-w2")
+    assert (root / "repo" / "f.txt").exists() and (root / "connection.json").exists()  # nothing was torn down
+    assert app.revokes == [] and len(app.creates) == 1
+    app.busy = 0
+    monkeypatch.setattr(setup, "CALL_WAIT_SECONDS", 60)
+    assert start(setup, home, primary, "--holder", "claude-w2") == 0  # the rerun reuses worktree and connection
+    try:
+        assert len(app.creates) == 1 and app.revokes == []
+        assert json.loads((root / "connection.json").read_text())["function"] == "func_8001"
+        assert "claim_pending" not in json.loads((root / "connection.json").read_text())
+        assert (root / "renew.pid").exists()
+    finally:
+        setup.main(["stop", "claude-w2"])
+
+
+def test_a_dropped_connection_or_503_is_repeated_not_fatal(world, monkeypatch):
+    setup, app, home, primary = world
+    monkeypatch.setattr(setup.time, "sleep", lambda _: None)
+    assert start(setup, home, primary, "--holder", "claude-w3") == 0
+    try:
+        gateway, _ = setup.session_gateway(holder="claude-w3")
+        app.drops, app.answers = 3, ["the function"]
+        assert gateway.call("get_function", {"function": "f"}) == "the function"
+        assert len(app.calls) == 1
+        app.drops = 10**6
+        with pytest.raises(setup.AppSlow):
+            gateway.call("get_function", {"function": "f"}, wait=0)
+    finally:
+        app.drops = 0
+        setup.main(["stop", "claude-w3"])
+
+
+def test_try_never_sends_a_second_source_while_the_first_is_still_in_flight(world, monkeypatch, tmp_path, capsys):
+    setup, app, home, primary = world
+    monkeypatch.setattr(setup.time, "sleep", lambda _: None)
+    assert start(setup, home, primary, "--holder", "claude-w4") == 0
+    root = setup.session_dir("claude-w4")
+    old, new = tmp_path / "old.c", tmp_path / "new.c"
+    old.write_text("int old;")
+    new.write_text("int new;")
+    try:
+        app.answers = [SLOW.format("compile_and_diff")]
+        monkeypatch.setattr(setup, "CALL_WAIT_SECONDS", 0)
+        with pytest.raises(SystemExit, match="still in flight"):
+            setup.main(["try", "claude-w4", str(old)])
+        assert (root / "try-pending.json").exists()
+        monkeypatch.setattr(setup, "CALL_WAIT_SECONDS", 60)
+        app.calls.clear()
+        app.answers = ["old verdict", "new verdict"]
+        assert setup.main(["try", "claude-w4", str(new)]) == 0
+        # the first source is repeated and finished before the second is sent
+        assert [a["source"] for _, a in app.calls] == ["int old;", "int new;"]
+        out = capsys.readouterr().out
+        assert out.index("old verdict") < out.index("new verdict")
+        assert not (root / "try-pending.json").exists()
+    finally:
+        setup.main(["stop", "claude-w4"])
+
+
+def test_stop_ends_the_renewal_even_when_it_ignores_sigterm(world, tmp_path, monkeypatch):
+    setup, app, home, primary = world
+    monkeypatch.setattr(setup, "STOP_GRACE_SECONDS", 1)
+    root = setup.session_dir("claude-w5")
+    root.mkdir(parents=True)
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)",
+         "_renew", str(root), "1"], start_new_session=True)
+    (root / "renew.pid").write_text(str(child.pid))
+    time.sleep(0.5)
+    assert setup.alive(child.pid)
+    assert setup.main(["stop", "claude-w5"]) == 0
+    assert child.poll() is not None and not setup.alive(child.pid)  # SIGKILLed, and gone
+    assert not root.exists()
+
+
+def test_stop_finds_a_renewal_whose_pid_file_is_gone(world, monkeypatch):
+    setup, app, home, primary = world
+    root = setup.session_dir("claude-w6")
+    root.mkdir(parents=True)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", "_renew", str(root), "1"],
+                             start_new_session=True)
+    time.sleep(0.5)
+    try:
+        assert setup.main(["stop", "claude-w6"]) == 0
+        assert child.poll() is not None
+    finally:
+        child.kill()
+
+
+def test_a_real_session_stop_leaves_no_renewal_behind(world):
+    setup, app, home, primary = world
+    assert start(setup, home, primary, "--holder", "claude-w7") == 0
+    root = setup.session_dir("claude-w7")
+    pid = int((root / "renew.pid").read_text())
+    assert setup.alive(pid)
+    assert setup.main(["stop", "claude-w7"]) == 0
+    assert not setup.alive(pid)
+
+
+def test_a_still_running_notice_flagged_as_an_error_is_repeated_not_fatal_and_phases_are_timed(world, monkeypatch, capsys):
+    """The gateway sends "still running" with isError set: a claim the app took over 45 s to start used to raise there
+    and tear the whole session down. The phases of the start are timed on stderr so a slow one is visible."""
+    setup, app, home, primary = world
+    monkeypatch.setattr(setup.time, "sleep", lambda _: None)
+    app.busy, app.busy_is_error = 3, True
+    assert start(setup, home, primary, "--holder", "claude-e1") == 0
+    try:
+        assert len(app.claims) == 4 and app.revokes == []
+        err = capsys.readouterr().err
+        assert "claim_function: answered after" in err and "3 repeats" in err
+        for name in ("worktree", "connection", "MCP handshake", "claim_function (gateway to app)"):
+            assert f"[setup] {name}" in err
+        assert "phases: worktree" in err and "claim_function (gateway to app)" in err.split("phases:")[1]
+    finally:
+        setup.main(["stop", "claude-e1"])
+
+
+def test_a_restarting_app_is_waited_for_and_a_refused_claim_says_what_to_do():
+    setup = load("setup")
+    gateway_text = ("decompdecomp isn't running or is restarting (connection refused). Nothing was changed. "
+                    "Wait a minute, then call claim_function again.")
+    assert setup.is_restarting(gateway_text.lower()) and not setup.is_still_running(gateway_text.lower())
+    assert "report_repair" in setup.claim_hint("Before claiming more work, call report_repair with function, case_id=3")
+    assert "release_function" in setup.claim_hint("you already hold func_1; match it or release_function it first")
+    assert "ask for another" in setup.claim_hint("func_2 is set aside (assembly): claim another")
+    assert setup.claim_hint("something unforeseen") == ""
+
+
+def test_a_refused_claim_at_start_prints_the_hint_and_leaves_nothing_behind(world, monkeypatch):
+    setup, app, home, primary = world
+    app.owner = "agent-x"
+    with pytest.raises(SystemExit, match="What to do: another agent"):
+        start(setup, home, primary, "--holder", "claude-e2", "func_9")
+    assert not setup.session_dir("claude-e2").exists()
