@@ -331,6 +331,28 @@ class Dos(Console):
         _, fp, _ = net.forks.get(slug)
         if scratch.write_tools(Path(fp.root)) and (version := self._version(fp)):
             fp.run(["python", "tools/configure.py", version], log=lambda *_: None, timeout=120)
+        self.restore_compiler_tests(fp, log)
+
+    def restore_compiler_tests(self, fp, log=print) -> list[str]:
+        """At start, nothing is mid-test: a file whose compiler differs from the last commit's (dos_compilers_map) is a
+        try_compiler test the app quit during, before it could put the file's compiler back. One game's file stayed
+        on OpenWatcom 2 that way, and the next by-hand switch committed the whole map, test and all. Each goes back to
+        its committed compiler; returns the files."""
+        import json
+        import subprocess
+        try:
+            head = subprocess.run(["git", "show", "HEAD:.decomp.wtf.json"], cwd=fp.root, capture_output=True, text=True,
+                                  timeout=30)
+            committed = (json.loads(head.stdout).get("dos_compilers_map") or {}) if head.returncode == 0 else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            committed = None
+        current = (fp.manifest or {}).get("dos_compilers_map") or {}
+        if committed is None or current == committed:
+            return []
+        changed = sorted(set(current) ^ set(committed) | {f for f in current if committed.get(f) != current[f]})
+        fp.update_manifest(dos_compilers_map=dict(committed))
+        log(f"put back the compilers of {', '.join(changed)}: a compiler test the app stopped during had left them")
+        return changed
 
     def cut_function(self, fp, symbol: str, at: int, keep: set[str], why: str = "") -> str:
         from . import project

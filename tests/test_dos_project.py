@@ -394,3 +394,35 @@ def test_drafts_fit_the_file_they_go_into():
     assert definition.startswith("void func_00010C30(void)")  # (the file's own declaration says void)
     assert "{ (u16)((int)(iVar1 - 0x7463) / 0xa4); return; }" in definition  # (a void function returns nothing)
     assert "extern" not in prelude  # (the file declares both globals already)
+
+
+def test_a_compiler_test_the_app_quit_during_is_put_back_at_start(tmp_path):
+    """try_compiler switches a file's compiler while it tests and puts it back after; an app quit in between left one
+    game's file on OpenWatcom 2, and the next by-hand switch committed it. At start, nothing is mid-test."""
+    import subprocess
+    root = tmp_path
+    (root / ".decomp.wtf.json").write_text(json.dumps({"compiler": "watcom-10.0a",
+                                                         "dos_compilers_map": {"src/auto/b.c": "watcom-9.5"}}))
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "x", "--allow-empty"],
+                   cwd=root, check=True)
+    subprocess.run(["git", "add", ".decomp.wtf.json"], cwd=root, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "m"], cwd=root, check=True)
+
+    class Fp:
+        def __init__(self):
+            self.root = root
+
+        @property
+        def manifest(self):
+            return json.loads((root / ".decomp.wtf.json").read_text())
+
+        def update_manifest(self, **keys):
+            m = self.manifest
+            m.update(keys)
+            (root / ".decomp.wtf.json").write_text(json.dumps(m))
+    fp = Fp()
+    assert DOS.restore_compiler_tests(fp, log=lambda *_: None) == []  # (nothing left over)
+    fp.update_manifest(dos_compilers_map={"src/auto/a.c": "openwatcom-2.0", "src/auto/b.c": "watcom-9.5"})
+    assert DOS.restore_compiler_tests(fp, log=lambda *_: None) == ["src/auto/a.c"]
+    assert fp.manifest["dos_compilers_map"] == {"src/auto/b.c": "watcom-9.5"}  # (the committed choice stays)
