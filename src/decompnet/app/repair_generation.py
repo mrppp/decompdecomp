@@ -52,9 +52,14 @@ def _bounded(function, args, kwargs):
         if maximum <= 0 or remaining < maximum:
             maximum = remaining
             request_limited = True
+    # An outer timer already running (pytest-timeout's, a caller's) is paused for the family's window and given back
+    # what it had left after it, firing at once if that ran out meanwhile. (The cut-off used to stand aside for any
+    # outer timer, so under pytest-timeout a slow family ran on until the test's own 20-minute limit: four tests did
+    # in every full run, which then waited for them.) An outer timer due first stays as it is.
+    outer = signal.getitimer(signal.ITIMER_REAL)[0] if hasattr(signal, 'getitimer') else 0
     timed = (depth == 0 and maximum > 0 and hasattr(signal, 'setitimer')
              and threading.current_thread() is threading.main_thread()
-             and signal.getitimer(signal.ITIMER_REAL)[0] == 0)
+             and (outer == 0 or outer > maximum))
     if not timed:
         _DEPTH.value = depth+1
         try:return function(*args, **kwargs)
@@ -64,6 +69,7 @@ def _bounded(function, args, kwargs):
     previous = signal.signal(signal.SIGALRM, expired)
     _DEPTH.value = 1
     produced = []
+    began = time.monotonic()
     try:
         try:
             signal.setitimer(signal.ITIMER_REAL, maximum)
@@ -90,6 +96,8 @@ def _bounded(function, args, kwargs):
     finally:
         signal.signal(signal.SIGALRM, previous)
         _DEPTH.value = 0
+        if outer:
+            signal.setitimer(signal.ITIMER_REAL, max(outer - (time.monotonic() - began), 0.001))
     return produced
 
 
