@@ -101,6 +101,22 @@ _LINKAGE_DECL = re.compile(
     r'__attribute__\s*\(\(\s*visibility\s*\(\s*"hidden"\s*\)\s*\)\)\s*;')
 
 
+def _put_back(path: Path, before: str, after: str) -> bool:
+    """`before` written back over a trial's `after`, only while the file still holds that trial: a trial put its
+    saved text back whatever had happened to the file meanwhile, and a deep pass's lanes (another process, outside
+    this one's locks) twice undid a repair made in between. A file someone else wrote since is theirs; logged."""
+    try:
+        now = path.read_bytes()
+    except FileNotFoundError:
+        now = None
+    if now is not None and now != after.replace("\n", os.linesep).encode("utf-8"):
+        logging.getLogger("decompdecomp").warning("left %s as it is: it changed during a trial, which would have put "
+                                                  "back the text from before it", path)
+        return False
+    _rewrite(path, before)
+    return True
+
+
 def _strip_comments(code: str) -> str:
     return _REGVAR.sub(" ", _LINKAGE_DECL.sub(" ", re.sub(r"//[^\n]*|/\*.*?\*/", " ", code, flags=re.S)))
 
@@ -3695,7 +3711,7 @@ class ForkEngine:
                 return text + self.net.same_score_and_seen_note(fn["id"], agent.id, score, code, project_id=fn["project_id"])
 
             def undo() -> None:
-                _rewrite(path, before)
+                _put_back(path, before, after)
                 unname()
                 if (proj["id"], unit.name) in self._trials and scores is not None and not renamed and not linked:
                     self._trials[(proj["id"], unit.name)] = True  # (a run of tries: built once, at its end)
@@ -3710,7 +3726,7 @@ class ForkEngine:
                 """The file as it was, when the build or diff raised instead of returning: a job cancelled while it
                 waited (as at shutdown) left the try in the file. Four of one game's files kept a saved draft placed
                 without its declarations that way, and broke every build of them after."""
-                _rewrite(path, before)
+                _put_back(path, before, after)
                 unname()
 
             handoff_inputs = agent_notes.project_inputs(fp, unit, fn) if quiet is None and not diagnostic else None
@@ -3723,7 +3739,7 @@ class ForkEngine:
                 # the build itself is broken, not the agent's code: nothing recorded or counted, and the project
                 # is set up again in the background (one project spent five compiles on a build.ninja whose python
                 # was in another home, then the sessions quit)
-                _rewrite(path, before)
+                _put_back(path, before, after)
                 unname()
                 threading.Thread(target=self.preflight, args=(slug,), daemon=True, name=f"preflight-{slug}").start()
                 return {"text": f"❌ The project's build is broken, not your code: {broken}. Your change was undone, "
@@ -5161,8 +5177,10 @@ class ForkEngine:
                     console.set_file_compiler(fp, source, own)
                 for u in units:
                     self._build_unit(proj, fp, u)
-                why = (f"{', '.join(sorted(broken)[:8])} no longer match with it" if broken
-                       else f"the file doesn't build with it:\n{_tail(log)}")
+                # (a file that doesn't build is the reason even when matches broke too: forced, they would have
+                # reopened, and naming them sent a reader after the wrong problem)
+                why = (f"the file doesn't build with it:\n{_tail(log)}" if not all(after.values())
+                       else f"{', '.join(sorted(broken)[:8])} no longer match with it")
                 raise NetworkError(f"{source} stays with {own}: {why}")
             why = (f"\n\nNo longer matching with it, reopened: {', '.join(sorted(broken))}." if broken else "")
             self._commit(proj, fp, rel, f"Build {source} with {compiler}\n\nChosen in decompdecomp's project settings.{why}")

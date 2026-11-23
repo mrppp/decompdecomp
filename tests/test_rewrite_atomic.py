@@ -38,3 +38,13 @@ def test_an_unchanged_file_is_only_touched(tmp_path):
     inode = path.stat().st_ino
     _rewrite(path, "int a;\n")
     assert path.stat().st_ino == inode and path.read_text() == "int a;\n"
+
+
+def test_a_trial_puts_back_its_text_only_while_the_file_holds_the_trial(tmp_path):
+    """A trial wrote its saved text back whatever had happened meanwhile: another process's repair was undone."""
+    from decompnet.app.forkengine import _put_back
+    path = tmp_path / "unit.c"
+    _rewrite(path, "trial;\n")
+    assert _put_back(path, "before;\n", "trial;\n") and path.read_text() == "before;\n"
+    _rewrite(path, "a repair made meanwhile;\n")
+    assert not _put_back(path, "before;\n", "trial;\n") and path.read_text() == "a repair made meanwhile;\n"
