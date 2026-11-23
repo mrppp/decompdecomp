@@ -102,17 +102,16 @@ _LINKAGE_DECL = re.compile(
 
 
 def _put_back(path: Path, before: str, after: str) -> bool:
-    """`before` written back over a trial's `after`, only while the file still holds that trial: a trial put its
-    saved text back whatever had happened to the file meanwhile, and a deep pass's lanes (another process, outside
-    this one's locks) twice undid a repair made in between. A file someone else wrote since is theirs; logged."""
+    """`before` written back after a trial, always. (Writing it only while the file still held the trial's text left
+    trials in files: a helper's edit made during a trial in the same app builds on the trial's text, and refusing the
+    restore kept both. On one game 18 refusals left trial C in four files, and some 170 matched functions reopened.)
+    A file that changed during the trial is logged."""
     try:
-        now = path.read_bytes()
-    except FileNotFoundError:
-        now = None
-    if now is not None and now != after.replace("\n", os.linesep).encode("utf-8"):
-        logging.getLogger("decompdecomp").warning("left %s as it is: it changed during a trial, which would have put "
-                                                  "back the text from before it", path)
-        return False
+        if path.read_bytes() != after.replace("\n", os.linesep).encode("utf-8"):
+            logging.getLogger("decompdecomp").info("%s changed during a trial; its text from before the trial is put "
+                                                   "back", path)
+    except OSError:
+        pass
     _rewrite(path, before)
     return True
 
