@@ -109,8 +109,12 @@ def _no_progress_wait(monkeypatch):
 # watches its own physical footprint and, above the limit, names the test, prints every thread's stack and ends
 # itself: the test fails ("worker crashed") and xdist carries on with a new worker. DECOMP_TEST_MEMORY_MB sets the
 # limit (0: off). The per-test time limit is pytest-timeout's (addopts).
+# The limit is what one test adds to its process (from that test's start): a worker runs thousands of tests and
+# grows by what they leave cached, and an absolute limit ended a worker every ~20% of a full run, the test that
+# crossed it named though it added nothing; xdist then never handed the dead worker's remaining tests on, and the run
+# waited at 97% until its time ran out (2,010 tests never run). A worker past three times the limit still ends.
 MEMORY_LIMIT_MB = int(os.environ.get("DECOMP_TEST_MEMORY_MB", "4096"))
-_running = {"test": None}
+_running = {"test": None, "start_mb": None}
 _config = {}
 
 
@@ -149,15 +153,20 @@ def _watch_memory(limit_mb, interval=1.0, stop=None):
     stop = stop or threading.Event()
     while not stop.wait(interval):
         used = memory_mb()
-        if used is None or used <= limit_mb:
+        if used is None:
+            continue
+        start = _running.get("start_mb")
+        added = used - start if start is not None else used
+        if added <= limit_mb and used <= 3 * limit_mb:
             continue
         try:  # (pytest captures stderr at the descriptor, and an ended process never hands it back: show it now)
             _config["config"].pluginmanager.getplugin("capturemanager").suspend_global_capture(in_=False)
         except Exception:
             pass
         stream = sys.__stderr__
-        stream.write(f"\n{_running['test'] or 'pytest'} used {used:,.0f} MB, over the {limit_mb:,} MB a test may use "
-                     "(DECOMP_TEST_MEMORY_MB); ending this test process. Where every thread was:\n")
+        stream.write(f"\n{_running['test'] or 'pytest'} added {added:,.0f} MB (the process: {used:,.0f} MB), over the "
+                     f"{limit_mb:,} MB a test may add or three times that in all (DECOMP_TEST_MEMORY_MB); ending this test "
+                     "process. Where every thread was:\n")
         stream.flush()
         faulthandler.dump_traceback(file=stream, all_threads=True)
         stream.flush()
@@ -175,6 +184,7 @@ def pytest_configure(config):
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     _running["test"] = item.nodeid
+    _running["start_mb"] = memory_mb() if MEMORY_LIMIT_MB > 0 else None
     try:
         yield
     finally:

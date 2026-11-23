@@ -29,5 +29,27 @@ def test_a_process_over_the_limit_names_its_test_and_ends(tmp_path):
     """) % str(conftest._CHECKOUT)
     done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
     assert done.returncode == 70
-    assert "tests/test_example.py::test_runaway used" in done.stderr and "over the 100 MB" in done.stderr
+    assert "tests/test_example.py::test_runaway added" in done.stderr and "over the 100 MB" in done.stderr
     assert "most recent call first" in done.stderr  # (every thread's stack follows)
+
+
+def test_a_worker_grown_by_earlier_tests_is_not_ended_for_what_they_left(tmp_path):
+    """The limit is what the running test adds: workers grown past it by thousands of earlier tests were ended
+    every ~20% of a full run, and xdist never ran the dead workers' remaining tests (the run waited at 97%)."""
+    if conftest.memory_mb() is None:
+        pytest.skip("this system has no footprint reading")
+    script = textwrap.dedent("""
+        import sys, threading
+        sys.path.insert(0, %r)
+        from tests import conftest
+        hold = bytearray(150 * 2**20)  # (earlier tests' leftovers: past the limit, under three times it)
+        for i in range(0, len(hold), 4096): hold[i] = 1
+        conftest._running["test"] = "tests/test_example.py::test_small"
+        conftest._running["start_mb"] = conftest.memory_mb()  # (this test starts here)
+        stop = threading.Event()
+        threading.Timer(0.5, stop.set).start()
+        conftest._watch_memory(limit_mb=100, interval=0.05, stop=stop)
+        print("still running")
+    """) % str(conftest._CHECKOUT)
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0 and "still running" in done.stdout, done.stderr[-400:]

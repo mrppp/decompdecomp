@@ -432,10 +432,12 @@ def test_opencode_helpers_use_independent_databases_without_losing_signin(tmp_pa
         _, env, _ = m._command(s, "tok", work)
         paths.append(env["OPENCODE_DB"])
         assert os.path.isabs(paths[-1]) and os.path.dirname(paths[-1]) == str(work.resolve())
-        for key in ("HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"):
-            assert env[key] == os.environ[key]  # auth/config discovery is unchanged
+        for key in ("HOME", "XDG_DATA_HOME"):
+            assert env[key] == os.environ[key]  # sign-in (auth.json in XDG_DATA_HOME) is unchanged
+        assert env["XDG_CONFIG_HOME"] == str((work / "xdg-config").resolve())  # (the user's config isn't read)
     assert paths[0] == paths[2] and paths[0] != paths[1] and str(shared) not in paths
     assert os.environ["OPENCODE_DB"] == str(shared)  # only the child environment changes
+
     # Exercise real SQLite contention at the paths passed to the CLI, without starting a model or a live project.
     with sqlite3.connect(shared, timeout=0) as user, sqlite3.connect(paths[0], timeout=0) as first:
         user.execute("BEGIN IMMEDIATE")
@@ -444,6 +446,33 @@ def test_opencode_helpers_use_independent_databases_without_losing_signin(tmp_pa
             second.execute("CREATE TABLE startup (ready INTEGER)")
             second.execute("INSERT INTO startup VALUES (1)")
             assert second.execute("SELECT ready FROM startup").fetchone() == (1,)
+
+
+
+def test_opencode_helpers_keep_the_users_providers_but_not_their_mcp_servers(tmp_path, monkeypatch):
+    """The user's OpenCode config was merged into every helper session, MCP servers and plugins too: sixteen MCP
+    servers started per session, and over 512 tools, which one model's provider refused."""
+    import json
+    m = _manager(tmp_path, monkeypatch, "opencode")
+    monkeypatch.setitem(kinds.known_versions, "opencode", (0, "opencode v2.3.0"))
+    config_home = tmp_path / "config"
+    (config_home / "opencode").mkdir(parents=True)
+    (config_home / "opencode" / "opencode.jsonc").write_text(
+        '{\n  // the user own settings\n  "model": "opencode-go/kimi-k2.7-code",\n'
+        '  "provider": {"ollama-beast": {"options": {"baseURL": "http://beast:11434/v1"}}},\n'
+        '  "mcp": {"reaper": {"type": "local", "command": ["reaper-mcp"]}, "servers": {"rea": {"type": "local"}}},\n'
+        '  "plugin": ["./plugins/memory.ts"],\n}\n')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    work = tmp_path / "helper"
+    work.mkdir()
+    s = agents.Session("h", "opencode", "h", "demo", "h", {"model": "opencode-go/beam-free"})
+    _, env, _ = m._command(s, "tok", work)
+    written = json.loads((work / "opencode.json").read_text())
+    assert written["provider"] == {"ollama-beast": {"options": {"baseURL": "http://beast:11434/v1"}}}
+    assert written["model"] == "opencode-go/kimi-k2.7-code"
+    servers = written["mcp"].get("servers", written["mcp"])
+    assert list(servers) == ["decompdecomp"] and "plugin" not in written
+    assert env["XDG_CONFIG_HOME"] == str((work / "xdg-config").resolve()) and (work / "xdg-config").is_dir()
 
 
 def test_opencode_2_helpers_get_a_plugin_that_waits_for_the_apps_tools(tmp_path, monkeypatch):

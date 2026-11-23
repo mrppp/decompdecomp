@@ -343,8 +343,11 @@ def server_config(app):
     import uvicorn
 
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
+    # ws="none": the app serves no websockets, and uvicorn's look for a websockets library could find the system's
+    # old one while the tray briefly had the system's packages on the path (for gi): the app quit at start, twice
+    # in one day on one desktop. Without websocket support uvicorn never imports it.
     return uvicorn.Config(app, log_config=None, access_log=False, timeout_graceful_shutdown=5,
-                          timeout_keep_alive=KEEP_ALIVE)
+                          timeout_keep_alive=KEEP_ALIVE, ws="none")
 
 
 def update_cmd(args) -> int:

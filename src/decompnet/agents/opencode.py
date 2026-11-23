@@ -22,6 +22,10 @@ PLACEHOLDER = "Unexpected server error"  # its JSON error when the log line says
 MCP_SERVER = "decompdecomp"  # the app's MCP server, in the config and in the plugin that waits for it
 MCP_WAIT_SECONDS = 10  # how long opencode 2's first prompt waits for that server to connect (#24)
 MCP_SETTLE_MS = 300  # then for the registry's 100 ms debounce to publish its tools
+# What a helper keeps of the user's own OpenCode settings: its providers (API keys, local servers) and default models.
+# Not their MCP servers, plugins, agents or language servers (HELPER_CONFIG_DIR).
+USER_SETTINGS = ("provider", "providers", "model", "small_model")
+HELPER_CONFIG_DIR = "xdg-config"  # a helper's own XDG_CONFIG_HOME, in its folder, so the user's isn't read
 PLUGIN_DIR = "decompdecomp-wait"  # the plugin's folder in a helper's own folder, next to its opencode.json
 _PLUGIN_SOURCE = Path(__file__).with_name("opencode_wait.js")
 
@@ -126,6 +130,21 @@ class Opencode(Agent):
                               r'|This Go model trains on request data|Allow paid endpoints that train on request data'
                               r'|\bModel [^\n]{1,120} has been deprecated\b|' + re.escape(FREE_ALLOWANCE),error,re.I))
 
+    @staticmethod
+    def user_settings() -> dict:
+        """USER_SETTINGS from the user's own OpenCode config (opencode.json, opencode.jsonc, config.json: JSON with
+        comments), the later file's wins."""
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "opencode"
+        kept: dict = {}
+        for name in ("config.json", "opencode.json", "opencode.jsonc"):
+            try:
+                data = json.loads(_strip_jsonc((base / name).read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict):
+                kept.update({k: data[k] for k in USER_SETTINGS if k in data})
+        return kept
+
     def config_model(self) -> str | None:
         base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
         return read_json(base / "opencode" / "opencode.json").get("model") or None
@@ -168,8 +187,14 @@ class Opencode(Agent):
             if zen:  # a rejected ask ends the whole run unless this says otherwise: a free model reaching for `rg`
                 # or `ls` on its third step ended every session of a PC game's helpers, 20 seconds in
                 config["experimental"] = {"continue_loop_on_deny": True}
+        # The user's own OpenCode config is merged into every session, MCP servers and plugins too: each helper
+        # session started a desktop's sixteen MCP servers (Reaper, ComfyUI, GitHub ...), and offered their tools with
+        # the app's, more than 512, which one free model's provider refuses outright. A helper reads a config folder
+        # of its own (XDG_CONFIG_HOME, below) and keeps only the user's providers and default models.
+        config = {**self.user_settings(), **config}
         (workdir / "opencode.json").write_text(json.dumps({"$schema": "https://opencode.ai/config.json", **config}),
                                                encoding="utf-8")
+        (workdir / HELPER_CONFIG_DIR).mkdir(parents=True, exist_ok=True)
         # --print-logs: opencode's JSON error only says "Unexpected server error"; the log line says what failed.
         # (No --dir: it runs in workdir, and OpenCode before 1.4 stops at the flag. No --log-level either: before
         # 2.0 it took only ERROR, from 2.0 only error, and either stops the other at once.)
@@ -183,7 +208,8 @@ class Opencode(Agent):
             # the saved selection, but pass effort through its separate flag.
             base, _, variant = model.partition('#')
             model_args = ["-m", base, "--variant", variant]
-        return cmd + model_args, {"OPENCODE_DB": str((workdir / "opencode.db").resolve())}
+        return cmd + model_args, {"OPENCODE_DB": str((workdir / "opencode.db").resolve()),
+                                  "XDG_CONFIG_HOME": str((workdir / HELPER_CONFIG_DIR).resolve())}
 
     def parse(self, event: dict, state: dict) -> list[tuple[str, str] | None]:
         t = event.get("type")
@@ -276,3 +302,34 @@ class Opencode(Agent):
 
 
 OPENCODE = Opencode()
+
+
+def _strip_jsonc(text: str) -> str:
+    """JSON with comments and trailing commas (OpenCode's .jsonc) as JSON: // and /* */ outside strings, then the
+    commas before a closing bracket."""
+    out, i, in_string = [], 0, False
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if c == "\\" and i + 1 < len(text):
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+        elif c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = len(text) if end < 0 else end + 2
+        else:
+            out.append(c)
+            i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
