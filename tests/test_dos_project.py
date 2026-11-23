@@ -426,3 +426,19 @@ def test_a_compiler_test_the_app_quit_during_is_put_back_at_start(tmp_path):
     fp.update_manifest(dos_compilers_map={"src/auto/a.c": "openwatcom-2.0", "src/auto/b.c": "watcom-9.5"})
     assert DOS.restore_compiler_tests(fp, log=lambda *_: None) == ["src/auto/a.c"]
     assert fp.manifest["dos_compilers_map"] == {"src/auto/b.c": "watcom-9.5"}  # (the committed choice stays)
+
+
+def test_drafts_write_c89_for_old_watcoms_and_respect_void_callees():
+    """bool (a file's own typedef clashed with ghidra.h's), a void callee's value (E1052) and Ghidra's 64-bit
+    locals and signed remainder (E1010, E1090), as Watcom 9.5 and 10 take them."""
+    known = "void func_0001C860(int);\n"
+    draft = ("int func_0001C570(int param_2)\n{\n  bool b;\n  longlong uVar1;\n  int p;\n  func_0001C860(1);\n"
+             "  p = (int)func_0001C860(param_2);\n  uVar1 = 5;\n"
+             "  return (short)((int)((unsigned int)(uint)((int)uVar1 >> 0x1f) << 0x20 | uVar1 & 0xffffffff) % 0xb);\n}\n")
+    _, definition = drafts.compilable(draft, "func_0001C570", {}, known)
+    assert "unsigned char b;" in definition and "bool" not in definition
+    assert "int uVar1;" in definition and "longlong" not in definition
+    assert "  func_0001C860((int)(1));" in definition  # (a call that is a statement stays one)
+    assert "(func_0001C860((int)(param_2)), 0)" in definition
+    assert "(int)(uVar1) % 0xb" in definition
+    assert "bool" not in drafts.GHIDRA_H.split("#define true")[0].split("*/", 1)[1]  # (ghidra.h declares none)

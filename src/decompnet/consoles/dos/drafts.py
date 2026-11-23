@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 
 GHIDRA_HEADER = "ghidra.h"
-GHIDRA_H = """/* ghidra.h 5. Ghidra's names for the types and operations it can't tell yet, so its machine drafts compile as they are:
+GHIDRA_H = """/* ghidra.h 6. Ghidra's names for the types and operations it can't tell yet, so its machine drafts compile as they are:
  * autopilot tries them (`#include "ghidra.h"`). The game's own types are better: agents write those in common.h. */
 #ifndef GHIDRA_H
 #define GHIDRA_H
@@ -41,7 +41,6 @@ typedef unsigned short ushort;
 typedef unsigned short word;
 typedef unsigned int uint;
 typedef unsigned int uint3;
-typedef unsigned char bool;  /* (Ghidra declares bool bVar1; with the game's types it often does: C89 has none) */
 typedef int int3;  /* (CONCAT31((int3)x, y): its 3-byte signed part, as an int) */
 typedef unsigned long ulong;
 typedef unsigned int dword;
@@ -179,6 +178,29 @@ def _cast_arguments(body: str, callee: str, types: list[str]) -> str:
     return "".join(out) + body[i:]
 
 
+def _void_calls(body: str, callee: str) -> str:
+    """A call to a function the file declares void, used as a value (Ghidra read what it left in eax: "Expression has
+    void type", E1052), as (callee(...), 0): the call stays, and the expression has a value. A call that is a
+    statement of its own stays as it is."""
+    out, i = [], 0
+    for m in re.finditer(rf"\b{callee}\s*\(", body):
+        if m.start() < i:
+            continue
+        j, depth = m.end(), 1
+        while j < len(body) and depth:
+            depth += body[j] == "("
+            depth -= body[j] == ")"
+            j += 1
+        if depth:
+            continue
+        before = body[:m.start()].rstrip()
+        statement = (not before or before[-1] in ";{}") and body[j:].lstrip().startswith(";")
+        call = body[m.start():j]
+        out.append(body[i:m.start()] + (call if statement else f"({call}, 0)"))
+        i = j
+    return "".join(out) + body[i:]
+
+
 def compilable(draft: str, symbol: str, stack: dict[str, str], known: str = "") -> tuple[str, str] | None:
     """Ghidra's draft (as it gave it) as C that compiles in the function's source file, (prelude, definition), or None.
     `symbol`: its Watcom symbol (_func_X@8: __stdcall); `stack`: the C name of each of the game's stack-convention
@@ -220,12 +242,19 @@ def compilable(draft: str, symbol: str, stack: dict[str, str], known: str = "") 
     # (longlong)(x) / n is Ghidra's cdq; idiv: a signed 32-bit division whose dividend it widens. Watcom before 11
     # has no 64-bit integer (ghidra.h's longlong is a structure, which nothing can be cast to: E1037), and (int)(x)
     # / n makes the same cdq; idiv. The entity-index arithmetic of one game, (p - entities) / 0xA4, was all this.
-    body = re.sub(r"\(\s*longlong\s*\)", "(int)", body)
-    body = re.sub(r"\(\s*ulonglong\s*\)", "(unsigned int)", body)
+    body = re.sub(r"\blonglong\b", "int", body)  # (its 64-bit locals and casts too: E1010, E1037)
+    body = re.sub(r"\bulonglong\b", "unsigned int", body)
+    # ...and its signed remainder, ((x >> 31) << 32 | x) % n: the dividend cdq makes, which is x
+    body = re.sub(r"\(\s*\(unsigned int\)\s*(?:\(uint\)\s*)?\(\s*\(int\)\s*(\w+)\s*>>\s*0x1f\s*\)\s*<<\s*0x20\s*\|\s*"
+                  r"\1\s*&\s*0xffffffff\s*\)", r"(\1)", body)
+    # bool: C89 has none, and ghidra.h can't declare it (a file's own typedef int bool; then clashes: E1034)
+    body = re.sub(r"\bbool\b", "unsigned char", body)
     callees = sorted({m.group(1) for m in _FUNC.finditer(body)} - {name})
     for callee in callees:  # (the file's prototypes: its parameter types, which Watcom holds every call to)
         if (proto := _prototype(known, callee)) is not None and proto[1]:
             body = _cast_arguments(body, callee, proto[1])
+        if proto is not None and proto[0] == "void":
+            body = _void_calls(body, callee)
     # the function's own declaration in the file: its return type and parameter types (Watcom: "Inconsistent return
     # type", E1062, "Type of parameter does not agree", E1071, where the draft's differ)
     if (own_proto := _prototype(known, name, declarations_only=True)) is not None:
