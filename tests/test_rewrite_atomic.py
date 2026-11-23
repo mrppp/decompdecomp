@@ -39,12 +39,16 @@ def test_an_unchanged_file_is_only_touched(tmp_path):
     _rewrite(path, "int a;\n")
     assert path.stat().st_ino == inode and path.read_text() == "int a;\n"
 
-def test_a_trial_always_puts_back_its_text(tmp_path):
-    """Writing it back only while the file held the trial left trials in files (a helper's edit in between builds on
-    the trial's text): ~170 matched functions reopened on one game."""
+def test_a_trial_takes_out_only_its_own_change(tmp_path):
+    """A trial puts back the file it changed; an edit made during the trial elsewhere in the file stays, and one that
+    overlaps the trial's change gives way to the text from before the trial."""
     from decompnet.app.forkengine import _put_back
+    before = "int a;\nint b;\nint c;\nint d;\nint e;\nint f;\n"
+    trial = before.replace("int b;", "int b_trial;")
     path = tmp_path / "unit.c"
-    _rewrite(path, "trial;\n")
-    assert _put_back(path, "before;\n", "trial;\n") and path.read_text() == "before;\n"
-    _rewrite(path, "trial; and an edit made on it;\n")
-    assert _put_back(path, "before;\n", "trial;\n") and path.read_text() == "before;\n"
+    _rewrite(path, trial)
+    assert _put_back(path, before, trial) and path.read_text() == before
+    _rewrite(path, trial.replace("int f;", "int f_helper;"))
+    assert _put_back(path, before, trial) and path.read_text() == before.replace("int f;", "int f_helper;")
+    _rewrite(path, trial.replace("int b_trial;", "int b_helper;"))
+    assert _put_back(path, before, trial) and path.read_text() == before

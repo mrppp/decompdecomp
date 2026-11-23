@@ -102,18 +102,49 @@ _LINKAGE_DECL = re.compile(
 
 
 def _put_back(path: Path, before: str, after: str) -> bool:
-    """`before` written back after a trial, always. (Writing it only while the file still held the trial's text left
-    trials in files: a helper's edit made during a trial in the same app builds on the trial's text, and refusing the
-    restore kept both. On one game 18 refusals left trial C in four files, and some 170 matched functions reopened.)
-    A file that changed during the trial is logged."""
+    """A trial's change taken back out of the file after the trial.
+
+    A file that still holds the trial's text gets `before` back. One that changed during the trial (a helper's edit
+    in the same app builds on the trial's text) has only the trial's change taken out, by a three-way merge with the
+    trial's text as the base, so the helper's edit stays; one whose edit overlaps the trial's gets `before` back,
+    the edit lost. (Writing `before` only over the trial's own text left trials in files: 18 refusals in three hours
+    on one game, some 170 matched functions reopened. Writing it always threw away some 230 helper edits an hour.)"""
+    log = logging.getLogger("decompdecomp")
     try:
-        if path.read_bytes() != after.replace("\n", os.linesep).encode("utf-8"):
-            logging.getLogger("decompdecomp").info("%s changed during a trial; its text from before the trial is put "
-                                                   "back", path)
-    except OSError:
-        pass
-    _rewrite(path, before)
+        now = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        now = None
+    if now is None or now == after:
+        _rewrite(path, before)
+        return True
+    merged = _take_out(now, after, before)
+    if merged is None:
+        log.info("%s changed during a trial where the trial had changed it; its text from before the trial is put "
+                 "back", path)
+        _rewrite(path, before)
+    else:
+        log.info("%s changed during a trial; the trial's change is taken out and the other edit kept", path)
+        _rewrite(path, merged)
     return True
+
+
+def _take_out(now: str, trial: str, before: str) -> str | None:
+    """`now` with the change from `before` to `trial` undone (git merge-file, base `trial`), or None when the two
+    edits overlap or git can't merge."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="decomp-putback-") as tmp:
+        files = []
+        for name, text in (("now", now), ("trial", trial), ("before", before)):
+            f = Path(tmp) / name
+            f.write_text(text, encoding="utf-8", newline="\n")
+            files.append(str(f))
+        try:
+            done = subprocess.run(["git", "merge-file", "-p", "--quiet", *files], capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+    if done.returncode != 0:
+        return None
+    return done.stdout.decode("utf-8")
 
 
 def _strip_comments(code: str) -> str:
