@@ -348,9 +348,9 @@ class Dos(Console):
         (ASM_CAPPED): scores saved before the cap (1, 2, 3: almost matched) ranked them first for every helper.
         Returns how many."""
         from ...app.forkengine import scaled
-        from ...forks.project import asm_bodied, asm_body_names
+        from ...forks.project import asm_bodied, asm_body_names, cross_file_bodies
         names = set()
-        everywhere = asm_body_names(Path(fp.root))
+        everywhere = cross_file_bodies(asm_body_names(Path(fp.root)))
         for path in Path(fp.root).glob("src/**/*.c"):
             try:
                 names.update(asm_bodied(path.read_text(errors="replace", encoding="utf-8"), everywhere))

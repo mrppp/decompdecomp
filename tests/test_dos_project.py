@@ -511,3 +511,11 @@ def test_functions_built_on_watcom_instruction_bodies_never_match():
     assert not d.matched and d.match_percent < 100 and d.asm_bodies == ["helper_aux"]
     assert d.unit_scores == {"func_00000100": 0.0, "func_00000200": 100.0, "func_00000300": 0.0}
     assert "hand-written assembly" in d.literals_note()
+
+
+def test_only_helper_thunks_count_across_files():
+    """Two files defined memcpy as an assembly body, and every call to memcpy anywhere was refused and scored 0. Another
+    file's calls count only helper-made thunks (`..._aux`, `func_...`)."""
+    from decompnet.forks.project import cross_file_bodies
+    assert cross_file_bodies({"memcpy", "id", "h1", "func_0005D679_aux", "vfx_c73b_aux", "func_00012345"}) == {
+        "func_0005D679_aux", "vfx_c73b_aux", "func_00012345"}

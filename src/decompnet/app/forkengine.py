@@ -160,8 +160,8 @@ def _strip_comments(code: str) -> str:
 def _asm_body_calls(fp, text: str) -> dict[str, int]:
     """How often `text` calls each of the project's `#pragma aux NAME = ...` instruction bodies (in any of its C files
     or headers): helpers wired functions to bodies another file defines, which no compile_and_diff text showed."""
-    from ..forks.project import asm_body_names
-    names = asm_body_names(Path(fp.root))
+    from ..forks.project import asm_body_names, cross_file_bodies
+    names = cross_file_bodies(asm_body_names(Path(fp.root)))
     if not names:
         return {}
     found: dict[str, int] = {}

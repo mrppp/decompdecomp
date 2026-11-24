@@ -339,6 +339,13 @@ def asm_body_names(root: Path) -> set[str]:
     return names
 
 
+def cross_file_bodies(names: set[str]) -> set[str]:
+    """The bodies another file's calls count as hand-written assembly: helper-made thunks (named `..._aux`, or after a
+    game function, `func_...`). Not library or generic names: two files defined `memcpy` as a body, and every call
+    to memcpy anywhere was then refused and scored 0 (`id`, `h1` and the like were bodies too)."""
+    return {n for n in names if "_aux" in n or n.startswith(("func_", "_func_"))}
+
+
 class ForkProject:
     def __init__(self, root: Path, *, create_state: bool = True):
         self.root = Path(root)
@@ -1435,7 +1442,7 @@ class ForkProject:
             text = (self.root / unit.source).read_text(errors="replace", encoding="utf-8") if unit.source else ""
         except OSError:
             return d
-        bodied = asm_bodied(text, asm_body_names(self.root))
+        bodied = asm_bodied(text, cross_file_bodies(asm_body_names(self.root)))
         if not bodied:
             return d
         for name in bodied:
