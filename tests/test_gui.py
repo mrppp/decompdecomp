@@ -493,6 +493,10 @@ renderDeepSweepResults({measurements:[{family:'typed_temporary',phase:'local rep
 assert.match(boxes.deepSweepRecipes.innerHTML,/typed temporary/);
 assert.match(boxes.deepSweepRecipes.innerHTML,/Rewrite performance/);
 assert.match(boxes.deepSweepRecipes.innerHTML,/1.5s/);
+// a run with thousands of compound rewrites draws a bounded table
+renderDeepSweepResults({has_activity:true,recipes:Array.from({length:5000},(_,i)=>({family:'a+b'+i,tested:1,improvements:i,score_gain:i}))});
+assert.equal((boxes.deepSweepRecipes.innerHTML.match(/<tr>/g)||[]).length,201);
+assert.match(boxes.deepSweepRecipes.innerHTML,/Showing the first 200 of 5,000/);
 """
     subprocess.run([NODE, '-e', script], check=True, capture_output=True, text=True, timeout=GUI_TIMEOUT_SECONDS)
 
@@ -886,3 +890,27 @@ def test_community_directory_filters_and_shows_rom_matches():
         pytest.skip("needs node to run the GUI's scripts")
     subprocess.run([NODE, str(Path(__file__).with_name("gui_fork_directory.js"))], check=True,
                    capture_output=True, text=True, encoding="utf-8", timeout=GUI_TIMEOUT_SECONDS)
+
+
+def test_deep_pass_stops_drawing_and_polls_slowly_while_hidden():
+    if NODE is None:
+        pytest.skip('needs node')
+    js = Path(__file__).parents[1] / 'src/decompnet/app/static/js'
+    base, steering = (js / 'base.js').read_text(), (js / 'steering.js').read_text()
+    follow = base[base.index('async function followJob('):base.index('// Polls in a row')]
+    callback = steering[steering.index('if (S.slug !== slug || deepSweepFollowing !== following) return;'):steering.index('renderDeepActivity((state.state')]
+    script = """const assert=require('node:assert/strict');
+const JOB_POLL_MS=500, JOB_POLL_RETRIES=5; const S={slug:'g',tab:'matching'}; const sleeps=[]; let polls=0;
+const document={hidden:true}; const sleep=ms=>{sleeps.push(ms);return Promise.resolve();};
+function transientPoll(){return false;}
+const api=async()=>({state:++polls>=3?'done':'running',log:[],progress:{},result:1});
+""" + follow + """
+(async()=>{
+  await followJob('j',null,()=>{});
+  assert.deepEqual(sleeps,[5000,5000]);
+})();
+"""
+    subprocess.run([NODE, '-e', script], check=True, capture_output=True, text=True, timeout=GUI_TIMEOUT_SECONDS)
+    # the callback's guard, as source: hidden window or another tab returns before drawing or fetching
+    guard = callback[callback.index('if (document.hidden'):]
+    assert 'document.hidden' in guard and 'S.tab !== "matching"' in guard

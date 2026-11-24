@@ -556,6 +556,81 @@ def test_renamed_strlen_uses_the_host_signature(tmp_path):
     assert "strlen\ti32\tptr" in sigs.read_text().splitlines()
 
 
+def test_an_unprototyped_function_called_in_different_shapes_gets_one_signature(tmp_path):
+    """A donor's `int gl_func_00000000();` (a placeholder for address 0) was called as (ptr) -> i64, (i64) -> void and
+    () -> i32: wasm imports those as different functions and the link stopped (`function signature mismatch`). One
+    signature is written for it; a function called one way keeps being called as each call site has it."""
+    import subprocess
+    import sys
+
+    from decompnet.port.wasm.build import HERE
+
+    source = tmp_path / "caller.ll"
+    source.write_text(
+        "declare i32 @gl_func_00000000(...)\ndeclare i32 @only_one_shape(...)\n"
+        "define void @a() {\n  %1 = call i64 @gl_func_00000000(ptr noundef %0)\n"
+        "  %2 = call i32 @only_one_shape(i32 noundef 1)\n  ret void\n}\n"
+        "define void @b() {\n  call void @gl_func_00000000(i64 noundef %0)\n  %3 = call i32 @gl_func_00000000()\n"
+        "  %4 = call i32 @only_one_shape(i32 noundef 2)\n  ret void\n}\n")
+    aliases = tmp_path / "renames.txt"
+    aliases.write_text("")
+    sigs = tmp_path / "sigs.txt"
+    known = get("n64").port_kit.wasm / "libultra.sigs"
+    subprocess.run([sys.executable, HERE / "sigs.py", sigs, known, aliases, source],
+                   check=True, capture_output=True, text=True)
+    rows = {row.split("\t")[0] for row in sigs.read_text().splitlines()}
+    assert "gl_func_00000000" in rows and "only_one_shape" not in rows
+
+
+def test_the_host_keeps_libultras_osSetIntMask_arity(tmp_path):
+    """A game's header declared `osSetIntMask` with two parameters (the longest declaration wins among a game's own),
+    so wasm2c's import took two and conflicted with the host's one: the host build failed for that game. libultra's
+    prototype wins."""
+    import subprocess
+    import sys
+
+    from decompnet.port.wasm.build import HERE
+
+    source = tmp_path / "caller.ll"
+    source.write_text("declare i32 @osSetIntMask(i32, ptr)\n")
+    aliases = tmp_path / "renames.txt"
+    aliases.write_text("")
+    sigs = tmp_path / "sigs.txt"
+    known = get("n64").port_kit.wasm / "libultra.sigs"
+    subprocess.run([sys.executable, HERE / "sigs.py", sigs, known, aliases, source],
+                   check=True, capture_output=True, text=True)
+    assert "osSetIntMask\ti32\ti32" in sigs.read_text().splitlines()
+
+
+def test_a_games_declaration_of_a_host_function_in_another_shape_gives_way_to_the_hosts(tmp_path):
+    """A game's header declared `s32 osSpTaskLoad(OSTask *)`; the host defines it as void, wasm2c imported the game's
+    shape and host.c stopped on conflicting types. The host's own definition decides, and a declaration WebAssembly
+    sees the same way keeps the game's spelling (a pointer stays one)."""
+    import subprocess
+    import sys
+
+    from decompnet.port.wasm.build import HERE
+
+    kit = tmp_path / "kit"
+    kit.mkdir()
+    (kit / "libultra.sigs").write_text("")
+    (kit / "host.c").write_text(
+        "void w2c_env_osSpTaskLoad(struct w2c_env *e, u32 task) { (void)e; (void)task; }\n"
+        "u32 w2c_env_osAiGetLength(struct w2c_env *e, u32 queue) { (void)e; return queue; }\n"
+        "void w2c_env_osViGetCurrentFramebuffer(struct w2c_env *e) { (void)e; }\n")
+    source = tmp_path / "caller.ll"
+    source.write_text("declare i32 @osSpTaskLoad(ptr)\ndeclare i32 @osAiGetLength(ptr)\ndeclare i32 @osViGetCurrentFramebuffer(...)\n")
+    aliases = tmp_path / "renames.txt"
+    aliases.write_text("")
+    sigs = tmp_path / "sigs.txt"
+    subprocess.run([sys.executable, HERE / "sigs.py", sigs, kit / "libultra.sigs", aliases, source],
+                   check=True, capture_output=True, text=True)
+    rows = sigs.read_text().splitlines()
+    assert "osSpTaskLoad\tvoid\ti32" in rows
+    assert "osAiGetLength\ti32\tptr" in rows
+    assert "osViGetCurrentFramebuffer\tvoid\t" in rows  # declared with no prototype at all
+
+
 def test_library_code_with_no_c_is_called_by_its_library_name(tmp_path):
     """A racing game's bzero kept its automatic name (`func_8003DDC0`): the host stubbed it to nothing. Library
     detection's name goes to the host, which answers bzero by name in any game; a name another file defines wins."""
@@ -565,6 +640,20 @@ def test_library_code_with_no_c_is_called_by_its_library_name(tmp_path):
                   "define void @mine() {\n}\n")
     out = renames([ll], ["mine 0x80001000 func"], {"func_8003DDC0": "bzero", "caller": "osOther"})
     assert out == {"func_8003DDC0": "bzero", "func_80001000": "mine"}
+
+
+def test_a_library_name_nothing_defines_is_not_given_to_a_function_with_no_c():
+    """A bowling game's two copies of alSynNew (code with no C) were renamed to that library name, which nothing
+    defined (no ultralib unit to know the build from): every call reached a stub ("not implemented, skipped") and
+    the audio never started. Kept under their own names the calls run the functions' recompiled code."""
+    from decompnet.port.wasm.build import reachable_library_names, renames
+
+    names = {"func_8005E8A8": "alSynNew", "func_8006428": "alSynNew", "func_8003DDC0": "bzero",
+             "func_80010000": "alFxNew", "func_80020000": "osContSetCh"}
+    kept = reachable_library_names(names, {"alFxNew.c"}, {"bzero", "mine"})
+    assert kept == {"func_8003DDC0": "bzero", "func_80010000": "alFxNew"}  # the host's; built from ultralib's C
+    assert reachable_library_names(None, set(), set()) == {}
+    assert callable(renames)
 
 
 def test_stubs_read_every_host_file(tmp_path):
@@ -824,3 +913,237 @@ def test_loader_with_adjacent_stack_objects_uses_original_code():
     host = Path(__file__).resolve().parents[1] / 'src/decompnet/consoles/n64/port_wasm'
     manifest = {'game': {'sha1': '79cd1166c365e5809dec9b62e6d40d6032d5db3a'}}
     assert original_code(host, manifest, ['loader 0x800018A8 func']) == {'loader.c'}
+
+
+def test_a_void_function_that_branches_after_a_call_still_leaves_that_calls_result():
+    """A heap allocator's wrapper was declared void: `t = alloc(...); if (t) align(t, ...); return;`. gcc leaves
+    alloc's result (or align's) in $v0 and its callers took the block from it, but only a call right before `ret
+    void` was forwarded, so the port gave 0 to every caller: a game's three buffers were null and its first graphics
+    task had no display list."""
+    from decompnet.port.wasm.adapt import V0, adapt
+    from decompnet.port.wasm.beir import Types
+    ir = ("declare i32 @alloc(i32)\ndeclare i32 @align(i32, i32)\n"
+          "define void @wrapper(i32 %n) {\n"
+          "  %1 = call i32 @alloc(i32 noundef %n) #2\n"
+          "  %2 = icmp ne i32 %1, 0\n  br i1 %2, label %3, label %5\n"
+          "3:\n  %4 = call i32 @align(i32 noundef %1, i32 noundef %n) #2\n  br label %5\n"
+          "5:\n  ret void\n}\n"
+          "define void @plain(ptr %p) {\n  store i32 1, ptr %p, align 4\n  ret void\n}\n"
+          "define void @empty() {\n  ret void\n}\n"
+          "define void @caller() {\n  %y = call i32 @wrapper(i32 noundef 1)\n  ret void\n}\n")
+    out = adapt(ir, [], Types(ir), {})
+    wrapper = out.split("define void @wrapper")[1].split("\n}")[0]
+    lines = wrapper.splitlines()
+    for call in ("%1 = call i32 @alloc", "%4 = call i32 @align"):
+        at = next(i for i, line in enumerate(lines) if call in line)
+        assert f"ptr {V0}" in lines[at + 1] or f"ptr {V0}" in lines[at + 2], call
+    assert f"store i32 0, ptr {V0}" not in wrapper
+    plain = out.split("define void @plain")[1].split("\n}")[0]
+    assert f"store i32 0, ptr {V0}" in plain, "no call: 0 as before"
+    empty = out.split("define void @empty")[1].split("\n}")[0]
+    assert V0 not in empty, "an empty function (`jr $ra; nop`) leaves $v0 as its caller had it"
+
+
+def test_a_call_by_a_name_the_project_changed_goes_to_the_function_there_now(tmp_path):
+    """C that still calls a function by a name polishing renamed (a port-only source, a recompiled body) was linked to
+    a logging stub: the recompiler's symbol table keeps the older name with its address, so the call goes to the
+    function defined at that address now. A name that matches no address stays unresolved."""
+    from decompnet.port.wasm.build import recompiler_names, renames
+
+    (tmp_path / "syms.toml").write_text('[[section]]\nname = "main"\nrom = 0x1000\nvram = 0x80001000\nsize = 0x40\n\n'
+                                        'functions = [\n    { name = "legacy_rotation_builder", vram = 0x80001000, size = 0x40 },\n]\n')
+    assert recompiler_names(tmp_path) == {"legacy_rotation_builder": 0x80001000}
+    assert recompiler_names(tmp_path / "missing") == {}
+    ll = tmp_path / "a.ll"
+    ll.write_text("define void @mat3FromEuler() {\n  ret void\n}\ndefine void @caller() {\n"
+                  "  call void @legacy_rotation_builder()\n  call void @unknown_name()\n  ret void\n}\n"
+                  "declare void @legacy_rotation_builder()\ndeclare void @unknown_name()\n")
+    fixed = ["mat3FromEuler 0x80001000 func"]
+    assert renames([ll], fixed, None, recompiler_names(tmp_path)) == {"legacy_rotation_builder": "mat3FromEuler"}
+    assert renames([ll], fixed) == {}
+
+
+def test_a_call_goes_to_the_projects_own_name_when_a_port_copy_shares_its_address(tmp_path):
+    """A port-only copy kept under the automatic name beside the matched function the project names now defined two
+    functions at one address, so a call by a data-style name was left a stub; the project's name wins."""
+    from decompnet.port.wasm.build import renames
+
+    ll = tmp_path / "a.ll"
+    ll.write_text("define void @drawSprite() {\n  ret void\n}\ndefine void @func_8000A840() {\n  ret void\n}\n"
+                  "define void @caller() {\n  call void @D_8000A840()\n  ret void\n}\ndeclare void @D_8000A840()\n")
+    assert renames([ll], ["drawSprite 0x8000A840 func"]) == {"D_8000A840": "drawSprite"}
+
+
+def test_next_arg_builtin_becomes_the_va_list_pointer():
+    """gcc's __builtin_next_arg linked to a stub returning 0 (clang has none); it is the address va_start gives."""
+    from decompnet.port.wasm.build import ido_c
+
+    text = "int f(int a, int b, ...) { return ((int *)(((int)__builtin_next_arg(b) + 3) & ~3))[0]; }\n"
+    out = ido_c(text)
+    assert out.startswith("#define __builtin_next_arg(last)") and "__builtin_va_start" in out and out.endswith(text)
+    assert ido_c("int g(void) { return 1; }\n") == "int g(void) { return 1; }\n"
+
+
+def test_a_library_name_the_host_does_not_answer_is_not_provided():
+    """Library detection names a function with no C by its library name (`alSynAllocFX`), and the build took every
+    such name as provided by the host. The synthesizer's functions are the game's own code in the port ("native"), so
+    ultralib's C for them was never built, the link stubbed them and the audio thread built a task from nothing: no
+    graphics task for the whole run."""
+    from decompnet.port.wasm.build import answered_names
+
+    groups = {"osSetTimer": "replaced", "osSpTaskLoad": "glue", "alSynAllocFX": "native", "alSavePull": "native"}
+    names = {"func_8011A000": "alSynAllocFX", "func_8011B000": "osSetTimer", "func_8011C000": "alSavePull",
+             "func_8011D000": "osSpTaskLoad", "func_8011E000": "strlen"}
+    assert answered_names(names, {"strlen"}, groups.get) == {"osSetTimer", "osSpTaskLoad", "strlen"}
+    assert answered_names(None, set(), groups.get) == set()
+
+
+def test_each_loop_of_wasm2cs_c_gets_a_safe_point(tmp_path):
+    """A game's idle thread lowers its priority and spins on a flag in a loop that calls nothing; the scheduler the
+    retrace woke outranks it and never ran, so nothing was drawn. wasm2c's `goto var_L<n>` is a loop's next round (a
+    block's exit is var_B): the host switches threads at the poll before it."""
+    from decompnet.port.wasm.build import loop_safe_points
+
+    c = tmp_path / "game_0.c"
+    c.write_text("  var_L0:\\n    if (x) {goto var_B1;}\\n    goto var_L0;\\n  var_B1:;\\n".replace("\\n", "\n"))
+    other = tmp_path / "game.h"
+    other.write_text("goto var_L9;\n")
+    loop_safe_points(tmp_path)
+    text = c.read_text()
+    assert "{ port_loop_poll(); goto var_L0; }" in text and "goto var_B1;" in text and "port_loop_poll(); goto var_B" not in text
+    assert text.startswith("void port_safe_point(void);") and other.read_text() == "goto var_L9;\n"
+
+
+def test_stopping_a_game_kills_one_that_ignores_the_request(tmp_path):
+    """A game stuck in its own loop kept running for an hour after Stop (terminate alone): the process is killed once
+    the grace time passes."""
+    import subprocess
+    import sys
+
+    from decompnet.port.wasm import play
+
+    proc = subprocess.Popen([sys.executable, "-c",
+                             "import signal,time,sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                             "print('ready', flush=True); time.sleep(60)"], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "ready"  # the handler is installed
+    play.end(proc, grace=0.5)
+    assert proc.poll() is not None
+
+
+def test_a_matched_function_the_host_provides_is_called_by_its_library_name():
+    """A battle game's matched osRecvMesg kept the automatic name func_8004DE70: the build left its C out, but the
+    recompiled code still ran a recompiled copy of the game's own body against kernel routines the host doesn't have
+    (every worker thread ended at once). The names the host answers are the ones to route to it; the game's own
+    library C (the synthesizer) stays the game's."""
+    from types import SimpleNamespace
+
+    from decompnet.port.wasm import play
+
+    kit = get("n64").port_kit
+    assert play.host_provides(kit, ["osRecvMesg"])
+    assert play.host_provides(kit, ["osCreateThread"])
+    assert not play.host_provides(kit, ["alSynAllocFX"])
+    # the port's "glue" group is every os* name, but the host defines only some: a matched osPiRawStartDma sent to a
+    # name the host lacks ran as a stub and a snowboarding game's file reader looped for ever
+    assert not play.host_provides(kit, ["osPiRawStartDma"]) and not play.host_provides(kit, ["osPiRawReadIo"])
+    assert play.host_provides(kit, ["osVirtualToPhysical"]) and play.host_provides(kit, ["__osSiRawStartDma"])
+    assert not play.host_provides(kit, [])
+    assert not play.host_provides(None, ["osRecvMesg"])
+    assert not play.host_provides(SimpleNamespace(sdk_group=lambda name: None), ["osRecvMesg"])
+
+
+def test_a_call_through_a_pointer_passes_the_argument_registers_it_was_not_given():
+    """A game's heap wrappers are drafts shaped `void f(void) { vtable->init(); }`: on MIPS $a0-$a3 pass straight
+    through to the target. The call through the pointer named no arguments, so the host called a target that
+    declares two with whatever its machine registers held, and the allocator started from garbage (bogus blocks, bogus
+    DMA destinations). The call passes four words: the caller's own arguments, then the register words."""
+    from decompnet.port.wasm.adapt import REGS, adapt
+    from decompnet.port.wasm.beir import Types
+    ir = ("define void @wrapper() {\n  %1 = load ptr, ptr @table, align 4\n"
+          "  %2 = call i32 %1()\n  ret void\n}\n"
+          "define void @own(i32 %a, ptr %b) {\n  %1 = load ptr, ptr @table, align 4\n"
+          "  %2 = call i32 %1(i32 noundef %a)\n  ret void\n}\n"
+          "define void @full(i32 %a) {\n  %1 = load ptr, ptr @table, align 4\n"
+          "  %2 = call i32 %1(i32 %a, i32 %a, i32 %a, i32 %a)\n  ret void\n}\n"
+          "define void @floats(float %f) {\n  %1 = load ptr, ptr @table, align 4\n"
+          "  %2 = call i32 %1(float %f)\n  ret void\n}\n")
+    out = adapt(ir, [], Types(ir), {})
+
+    def body(name):
+        return out.split(f"define void @{name}")[1].split("\n}")[0]
+    call = next(line for line in body("wrapper").splitlines() if "call i32 %1(" in line)
+    assert call.count("i32 %port_ia") == 4  # all four from the register words
+    for i in range(4):
+        assert f"inttoptr (i32 {REGS + 4 * i} to ptr)" in body("wrapper")
+    own = next(line for line in body("own").splitlines() if "call i32 %1(" in line)
+    arguments = own.split("%1(")[1].rstrip(")")
+    assert arguments.startswith("i32 noundef %a, i32 ") and arguments.count(", ") == 3  # its own, then three more
+    assert "ptrtoint ptr %b" in body("own")  # the second is the caller's own pointer parameter
+    assert body("full").count("%port_ia") == 0 and "call i32 %1(i32 %a, i32 %a, i32 %a, i32 %a)" in body("full")
+    assert "call i32 %1(float %f)" in body("floats")  # a float argument is left as it is
+
+
+def test_routines_sharing_one_body_are_called_by_the_name_the_host_answers(monkeypatch):
+    """osViGetCurrentFramebuffer and osViGetNextFramebuffer are the same 64 bytes in libultra 2.0I-2.0L, so detection
+    refuses to name either (`ambiguous`). A fighting game's main thread then ran its own copy against the VI state
+    only the host keeps, and spun for the buffer it had handed over: 0 graphics tasks. When the host answers a
+    candidate, a call goes to it."""
+    import contextlib
+    from types import SimpleNamespace
+
+    from decompnet.app import sdk_identity
+    from decompnet.port import identities
+    from decompnet.port.wasm import play
+
+    rows = [{"id": 1, "name": "func_8003B550", "status": "open", "meta": "{}"},
+            {"id": 2, "name": "func_80000100", "status": "open", "meta": "{}"}]
+    store = SimpleNamespace(all=lambda *a, **k: rows)
+    net = SimpleNamespace(progress=SimpleNamespace(view=contextlib.nullcontext), _project=lambda slug: {"id": 7},
+                          sdk_functions=lambda proj: {}, project_store=lambda pid: store,
+                          console=lambda proj: SimpleNamespace(port_kit=get("n64").port_kit))
+    monkeypatch.setattr(sdk_identity, "identify", lambda *a, **k: {})
+    monkeypatch.setattr(identities, "confirmed", lambda *a, **k: {})
+    monkeypatch.setattr(sdk_identity, "ambiguous", lambda *a, **k: {
+        1: {"names": ["osViGetCurrentFramebuffer", "osViGetNextFramebuffer"]},
+        2: {"names": ["osMadeUpA", "osMadeUpB"]}})  # (no name the host answers: left alone)
+    assert play.library_names(net, "game") == {"func_8003B550": "osViGetCurrentFramebuffer"}
+
+
+def test_a_module_with_no_host_imports_builds_the_host_without_import_state():
+    """A game whose C calls nothing the host provides gets `wasm2c_game_instantiate(w2c_game*)` with no import
+    state; the host's two-argument call stopped the build for a game that otherwise ran (224 graphics tasks)."""
+    from decompnet.port.wasm import build
+
+    assert build.host_import_flags("void wasm2c_game_instantiate(w2c_game*);") == ["-DPORT_WASM_NO_IMPORTS=1"]
+    assert build.host_import_flags("void wasm2c_game_instantiate(w2c_game *);\n") == ["-DPORT_WASM_NO_IMPORTS=1"]
+    assert build.host_import_flags("void wasm2c_game_instantiate(w2c_game*, struct w2c_env*);") == []
+    host = (get("n64").port_kit.wasm / "host.c").read_text(encoding="utf-8")
+    assert "#ifdef PORT_WASM_NO_IMPORTS" in host and "wasm2c_game_instantiate(&game);" in host
+
+
+def test_original_code_functions_are_left_to_the_interpreter_not_left_out_of_it():
+    """The functions a game's .original file names are left out of the C so the original code runs; the interpreter is what runs
+    it where N64Recomp doesn't. They were counted among the names the interpreter skips, so a build without a recompiler
+    (the browser export) stubbed them to nothing."""
+    from decompnet.port.wasm.build import interpreter_left_out
+
+    left = interpreter_left_out({"osCreateThread.c"}, {"bzero.c", "applyPackedRotation.c"}, {"applyPackedRotation.c"})
+    assert left == {"osCreateThread", "bzero"}
+
+
+def test_a_call_by_another_spelling_of_a_defined_name_goes_to_it(tmp_path):
+    """With no recompiler's symbol table to look an older name up in (the browser export, the command-line build), a call by
+    `mat3x3_from_euler` to the function polishing renamed `mat3x3FromEuler` was a stub. The one defined function with the same
+    name, case and underscores aside, is the match; two candidates, or a short name, are not."""
+    from decompnet.port.wasm.build import renames
+
+    ll = tmp_path / "a.ll"
+    ll.write_text("define void @mat3x3FromEuler() {\n  ret void\n}\ndefine void @fooBar() {\n  ret void\n}\n"
+                  "define void @foo_Bar2() {\n  ret void\n}\n"
+                  "define void @caller() {\n  call void @mat3x3_from_euler()\n  call void @mat3x3_from_euler_x()\n  ret void\n}\n"
+                  "declare void @mat3x3_from_euler()\ndeclare void @mat3x3_from_euler_x()\n")
+    assert renames([ll], ["mat3x3FromEuler 0x80001000 func"]) == {"mat3x3_from_euler": "mat3x3FromEuler"}
+    two = tmp_path / "b.ll"
+    two.write_text("define void @fooBarBaz() {\n  ret void\n}\ndefine void @foo_bar_baz() {\n  ret void\n}\n"
+                   "declare void @FOO_BAR_BAZ()\n")
+    assert renames([two], []) == {}

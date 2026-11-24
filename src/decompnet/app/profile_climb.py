@@ -45,7 +45,8 @@ def lead(search, agent, proj, fn, source, own_score, *, check=None):
     ranked = compiler_fingerprints.ranked(search.net, proj, cfg, fn, own, limit=PROFILES_MEASURED)
     if proj['arch'] == 'mips':
         rows = repair_ranking.instruction_rows(repair_ranking.evidence(search.net, fn['id'], getattr(agent, 'id', None)))
-        for flags in (profile_hypotheses.kmc_cse_address_probe(own, rows), profile_hypotheses.kmc_expensive_probe(own, rows)):
+        for flags in (profile_hypotheses.kmc_cse_address_probe(own, rows), profile_hypotheses.kmc_cse_skip_probe(own, rows),
+                      profile_hypotheses.kmc_expensive_probe(own, rows)):
             if not flags:
                 continue
             profile = dict(own, flags=flags)
@@ -213,7 +214,13 @@ def explore(search, agent, proj, fn, baseline, clean_profile=None):
             found = profile, clean_profile['score']
         else:
             source = fn['best_source']
-            found = lead(search, agent, proj, fn, source, baseline, check=check)
+            from .profile_detection import detected, settings
+            # (the profile compiler detection found for this C, already measured on it: climbed under first)
+            if (finding := detected(getattr(search, 'net', None), proj, fn)) is not None:
+                search.log(f"Climbing under the detected compiler profile {settings(finding['profile'])}.")
+                found = finding['profile'], finding['score']
+            else:
+                found = lead(search, agent, proj, fn, source, baseline, check=check)
         if found is not None:
             if found[1] == 0:
                 search.check()

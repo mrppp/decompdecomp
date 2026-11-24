@@ -25,8 +25,23 @@ static uint8_t *mem;
 uint8_t *port_memory(void) { return mem; }
 uint64_t port_io_load(uint64_t a) { return a; }
 uint32_t port_stack_bus(uint32_t a) { return a >= 0x14000000u && a < 0x15000000u ? a : 0; }
+unsigned port_tlb_n;
+uint32_t port_tlb_canon(uint32_t a) { return a; }  /* (host.c's TLB windows: none here) */
+uint32_t port_tlb_alias(uint32_t a) { return a; }
+uint32_t port_tlb_jump(uint32_t slot, uint32_t imm) { return (slot & 0xF0000000u) | imm; }
+uint32_t port_tlb_call(uint32_t a) { return a; }     /* (no window kept at its physical address here) */
+uint32_t port_tlb_spelled(uint32_t a) { return a; }
+uint32_t port_tlb_virtual(uint32_t a) { return a; }
+void port_tlb_write(uint32_t pm, uint32_t hi, uint32_t lo0, uint32_t lo1) { (void)pm; (void)hi; (void)lo0; (void)lo1; }
+void port_tlb_set(unsigned i, uint32_t pm, uint32_t hi, uint32_t lo0, uint32_t lo1) { (void)i; (void)pm; (void)hi; (void)lo0; (void)lo1; }
+uint32_t port_tlb_probe(uint32_t hi) { (void)hi; return 0x80000000u; }
+int port_tlb_read(unsigned i, uint32_t *pm, uint32_t *hi, uint32_t *lo0, uint32_t *lo1) { (void)i; (void)pm; (void)hi; (void)lo0; (void)lo1; return 0; }
+int port_tlb_invalid(uint32_t a) { (void)a; return 0; }
+int port_tlb_fault(uint32_t e, uint32_t b, uint32_t c) { (void)e; (void)b; (void)c; return 0; }
+uint32_t port_tlb_wired(int set, uint32_t v) { (void)set; (void)v; return 0; }
 uint64_t port_io_store(uint64_t a, uint64_t v) { (void)v; return a; }
 void port_safe_point(void) {}
+void port_boot_spin(void) {}
 /* a thread whose code jumps to itself is parked for good (host.c): here, say so with the word at DATA, and end */
 void port_idle_forever(void) {
     uint32_t w; memcpy(&w, mem + 0x%(data)08Xu, 4);
@@ -256,6 +271,14 @@ def test_a_jump_to_itself_parks_the_thread_instead_of_spinning(run, loop):
     assert run.raw(prog) == "idle 0000002A"
 
 
+def test_an_eret_parks_the_thread_instead_of_running_into_the_next_function(run):
+    """libultra's thread dispatch ends with `eret`, which resumes another thread and never falls through. The game's own
+    copy of osCreateThread/osStartThread (library detection did not name it for its SDK build) ran into the next
+    routine, the thread cleanup, which called osDestroyThread and came back for ever at 100% CPU: the thread parks."""
+    prog = [*_data_base(), addiu("t0", "zero", 42), sw("t0", 0, "t9"), 0x42000018, NOP]
+    assert run.raw(prog) == "idle 0000002A"
+
+
 def test_the_addresses_the_game_starts_running_are_written_down_once(run, tmp_path):
     """PORT_ENTRIES: each function entry the interpreter sees (where a run starts, each call's target), once, for the
     importer's evidence of where functions start (consoles/n64/code.py, runtime_entries)."""
@@ -425,7 +448,14 @@ def test_interpreter_preserves_its_frames_when_c_reenters_recompiled_code(tmp_pa
     # Use the runtime's actual stack handoff, with a small stand-in for a recompiled callee that writes its frame.
     runtime = recomp.BRIDGE_RUNTIME.split("void port_recomp_thread", 1)[0]
     source = HARNESS % {"c": C_FUNCTION, "code": CODE, "data": DATA}
-    source = source.replace("static int c_calls;", runtime + "\nstatic int c_calls;")
+    # the types the runtime's float-register switch (the game's Status.FR) needs from N64Recomp's header, stood in
+    stand_in = (
+        "typedef union { double d; struct { uint32_t u32l, u32h; }; } fpr;\n"
+        "typedef struct { fpr f0, f1; uint32_t *f_odd; int mips3_float_mode; } recomp_context;\n"
+        "static uint32_t cop0_status_value = 0x04000000u;\n"
+        "uint32_t port_cop0_status(void) { return cop0_status_value; }\n"
+        "void port_cop0_status_set(uint32_t value) { cop0_status_value = value; }\n")
+    source = source.replace("static int c_calls;", stand_in + runtime + "\nstatic int c_calls;")
     source = source.replace("(void)f; c_calls++; r[2]", "(void)f; c_calls++; memset(mem + port_recomp_sp - 4, 0, 4); r[2]")
     source = source.replace("port_mips_enter(r, f, 8);", "port_mips_enter(r, f, 8); port_recomp_sp = (uint32_t)r[29];")
     source = source.replace("printf(\" %d %08X %08X\\n\", c_calls, __builtin_bswap32(w0), __builtin_bswap32(w1));",
@@ -490,3 +520,272 @@ const unsigned port_mips_pattern_count = 1;
     result = subprocess.run([str(binary), str(data), '3', '5'], capture_output=True, text=True, timeout=30, check=True)
     fields = result.stdout.split()
     assert int(fields[0], 16) == 35 and fields[14] == '1'
+
+
+def mfc0(rt, rd): return 0x40000000 | REG.get(rt, rt) << 16 | rd << 11
+def mtc0(rt, rd): return 0x40800000 | REG.get(rt, rt) << 16 | rd << 11
+SYSCALL, ERET = 12, 0x42000018
+
+
+def test_a_syscall_is_an_exception_the_games_own_handler_answers(run):
+    """An overlay game's thunks are `syscall N` words and its exception handler (the jump libultra's osInitialize
+    copies to 0x80000180) sends EPC on to a dispatcher; the interpreter skipped the syscall, so every call into an
+    overlay did nothing. The syscall takes the exception (EPC is its address, Cause says syscall), the handler runs
+    from RAM, and eret goes where EPC says: here, past the syscall and its slot."""
+    handler = CODE + 0x200
+    jump = 0x08000000 | (handler & 0x0FFFFFFF) >> 2
+    prog = [*_data_base(), lui("t0", 0x8000), ori("t0", "t0", 0x0180), lui("t1", jump >> 16), ori("t1", "t1", jump & 0xFFFF),
+            sw("t1", 0, "t0"), SYSCALL, NOP, addiu("v0", "zero", 77), JR_RA, NOP]
+    prog += [NOP] * (0x200 // 4 - len(prog))
+    prog += [mfc0("t2", 13), sw("t2", 0, "t9"), mfc0("t3", 14), addiu("t3", "t3", 8), mtc0("t3", 14), ERET, NOP]
+    out = run(prog)
+    assert out["v0"] == 77  # the handler's eret resumed past the syscall
+    assert out["data"][0] == 8 << 2  # Cause.ExcCode: syscall
+
+
+def test_a_function_in_a_tlb_window_has_code_where_the_interpreter_fetches_it(tmp_path):
+    """A game linked at 0x200000 and loaded at 0 spells its functions 0x80200000 | offset, where RAM holds nothing:
+    its bytes are at the physical alias, which the interpreter's fetch reads. `port_mips_has_code` asked RAM at the
+    spelling alone, said no code and skipped every such function the recompiler couldn't translate, so none of an
+    Armorines-like game's threads ever did their work."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    source = HARNESS % {"c": C_FUNCTION, "code": CODE, "data": DATA}
+    source = source.replace("unsigned port_tlb_n;", "unsigned port_tlb_n = 1;")
+    source = source.replace("uint32_t port_tlb_canon(uint32_t a) { return a; }",
+                            "uint32_t port_tlb_canon(uint32_t a) { return a >= 0x200000u && a < 0x300000u ? a | 0x80000000u : a; }")
+    source = source.replace("uint32_t port_tlb_alias(uint32_t a) { return a; }",
+                            "uint32_t port_tlb_alias(uint32_t a) { return a >= 0x80200000u && a < 0x80300000u ? "
+                            "0x80000000u + (a - 0x80200000u) : 0; }")
+    source = source.replace("int main(int argc, char **argv) {", """int port_mips_has_code(uint32_t address);
+int main(int argc, char **argv) {
+    if (argc > 2 && !strncmp(argv[2], "has:", 4)) {
+        mem = mmap(NULL, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        uint32_t w = __builtin_bswap32(0x24020001u); /* addiu $v0, $zero, 1: at physical 0x500 only */
+        memcpy(mem + 0x80000500u, &w, 4);
+        printf("%d\\n", port_mips_has_code((uint32_t)strtoul(argv[2] + 4, NULL, 16)));
+        return 0;
+    }""", 1)
+    harness = tmp_path / "harness.c"
+    harness.write_text(source)
+    program = tmp_path / "interp"
+    done = subprocess.run([cc, "-O1", "-o", str(program), str(harness), str(MIPS), "-lm"],
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    code = tmp_path / "unused.bin"
+    code.write_bytes(b"")
+
+    def has(address):
+        out = subprocess.run([str(program), str(code), f"has:{address:08X}"], capture_output=True, text=True,
+                             timeout=30, check=True)
+        return out.stdout.strip()
+
+    assert has(0x80000500) == "1"  # code at its own address
+    assert has(0x80200500) == "1"  # the window's spelling: the bytes are at 0x80000500
+    assert has(0x00200500) == "1"  # as the game's own pointer has it, below KSEG0
+    assert has(0x80200600) == "0"  # nothing at the alias either
+    assert has(0x80100000) == "0"  # outside any window
+
+
+def test_a_fetch_from_an_invalid_page_takes_the_general_vector_with_the_tlbl_cause(tmp_path):
+    """A page an entry covers with its valid bit clear is TLB Invalid: the console enters the general exception vector
+    (0x80000180, not the refill vector 0x80000000), with Cause TLBL (code 2), BadVAddr and EPC the fetch. The game's
+    handler there pages the code in (here: `tlbwi` of a valid entry) and returns with eret to retry the fetch."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    target = CODE + 0x300
+    source = HARNESS % {"c": C_FUNCTION, "code": CODE, "data": DATA}
+    source = source.replace("unsigned port_tlb_n;", "unsigned port_tlb_n = 1; static int tlb_mapped;")
+    source = source.replace("uint32_t port_tlb_canon(uint32_t a) { return a; }",
+                            "uint32_t port_tlb_canon(uint32_t a) { return tlb_mapped && a >= 0x400000u && a < 0x401000u ? "
+                            "a - 0x400000u + 0x%08X : a; }" % target)
+    source = source.replace("void port_tlb_set(unsigned i, uint32_t pm, uint32_t hi, uint32_t lo0, uint32_t lo1) { (void)i; (void)pm; "
+                            "(void)hi; (void)lo0; (void)lo1; }",
+                            "void port_tlb_set(unsigned i, uint32_t pm, uint32_t hi, uint32_t lo0, uint32_t lo1) { (void)i; (void)pm; "
+                            "(void)hi; (void)lo0; (void)lo1; tlb_mapped = 1; }")
+    source = source.replace("int port_tlb_invalid(uint32_t a) { (void)a; return 0; }",
+                            "int port_tlb_invalid(uint32_t a) { return !tlb_mapped && a >= 0x400000u && a < 0x401000u; }")
+    harness = tmp_path / "harness.c"
+    harness.write_text(source)
+    program = tmp_path / "interp"
+    done = subprocess.run([cc, "-o", str(program), str(harness), str(MIPS), "-lm"], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    handler = CODE + 0x200
+    jump = 0x08000000 | (handler & 0x0FFFFFFF) >> 2
+    # a jump at the general vector 0x80000180 to the handler, and the refill vector 0x80000000 left empty (a refill
+    # would run zeros: it must not be entered)
+    prog = [*_data_base(), lui("t0", 0x8000), lui("t1", jump >> 16), ori("t1", "t1", jump & 0xFFFF), sw("t1", 0x180, "t0"),
+            lui("t2", 0x40), r_type(8, rs="t2"), NOP]  # jr 0x00400000: its page is invalid
+    prog += [NOP] * (0x200 // 4 - len(prog))
+    prog += [mfc0("t3", 13), sw("t3", 0, "t9"), mfc0("t4", 8), sw("t4", 4, "t9"), 0x42000002, NOP, ERET, NOP]
+    prog += [NOP] * (0x300 // 4 - len(prog))
+    prog += [addiu("v0", "zero", 66), JR_RA, NOP]  # the page's code, once the handler mapped it
+    code = tmp_path / "code.bin"
+    code.write_bytes(b"".join(struct.pack(">I", w & 0xFFFFFFFF) for w in prog))
+    out = subprocess.run([str(program), str(code)], capture_output=True, text=True, timeout=30, check=True).stdout.split()
+    assert int(out[0], 16) == 66  # the general handler ran, mapped the page, and eret retried the fetch
+    assert int(out[6], 16) == 2 << 2  # Cause: TLBL
+    assert int(out[7], 16) == 0x400000  # BadVAddr
+
+
+def test_a_fetch_from_an_unmapped_page_takes_the_games_tlb_refill_handler(tmp_path):
+    """A game that maps its main program page by page (a shooter linking it at 0x7F000000 and bringing 4 KB pages in as
+    the code first runs) installs a refill handler at the vector 0x80000000: it reads Context, loads the page pair's
+    EntryLo words, writes them with tlbwr and returns with eret to retry. The interpreter had no refill exception,
+    so the fetch read zeros. Here the handler reads Context and BadVAddr, `tlbwr` maps the page, eret retries."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    target = CODE + 0x300
+    source = HARNESS % {"c": C_FUNCTION, "code": CODE, "data": DATA}
+    source = source.replace("unsigned port_tlb_n;", "unsigned port_tlb_n = 1; static int tlb_mapped;")
+    source = source.replace("uint32_t port_tlb_canon(uint32_t a) { return a; }",
+                            "uint32_t port_tlb_canon(uint32_t a) { return tlb_mapped && a >= 0x400000u && a < 0x401000u ? "
+                            "a - 0x400000u + 0x%08X : a; }" % target)
+    source = source.replace("void port_tlb_write(uint32_t pm, uint32_t hi, uint32_t lo0, uint32_t lo1) { (void)pm; (void)hi; "
+                            "(void)lo0; (void)lo1; }",
+                            "void port_tlb_write(uint32_t pm, uint32_t hi, uint32_t lo0, uint32_t lo1) { (void)pm; (void)hi; "
+                            "(void)lo0; (void)lo1; tlb_mapped = 1; }")
+    harness = tmp_path / "harness.c"
+    harness.write_text(source)
+    program = tmp_path / "interp"
+    done = subprocess.run([cc, "-O1", "-o", str(program), str(harness), str(MIPS), "-lm"],
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    handler = CODE + 0x200
+    jump = 0x08000000 | (handler & 0x0FFFFFFF) >> 2
+    prog = [*_data_base(), lui("t0", 0x8000), lui("t1", jump >> 16), ori("t1", "t1", jump & 0xFFFF), sw("t1", 0, "t0"),
+            lui("t2", 0x40), r_type(8, rs="t2"), NOP]  # jr 0x00400000: no TLB entry yet
+    prog += [NOP] * (0x200 // 4 - len(prog))
+    prog += [mfc0("t3", 4), sw("t3", 0, "t9"), mfc0("t4", 8), sw("t4", 4, "t9"), 0x42000006, NOP, ERET, NOP]
+    prog += [NOP] * (0x300 // 4 - len(prog))
+    prog += [addiu("v0", "zero", 55), JR_RA, NOP]  # the page's code, once mapped
+    code = tmp_path / "code.bin"
+    code.write_bytes(b"".join(struct.pack(">I", w & 0xFFFFFFFF) for w in prog))
+    out = subprocess.run([str(program), str(code)], capture_output=True, text=True, timeout=30, check=True).stdout.split()
+    assert int(out[0], 16) == 55  # the handler mapped the page and the retried fetch ran the code
+    assert int(out[6], 16) == 0x400000 >> 13 << 4  # Context: the faulting page number in bits 4 and up
+    assert int(out[7], 16) == 0x400000  # BadVAddr
+
+
+def test_trace_level_3_keeps_the_last_jumps_for_a_wild_one():
+    """A thread that ends up running data (a jump to a ROM table, a call through a stale pointer) shows where it went
+    wrong only in the jumps before it: PORT_INTERP_TRACE=3 prints each thread's last 40 when the interpreter meets an
+    instruction it can't run or no code at all."""
+    text = MIPS.read_text()
+    assert "PORT_INTERP_TRACE=3" in text and "jump_history(\"an unknown instruction\", pc)" in text
+    assert "jump_history(\"no instructions\", pc)" in text
+
+
+def test_code_reached_through_a_window_goes_on_in_the_next_virtual_page_not_the_next_frame(tmp_path):
+    """A game that pages its code in puts consecutive virtual pages in any frames. The interpreter runs the code at its
+    spelling in RAM (the frame), so an instruction at the end of a page was followed by the next frame's: here the page at
+    virtual 0x400000 sits at 0x80000400 and the next virtual page 0x401000 at 0x80001600; the instruction after the
+    page's last word must come from the second."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    source = HARNESS % {"c": C_FUNCTION, "code": CODE, "data": DATA}
+    source = source.replace("unsigned port_tlb_n;", "unsigned port_tlb_n = 1;")
+    source = source.replace("uint32_t port_tlb_canon(uint32_t a) { return a; }",
+                            "uint32_t port_tlb_canon(uint32_t a) { return a >= 0x400000u && a < 0x401000u ? a - 0x400000u + 0x80000400u : "
+                            "a >= 0x401000u && a < 0x402000u ? a - 0x401000u + 0x80001600u : a; }")
+    harness = tmp_path / "harness.c"
+    harness.write_text(source)
+    program = tmp_path / "interp"
+    done = subprocess.run([cc, "-o", str(program), str(harness), str(MIPS), "-lm"], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    prog = [lui("t2", 0x40), ori("t2", "t2", 0x0FF8), r_type(8, rs="t2"), NOP]  # jr 0x00400FF8: two words before the page's end
+    prog += [NOP] * (0x3F8 // 4 - len(prog))
+    prog += [addiu("v0", "zero", 10), addiu("v0", "v0", 5)]  # the page's last two words (frame offsets 0x3F8, 0x3FC)
+    prog += [addiu("v0", "zero", 99), JR_RA, NOP]            # the NEXT FRAME's code: the wrong place to go on at
+    prog += [NOP] * (0x600 // 4 - len(prog))
+    prog += [JR_RA, NOP]                                     # the next virtual page's first word: where it goes on
+    code = tmp_path / "code.bin"
+    code.write_bytes(b"".join(struct.pack(">I", w & 0xFFFFFFFF) for w in prog))
+    out = subprocess.run([str(program), str(code)], capture_output=True, text=True, timeout=30, check=True).stdout.split()
+    assert int(out[0], 16) == 15
+
+
+def test_a_page_the_refill_handler_mapped_goes_on_in_the_next_virtual_page(tmp_path):
+    """A refill returns with eret to EPC, the virtual address of the fetch that missed. The interpreter ran on at the
+    page's frame with no virtual address kept, so a relative branch or the end of the page landed in the next
+    *frame* (the neighbouring physical page: "no instructions" in a game that pages its code in through a plain
+    refill handler). Here a fetch in virtual page 0x400000 faults; the handler maps it (`tlbwr`) and returns. The
+    code takes a relative branch (which moves the interpreter to the page's frame), and a second branch at the
+    page's end must land in the next virtual page, not the neighbouring frame."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    source = HARNESS % {"c": C_FUNCTION, "code": CODE, "data": DATA}
+    source = source.replace("unsigned port_tlb_n;", "unsigned port_tlb_n = 1; static int tlb_mapped;")
+    source = source.replace("uint32_t port_tlb_canon(uint32_t a) { return a; }",
+                            "uint32_t port_tlb_canon(uint32_t a) { return !tlb_mapped ? a : a >= 0x400000u && a < 0x401000u ? "
+                            "a - 0x400000u + 0x80000400u : a >= 0x401000u && a < 0x402000u ? a - 0x401000u + 0x80001600u : a; }")
+    source = source.replace("void port_tlb_write(uint32_t pm, uint32_t hi, uint32_t lo0, uint32_t lo1) { (void)pm; (void)hi; "
+                            "(void)lo0; (void)lo1; }",
+                            "void port_tlb_write(uint32_t pm, uint32_t hi, uint32_t lo0, uint32_t lo1) { (void)pm; (void)hi; "
+                            "(void)lo0; (void)lo1; tlb_mapped = 1; }")
+    harness = tmp_path / "harness.c"
+    harness.write_text(source)
+    program = tmp_path / "interp"
+    done = subprocess.run([cc, "-O1", "-o", str(program), str(harness), str(MIPS), "-lm"],
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    handler = CODE + 0x100
+    jump = 0x08000000 | (handler & 0x0FFFFFFF) >> 2
+    prog = [lui("t0", 0x8000), lui("t1", jump >> 16), ori("t1", "t1", jump & 0xFFFF), sw("t1", 0, "t0"),
+            lui("t2", 0x40), ori("t2", "t2", 0x0FE0), r_type(8, rs="t2"), NOP]  # jr 0x00400FE0: no TLB entry yet
+    prog += [NOP] * (0x100 // 4 - len(prog))
+    prog += [0x42000006, NOP, ERET, NOP]  # the refill handler: tlbwr, eret
+    prog += [NOP] * (0x3E0 // 4 - len(prog))
+    beq = lambda off: i_type(4, "zero", "zero", off)
+    prog += [beq(2), NOP, addiu("v0", "zero", 77), addiu("v0", "zero", 10)]  # a taken branch, over the 77
+    prog += [NOP, NOP, beq(1), NOP]                                          # at virtual 0x400FF8: into the next page
+    prog += [addiu("v0", "zero", 99), JR_RA, NOP]            # the next FRAME's code: the wrong place to go on at
+    prog += [NOP] * (0x600 // 4 - len(prog))
+    prog += [JR_RA, NOP]                                     # the next virtual page's first word
+    code = tmp_path / "code.bin"
+    code.write_bytes(b"".join(struct.pack(">I", w & 0xFFFFFFFF) for w in prog))
+    out = subprocess.run([str(program), str(code)], capture_output=True, text=True, timeout=30, check=True).stdout.split()
+    assert int(out[0], 16) == 10  # (99: the neighbouring frame; the next virtual page's code returns with $v0 as it was)
+
+
+def test_a_call_from_window_code_returns_to_the_virtual_address(tmp_path):
+    """$ra of a call made from code reached through a window is the virtual address after the call, as on the console:
+    the frame it sits in may hold another page by the time the callee returns."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    source = HARNESS % {"c": C_FUNCTION, "code": CODE, "data": DATA}
+    source = source.replace("unsigned port_tlb_n;", "unsigned port_tlb_n = 1;")
+    source = source.replace("uint32_t port_tlb_canon(uint32_t a) { return a; }",
+                            "uint32_t port_tlb_canon(uint32_t a) { return a >= 0x400000u && a < 0x401000u ? a - 0x400000u + 0x80000400u : a; }")
+    harness = tmp_path / "harness.c"
+    harness.write_text(source)
+    program = tmp_path / "interp"
+    done = subprocess.run([cc, "-o", str(program), str(harness), str(MIPS), "-lm"], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    prog = [lui("t2", 0x40), ori("t2", "t2", 0x0F00), r_type(8, rs="t2"), NOP]  # jr 0x00400F00 (frame offset 0x300)
+    prog += [NOP] * (0x300 // 4 - len(prog))
+    prog += [r_type(0x25, rd="s0", rs="ra", rt="zero"), jal(0x400F40), NOP, r_type(8, rs="s0"), NOP]  # keep $ra; jal the callee (virtual 0x400F40); return
+    prog += [NOP] * (0x340 // 4 - len(prog))
+    prog += [r_type(0x25, rd="v0", rs="ra", rt="zero"), JR_RA, NOP]             # the callee: $v0 = $ra
+    code = tmp_path / "code.bin"
+    code.write_bytes(b"".join(struct.pack(">I", w & 0xFFFFFFFF) for w in prog))
+    out = subprocess.run([str(program), str(code)], capture_output=True, text=True, timeout=30, check=True).stdout.split()
+    assert int(out[0], 16) == 0x400F0C
+
+
+def test_the_interpreter_reports_its_rate_and_a_nop_does_not_search_the_windows():
+    """A game that spins in interpreted code and one that is slow look alike from outside: PORT_INTERP_STATS=1 prints
+    the instructions run and their rate (a racing game's decompressor and a puzzle game's main loop both ran at
+    30-125 M/s, so neither was too slow: the second just never blocked). And a nop (a zero word, common in delay
+    slots) first looks at its block of four, so the search through the game's TLB windows (port_tlb_alias) happens
+    only where the block really is empty."""
+    text = MIPS.read_text()
+    assert 'getenv("PORT_INTERP_STATS")' in text and "interpreter stats:" in text and "interp_stats(0x10000)" in text
+    fetch = text[text.index("HOT uint32_t fetch("):text.index("HOT uint64_t ld(")]
+    assert fetch.index("!lw(blk)") < fetch.index("port_tlb_alias(")

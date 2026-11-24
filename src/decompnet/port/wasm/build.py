@@ -39,6 +39,8 @@ from pathlib import Path
 
 from ... import consoles, limits, toolchains
 from ...network import NetworkError
+from .. import ultralib
+from . import library_data
 
 HERE = Path(__file__).parent
 # The game's C as wasm32 IR, unoptimised: LLVM's load combining would assume little-endian memory, which beir.py and
@@ -149,6 +151,41 @@ def _stamp(made: Path, key: str) -> None:
 def _unstamp(made: Path) -> None:
     """A failed or redone file loses its key, so it's made again next time whatever its inputs say."""
     made.with_name(made.name + ".key").unlink(missing_ok=True)
+
+
+def answered_names(library_names, hosted, sdk_group) -> set[str]:
+    """The library names (the values of `library_names`) the host or the port's glue really answers: the host defines
+    it, or the console says the port replaces it or supplies it ("replaced", "glue"). The others, as the synthesizer's
+    own functions are, stay unprovided so ultralib's C for them is built (`_library`)."""
+    return {n for n in (library_names or {}).values()
+            if n in hosted or (sdk_group is not None and sdk_group(n) in ("replaced", "glue"))}
+
+
+def reachable_library_names(library_names, library, provided) -> dict[str, str]:
+    """`library_names` less the entries whose library name nothing defines: the host defines it or the game's C has
+    it (`provided`), or ultralib's C was built for it (`library`: its file names). The port's "glue" group is every os*
+    name, though the host defines only some. A call renamed to a name nothing defines reached a stub ("not
+    implemented, skipped"); kept under the function's own name it runs the function's recompiled or interpreted
+    code."""
+    return {name: lib for name, lib in (library_names or {}).items() if lib in provided or f"{lib}.c" in library}
+
+
+LOOP_BACK = re.compile(r"\bgoto (var_L\d+);")
+LOOP_POLL = ("void port_safe_point(void);\n"
+             "static inline void port_loop_poll(void) { static __thread unsigned n; if (!(++n & 0x3FF)) port_safe_point(); }\n")
+
+
+def loop_safe_points(folder: Path) -> None:
+    """A safe point (port_loop_poll) before each loop's next round in wasm2c's C (`goto var_L<n>`: wasm2c names a
+    loop's label var_L and a block's var_B, so every goto to a var_L is a backward branch). The host switches threads
+    only at safe points, and a game's idle thread spins on a flag in a loop that calls nothing: it lowers its own
+    priority and waits, the scheduler thread the retrace woke outranks it but never got the CPU, and a game with no
+    graphics task drew nothing. Every 1024th round a thread the retrace woke that outranks this one takes over."""
+    for path in sorted(Path(folder).glob("game_*.c")):
+        text = path.read_text(encoding="utf-8")
+        patched = LOOP_BACK.sub(lambda m: f"{{ port_loop_poll(); goto {m.group(1)}; }}", text)
+        if patched != text:
+            path.write_text(LOOP_POLL + patched, encoding="utf-8")
 
 
 def _sync(new: Path, old: Path) -> None:
@@ -316,10 +353,20 @@ def standalone_loops(text):
         previous = token
 
 
+# gcc's `__builtin_next_arg(last)` (the address of a function's first variadic argument) is no clang builtin: the call
+# linked to a logging stub that returned 0, so a variadic allocator read its extra argument from address 0. The same
+# address is what va_start leaves in the va_list (a pointer in WebAssembly's calling convention), whose buffer the
+# callers fill with the words o32 passed (adapt.py's varargs).
+NEXT_ARG = ("#define __builtin_next_arg(last) ({ __builtin_va_list __next; __builtin_va_start(__next, last); "
+            "(void *)__next; })\n")
+
+
 def ido_c(text: str) -> str:
     """The game's C as clang reads what IDO took: m2c's untyped declarations unprototyped, a hex constant followed
     by a sign spaced apart, and an endless empty loop as the thread parking for good (EMPTY_FOREVER)."""
     text = HEX_EXPONENT_SIGN.sub(r"\1 \2 ", UNTYPED_DECLARATION.sub(r"\1()\2", text))
+    if "__builtin_next_arg" in text:
+        text = NEXT_ARG + text
     if not EMPTY_FOREVER.search(text):
         return text
     starts = set(standalone_loops(text))
@@ -386,10 +433,21 @@ def _empty_unit(out: Path) -> Path:
 def _save_manifest(repo: Path) -> dict:
     progress = repo / "progress"
     path = progress / "decompdecomp.json"
-    if not (progress / "src").is_dir() or not path.is_file():
-        raise NetworkError(f"{repo} has no progress/src and progress/decompdecomp.json: choose the game's save "
+    # progress/src is absent in the save of a game with nothing matched yet: the build then has no game C
+    # (EMPTY_UNIT) and the recompiled code and the interpreter run every function
+    if not path.is_file():
+        raise NetworkError(f"{repo} has no progress/decompdecomp.json: choose the game's save "
                            "repository (the folder Save writes)")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def interpreter_left_out(excluded, leave_out, original) -> set[str]:
+    """The names the interpreter doesn't run: the files the build leaves out on purpose (exclude.txt, library code the host
+    provides), without the functions that need the original instructions. Those are left out of the C so that the original
+    code runs, and the interpreter is what runs it where N64Recomp doesn't (a build with no recompiler, the browser
+    export): counted among the left-out they were stubs that did nothing, though the build said the interpreter ran
+    them (a racing game's wheel rotation, its menu's quad allocator)."""
+    return {n.removesuffix(".c") for n in set(excluded) | set(leave_out)} - {n.removesuffix(".c") for n in original}
 
 
 def original_code(host: Path, manifest: dict, fixed: list[str]) -> set[str]:
@@ -449,10 +507,17 @@ def gather(repo: Path, out: Path, leave_out=(), function_headers=None, *, ensure
     return chosen
 
 
-def _library(out: Path, units: dict, sources: dict, log) -> dict[str, list[str]]:
-    """Write the library units (`library_c`) to out/ultralib; {file name: flags}. The game's own C for a function
-    wins: a unit whose function the save has C for is left out (it was matched after it was set aside)."""
+def _library(out: Path, units: dict, sources: dict, log, provided=None) -> dict[str, list[str]]:
+    """Write the library units (`library_c`) to out/ultralib; {file name: flags}. The
+    game's own C for a function wins: a unit whose function the save has C for is left out (it was matched after it
+    was set aside). `provided(name)`: something else defines that function (the game's functions, the host, the
+    port's recompiled and interpreted code); ultralib's other functions the units call are built too
+    (ultralib.with_callees), so the link has them in place of stubs."""
     folder = out / "ultralib"
+    if provided is not None and (ultralib_folder := ultralib.root()) is not None:
+        units = ultralib.game_callees(units, ultralib_folder, provided, (
+            path.read_text(encoding="utf-8", errors="replace") for path in sources.values() if Path(path).is_file()))
+        units = ultralib.with_callees(units, ultralib_folder, provided)
     taken = {name.casefold() for name in sources}
     library = {name: list(flags) for name, (_, flags) in units.items() if name.casefold() not in taken}
     if library:
@@ -564,6 +629,15 @@ def host_compiler(zig: Path) -> list:
 # A Mac app that runs on both kinds of Mac: Apple Silicon and Intel. Only the export asks for it (export.py), since
 # Play runs the game on this Mac and a second architecture would double its build for nothing.
 UNIVERSAL = ["-arch", "arm64", "-arch", "x86_64"]
+
+
+def host_import_flags(game_h: str) -> list:
+    """`-DPORT_WASM_NO_IMPORTS=1` for a module that imports nothing from the host. A game with so little C that no
+    function calls libultra gets `wasm2c_game_instantiate(w2c_game*)` with no import-state parameter, and the
+    host's two-argument call stopped its build ("too many arguments to function call")."""
+    if re.search(r"wasm2c_game_instantiate\(\s*w2c_game\s*\*\s*\)\s*;", game_h):
+        return ["-DPORT_WASM_NO_IMPORTS=1"]
+    return []
 
 
 def host_arch_flags(universal: bool, platform: str = sys.platform) -> list:
@@ -696,12 +770,44 @@ class Progress:
             self.report(value)
 
 
-def renames(lls: list[Path], fixed: list[str], library_names=None) -> dict[str, str]:
+def recompiler_names(folder: Path | None) -> dict[str, int]:
+    """{function name: address} from the recompiler's symbol table (syms.toml). It was written when the recompiler
+    last ran, so it keeps the names the functions had then: C that still calls a function by a name polishing has
+    since renamed (a port-only source, a recompiled body) names it there, with its address."""
+    import tomllib
+    try:
+        table = tomllib.loads(Path(folder, "syms.toml").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    found = {}
+    for section in table.get("section", ()):
+        for row in section.get("functions", ()):
+            if isinstance(row, dict) and isinstance(row.get("name"), str) and isinstance(row.get("vram"), int):
+                found[row["name"]] = row["vram"]
+    return found
+
+
+def _spelling_twin(name: str, defined) -> str | None:
+    """The one defined function that is `name` spelled another way (case and underscores aside): a call by `mat3x3_from_euler`
+    to what polishing renamed `mat3x3FromEuler`. With no recompiler there is no older name to look up (recompiler_names), and
+    the spelling is all that is left to go by; two candidates, or a name that is only an underscore short of a library's,
+    is no match."""
+    key = re.sub(r"[_\W]", "", name).lower()
+    if len(key) < 6 or key == name.lower():
+        return None
+    found = {d for d in defined if d != name and re.sub(r"[_\W]", "", d).lower() == key}
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def renames(lls: list[Path], fixed: list[str], library_names=None, history: dict[str, int] | None = None) -> dict[str, str]:
     """{name a call uses: the defined function at its address}: C still calling a function by an older name (its
     automatic one, before polishing renamed it) links in the decomp through the symbol table; here it must name the
     function wasm-ld has. Only a name that resolves to exactly one defined function is renamed. `library_names`:
     {a function's name: its library name} for library code no file has C for (play.library_names): a call to it is
-    to the library's name, which the host answers (a racing game's bzero was `func_8003DDC0`, stubbed to nothing)."""
+    to the library's name, which the host answers (a racing game's bzero was `func_8003DDC0`, stubbed to nothing).
+    `history`: {an older name: its address} (recompiler_names): a call by a name the project has since changed, which
+    no automatic name or current name says, goes to the function now at that address, so a renamed function's
+    callers aren't left calling a stub."""
     defined, declared = set(), set()
     for ll in lls:
         for m in re.finditer(r"^(define|declare) [^@\n]*@([\w.$]+)\(", ll.read_text(encoding="utf-8"), re.M):
@@ -728,8 +834,18 @@ def renames(lls: list[Path], fixed: list[str], library_names=None) -> dict[str, 
         # function for data: a racing game's HUD called D_8000A840 for the sprite drawer there)
         if address is None and (auto := re.fullmatch(r"(?:func|D)_([0-9A-Fa-f]{8})", n)):
             address = int(auto.group(1), 16)
-        if address is not None and len(at.get(address, ())) == 1:
-            out[n] = next(iter(at[address]))
+        if address is None:
+            address = (history or {}).get(n)
+        if address is None and n not in out and (twin := _spelling_twin(n, defined)):
+            out[n] = twin  # the same name in another spelling (a snake_case call to what polishing made camelCase)
+            continue
+        here = at.get(address, set()) if address is not None else set()
+        if len(here) > 1:
+            # a port-only copy under the automatic name beside the matched function the project names now (a racing
+            # game's sprite drawer, defined twice): the call goes to the project's own
+            here = here & named.get(address, set()) or here
+        if address is not None and len(here) == 1:
+            out[n] = next(iter(here))
         elif n not in out and (library := (library_names or {}).get(n)) and library != n:
             out[n] = library
         elif address is not None and address not in at and len(named.get(address, ())) == 1 and n not in named[address]:
@@ -884,7 +1000,7 @@ def place_all(out: Path, lls: list[Path], functions: set, zig, env: dict, log, s
 
 def build(repo: Path, *, console: str = "n64", log=print, steps=STEPS, leave_out=(), universal: bool = False,
           library_c=None, library_names=None, recomp=None, function_headers=None, ensure_host_import=False,
-          runtime_image=None) -> Path:
+          runtime_image=None, code_offsets=None) -> Path:
     """Build the game in the save repository `repo` for the PC; returns the program (port/wasm/build/game). Only
     what changed since the last build is made again (the keys, above). `steps` are the progress bar's, when a
     caller adds its own after these (play.py); `leave_out`, library files the host provides (gather). A second
@@ -901,11 +1017,13 @@ def build(repo: Path, *, console: str = "n64", log=print, steps=STEPS, leave_out
     with build_turn(repo / "port" / "wasm" / "build", log, resource="native port build"), recomp_turn:
         return _build(repo, console=console, log=log, steps=steps, leave_out=leave_out, universal=universal,
                       library_c=library_c or {}, library_names=library_names or {}, recomp=recomp,
-                      function_headers=function_headers, ensure_host_import=ensure_host_import, runtime_image=runtime_image)
+                      function_headers=function_headers, ensure_host_import=ensure_host_import, runtime_image=runtime_image,
+                      code_offsets=code_offsets)
 
 
 def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool = False, library_c=None,
-           library_names=None, recomp=None, function_headers=None, ensure_host_import=False, runtime_image=None) -> Path:
+           library_names=None, recomp=None, function_headers=None, ensure_host_import=False, runtime_image=None,
+           code_offsets=None) -> Path:
     kit = consoles.get(console).port_kit
     if kit is None or kit.wasm is None:
         raise NetworkError(f"{consoles.get(console).name} has no WebAssembly build yet (its port kit has no host)")
@@ -932,7 +1050,26 @@ def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool =
             "stack layout or registers")
     leave_out = set(leave_out) | original
     sources = gather(repo, out, leave_out, function_headers, ensure_host_import=ensure_host_import, manifest=manifest)
-    library = _library(out, library_c or {}, sources, log)
+    from . import recomp as recomp_c
+    hosted = {recomp_c._demangle(c) for path in sorted(host.glob("*.c")) for c in
+              re.findall(r"\bw2c_env_(\w+)\(struct w2c_env \*", path.read_text(encoding="utf-8", errors="replace"))}
+    taken_names = {name.removesuffix(".c").casefold() for name in sources}
+    # A library name given to code with no C (library_names) is provided only where the host or the port's glue
+    # answers it by name. The synthesizer's own functions (alSynAllocFX, alSavePull, ...) are "native": nothing
+    # answered them, so ultralib's C for them was never built and the link stubbed them ("not implemented,
+    # skipped"); a game's audio thread then built a task from nothing and its graphics never started.
+    provided_by = set(functions) | hosted | answered_names(library_names, hosted, kit.sdk_group)
+    library = _library(
+        out, library_c or {}, sources, log,
+        lambda name: name.casefold() in taken_names or name in provided_by
+        or (kit.sdk_group is not None and kit.sdk_group(name) in ("replaced", "glue")))
+    callees = set(library) - set(library_c or {})  # built for the link, not because the project set them aside
+    # A library name nothing defines (the host and the glue don't answer it, ultralib's C wasn't built for it: not
+    # installed, or no unit to know the library's build from) would send the calls to a stub that logged "not
+    # implemented, skipped": a bowling game's two copies of alSynNew, code with no C, stayed unreachable and its audio
+    # never started. The calls keep the function's own name and run its recompiled or interpreted code instead.
+    paired_names = library_names  # (the pairing of ultralib's data with the game's still wants every library name)
+    library_names = reachable_library_names(library_names, library, set(functions) | hosted)
     _write(out / "fixed.txt", "\n".join(fixed) + "\n")
     _write(out / "functions.txt", "\n".join(sorted(functions)) + "\n")
 
@@ -948,6 +1085,10 @@ def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool =
             _unstamp(ll)
             done = _run([zig, "cc", *IR_FLAGS, *library[name], "-S", "-emit-llvm", src, "-o", ll], log, env=env)
             if done.returncode:
+                if name in callees:  # a callee added for the link, not one the game needs by itself: stubbed as before
+                    library.pop(name, None)
+                    log(f"{name} (ultralib callee) left to a stub: " + (done.stderr.strip().splitlines() or ["failed"])[0])
+                    return None
                 return f"{name} (ultralib): " + (done.stderr.strip().splitlines() or ["failed"])[0]
             _stamp(ll, key)
             return None
@@ -986,10 +1127,33 @@ def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool =
             for made in (stale, stale.with_name(stale.name + ".key")):
                 made.unlink(missing_ok=True)
 
+    if library and runtime_image:
+        # the state ultralib's C shares (alGlobals) is the game's variable at the game's address
+        try:
+            shared, own = library_data.pair(out, set(library), manifest.get("layout") or [], paired_names or {},
+                                       Path(runtime_image).read_bytes(),
+                                       next((int(r.split()[1], 16) for r in fixed if r.split()[0] == "entrypoint"),
+                                            0x80000400),
+                                       {r.split()[0] for r in fixed},
+                                       {int(r.split()[1], 16) for r in fixed
+                                        if len(r.split()) > 2 and r.split()[2] == "func"},
+                                       code_offsets)
+        except (OSError, ImportError, ValueError) as error:
+            shared, own = {}, {}
+            log(f"the game's addresses for ultralib's shared variables weren't read: {error}")
+        if shared or own:
+            fixed = (fixed + [f"{name} 0x{address:08X} data" for name, address in sorted(shared.items())]
+                     + [f"{name} 0x{address:08X} func" for name, address in sorted(own.items())])
+            _write(out / "fixed.txt", "\n".join(fixed) + "\n")
+            if shared:
+                log("ultralib's " + ", ".join(sorted(shared)) + " are the game's own variables at "
+                    + ", ".join(f"{a:08X}" for a in sorted(shared.values())))
+            if own:
+                log(f"ultralib's functions are at the game's addresses ({len(own)})")
     progress.start(STEPS[2])
     log("one signature per function")
     lls = sorted((out / "ll").glob("*.ll"))
-    renamed = renames(lls, fixed, library_names)
+    renamed = renames(lls, fixed, library_names, recompiler_names(recomp["folder"]) if recomp else None)
     _write(out / "renames.txt", "".join(f"{a} {b}\n" for a, b in sorted(renamed.items())))
     done = _run([py, HERE / "sigs.py", out / "sigs.txt", host / "libultra.sigs", out / "renames.txt", *lls], log)
     if done.returncode:
@@ -998,7 +1162,7 @@ def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool =
     # what only recompiled C or the interpreter runs (interp.py): MIPS's own shape
     from . import interp
     from . import recomp as recomp_c
-    left_out = {n.removesuffix(".c") for n in _names(repo / "port" / "wasm" / "exclude.txt") | set(leave_out)}
+    left_out = interpreter_left_out(_names(repo / "port" / "wasm" / "exclude.txt"), leave_out, original)
     replaced = (lambda n: kit.sdk_group(n) in ("replaced", "glue")) if kit and kit.sdk_group else (lambda n: False)
     known = _rows(out / "sigs.txt", "\t")
     extra = []
@@ -1045,6 +1209,7 @@ def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool =
     done = _run([py, HERE / "bemem.py", fresh / "game-impl.h"], log)
     if done.returncode:
         raise NetworkError(f"making memory big-endian failed: {done.stderr.strip()[-400:]}")
+    loop_safe_points(fresh)
     _sync(fresh, out / "c")  # only the parts that changed are compiled again
     _write(out / "funcs.c", function_table((out / "c" / "game.h").read_text(encoding="utf-8"), fixed))
     recompiled = []
@@ -1053,7 +1218,7 @@ def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool =
         try:
             prepared = recomp_c.prepare(Path(recomp["folder"]), out / "recomp", (out / "c" / "game.h").read_text(
                 encoding="utf-8"), fixed, [*sorted(host.glob("*.c")), *own], Path(recomp["header"]), library_names, log,
-                renames=renamed)
+                renames=renamed, image=Path(runtime_image) if runtime_image else None)
         except (OSError, ValueError) as error:
             raise NetworkError(f"the recompiled C couldn't be prepared for the port: {error}") from error
         recompiled = prepared["units"]
@@ -1097,17 +1262,24 @@ def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool =
     arch = host_arch_flags(universal)
     cc = [*host_compiler(zig), *arch]
     host_flags = ["-O1", "-g", "-fno-inline"]
+    host_flags += host_import_flags((out / "c" / "game.h").read_text(encoding="utf-8"))
+    # The interpreter and the software renderer are where a game's time goes while it decompresses its code or draws
+    # (a loader's decompressor ran for minutes at -O1): they get -O2; the rest of the host stays -O1 for readable
+    # stack samples.
+    hot_flags = ["-O2" if f == "-O1" else f for f in host_flags]
+    hot_units = {"mips.c", "render.c"}
     objs = out / ("obj-universal" if arch else "obj")
     objs.mkdir(parents=True, exist_ok=True)
 
     def compile_unit(unit: Path) -> str | None | bool:
         obj = objs / (unit.stem + ".o")
         extra = quiet if unit.parent == out / "recomp" else []
-        key = files.key(unit, [wabt / "include", rt, out / "c", out / "recomp"], *cc, *host_flags, *extra)
+        flags = hot_flags if unit.name in hot_units else host_flags
+        key = files.key(unit, [wabt / "include", rt, out / "c", out / "recomp"], *cc, *flags, *extra)
         if _fresh(obj, key):
             return False
         _unstamp(obj)
-        done = _run([*cc, *host_flags, *extra, *includes, "-c", unit, "-o", obj], log, env=env)
+        done = _run([*cc, *flags, *extra, *includes, "-c", unit, "-o", obj], log, env=env)
         if done.returncode:
             return (done.stderr.strip().splitlines() or ["failed"])[0]
         _stamp(obj, key)

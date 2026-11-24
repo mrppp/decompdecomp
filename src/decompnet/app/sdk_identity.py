@@ -5,8 +5,13 @@ from collections import defaultdict
 from .maintenance import checkpoint
 
 
-def identify(net, proj, recorded, *, include_asm=False):
+def identify(net, proj, recorded, *, include_asm=False, builtin=False):
     """Full-size, unambiguous SDK signatures only; never guess from a familiar name.
+
+    `builtin`: the app's own tables count whatever libraries the project's Settings selected (the port asks this:
+    whether a routine is libultra's doesn't depend on which libraries the user ticked for display. A project whose
+    selection was saved before a table shipped, a 2.0D game's exact osDestroyThread, kept its own copy and spun on
+    kernel lists the host doesn't keep).
 
     Both ROM and imported projects use the target fingerprints cached by Twins.
     Nothing is written to project settings or counted as matching C. Naming may
@@ -16,9 +21,9 @@ def identify(net, proj, recorded, *, include_asm=False):
     ensure(net)  # the libraries the app ships, loaded before the index's version is read
     version = (net.project_store(proj['id']).read_version('fingerprints', proj['id']), net.store.read_version('sdk_names'),
                net.project_store(proj['id']).read_version('naming', proj['id']),
-               repr(net.cfg(proj).get('sdk_libraries')), include_asm)
-    discovered = net.project_store(proj['id']).read_cache.get(('sdk-identities', proj['id'], include_asm), version,
-                                         lambda: _identify(net, proj, include_asm=include_asm), ttl=10 if net.cfg(proj).get('kind') == 'fork' else None)
+               repr(net.cfg(proj).get('sdk_libraries')), include_asm, builtin)
+    discovered = net.project_store(proj['id']).read_cache.get(('sdk-identities', proj['id'], include_asm, builtin), version,
+                                         lambda: _identify(net, proj, include_asm=include_asm, builtin=builtin), ttl=10 if net.cfg(proj).get('kind') == 'fork' else None)
     from .sdk_evidence import current
     return dict(recorded) | {fid: hint for fid, hint in discovered.items() if current(proj, hint)}
 
@@ -42,7 +47,20 @@ def naming_prints(net, proj):
     return prints
 
 
-def _identify(net, proj, *, include_asm=False):
+def ambiguous(net, proj, *, include_asm=True, builtin=False):
+    """{function id: its candidate library names} for functions whose full-size fingerprint several library routines
+    share (identical bodies: osViGetCurrentFramebuffer and osViGetNextFramebuffer are the same 64 bytes). Naming
+    refuses them (`identify`); the port may use one when its host answers every candidate the same way."""
+    from .sdk_builtin import ensure
+    ensure(net)
+    version = (net.project_store(proj['id']).read_version('fingerprints', proj['id']), net.store.read_version('sdk_names'),
+               repr(net.cfg(proj).get('sdk_libraries')), include_asm, builtin)
+    return net.project_store(proj['id']).read_cache.get(('sdk-ambiguous', proj['id'], include_asm, builtin), version,
+                                                       lambda: _identify(net, proj, include_asm=include_asm, collect={},
+                                                                         builtin=builtin) or {})
+
+
+def _identify(net, proj, *, include_asm=False, collect=None, builtin=False):
     recorded = {}
     from .shared_reuse import machine
     processor, big = machine(net, proj)
@@ -68,20 +86,31 @@ def _identify(net, proj, *, include_asm=False):
                                 'evidence':proof['evidence'],'verified_assembly':True,
                                 **({'sdk_file':proof['source_file'],'sdk_stamp':proof.get('source_stamp')} if proof.get('source_file') else {})}
     if not by_key:
-        return binary  # No local corpus: avoid reading target objects merely to discover there is no evidence.
+        return {} if collect is not None else binary  # No local corpus: avoid reading target objects merely to discover there is no evidence.
     selection = net.cfg(proj).get('sdk_libraries')
     selected = set(selection) if selection is not None else None
+    if builtin and selected is not None:
+        from .sdk_builtin import corpora as shipped
+        selected |= shipped(net)
     out, ambiguous = dict(recorded), set()
     for fid, target in (naming_prints(net, proj) if include_asm else net.twins.prints(proj)).items():
         checkpoint()
         hints = [r for r in by_key.get(target.key, []) if r["size"] == target.size
                  and (selected is None or r["corpus"] in selected)]
+        if not hints and getattr(target, "alt_key", ""):  # (address pairs the split didn't record: twins.unrecorded_pairs)
+            hints = [r for r in by_key.get(getattr(target, "alt_key", ""), []) if r["size"] == target.size
+                     and (selected is None or r["corpus"] in selected)]
         names = {r["name"] for r in hints}
         if len(names) > 1:
             ambiguous.add(fid)
+            if collect is not None and (include_asm or not target.asm) and target.size >= 32:
+                collect[fid] = {"names": sorted(names), "corpora": sorted({r["corpus"] for r in hints}),
+                                "fingerprint": target.key}
         if (include_asm or not target.asm) and target.size >= 32 and len(names) == 1:
             out[fid] = {"names": sorted(names), "corpora": sorted({r["corpus"] for r in hints}),
                         "fingerprint": target.key, "evidence": "exact relocation-normalized SDK signature"}
+    if builtin and collect is None:
+        _by_shape(net, proj, out, ambiguous)
     for fid, hint in binary.items():
         if hint.get('verified_assembly'):
             out[fid]=hint
@@ -94,7 +123,26 @@ def _identify(net, proj, *, include_asm=False):
             out[fid] = hint | {'corpora': sorted(set(out[fid]['corpora']) | set(hint['corpora']))}
         else:
             out[fid] = hint
-    return out
+    return collect if collect is not None else out
+
+
+def _by_shape(net, proj, out, ambiguous):
+    """The console's routines told by structure (`Console.sdk_shape_identity`), for functions no fingerprint named: the
+    build of libultra a game links can be one no table has, and the port needs the name to give the host's version."""
+    console = net.console(proj)
+    low, high = console.sdk_shape_sizes
+    if not high:
+        return
+    big = bool(net.cfg(proj).get('big_endian', True))
+    for row in net.project_store(proj['id']).all("SELECT id,target FROM functions WHERE project_id=? AND size BETWEEN ? AND ?",
+                                                 proj['id'], low, high):
+        if row['id'] in out or row['id'] in ambiguous or not row['target']:
+            continue
+        checkpoint()
+        found = console.sdk_shape_identity(bytes(row['target']), big)
+        if found:
+            out[row['id']] = {'names': [found['name']], 'corpora': [found['corpus']], 'fingerprint': '',
+                              'evidence': found['evidence']}
 
 
 def display_name(hint, fallback):

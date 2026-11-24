@@ -103,7 +103,7 @@ DECOMP_PORT=...` (the token is never printed); `eval "$(setup.py env <holder>)"`
 The other scripts, run with that venv's python (`$UV_PROJECT_ENVIRONMENT/bin/python`): `fast_judge.py FILE.c --slug S
 --function F [--diff [--rows N|all]]` (score, and the app's differing rows: 60 by default, then a "... N more rows" line; `--rows all` shows every row; a session's worktree off an older origin/main may lack `--rows`: `git pull --rebase` there and `setup.py sync <holder>`), `passes.py FILE.c --slug S --function F` (allocation
 priorities, register preferences, scheduler orders), `prove_chain.py --slug S --function F --families a,b|all` (greedy
-chain of library families, scored), `families.py [words]` (the library's families, one line each), `similar.py SLUG FUNC` (matched look-alikes and their saved C; step 1), `callers.py SLUG FUNC` (every call site with the instructions around it, and whether the callers read a result: the return type; step 1), `grid.py FILE.c --slug S --function F` (every combination of marked alternatives and statement orders, scored; step 2), `shared_types.py list|add SLUG` (the shared header's types; propose or add one, step 2), `regions.py` (a large function region by region, step 2),
+chain of library families, scored), `families.py [words]` (the library's families, one line each), `similar.py SLUG FUNC` (matched look-alikes and their saved C; step 1), `callers.py SLUG FUNC` (every call site with the instructions around it, and whether the callers read a result: the return type; step 1), `grid.py FILE.c --slug S --function F` (every combination of marked alternatives and statement orders, scored; `--by-rows` ranks by the differing rows; step 2), `shared_types.py list|add SLUG` (the shared header's types; propose or add one, step 2), `regions.py` (a large function region by region, step 2),
 `tools/learnings.py` (evidence entries; `search "<symptom>"` ranks them by symptom, step 3).
 
 ## Connect through the Rust MCP gateway
@@ -377,6 +377,13 @@ says the fix and the library families it names; try those families with `prove_c
   them in a block opened after it, in the target's order (no `volatile` needed). decomp-repair `late_aggregate_scope`;
   the m2c `(flag = p != NULL, a) || (flag = p != NULL, b)` then `flag && q` guard sinks with `boolean_guard_operands`
   (220 -> 5 -> 0 on a 418-instruction function; docs/learnings/finding/address-taken-scalar-slot-after-block-arrays.md).
+- **A `switch` whose arms meet at an m2c `block_N:` label (`case A: v = 1; block_4: if (t == v) { case 6: ... return 1; } return 0; case B: v = 2; goto block_4;`).**
+  The compiler lays the block directly after the arm that falls into it, so which arm holds it, and the arms' order, are
+  bytes (570 -> 0 on a 31-instruction predicate); no whole-arm reorder moves the block. `switch_join_host` moves it and
+  tries the orders (the target's jump table, `tables`, names the host arm); `switch_join_values` exchanges the constants of
+  two arms that reach one join. A **score of 1 with no differing rows** is the jump table's data: `fast_judge.py --diff` now
+  prints "Linked jump-table differences" (case | target | compiled) and `prove_chain.py` hands them to `linked_switch_labels`
+  (docs/learnings/finding/switch-join-block-host-and-order.md).
 - **Several changes that are each no better alone** are the normal shape of a late match. Offer the combination as
   one child, and keep non-improving children for a second step (`operand_order_pass`'s combined step).
 - **A copy that lands in the wrong register (`$v1` for `$v0`) beside a `goto blockN` join.** m2c writes `v = s;`
@@ -425,6 +432,13 @@ says the fix and the library families it names; try those families with `prove_c
   it double-counts the references).
 - **Stray call arguments m2c leaves on one-argument callees** change sched1's order elsewhere: drop them all at once.
 - **A copy-back (`B = A;` after `A = B;`) that emits nothing** can fix ordering by making a variable multi-set.
+- **A table address the target loads fresh inside a guard, where every spelling gives a hoisted, spilled copy
+  reloaded into `$s7`** (KMC 2.7.2): loop.c moves a constant's set unless it is a user variable set where the loop may
+  not reach it (`maybe_never`) and used in a later block, and never moves registers made by an inner loop's
+  optimisation. Set a pointer in the guard (`u32 *tp = T;`) and read the loop through it; one pointer assigned in
+  several guards is never moved at all. `-dL`'s `done move-insn matches` lines show the merge that hoists it.
+  decomp-repair `guard_symbol_pointer`, `guard_alias_pointer`, `stepped_cursor_index` (290 -> 230 on a bit-stream
+  decoder; docs/learnings/function/bit-stream-decoder-guard-pointers-and-loop-made-registers.md).
 - **A goto loop stops loop.c hoisting constants** (do/while/for loops get the loop pass's treatment).
 - **Copy a short block in place of a `goto` to it** to give a value an extra use (cross-jumping merges the copies back).
 - **`const` pointer parameters** change the prologue's load order.
@@ -488,10 +502,183 @@ says the fix and the library families it names; try those families with `prove_c
   far worse). decomp-repair `loop_giv_local_arm_inline`
   (docs/learnings/finding/giv-locals-set-at-loop-top-vs-in-the-arms.md); `cc1 -dL` prints the giv list in emission order.
 
+- **Volatile step cursors, `if (n > 0) do { } while`, and the loop's frame hole** (KMC 2.7.2, 922 -> 0 on a 529-instruction
+  function, docs/learnings/function/volatile-cursors-to-guarded-loops.md). Stepped `volatile` locals are the loop pass's own
+  givs (`i * 3`, `i * 6`), spilled: write them off the counter, and the spill area's slots then fall where the target has
+  them (the 8-byte hole is the dropped mult-2 giv; a `for`'s copied entry test leaves stale pseudos that take slots too).
+  The counter must out-rank the argument copy (`floor_log2 (refs) * refs / live`, refs weighted by loop depth): a `for`
+  with the plain bound did it, a `do { } while (0)` around its start raised the givs as well. Library: `volatile_step_for_loop`,
+  `counter_offset_local`, `guarded_cursor_do_loop`, `load_add_in_place`, `sequential_cursor_split`, `scope_unwrap_rewrap`,
+  `adjacent_init_swap`; `prove_chain` reaches 0 from the saved best with them.
+
+- **Typed one-member field reads that sit too early, two neighbours the scheduler swaps, and a block of exactly three
+  local quantities** (KMC 2.7.2, a 603-instruction state machine, 1695 -> 0; docs/learnings/function/state-machine-volatile-pin-and-plain-field-reads.md,
+  docs/learnings/finding/local-alloc-three-quantity-block-sort.md). `((Rec *) p)->value` reads hoist above a store to a scalar
+  global (sched.c `true_dependence` treats the member load as a different object): write all of them as plain casts
+  (`record_member_plain`, 1370 -> 415). Two accesses through one base are free to swap unless both are `volatile`: mark exactly the
+  two (`volatile_access_pin`, 120 -> 60 -> 0). A block with exactly three local quantities is sorted by a buggy exchange in
+  local-alloc.c, so the spelling that makes one of them global (the mask written into the shared result local,
+  `rmw_result_local`) flips the allocation. One scratch local reused by two goto ladders gets a name per ladder
+  (`region_local_split`, 1675 -> 1370); `a = b = c = 0.0f` instead of a zero local in a `do { } while (0)` fence
+  (`float_literal_chain`); m2c's mask-and-shift word updates as `p->field |= K` on a bit-field typedef (`field_rmw_bitfield`).
+
+- **A frame 8 bytes larger than the target's with every spill at the target's offset: look for a table read twice as bytes.**
+  Two straight-line reads of one symbol through byte arithmetic (`FIELD(table, s32, e * 24)`, `*(T *)(table + e * 12)`,
+  `table[i * 24]`) leave a stale address-sum pseudo that reload gives an unread slot; the byte table counted in a loop also
+  has its `la` hoisted into a register the target doesn't spend. Typed rows (`Row table[]`, `table[e].f0`; a loop's table
+  `u8 table[][24]`, `table[i][0]`) fix both (2028 -> 1015 on a 445-instruction picker). decomp-repair `record_slot_rows`
+  (docs/learnings/finding/byte-arithmetic-table-reads-leave-a-frame-hole.md). Check `.frame ... vars=` in cc1's output before
+  chasing the frame by hand.
+- **Hoisted invariants (a literal compared twice, three symbol pointers) take registers in pseudo-creation order, ranked by
+  references over live length.** A literal held in a counter the function has finished with (`n = 3;` before the pointers,
+  which are assigned afterwards) takes the counter's high-priority register and is emitted first; the same literal as a new
+  local ranks last. A product written back into one of its operands (`d = call() * d`) has the destination's register first
+  in the `mul.s`; write it to another float that is free there. decomp-repair `loop_constant_holder`,
+  `float_product_retarget` (685 -> 0 together); `guard_load_split` (the load before a float guard's last test plus the loop
+  bound assigned after the guard, 1015 -> 705 only together) and `switch_join_condition` (705 -> 685).
+- **A switch whose arms `goto` labels inside it (m2c's `goto set_kind_flags`), a parameter that loses a saved register by one
+  priority step, and four small edits that are each worse alone** (KMC 2.7.2, a 713-instruction object spawner, 2420 -> 0;
+  docs/learnings/function/spawner-label-arms-and-flag-scope-2420-to-0.md). The shared `var_v1`/`kind_mask` locals of the
+  merged tail are function-wide pseudos that global.c ranks first; each arm needs its own copy of the run with block-local
+  scratch values, literals folded and the word update as `v = X; v &= M; v |= K; <the arm's earlier statements> X = v;`
+  (`switch_label_arms`, `_mixed`). A parameter read once for a flag test (`if ((a15 << 0x18) != 0)`) is 0.071 against a
+  parameter the arms read five times (0.083): compute the flag in `do { f = a15 << 0x18; } while (0);` and test `f`
+  outside it (`parameter_test_scope`; the scope around the whole `if`/`else` turns the arms through jump.c's "if (foo)
+  bar; else break;" rule). Also `narrow_return_compare` (a `volatile short` callee widened and `3 < (x + 1)` as
+  `x >= 3` together), `switch_range_trim` (the aliases of `default:` outside the target's `addiu`/`sltiu` range) and
+  `volatile_cast_unpin` (a volatile load cannot fill a delay slot, and the `nop` moves every later table entry).
+
+- **A display-list builder whose draft has two pointer chains (`var_t0 = var_t1 - 4`, `temp_t0 = var_t0 + 8`, `M2C_FIELD(temp_t0, s32 *, -4)` /
+  `(prev, s32 *, 8)`) and a cursor advanced by `+ 0x38` / `+ 0x18` per arm** (KMC 2.7.2, a 369-instruction N64 sprite-tile
+  builder, 10891 after 340 attempts -> 0): that is the loop pass's own reduction of one cursor written as the SDK macros on
+  `Gfx *_g = gfx++`; write the macros (`gDPSetTile`, `gSPTextureRectangle`, ... on `gfx++`, the format field as the argument
+  itself, the rectangle whole in each arm with its operands `a * 4`, `b * 4`, `s * 4`, `t * 4` as locals before the hi-res
+  branch) and gcc gives back the second register, the -4/0 stores and the chunked increments. A hand-written
+  `g->w0 = ..; g->w1 = ..; g++` without the `_g` copy gives one register and a worse score. decomp-repair
+  `gbi_loop_cursor` writes the macros and `hoisted_invariant_inline` the invariants back (docs/learnings/function/display-list-local-cursor-macros.md);
+  the clamp order, signed `x1`/`y1`, in-place operands and the `for` header after them are still by hand.
+- **A cursor walk that kept an extra saved register (`$fp`), a byte copy that must survive in one arm, a global read that
+  must stay a temporary** (KMC 2.7.2, a 384-instruction sound-entity starter, 2696 -> 0, nine library families;
+  docs/learnings/function/sound-entity-starter-narrow-copy-and-counter-forms.md). loop.c reduces a pointer stepped beside a
+  counter into a giv of its own when two or more address uses exist, so the cursor and the parameter it started from take two
+  registers; write the walk as `(arg + i * 8)` with the counter stepped last and the parameter keeps its register
+  (`walk_counter_for`). One counter variable per width gives the allocator one pseudo with every loop's references
+  (`loop_counter_unify`). A byte read into a wide local and read in both arms of an `if` shares one address sum through the
+  branch's delay slot; a narrow (`u8`) copy that the first arm reads is another machine mode, so cse keeps it and combine
+  makes it a `move` (`arm_byte_copy_split`). `t = G; G = f(t); v = t;` keeps the copy after the store where `v = G;` folds it
+  (`global_read_store_copy`). A saved register's value read once more after a call-free loop wants a copy before the loop
+  (`post_loop_copy`); a call argument m2c rotated one iteration ahead is `f(i & 0xFF)` (`loop_argument_inline`); a store
+  address staged in a local with the value's `|` chain left-associated (`store_address_stage`) and a literal local above the
+  loop's initialisations (`loop_literal_local`) each pay off only with their partner edit. `reach.py`-style check: the app's
+  proposal code offers every child of the state before an edit, and the edit is a gap when none of them moves the score.
+
+- **A 795-instruction object spawner, 3693 -> 0 (KMC 2.7.2; docs/learnings/function/object-spawner-arm-and-join-rewrites.md).** A clean
+  rewrite from the target's assembly, then one named edit at a time (each now a library family): constants an arm sets after its calls
+  assigned at the arm's head so they cross the calls and take saved registers (`arm_constants_to_head`); a call after the
+  `if`/`else` written in each arm so jump2 cross-jumps the two `jal`s (`call_into_each_arm`); a pointer local assigned twice split
+  per lookup (`local_pointer_web_split`); `local + 1` named once (`shared_sum_local`); an `s16` parameter's masks as `(u16) id`,
+  which stops cse sharing the extension and lets combine fold the index shifts (`narrow_param_mask_cast`); a call's result written
+  through its field (`result_field_reread`); a word update as `w = F; w &= M; w |= K; F = w;` with a temporary per site
+  (`rmw_compound_temp`); and a table slot staged `ex = (s16) id; tab = T; p = &tab[ex];` so the `la` sits between the index's
+  halves (`table_base_stage`). Sched/regalloc rows near the end were closed by `grid.py --by-rows` and a random hill-climb over
+  statement order and spelling alternatives (ranked by differing rows: 635 -> 180 -> 120 -> 60 -> 0), not by the score. A parameter
+  copied in a different order at entry means the original parameter was narrow (`s16`): its conversion insn is emitted last.
+
+- **Two loads in the wrong order in one block, every statement order the same: the one that is set once is boosted.**
+  `sched.c` schedules backwards and launches an insn whose destination pseudo is set exactly once
+  (`birthing_insn_p`, the `7f000001` priority in the `;;` lines of the `-dS` dump) as soon as it is ready. A masked update
+  written `p->w = (u32)((p->w & M) | O)` loads into such a pseudo and goes ahead of a float load into a register that has
+  several sets; written as a local updated by separate statements (`w = p->w; w &= M; w |= O; p->w = w;`, the local declared
+  one place above the last) the load is not boosted and the target's order comes (60 -> 0, decomp-repair
+  `rmw_user_local_steps`; docs/learnings/function/player-update-routine-chain.md). A 25-line program with the same few
+  statements reproduces the order in a second: do that before spelling variants on the real function.
+
+- **A 1133-instruction effect spawner, 7905 -> 2930 in nine steps (KMC 2.7.2; docs/learnings/function/effect-spawner-switch-slot-counter-goto-loop.md).**
+  m2c's `if (n != 2) { if (n >= 3) { if (n < 5) B } } else if (flag) A1 else A2` is a `switch (n)` (the dispatch is
+  `beq`, `slti`, `slti` with the single-value arm first: `embedded_if_tree_switch`); a record member read twice in a loop
+  block is a pointer local at the head of that block, inside the `if` (`member_slot_pointer_local`: above the `if` it
+  becomes the loop's induction variable); a constant word store where the target has `sb` is `u8` (`narrow_store_width`);
+  a literal stored after a `(u32) f` conversion is a local set before the float arithmetic, stored first
+  (`constant_store_early_local`); a later loop counted with the first loop's counter, read after it, shares one pseudo
+  (`loop_counter_reassign`); a call result tested and used throughout the arm is copied at the arm's head
+  (`call_result_arm_local`); a `do { } while` whose literals the target does not hoist is a goto loop (`loop_goto_form`,
+  4035 -> 3555); and a local update (`x += K;`) goes below a statement with a call that does not name it
+  (`statement_slide` past a call). A hill-climb that swaps adjacent statements must check that they commute: one
+  accepted a read before its set (60 points "better"). Run the library's children over **all** of them (`prove_chain`
+  stops at `--children 80` of ~2700): a chain of the best child, scored in full, found 5 more steps (-1900).
+  Continued 2930 -> 70 (docs/learnings/function/effect-spawner-loop-index-forms-2930-to-70.md): m2c's cursors back to the
+  index loop (`markers[i]`, `base + 0x438 + i * 16`, the call's arguments inline); a loop's computed table index named
+  in a local so the symbol is not hoisted (`loop_table_index_local`, 1875 -> 810); a stray argument on a callee the
+  project renamed (signatures.py reads old address names now); a double kept in `$s4/$s5` as a literal (GAS `li.d`:
+  `lui $at; lw; lw`, `double_literal_global`); a flags update as a local in steps (`rmw_user_local_steps` on m2c's
+  cast form, 470 -> 185); parallel `D_ADDR` field tables as one record array (`record_field_array`); `<< k` for scaled
+  record offsets (`index_shift_spelling`); a no-op copy-back dropped (`copy_back_drop`); a shared temporary holding
+  the word with the mask at its use (`temp_operand_stage`); a constant set apart from its copy, since cse swaps an
+  adjacent `A = K; B = A;` when B lives longer (`statement_slide`, docs/learnings/finding/cse-swaps-a-constant-into-its-adjacent-copy.md). Left: two float pairs whose
+  copies the target keeps in the switch arms though never read, and local-alloc's `optimize_reg_copy_1` comparing a
+  clamp on its copy.
+
+## 3a. The fast tools (use them before writing variants by hand)
+
+- **A claim starts with several sources.** `setup.py` prints the saved best, its plain form (`plain_best.py`:
+  decomprepair `scaffold_strip.plain`, fences opened and scaffolding stripped) and the levels of decomprepair
+  `clean_rewrite` (`clean_rewrite_structure.c`: m2c's gotos as loops, `if`s, `break`s and returns;
+  `clean_rewrite_scaffold.c`: also inline helpers, `__repair_` literals and m2c's deref spelling written out;
+  `clean_rewrite.c`: also field views, fences and `scaffold_strip`) with their isolated scores, in
+  `/tmp/dd-HOLDER/start/`. When prove_chain stalls on the best, chain from the others. A clean level rarely scores
+  below the best (the search tuned the best's spelling) but it is the readable start for a rewrite by hand
+  (docs/learnings/experiment/clean-rewrite-start.md).
+- **Matched neighbours.** `setup.py` also prints `neighbours.py --slug S --function F`: the closest matched functions
+  (callers, callees, the functions beside it in its file, ones reading the same globals, look-alikes) with the start
+  of their matching C. Their temporaries, loop shapes and prototypes are the cheapest evidence there is; helpers get
+  the same section in their brief. Given the saved best (setup.py passes it) or `--source CAND.c`, it also lists
+  matched functions whose assembly holds the *mismatched region's* instruction shape (the same clamp, cursor write
+  or helper idiom), with their C around that place: someone already found the C for that idiom.
+- **Call signatures: `signatures.py --slug S --function F [CAND.c]`** (`setup.py` prints it for the saved best). Each
+  call is checked against the callee's matched C, the header's prototype and (MIPS) the target's call site: an
+  argument the callee never takes, a missing one, a narrow return type the header gets wrong, a result the target
+  reads that the C ignores (or the reverse), and the function's own parameters against its matched callers. Make
+  those edits first: a stray m2c argument moved a display-list builder's cursor sums (55 -> 0 by dropping it) after
+  twelve spellings of the code around it compiled identically.
+- **Edits that are each worse alone: `prove_chain.py ... --combine 8`.** A stalled step then ranks the non-improving
+  children by differing rows, merges pairs and triples of different families (decomprepair `compose`), and judges the
+  children of the best three (`--lookahead`). It only combines what the library offers: when it finds nothing, check
+  whether each half of your combination is a child at all (`--list`); a missing half is a family to write, not a
+  search to widen (docs/learnings/experiment/combined-step-compose-lookahead.md).
+  With `--combine` it also demotes children that leave one more value to global.c than their parent (a block-local
+  value given a second death: the dead-end shape of the retired `volatile_rmw_counter_share`); `--no-dead-end` skips
+  that check (one diagnostic compile per ranked child).
+- **Register rows: `explain_regs.py CAND.c --slug S --function F`.** For each register pair the rows swap it names the
+  pseudo in the candidate's register and the one in the target's (refs, live, priority, block-local or global, deaths,
+  copy preferences, C lines) and the rule that decided it (a hard conflict, a pseudo allocated first, a lower-priority
+  pseudo's preference skipped by find_reg, its own copy preference, local-alloc's block order), then `cause:` lines
+  naming the instruction that made each conflict or preference, its kind and C line ("call-argument copy: ... into
+  $a1 for the call to helper, argument 2, C line 5"). Read it before reordering declarations; a call-argument cause
+  sends you to that call (its arguments, signatures.py), not to the code around it.
+- **Many register rows in a large leaf: `alloc_roles.py CAND.c --slug S --function F --whatif 8`.** It reads, for every
+  pseudo, the register the target has where ours has the pseudo's (its role), replays global.c's colouring from the greg
+  dump (it reproduced 84 of 85 allocnos on a 681-instruction decoder) and names the priority changes that would put the
+  misplaced ones in their target registers. An inner loop's temporary shown in a long-lived variable's target register
+  was that variable in the original: write it as that variable (decomp-repair `block_temp_role_merge`; 1240 -> 585 on
+  the decoder, docs/learnings/function/bit-stream-decoder-frame-slot-and-allocation-simulator.md). Apply role edits
+  together and grid their subsets: one at a time they usually score worse.
+
 ## 3b. Out of hand-written shapes? Trace the compiler instead of guessing
 
 Three or four structurally different sources landing on the same score (or the same missing/extra instruction) means
-the shape is decided by a compiler pass, not by how you spell the C. Stop writing variants and find the pass:
+the shape is decided by a compiler pass, not by how you spell the C. Stop writing variants and find the pass.
+
+**Invariant spellings mean the cause is elsewhere.** When distinct spellings of one block compile to *identical
+instructions* (grid.py and fast_judge.py with several files print a `hint:` line when three do), the compiler
+normalises that block: no fourth spelling moves it. Look at what feeds or consumes it instead: the call arguments
+next to it (`signatures.py`: a stray argument decided a cursor block twelve spellings could not), values live across
+it (`explain_regs.py` `cause:` lines), the matched neighbours' C for the same idiom, and the statements just before
+and after it.
+
+**Routine: read the dumps at 20 minutes.** After about 20 minutes on a function whose remaining rows are register or
+order rows, run `dumps.py BEST.c --slug S --function F` once before any more spelling search: it prints
+explain_regs.py's register pairs with their `cause:` lines, greg's conflicts and preferences, and both schedulers'
+orders for the same source. Act on the cause it names (a call argument, a copy, a value live across a call) first.
 
 1. **Dump the compiler's own intermediate code.** The pinned GCC `cc1` is a native binary you can run directly
    (`<toolchains>/gcc-2.7.2-kmc/cc1`; the folder is `~/Library/Application Support/decompnet/toolchains` on macOS,
@@ -646,6 +833,12 @@ the existing families on the saved best first (`prove_chain.py --list`): what th
 
 ## 5c. Handing off (only by the clock, never early)
 
+**The strongest model never hands off.** The clock exists so a weaker model (Sonnet) passes a stalled near-match
+to a stronger one (Opus). An Opus agent would only hand off to another Opus, so it doesn't: it never waits for the
+clock and never stops to hand off. Out of ideas, it goes back to step 1 with a new angle (another compiler profile
+through `try_compiler`, the pass that decides the rows, grids over combined edits). The one exception is its own
+context running low: then it writes the note with `handoff.py` so the next agent starts from its evidence.
+
 Persistence is the default: a near-match nobody finishes is worth more than three abandoned ones. A hand-off is allowed
 only when `clock.py <holder>` (or `clock.py --slug S --function F --agent NAME --since T`) prints **"hand-off allowed"**:
 at least 45 minutes on the function **and** 45 minutes since your last improvement, read from the app's attempt history,
@@ -654,13 +847,21 @@ can't see it. Before that verdict, or while the score still improves, keep going
 with the verdict, hand off only when you are near 0 and stuck on the last rows, or can state the stall precisely
 (a compiler behaviour with no known source shape); a run that is still learning keeps working.
 
+A near-match under about 60 that stalls is exactly what to hand off when the clock allows: the coordinator gives it
+to a stronger model, which needs your evidence, not your conclusions. Don't keep it for hours past the clock.
+
 To hand off:
-1. `add_note(function=F, text=...)` with what the next agent needs: the remaining differing rows (`fast_judge --diff`),
-   the edit list from the saved best, each idea tried with its score, any scaffolding in the best, and the compiler
-   findings (dumps read, pass orders, allocation priorities).
+1. Write the note and release in one command (it makes `add_note` and `release_function` with every argument they
+   need, claim token included, then `setup.py release`):
+   ```bash
+   handoff.py <holder> --source BEST.c --tried "dropped the index cast: 45" --tried "cursor temp: 40" ... \
+       --findings "sched2 keeps the load first; greg: pseudo 80 prefers $a1"
+   ```
+   The note carries the best score, the remaining differing rows, the register pairs and `cause:` lines from
+   explain_regs.py, every `--tried` approach with its score (one per approach: all of them, failed ones included),
+   your findings and the source's path. `--dry-run` prints it without calling anything; check it reads complete.
 2. Merge any library or app work it produced (step 5), with tests, as on a match.
-3. `release_function(function=F, notes=<one line>, claim_token=...)` (the app accepts it once the clock allows and your
-   `add_note` is written, whatever the compile count says), then `setup.py stop <holder>`.
+3. `setup.py stop <holder>`.
 4. Report **"handed off"**, with the clock's line, the best score and the note's summary, so a stronger agent resumes
    from the history.
 

@@ -138,3 +138,52 @@ def test_main_says_what_a_bad_marker_is(tmp_path, capsys):
     path = tmp_path / "c.c"
     path.write_text("/*{*/a/*|*/b")
     assert grid.main([str(path), "--count"]) == 2 and "grid:" in capsys.readouterr().err
+
+
+def test_candidates_compiling_to_identical_code_get_the_invariant_spelling_hint(capsys, tmp_path):
+    invariant = load("invariant")
+    assert invariant.groups([("a", "x"), ("b", "x"), ("c", "x"), ("d", "y"), ("e", None)]) == [["a", "b", "c"]]
+    assert invariant.hint([("a", "x"), ("b", "x")]) == []  # two can be one cosmetic edit
+    line = invariant.hint([(str(i), "x") for i in range(6)])[0]
+    assert line.startswith("hint: 6 distinct candidates (0, 1, 2, 3 and 2 more) compiled to identical instructions")
+    assert "signatures.py" in line and "explain_regs.py" in line
+
+    class Same(Stub):
+        def judge(self, source, diff=False, rows=None):
+            return {"score": 7, "code": "same"}
+    path = tmp_path / "g.c"
+    path.write_text(SOURCE)
+    assert grid.main([str(path), "--slug", "s", "--function", "f", "--jobs", "1"], make_judge=Same) == 0
+    assert "36 distinct candidates" in capsys.readouterr().err
+
+
+
+class RowStub(Stub):
+    """The same stub with rows: a row differs for each misplaced fragment, whatever its score says."""
+
+    def rows(self, source):
+        score = self.score(source)
+        if score is None:
+            return None, []
+        # the score weighs the missing `b + a` heavily; the row count sees only the statement order
+        order = [source.index(w) for w in ("gC", "gA", "gB")]
+        return score, [("o", "gx", "gy")] * (0 if order == sorted(order) else 1)
+
+
+def test_by_rows_ranks_the_fewest_differing_rows_first_and_the_score_breaks_ties():
+    template = grid.Template(SOURCE)
+    results, error = grid.search(template, RowStub, jobs=1, by_rows=True)
+    assert error is None
+    best_score, best = results[0]
+    assert grid.search.bad[best] == 0
+    rows = [grid.search.bad[d] for _, d in results]
+    assert rows == sorted(rows)
+    zero_row = [(s, d) for s, d in results if grid.search.bad[d] == 0]
+    assert [s for s, _ in zero_row] == sorted(s for s, _ in zero_row)
+    # ranked by score alone, a candidate with a misplaced statement and a better score could come first
+    by_score, _ = grid.search(template, RowStub, jobs=1)
+    assert by_score[0][0] == 0
+
+
+def test_differing_counts_rows_with_a_marker():
+    assert grid.differing([("", "a", "a"), ("o", "b", "c"), (" ", "d", "d"), ("r", "e", "f"), ("...", "", "")]) == 2

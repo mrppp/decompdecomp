@@ -9,7 +9,8 @@ needs no claim, and opens the project attach-only so it runs beside the app with
 Only the project and the function are needed: the worker's `function` op supplies the target bytes, the function's
 own compiler profile and the project's header (typedefs and externs, which the judge prepends to every candidate:
 a source needs none of its own). `--diff` prints the rows that differ, the app's own normalisation (the same text
-`compile_and_diff` shows), after the score: the first 60, then a "... (N more rows not shown ...)" line; `--diff --rows all` (or N) changes that. `--header` prints the header, for compiling a candidate outside the judge.
+`compile_and_diff` shows), after the score: the first 60, then a "... (N more rows not shown ...)" line; `--diff --rows all` (or N) changes that. `--header` prints the header, for compiling a candidate outside the judge. With several files, three or more that compile
+to identical instructions get a hint (invariant.py): their difference is not what decides the rows.
 
     # as a library in a search loop (one worker process per search process; run several in parallel):
     from fast_judge import Judge
@@ -63,6 +64,8 @@ class Judge:
         self.header, self.arch, self.asm = "", "mips", ""
         self.big_endian = True
         self.tables, self.callees, self.entry_scope = [], "", None
+        self.words = {}
+        self.jump_tables = []  # set by rows(): the linked jump-table differences of the last candidate (switch_tables.differences)
         if vram is None or target_hex is None or toolchain is None:
             info = self.ask({"op": "function", "slug": slug, "name": name, **({"vram": vram} if vram is not None else {})})
             vram, target_hex = info["vram"], info["target"]
@@ -72,9 +75,11 @@ class Judge:
             self.big_endian = bool(info.get("big_endian", True))
             self.tables = [(low, list(targets)) for low, targets in info.get("tables") or []]
             self.callees, self.entry_scope = info.get("callees") or "", info.get("entry_scope") or None
+            self.words = {str(k): int(v) for k, v in (info.get("words") or {}).items()}  # float constants' words
         self.compiler = {"toolchain": toolchain, "flags": list(flags if flags is not None else
                                                               ("-G0", "-mips3", "-mgp32", "-mfp32", "-O2"))
-                                                          + list(extra_flags or [])}
+                                                          + list(extra_flags if extra_flags is not None
+                                                                 else os.environ.get("DD_EXTRA_FLAGS", "").split())}
         self.request = {"op": "judge", "slug": slug, "function": {"name": name, "vram": vram, "target": target_hex},
                         "compiler": self.compiler}
 
@@ -102,6 +107,7 @@ class Judge:
         """(score, rows): the exact score and every row of the judge's diff, (marker, target, candidate) each; the
         rows say which of the target's instructions differ (prove_chain.py's row-coverage combinations)."""
         reply = self.ask(dict(self.request, source=source, raw_rows=True))
+        self.jump_tables = reply.get("jump_tables") or []  # the cases whose table entry differs (instructions exact)
         return reply.get("score"), [tuple(row) for row in reply.get("rows") or []]
 
     def close(self):
@@ -131,12 +137,20 @@ def main(argv=None):
         if a.header:
             print(judge.header)
             return
+        codes = []
         for path in a.source:
             with open(path) as f:
-                reply = judge.judge(f.read(), diff=a.diff, rows=limit)
+                text = f.read()
+            reply = judge.judge(text, diff=a.diff, rows=limit)
             print(reply.get("score") if len(a.source) == 1 else f"{path}: {reply.get('score')}")
             if a.diff:
                 print(reply.get("diff") or reply.get("detail") or "")
+            if reply.get("score") and text not in {t for t, _ in codes}:
+                codes.append((text, reply.get("code")))
+        import invariant
+        labels = {text: path for path in reversed(a.source) for text in [open(path).read()]}
+        for line in invariant.hint([(labels[t], c) for t, c in codes]):
+            print(line, file=sys.stderr)
     finally:
         judge.close()
 
