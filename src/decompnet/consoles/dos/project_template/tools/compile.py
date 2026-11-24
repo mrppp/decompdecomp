@@ -23,8 +23,10 @@ import omf2elf  # noqa: E402
 
 # how long one compile may take: a file compiles in well under a second, but an old Watcom's optimiser can search
 # for minutes on some C (Watcom 10.0a, -os -of, 192 s on a game's goto-heavy function before failing), and every
-# attempt that builds the file waited on it, a project's helpers for 15 minutes a try
-COMPILE_SECONDS = 60
+# attempt that builds the file waited on it, a project's helpers for 15 minutes a try. 15 s: one game's largest file
+# compiles in 0.7 s and most in 0.03 s, and at 60 s one file's helpers held it a minute a try (attempts across the
+# whole project fell from ~200 to ~15 in ten minutes)
+COMPILE_SECONDS = 15
 
 
 def _run_limited(cmd: list[str], env: dict) -> subprocess.CompletedProcess:
