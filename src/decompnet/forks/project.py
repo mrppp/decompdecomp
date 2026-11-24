@@ -1417,7 +1417,32 @@ class ForkProject:
         return self.run([_tool(make) or make, *cfg.get("custom_args", []), *keep_going], log=log, failed=failed)
 
     def report(self) -> dict:
-        return objdiff.report(self.root, self.root / STATE / "report.json")
+        return self._report_without_asm_bodies(objdiff.report(self.root, self.root / STATE / "report.json"))
+
+    def _report_without_asm_bodies(self, rep: dict) -> dict:
+        """The progress report with every function that is or calls a `#pragma aux NAME = ...` body scored as diff
+        scores it (_without_asm_bodies): the report reads objdiff's own, and a project check re-matched 109 of them
+        in ten minutes on one game. A unit's measures aren't recounted; the functions' scores are what matching reads."""
+        try:
+            sources = {u.name: u.source for u in self.units() if u.source}
+        except Exception:
+            return rep
+        cross = cross_file_bodies(asm_body_names(self.root))
+        for unit in rep.get("units") or []:
+            source = sources.get(unit.get("name"))
+            if not source:
+                continue
+            try:
+                text = (self.root / source).read_text(errors="replace", encoding="utf-8")
+            except OSError:
+                continue
+            bodied = asm_bodied(text, cross)
+            if not bodied:
+                continue
+            for fn in unit.get("functions") or []:
+                if fn.get("name") in bodied and fn.get("fuzzy_match_percent") is not None:
+                    fn["fuzzy_match_percent"] = min(fn["fuzzy_match_percent"], self.ASM_CAPPED)
+        return rep
 
     def diff(self, unit: Unit, symbol: str) -> objdiff.FunctionDiff:
         from .linkedimages import stale
