@@ -313,29 +313,29 @@ def asm_bodied(text: str, elsewhere: set[str] | frozenset = frozenset()) -> dict
     return found
 
 
-_BODY_NAMES: dict[str, tuple[tuple, set[str]]] = {}
+_BODY_FILES: dict[str, tuple[int, int, frozenset[str]]] = {}  # path -> (mtime_ns, size, its bodies' names)
 
 
 def asm_body_names(root: Path) -> set[str]:
-    """Every `#pragma aux NAME = ...` instruction body's name in the project's C files and headers (cached on their
-    modification times)."""
-    files = sorted([*root.glob("src/**/*.c"), *root.glob("include/**/*.h")])
-    try:
-        key = tuple((str(f), f.stat().st_mtime_ns) for f in files)
-    except OSError:
-        key = None
-    hit = _BODY_NAMES.get(str(root))
-    if key is not None and hit and hit[0] == key:
-        return hit[1]
+    """Every `#pragma aux NAME = ...` instruction body's name in the project's C files and headers. Each file is read
+    again only when it changed (helpers change files all the time: re-reading the whole project on any change cost
+    ~0.8 s of the app's processor on every compile and diff)."""
     names: set[str] = set()
-    for f in files:
+    for f in [*root.glob("src/**/*.c"), *root.glob("include/**/*.h")]:
+        key = str(f)
         try:
-            found = asm_bodied(f.read_text(errors="replace", encoding="utf-8"))
+            st = f.stat()
         except OSError:
             continue
-        names.update(n for n, used in found.items() if used == {n})
-    if key is not None:
-        _BODY_NAMES[str(root)] = (key, names)
+        hit = _BODY_FILES.get(key)
+        if hit is None or hit[0] != st.st_mtime_ns or hit[1] != st.st_size:
+            try:
+                found = asm_bodied(f.read_text(errors="replace", encoding="utf-8"))
+            except OSError:
+                continue
+            hit = (st.st_mtime_ns, st.st_size, frozenset(n for n, used in found.items() if used == {n}))
+            _BODY_FILES[key] = hit
+        names |= hit[2]
     return names
 
 
