@@ -31,12 +31,17 @@ MIPS stacks mapped by miyoo/mem32.c); the browser build takes the game's C alone
 from __future__ import annotations
 
 import json
+import mmap
 import re
+import tomllib
 from pathlib import Path
 
 from .adapt import REGS  # MIPS's $a0-$a3 and $v0 as words of memory the game's C passes and reads
 
-STACKS = 0x14000000  # each host thread's MIPS stack for recompiled code: 256 KB, above the shadow stacks
+# Each host thread's MIPS stack for recompiled code: 256 KB each, in KSEG0 just above the console's 8 MB of RAM, as a
+# stack is on the console. Below 0x80000000 a game that tells a RAM pointer from a ROM offset by its sign (a loader
+# that reads through `if ((s32)p >= 0) osPiStartDma(...)`) took a local's address for a ROM offset and recursed.
+STACKS = 0x80800000
 STACK_SIZE = 0x40000
 STORE = re.compile(r"^(\s*)MEM_(W|H|B|HU|BU)\(([^()]*)\) = (.+);\s*$", re.M)
 CALL = re.compile(r"\b([A-Za-z_]\w*)(?=\(rdram, ctx\))")
@@ -111,7 +116,8 @@ def loops(text: str) -> str:
                     if where.get(m.group(1), len(text)) < m.start() else m.group(0), text)
 
 
-_LINK_BRANCH = re.compile(r"^([ \t]*)// 0x([0-9A-F]{8}): (?:bal|b(?:gez|ltz)all?)\b[^\n]*", re.M)
+_LINK_BRANCH = re.compile(r"^([ \t]*)// 0x([0-9A-F]{8}): (?:bal|b(?:gez|ltz)all?|jal|jalr\s+\$(?!ra\b)\w+)(?![\w,])[^\n]*",
+                          re.M)
 
 
 def link_branches(text: str) -> str:
@@ -119,6 +125,9 @@ def link_branches(text: str) -> str:
 
     N64Recomp models the branch as a C call and omits the architectural link. The R4300 writes $ra even
     when the condition is false, which code uses to locate a local jump target before the next call.
+    The same goes for `jal` and `jalr`: a hand-written routine that copies its own $ra (`or $a1, $ra, $zero`)
+    and ends in `jr $a1` (a math routine of a platformer, which then jumped to address 0) needs the real return
+    address, and the C call alone left whatever $ra held before.
     """
     return _LINK_BRANCH.sub(
         lambda branch: f"{branch[0]}\n{branch[1]}ctx->r31 = (gpr)(int32_t)0x{int(branch[2], 16) + 8:08X}u;",
@@ -251,6 +260,85 @@ def _returned(ret: str) -> str:
             "f32": "return c.f0.fl;", "f64": "return c.f0.d;"}[ret]
 
 
+# ---------------------------------------------------------------- code several overlays load at one address
+
+RUNTIME_SLOT = ("raw_slot",)  # section names of overlay slots the game fills at run time (the split's raw slots)
+GUARD_WORDS = 16  # how much of a function's start tells which overlay's code is in RAM
+
+
+def code_hash(words) -> int:
+    """FNV-1a over 32-bit words: the same as `port_recomp_ram_hash` in the bridges, which hashes what is in RAM."""
+    h = 2166136261
+    for w in words:
+        h = ((h ^ w) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def overlay_guards(folder: Path, image: Path | None, defined: set[str]) -> dict[str, tuple[int, int, int]]:
+    """{C function: (its address, words hashed, their hash)} for the functions whose addresses are shared by code from
+    different places in the ROM: overlays the game loads into one slot, one at a time. The split lists each overlay's
+    functions at the slot's addresses, and the recompiler writes every one of them, but only the overlay in RAM at
+    the moment is the game's code there: a call by address ran the one the table listed first (a tank game's main
+    thread spun in the delay routine of one overlay while another was loaded), however the game had filled the slot.
+    The hash is of the function's first words as the ROM holds them; a call checks it against RAM (port_recomp_guard)
+    and runs the candidate whose code is there, else the interpreter from RAM."""
+    if image is None or not Path(image).is_file():
+        return {}
+    try:
+        sections = tomllib.loads((Path(folder) / "syms.toml").read_text(encoding="utf-8")).get("section", [])
+    except (OSError, ValueError):
+        return {}
+    entries = []  # (vram, end, rom offset, name)
+    slots = []  # sections the game loads at run time: (vram, end, rom, rom end, raw slot by name)
+    for sec in sections:
+        if "rom" not in sec or "vram" not in sec:
+            continue
+        size = sec.get("size", 0)
+        slots.append((sec["vram"], sec["vram"] + size, sec["rom"], sec["rom"] + size,
+                      str(sec.get("name", "")).startswith(RUNTIME_SLOT)))
+        for f in sec.get("functions", []):
+            size = f.get("size", 0)
+            if size < 4 or size & 3 or f["vram"] & 3:
+                continue
+            entries.append((f["vram"], f["vram"] + size, sec["rom"] + f["vram"] - sec["vram"], f["name"]))
+    entries.sort()
+    shared: set[int] = set()
+    for i, (vram, end, rom, _) in enumerate(entries):
+        for j in range(i + 1, len(entries)):
+            other = entries[j]
+            if other[0] >= end:
+                break
+            if rom + (other[0] - vram) != other[2]:  # the same addresses, other bytes of the ROM: another overlay
+                shared.update((i, j))
+    # Overlays the split spells as sections of one slot: every function of such a section is only the game's code
+    # while its overlay is the one loaded, whether or not another overlay's function starts at the same address
+    # (a puzzle game's main thread spun in the one function of the first slot that no other overlay's listed
+    # function overlapped, with another overlay loaded there).
+    loaded = [(a, b) for a, b, ra, rb, raw in slots if raw and b > a]
+    for k, (a, b, ra, rb, raw) in enumerate(slots):
+        if b <= a:
+            continue
+        if raw or any(a < b2 and a2 < b and (ra, rb) != (ra2, rb2)
+                      for m, (a2, b2, ra2, rb2, _) in enumerate(slots) if m != k):
+            loaded.append((a, b))
+    if loaded:
+        shared.update(i for i, (vram, end, _, _) in enumerate(entries)
+                      if any(a <= vram < b for a, b in loaded))
+    if not shared:
+        return {}
+    out = {}
+    with open(image, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as rom_bytes:
+        for i in sorted(shared):
+            vram, end, rom, name = entries[i]
+            c = next((n for n in (name, f"{name}_recomp") if n in defined), None)
+            words = min((end - vram) // 4, GUARD_WORDS)
+            if c is None or rom < 0 or rom + words * 4 > len(rom_bytes):
+                continue
+            out[c] = (vram, words, code_hash(int.from_bytes(rom_bytes[rom + 4 * k:rom + 4 * k + 4], "big")
+                                             for k in range(words)))
+    return out
+
+
 # ---------------------------------------------------------------- the choice and the bridges
 
 def table(folder: Path, entry: int | None = None) -> dict[int, tuple[str, str | None]]:
@@ -309,13 +397,17 @@ def _addresses(fixed: list[str]) -> dict[str, int]:
 
 def unfinished(texts) -> set[str]:
     """The recompiled functions whose C can't compile as N64Recomp wrote it: a branch to a label the function doesn't
-    have (a racing game's func_800424C0 branched past its end in the split, to L_80042650). Each runs only as the
-    game's C, or is a stub that says so."""
+    have (a racing game's func_800424C0 branched past its end in the split, to L_80042650), and those that raise a
+    SYSCALL. Each runs only as the game's C, or is a stub that says so (the interpreter runs it from RAM)."""
     from ..csource import items
     out = set()
     for text in texts:
         for chunk, name, _ in items(text):
             if name and set(re.findall(r"goto (L_[0-9A-Fa-f]+);", chunk)) - set(re.findall(r"^\s*(L_[0-9A-Fa-f]+):", chunk, re.M)):
+                out.add(name)
+            # a SYSCALL is an exception the game's own handler answers (an overlay game's thunks are `syscall N`
+            # words): recompiled C has no exception to take, so the interpreter runs such a function from RAM
+            elif name and "recomp_syscall_handler(" in chunk:
                 out.add(name)
     return out
 
@@ -342,7 +434,7 @@ def _import_addresses(where: dict[str, int], renames: dict[str, str]) -> dict[st
 
 
 def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[Path], recomp_h: Path,
-            library_names=None, log=print, *, renames=None) -> dict:
+            library_names=None, log=print, *, renames=None, image: Path | None = None) -> dict:
     """Write the port's recompiled C into `out` (recomp.h, funcs.h, rec_*.c and bridges.c, each only when it
     changed); returns {"units": [paths], "include": out, "counts": {...}, "pointers_lose_floats": bool}."""
     out = Path(out)
@@ -362,6 +454,8 @@ def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[
     recompiled = table(folder)
     sources = {f: f.read_text(encoding="utf-8", errors="replace") for f in sorted((Path(folder) / "funcs").glob("funcs_*.c"))}
     broken = unfinished(sources.values())
+    defined_in_sources = {n for text in sources.values() for n in DEFINED.findall(text)}
+    guards = overlay_guards(folder, image, defined_in_sources)
     # what N64Recomp refused it writes as an empty function (its `stubs`): that is no translation, and running one
     # returned at once (a racing game's main thread, whose code calls into an overlay the split doesn't describe)
     try:
@@ -412,15 +506,30 @@ def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[
         text = CALL.sub(lambda m: f"R_{m.group(1)}", text)
         text = FALLS.sub(falls_into_next, text)
         # each function's start tells port_recomp_entered, when PORT_RECOMP_CALLS asks (one test of a flag otherwise)
-        return ENTRY.sub(lambda m: m.group(0) if m.group(1) not in at else (
-            f"static void R_{m.group(1)}_body(uint8_t* rdram, recomp_context* ctx);\n"
-            f"RECOMP_FUNC void R_{m.group(1)}(uint8_t* rdram, recomp_context* ctx) {{ if (port_recomp_watch) "
-            f"port_recomp_entered(0x{at[m.group(1)]:08X}u, ctx); R_{m.group(1)}_body(rdram, ctx); }}\n"
-            f"static void R_{m.group(1)}_body(uint8_t* rdram, recomp_context* ctx) {{"), text)
+        def entry(m: re.Match) -> str:
+            n = m.group(1)
+            vram = at.get(n, guards[n][0] if n in guards else None)
+            if vram is None:
+                return m.group(0)
+            # code several overlays load at this address: if RAM holds another one's, that one runs (or the
+            # interpreter, from RAM), not the copy the recompiler happened to write under this name
+            check = ""
+            if n in guards:
+                v, words, h = guards[n]
+                check = (f"if (port_recomp_guard(0x{v:08X}u, {words}u, 0x{h:08X}u)) "
+                         f"{{ port_recomp_other(0x{v:08X}u, R_{n}, rdram, ctx); return; }} ")
+            return (f"static void R_{n}_body(uint8_t* rdram, recomp_context* ctx);\n"
+                    f"RECOMP_FUNC void R_{n}(uint8_t* rdram, recomp_context* ctx) {{ if (port_recomp_watch) "
+                    f"port_recomp_entered(0x{vram:08X}u, ctx); {check}R_{n}_body(rdram, ctx); }}\n"
+                    f"static void R_{n}_body(uint8_t* rdram, recomp_context* ctx) {{")
+        return ENTRY.sub(entry, text)
 
     from ..csource import only
     keep = {c for kind, _, c, _ in choice.values() if kind == "recomp" and c}
-    drop = names - keep
+    # N64Recomp also writes functions it found by the calls into them (`static_4_80171B34`): no symbol of the split,
+    # so not in `names`, and left in when their C can't compile (a branch past their end) -- the host build then
+    # stopped on the missing label. Whatever is broken goes, named or not.
+    drop = (names - keep) | broken
     units = []
     _write(out / "recomp.h", header(Path(recomp_h).read_text(encoding="utf-8")))
     declared_h = (Path(folder) / "funcs" / "funcs.h").read_text(encoding="utf-8", errors="replace")
@@ -428,9 +537,14 @@ def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[
     # (`__osSiRawStartDma_recomp`), and each gets an R_ definition below
     seen = set(DECLARED.findall(declared_h)) | {n for text in sources.values() for n in CALL.findall(text)}
     _write(out / "funcs.h", rename(declared_h) + "".join(
-        f"void R_{n}(uint8_t* rdram, recomp_context* ctx);\n" for n in sorted(seen - set(DECLARED.findall(declared_h)))))
+        f"void R_{n}(uint8_t* rdram, recomp_context* ctx);\n" for n in sorted(seen - set(DECLARED.findall(declared_h))))
+        + ("int port_recomp_guard(uint32_t vram, unsigned words, uint32_t hash);\n"
+           "void port_recomp_other(uint32_t vram, recomp_func_t *self, uint8_t *rdram, recomp_context *ctx);\n"
+           if guards else ""))
+    final_defined: set[str] = set()
     for f, text in sources.items():
         text = only(text, drop & set(DEFINED.findall(text)))
+        final_defined.update(DEFINED.findall(text))
         target = out / f"rec_{f.stem}.c"
         _write(target, stores(rename(loops(link_branches(text)))))
         units.append(target)
@@ -447,7 +561,8 @@ def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[
              "static u64 port_rb64(f64 v) { u64 b; memcpy(&b, &v, 8); return b; }",
              "static f32 port_rf32(u32 b) { f32 v; memcpy(&v, &b, 4); return v; }",
              "static f64 port_rf64(u64 b) { f64 v; memcpy(&v, &b, 8); return v; }",
-             BRIDGE_RUNTIME % {"stacks": STACKS, "size": STACK_SIZE, "regs": REGS}]
+             BRIDGE_RUNTIME % {"stacks": STACKS, "size": STACK_SIZE, "regs": REGS,
+                               "fr_default": int(uses_odd_float_registers(sources.values()))}]
     used = set()  # the host's functions the bridges call, declared before them
 
     def call_host(library: str) -> str:
@@ -477,7 +592,9 @@ def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[
     by_name = {}
     for vram, (_, name, c, _) in choice.items():
         by_name.setdefault(name.removesuffix("_recomp"), []).append((vram, c or name))
-    for n in sorted(seen - names - {c for _, _, c, _ in choice.values() if c}):
+    # (not what a recompiled file defines: RECOMP_FUNC is weak, so a stub here overrode the real body of every
+    # overlay's function at an address several share, and the game's entry for that overlay did nothing)
+    for n in sorted(seen - names - final_defined - {c for _, _, c, _ in choice.values() if c}):
         if f"R_{n}" in covered:
             continue
         library = library_names.get(n.removesuffix("_recomp"), n.removesuffix("_recomp"))
@@ -487,7 +604,9 @@ def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[
             _, target = by_name[n.removesuffix("_recomp")][0]
             body = f"R_{target}(rdram, ctx);"
         else:
-            body = f'port_recomp_missing(0, "{n}", rdram, ctx);'
+            found = re.fullmatch(r"static_\d+_([0-9A-Fa-f]{8})", n)  # (its address is in its name: the interpreter runs it)
+            body = f'port_recomp_missing(0x{found.group(1)}u, "{n}", rdram, ctx);' if found else \
+                f'port_recomp_missing(0, "{n}", rdram, ctx);'
         lines.append(f"void R_{n}(uint8_t* rdram, recomp_context* ctx) {{ (void)rdram; {body} }}")
     lines[first:first] = [f"{hosted[n][1]} {hosted[n][0]}(struct w2c_env *" + "".join(f", {t}" for t in hosted[n][2]) + ");"
                           for n in sorted(used)]
@@ -522,7 +641,13 @@ def prepare(folder: Path, out: Path, game_h: str, fixed: list[str], hosts: list[
     lines.append("static const struct { uint32_t vram; void *func; } port_recomp_pointers[] = {")
     lines += [f"    {{0x{v:08X}u, (void *)G_{c}}}," for v, c in pointers] or ["    {0, 0},"]
     lines.append("};")
-    lines.append(LOOKUPS % {"tables": len(choice), "pointers": len(pointers)})
+    # code several overlays load at one address: each candidate by address, with the hash of its first words
+    guarded = sorted((v, n, w, h) for n, (v, w, h) in guards.items() if n in final_defined)
+    lines.append("typedef struct { uint32_t vram; unsigned words; uint32_t hash; recomp_func_t *func; } PortGuard;")
+    lines.append("static const PortGuard port_recomp_guards[] = {")
+    lines += [f"    {{0x{v:08X}u, {w}u, 0x{h:08X}u, R_{n}}}," for v, n, w, h in guarded] or ["    {0, 0, 0, 0},"]
+    lines.append("};")
+    lines.append(LOOKUPS % {"tables": len(choice), "pointers": len(pointers), "guards": len(guarded)})
     bridges = out / "bridges.c"
     _write(bridges, "\n".join(lines) + "\n")
     units.append(bridges)
@@ -537,22 +662,56 @@ def _write(path: Path, text: str) -> None:
         path.write_text(text, encoding="utf-8")
 
 
+ODD_FR = re.compile(r"CHECK_FR\(ctx, \d*[13579]\)")
+
+
+def uses_odd_float_registers(texts) -> bool:
+    """Whether the recompiled C does arithmetic on an odd floating-point register of its own (N64Recomp checks those
+    with CHECK_FR, which only holds in FR=1): such a game runs with Status.FR set, a game that doesn't runs with it
+    clear, where an odd register is the upper half of the even one before (the double-zero idiom of FR=0 code)."""
+    return any(ODD_FR.search(text) for text in texts)
+
+
 BRIDGE_RUNTIME = r'''
 /* the MIPS stack recompiled code runs on: one per host thread, handed down as it calls into the game's C and back */
 __thread uint32_t port_recomp_sp;
+uint32_t port_cop0_status(void);
+void port_cop0_status_set(uint32_t value);
+/* FR=0 keeps an odd register in the upper half of the even one before it; FR=1 gives each its own 64 bits (N64Recomp
+   reaches the odd ones through f_odd). Switching moves the odd registers' values, as the hardware's registers do. */
+static void port_recomp_fr(recomp_context *c, unsigned fr) {
+    fpr *f = &c->f0;
+    if ((fr != 0) == (c->mips3_float_mode != 0)) return;
+    if (fr) { for (int i = 1; i < 32; i += 2) f[i].u32l = f[i - 1].u32h; c->f_odd = &c->f1.u32l; }
+    else { for (int i = 1; i < 32; i += 2) f[i - 1].u32h = f[i].u32l; c->f_odd = &c->f0.u32h; }
+    c->mips3_float_mode = fr != 0;
+}
 /* C called by the interpreter can call back into recompiled code. Its next frame must be below the
    interpreter's live frames, rather than the older stack pointer saved by the recompiled caller. */
 uint32_t port_recomp_stack_enter(uint32_t sp) { uint32_t saved = port_recomp_sp; port_recomp_sp = sp; return saved; }
 void port_recomp_stack_leave(uint32_t saved) { port_recomp_sp = saved; }
 void port_recomp_thread(int number) { port_recomp_sp = 0x%(stacks)Xu + (uint32_t)(number + 2) * 0x%(size)Xu - 0x100u; }
+void port_safe_point(void);
 static void port_recomp_frame(recomp_context *c, int words) {
+    /* Every call from the game's C into recompiled code starts here, so it is a safe point too: a game thread that
+       loops calling one recompiled function (a frame-wait helper with no call through a pointer inside) otherwise
+       never lets the higher-priority thread the retrace woke run, and nothing is drawn (a shooter's main thread
+       spun in one with its scheduler thread ready and never switched to). */
+    port_safe_point();
     memset(c, 0, sizeof *c);
     if (!port_recomp_sp) port_recomp_thread(-1);
     c->r29 = (gpr)(int32_t)((port_recomp_sp - 16u - 4u * (uint32_t)words) & ~7u);
     c->r31 = 0;
+    /* The floating-point registers follow the game's Status.FR, as the console's CPU does: libultra's threads start
+       with FR=0 (their saved Status has no FR bit), where an odd register is the upper half of the even one before it
+       (a double's zero is `mtc1 $zero,$f5; mtc1 $zero,$f4`: with every register its own, that left the upper half
+       stale and a fabs-like function called itself for ever). A game that does arithmetic on an odd register of its
+       own (N64Recomp's CHECK_FR(ctx, odd): a tank game's vector code, `mul.s $f1`) runs with FR=1, which it
+       sets for its threads: the build says which by whether the recompiled code uses odd registers. */
+    c->status_reg = port_cop0_status();
     c->f_odd = &c->f0.u32h;
     c->mips3_float_mode = 0;
-    c->status_reg = 0x2000FF01u;
+    port_recomp_fr(c, ((c->status_reg >> 26) & 1u) | %(fr_default)du);
 }
 /* the game's C passes the arguments its callee doesn't declare (an unprototyped `alSynNew()` called with two) as
    MIPS's $a0-$a3, four words of memory at REGS (adapt.py), and takes a void function's value from the $v0 word
@@ -574,6 +733,8 @@ static void port_recomp_decomp(uint32_t vram, uint8_t *rdram, recomp_context *ct
        game's `void heap_free_stub(void)` hands its caller's block on to heapFreeBlock through them: adapt.py's
        register words, which the game's own callers fill and a call from recompiled code left stale) */
     for (int i = 0; i < 4; i++) STORE_W(4 * i, 0x%(regs)Xu, w[i]);
+    /* and $v0 as the caller has it: a void function that never writes it (an empty `jr $ra; nop`) leaves it so */
+    STORE_W(16, 0x%(regs)Xu, ctx->r2);
     uint32_t saved = port_recomp_sp;
     port_recomp_sp = (uint32_t)ctx->r29;
     port_calls[lo].invoke(port_game(), w, f, out);
@@ -620,7 +781,13 @@ static void port_recomp_missing(uint32_t vram, const char *name, uint8_t *rdram,
 /* what N64Recomp's output needs from a runtime (recomp.h) */
 static int32_t no_sections[64];
 int32_t *section_addresses = no_sections;
-void cop0_status_write(recomp_context *ctx, gpr value) { ctx->status_reg = (uint32_t)value; }
+void cop0_status_write(recomp_context *ctx, gpr value) {
+    ctx->status_reg = (uint32_t)value;
+    port_cop0_status_set((uint32_t)value); /* the host's Status, which the next recompiled call starts from */
+    /* (a game whose recompiled C computes on odd registers stays in FR=1 even when its thread's saved Status has the bit
+       clear, as libultra's threads do: N64Recomp's CHECK_FR stops the game on its first `mul.s $f1` otherwise) */
+    port_recomp_fr(ctx, (((uint32_t)value >> 26) & 1u) | %(fr_default)du);
+}
 gpr cop0_status_read(recomp_context *ctx) { return (gpr)(int32_t)ctx->status_reg; }
 void switch_error(const char *func, uint32_t vram, uint32_t jtbl) {
     fprintf(stderr, "recompiled %%s: a switch out of its table at %%08X (table %%08X)\n", func, vram, jtbl); exit(5);
@@ -675,8 +842,53 @@ void port_recomp_entered(uint32_t vram, void *context) {
 }
 void port_safe_point(void); /* the host's (host.c): a thread the retrace woke that outranks this one takes over */
 void port_trace(void);
+/* Code several overlays load at one address: the candidates listed by address (port_recomp_guards), each with the
+   hash of its function's first words. What RAM holds decides which runs; none matching, the interpreter, from RAM. */
+uint32_t port_mips_lw(uint32_t a);
+static uint32_t port_recomp_ram_hash(uint32_t vram, unsigned words) {
+    uint32_t h = 2166136261u;
+    for (unsigned i = 0; i < words; i++) h = (h ^ port_mips_lw(vram + 4 * i)) * 16777619u;
+    return h;
+}
+int port_recomp_guard(uint32_t vram, unsigned words, uint32_t hash) {
+    return port_mips_has_code(vram) && port_recomp_ram_hash(vram, words) != hash;
+}
+/* port_recomp_guards is sorted by address: the first candidate at `vram`, or the table's end */
+static unsigned port_recomp_first(uint32_t vram) {
+    unsigned lo = 0, hi = %(guards)du;
+    while (lo < hi) { unsigned mid = (lo + hi) / 2; if (port_recomp_guards[mid].vram < vram) lo = mid + 1; else hi = mid; }
+    return lo;
+}
+static int port_recomp_shared(uint32_t vram) {
+    unsigned i = port_recomp_first(vram);
+    return i < %(guards)du && port_recomp_guards[i].vram == vram;
+}
+static recomp_func_t *port_recomp_match(uint32_t vram, recomp_func_t *self) {
+    for (unsigned i = port_recomp_first(vram); i < %(guards)du && port_recomp_guards[i].vram == vram; i++) {
+        const PortGuard *g = &port_recomp_guards[i];
+        if (g->func != self && port_recomp_ram_hash(vram, g->words) == g->hash) return g->func;
+    }
+    return 0;
+}
+void port_recomp_other(uint32_t vram, recomp_func_t *self, uint8_t *rdram, recomp_context *ctx) {
+    recomp_func_t *f = port_recomp_match(vram, self);
+    if (f) { f(rdram, ctx); return; }
+    port_recomp_unlisted = vram;
+    port_recomp_interpret(rdram, ctx);
+}
+/* The host's TLB windows (host.c): a call through a pointer at a TLB-mapped virtual address (a table of overlay code
+   the game maps at 0x0F000000 with osMapTLB) is the code at the spelling the split gives it. */
+extern unsigned port_tlb_n;
+uint32_t port_tlb_canon(uint32_t a);
 recomp_func_t *get_function(int32_t vram) {
     port_safe_point();
+    if (__builtin_expect((uint32_t)vram < 0x80000000u && port_tlb_n, 0)) vram = (int32_t)port_tlb_canon((uint32_t)vram);
+    if (port_recomp_shared((uint32_t)vram) && port_mips_has_code((uint32_t)vram)) {
+        recomp_func_t *f = port_recomp_match((uint32_t)vram, 0);
+        if (f) return f;
+        port_recomp_unlisted = (uint32_t)vram;
+        return port_recomp_interpret;
+    }
     unsigned lo = 0, hi = %(tables)d;
     while (lo < hi) { unsigned mid = (lo + hi) / 2; if (port_recomp_table[mid].vram < (uint32_t)vram) lo = mid + 1; else hi = mid; }
     if (lo < %(tables)du && port_recomp_table[lo].vram == (uint32_t)vram) return port_recomp_table[lo].func;

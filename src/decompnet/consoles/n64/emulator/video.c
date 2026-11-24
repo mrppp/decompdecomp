@@ -39,6 +39,23 @@ static void frame_dumps(void) {
                     fwrite(b, 1, 4, f);
                 }
                 fclose(f);
+                /* the task the RSP was given (the OSTask libultra leaves in DMEM at 0xFC0, 64 bytes, pointers
+                   physical), beside the dump as NAME.task: a game keeps its own copy of the task wherever it likes, so
+                   scanning RAM for it (tools/n64_frame_compare.py) can miss it or find something else */
+                if (strlen(name) + 6 < sizeof name) {
+                    strcat(name, ".task");
+                    FILE *t = fopen(name, "wb");
+                    if (t) {
+                        const uint32_t *dmem = (const uint32_t *)(gfx.DMEM + 0xFC0);
+                        for (int i = 0; i < 16; i++) {
+                            uint32_t w = dmem[i];
+                            unsigned char b[4] = {w >> 24, w >> 16, w >> 8, w};
+                            fwrite(b, 1, 4, t);
+                        }
+                        fclose(t);
+                    }
+                    name[strlen(name) - 5] = 0;
+                }
                 fprintf(stderr, "framedump %u %s\n", frames, name);
             } else fprintf(stderr, "error can't write RDRAM to %s\n", name);
         }
@@ -60,9 +77,19 @@ EXPORT m64p_error CALL PluginGetVersion(m64p_plugin_type *type, int *version, in
     return M64ERR_SUCCESS;
 }
 EXPORT int CALL InitiateGFX(GFX_INFO info) { gfx = info; ready = 1; return 1; }
+static unsigned vis; /* video refreshes so far: one a retrace */
+/* EMU_TASK_LOG=file: "TASK VI" for each graphics task handed over: the retrace the console was at when the game started that
+   task, so the port's virtual time (PORT_VTIME_TRACE) can reach each task at the retrace the console did: the console
+   spends two to three retraces on a frame it adapts its frame rate to, which no per-task cost reproduces. */
+static void task_log(void) {
+    static FILE *log; static int tried;
+    if (!tried) { const char *path = getenv("EMU_TASK_LOG"); tried = 1; if (path) log = fopen(path, "w"); }
+    if (log) { fprintf(log, "%u %u\n", frames, vis); fflush(log); }
+}
 EXPORT void CALL ProcessDList(void) {
     if (!ready) return;
     frames++;
+    task_log();
     frame_dumps();
     *gfx.MI_INTR_REG |= 0x20; /* MI_INTR_DP: the frame is drawn */
     gfx.CheckInterrupts();
@@ -78,8 +105,25 @@ EXPORT void CALL MoveScreen(int x, int y) { (void)x; (void)y; }
 EXPORT void CALL RomClosed(void) {}
 EXPORT int CALL RomOpen(void) { return 1; }
 EXPORT void CALL ShowCFB(void) {}
-EXPORT void CALL UpdateScreen(void) {}
-EXPORT void CALL ViStatusChanged(void) {}
+/* EMU_VI_LOG=file: a line each time the VI's status, origin or horizontal video changes, "task N status S origin O
+   width W hvideo H": N the graphics tasks handed over so far. libultra's osViBlack blanks the picture by writing 0 to
+   the horizontal video register (an active area no wide), leaving the status alone, so the file says when the console
+   showed nothing, to compare with the port's PORT_SWAP_LOG (tools/n64_vi_compare.py). */
+static void vi_log(void) {
+    static FILE *log; static int tried; static unsigned last_status = ~0u, last_origin = ~0u, last_hvideo = ~0u;
+    if (!ready || !gfx.VI_STATUS_REG || !gfx.VI_ORIGIN_REG) return;
+    if (!tried) { const char *path = getenv("EMU_VI_LOG"); tried = 1; if (path) log = fopen(path, "w"); }
+    if (!log) return;
+    unsigned status = *gfx.VI_STATUS_REG, origin = *gfx.VI_ORIGIN_REG & 0xFFFFFF;
+    unsigned hvideo = gfx.VI_H_START_REG ? *gfx.VI_H_START_REG : 0;
+    if (status == last_status && origin == last_origin && hvideo == last_hvideo) return;
+    last_status = status; last_origin = origin; last_hvideo = hvideo;
+    fprintf(log, "task %u status %08X origin %06X width %u hvideo %08X vi %u\n", frames, status, origin,
+            gfx.VI_WIDTH_REG ? *gfx.VI_WIDTH_REG : 0, hvideo, vis);
+    fflush(log);
+}
+EXPORT void CALL UpdateScreen(void) { vis++; vi_log(); }
+EXPORT void CALL ViStatusChanged(void) { vi_log(); }
 EXPORT void CALL ViWidthChanged(void) {}
 EXPORT void CALL ReadScreen2(void *dest, int *width, int *height, int front) { (void)dest; (void)front; if (width) *width = 0; if (height) *height = 0; }
 EXPORT void CALL SetRenderingCallback(void (*callback)(int)) { (void)callback; }

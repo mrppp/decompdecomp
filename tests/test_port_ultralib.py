@@ -114,6 +114,46 @@ def test_the_build_writes_units_beside_the_game_never_in_the_save(tmp_path):
     assert sorted(p.name for p in (out / "ultralib").iterdir()) == ["guToy.c"]
 
 
+def test_ultralib_functions_a_unit_calls_are_built_with_it(tree):
+    """A synthesizer function set aside as ultralib's own called alFilterNew and its neighbours, which nothing
+    defined: the link stubbed them ("not implemented, skipped") and the audio thread never finished a frame, so it
+    kept the CPU from the game's main thread. A callee nothing else provides is built with its caller's flags."""
+    text = ultralib.extract(ultralib.index(str(tree))["guToy"], "guToy")
+    units = {"guToy.c": (text, ["-DBUILD_VERSION=VERSION_J"])}
+    out = ultralib.with_callees(units, tree, lambda name: False)
+    assert set(out) == {"guToy.c", "guToyF.c"} and out["guToyF.c"][1] == ["-DBUILD_VERSION=VERSION_J"]
+    assert "void guToyF(float" in out["guToyF.c"][0] and "void guToy(" not in out["guToyF.c"][0]
+    # what the game, the host or the recompiler provides is left to them
+    assert set(ultralib.with_callees(units, tree, lambda name: name == "guToyF")) == {"guToy.c"}
+
+
+def test_a_helper_declared_static_in_the_files_own_prototype_or_header_is_exported(tmp_path):
+    """`_bnkfPatchBank` and `_sndpVoiceHandler` are declared static (in the file, or in a header beside it) and
+    defined without it: the unit built for the function must export it, else its callers stay unresolved."""
+    folder = tmp_path / "ultralib" / "src" / "audio"
+    folder.mkdir(parents=True)
+    (folder / "priv.h").write_text("static int _handler(void *node);\nstatic int _other(void);\n")
+    path = folder / "player.c"
+    path.write_text('#include "priv.h"\n#include <ultra64.h>\nstatic void _patch(int x);\n\n'
+                    "int _handler(void *node)\n{\n    return 1;\n}\n\nvoid _patch(int x)\n{\n}\n")
+    handler = ultralib.extract(path, "_handler")
+    assert "\nint _handler(void *node);" in "\n" + handler and "static int _other(void);" in handler  # (only its own)
+    assert '#include "priv.h"' not in handler and "#include <ultra64.h>" in handler
+    assert "static void _patch" not in ultralib.extract(path, "_patch")  # the file's own prototype
+    assert "static void _patch" in handler  # (another function's prototype stays)
+
+
+def test_the_build_adds_callees_nothing_else_provides(tree, tmp_path):
+    text = ultralib.extract(ultralib.index(str(tree))["guToy"], "guToy")
+    units = {"guToy.c": (text, ["-DX"])}
+    out = tmp_path / "port" / "wasm" / "build"
+    library = build._library(out, units, {}, lambda *a: None, lambda name: False)
+    assert sorted(library) == ["guToy.c", "guToyF.c"] and library["guToyF.c"] == ["-DX"]
+    # the game's own C for the callee wins, as it does for a unit
+    library = build._library(out, units, {"guToyF.c": Path("progress/src/guToyF.c")}, lambda *a: None, lambda name: True)
+    assert sorted(library) == ["guToy.c"]
+
+
 def test_the_link_report_names_ultralib_apart_from_the_games_assembly(monkeypatch):
     class Kit:
         @staticmethod
@@ -126,6 +166,23 @@ def test_the_link_report_names_ultralib_apart_from_the_games_assembly(monkeypatc
     assert pc_link._group(None, None, "func_80001000") == "assembly"
 
 
+def test_a_game_with_no_set_aside_function_still_gets_the_callees_its_code_names_through_a_header_macro(tree):
+    """A game's C says `alHeapAlloc(...)`, a macro in libaudio.h for `alHeapDBAlloc(...)`: the compiled code imports
+    `alHeapDBAlloc`, a name no source text held, and with no function set aside there was no known build either, so
+    nothing was built for it ("alHeapDBAlloc: not implemented, skipped" and the game went on with a null pointer).
+    Header macros are followed, and the library's default build is used when there is no unit to take one from."""
+    (tree / "include" / "PR" / "alias.h").write_text("#define guToyAlias(m, a) guToyF(m, a)\n#define NOT_A_CALL 3\n")
+    ultralib.macro_targets.cache_clear()
+    assert ultralib.macro_targets(str(tree)) == {"guToyAlias": "guToyF"}
+    out = ultralib.game_callees({}, tree, lambda name: False, ["void g(void) { guToyAlias(m, 1); }"])
+    assert set(out) == {"guToyF.c"} and "-DBUILD_VERSION=VERSION_L" in out["guToyF.c"][1]
+    # a unit's own macro use is followed too
+    units = {"x.c": ("void x(void) { guToyAlias(m, 2); }", ["-DX"])}
+    assert set(ultralib.with_callees(units, tree, lambda name: False)) == {"x.c", "guToyF.c"}
+    # the game's own C or the host providing it leaves it to them
+    assert ultralib.game_callees({}, tree, lambda name: True, ["guToyAlias(m, 1);"]) == {}
+
+
 def test_ultralib_is_a_pinned_proprietary_pack_at_the_tables_commit():
     pack = toolchains.get("ultralib-source")
     assert pack.proprietary  # installed only when the user accepts it in Compilers & tools
@@ -135,3 +192,18 @@ def test_ultralib_is_a_pinned_proprietary_pack_at_the_tables_commit():
     tool = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tool)
     assert tool.COMMIT in pack.parts[0]["url"] and pack.parts[0]["sha256"]  # the C of the build the table hashes
+
+
+def test_ultralib_functions_the_games_own_c_calls_are_built_too(tree):
+    """A game's own alInit called alSynNew, which no unit calls and the project had not set aside: nothing defined it,
+    the link stubbed it ("not implemented, skipped") and the audio never started. A name the game's C uses that
+    ultralib defines and nothing provides is built with the flags most units use; with no unit there is no known
+    build, so the library's default one is used (a game that set nothing aside still got no `alHeapDBAlloc`)."""
+    text = ultralib.extract(ultralib.index(str(tree))["guToy"], "guToy")
+    units = {"guToy.c": (text, ["-DBUILD_VERSION=VERSION_J"])}
+    game = ["void game_init(void) { guToyF(0, 0); }", "int unrelated(void) { return guNotInUltralib(1); }"]
+    out = ultralib.game_callees(units, tree, lambda name: False, game)
+    assert set(out) == {"guToy.c", "guToyF.c"} and out["guToyF.c"][1] == ["-DBUILD_VERSION=VERSION_J"]
+    assert ultralib.game_callees(units, tree, lambda name: name == "guToyF", game) == units  # provided elsewhere
+    none = ultralib.game_callees({}, tree, lambda name: False, game)  # no unit: the default build
+    assert set(none) == {"guToyF.c"} and "-DBUILD_VERSION=VERSION_L" in none["guToyF.c"][1]

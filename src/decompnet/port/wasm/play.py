@@ -34,7 +34,9 @@ def save_repository(folder: Path) -> Path:
     """The save repository holding `folder`, the project's progress folder: the build reads its progress/ and port/."""
     folder = Path(folder)
     for repo in (folder.parent, folder):
-        if (repo / "progress" / "decompdecomp.json").is_file() and (repo / "progress" / "src").is_dir():
+        # (a save of a game with nothing matched yet has no progress/src: it still runs, from the recompiled code
+        # and the ROM interpreter)
+        if (repo / "progress" / "decompdecomp.json").is_file():
             return repo
     raise NetworkError(f"{folder} isn't a saved project yet: Save the project first, then Play builds from the save")
 
@@ -81,6 +83,18 @@ def native_adapter(net, slug: str, runtime_id: str) -> Path:
     raise NetworkError("Choose N64 compatibility and the decompdecomp runtime to play or export today.")
 
 
+def end(proc: subprocess.Popen, grace: float = 3.0) -> None:
+    """Ends a game's process: asked to stop, then killed if it doesn't within `grace` seconds. A game stuck in a
+    loop of its own code (a boot that never leaves its loader) ignored the request and kept a core busy for an
+    hour after Stop."""
+    proc.terminate()
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=grace)
+
+
 def stop(slug: str) -> bool:
     with _lock:
         entry = _running.pop(slug, None)
@@ -89,7 +103,7 @@ def stop(slug: str) -> bool:
     if win is not None and win.poll() is None:
         win.terminate()
     if entry and entry[0].poll() is None:
-        entry[0].terminate()
+        end(entry[0])
         return True
     return False
 
@@ -135,7 +149,7 @@ def library(net, slug: str, log=print) -> set[str]:
     kit = net.console(proj).port_kit
     if kit is None:
         return set()
-    sdk = identify(net, proj, net.sdk_functions(proj), include_asm=True) | confirmed(net, proj)
+    sdk = identify(net, proj, net.sdk_functions(proj), include_asm=True, builtin=True) | confirmed(net, proj)
     # Every function, not only the matched: a save also carries C that isn't proven yet (a twin from another game,
     # a draft), and a racing game's twin of osEPiStartDma, still open, was compiled over the host's: it posted to
     # libultra's PI manager, which the host doesn't run, and the boot thread waited for its first DMA for ever.
@@ -185,26 +199,67 @@ def default_save(net, slug: str) -> Path | None:
         return None
 
 
+def host_defined(kit) -> set[str]:
+    """The library routines the host's own C defines (`w2c_env_<name>`, leading underscores dropped): the names a call
+    can be sent to and be answered."""
+    from .recomp import _demangle
+
+    out = set()
+    folder = Path(kit.wasm) if kit and getattr(kit, "wasm", None) else None
+    for path in sorted(folder.glob("*.c")) if folder and folder.is_dir() else ():
+        for m in re.finditer(r"\bw2c_env_(\w+)\(", path.read_text(encoding="utf-8", errors="replace")):
+            out.add(_demangle(m.group(1)).lstrip("_"))
+    return out
+
+
+def host_provides(kit, names) -> bool:
+    """Whether the port's host answers a function known by these library names: the port says it replaces or
+    supplies it (what `library` decides leaves a matched function's C out) AND the host defines the routine. The
+    port's "glue" group is every other os* name, though the host defines only some: a game's matched
+    osPiRawStartDma / osPiRawReadIo, sent to a name the host lacks, ran as a stub, and the game's file reader
+    looped on headers for ever."""
+    if not kit:
+        return False
+    names = [n for n in names or () if kit.sdk_group(n) in ("replaced", "glue")]
+    return bool(names) and bool({n.lstrip("_") for n in names} & (host_defined(kit)))
+
+
 def library_names(net, slug: str) -> dict[str, str]:
-    """{a function's name: its library name} for library code with no matched C, found by library detection: its
+    """{a function's name: its library name} for library code that doesn't run as the game's own C (no matched C,
+    or the host provides it), found by library detection: its
     calls go to the library's name, which the host answers by name in any game (a racing game's bzero kept its
     automatic name, `func_8003DDC0`, and the host stubbed it to nothing). One name each; names already the
     library's, and the user's confirmed identities, as they are."""
-    from ...app.sdk_identity import identify
+    from ...app.sdk_identity import ambiguous, identify
     from ..identities import confirmed
 
     with net.progress.view():
         proj = net._project(slug)
-    sdk = identify(net, proj, net.sdk_functions(proj), include_asm=True) | confirmed(net, proj)
+    sdk = identify(net, proj, net.sdk_functions(proj), include_asm=True, builtin=True) | confirmed(net, proj)
+    shared = ambiguous(net, proj, builtin=True)  # (several library routines with one body: see below)
+    kit = net.console(proj).port_kit
     out = {}
-    for r in net.project_store(proj["id"]).all("SELECT id, name, meta FROM functions WHERE project_id=? AND "
-                                               "status!='matched'", proj["id"]):
+    for r in net.project_store(proj["id"]).all("SELECT id, name, status, meta FROM functions WHERE project_id=?",
+                                               proj["id"]):
         # detection's identity, else the name it showed (`sdk_display`): an exact-bytes proof of hand-written assembly
         # goes stale with the project's compiler setting (its fingerprint holds it), not with the bytes
-        names = (sdk.get(r["id"]) or {}).get("names") or []
+        names = (sdk.get(r["id"]) or {}).get("names") or (shared.get(r["id"]) or {}).get("names") or []
+        # A matched function keeps its automatic name too when polishing hasn't renamed it. When the host provides it
+        # (`library` leaves its C out), recompiled code must call the host's: a battle game's osRecvMesg
+        # (func_8004DE70, matched) ran as a recompiled copy against kernel routines the host doesn't have, and every
+        # worker thread ended at once.
+        if r["status"] == "matched" and not host_provides(kit, names):
+            continue
         if not names and '"sdk_display"' in (r["meta"] or ""):
             shown = (json.loads(r["meta"]).get("sdk_display") or {}).get("name") or ""
             names = [shown] if shown and " / " not in shown else []
+        # Routines whose bodies are identical share one fingerprint, so detection names them all (osViGetCurrent-
+        # and osViGetNextFramebuffer are the same 64 bytes in libultra 2.0I-2.0L). When the host answers some of
+        # them, any of those is the right call: a fighting game's main thread waited in its own copy of
+        # osViGetCurrentFramebuffer for the buffer it had handed the VI, which only the host's VI ever shows.
+        if len(names) > 1:
+            hosted = sorted(n for n in names if host_provides(kit, [n]))
+            names = hosted[:1] or names
         if len(names) == 1 and names[0] != r["name"] and re.fullmatch(r"[A-Za-z_]\w*", names[0]):
             out[r["name"]] = names[0]
     return out
@@ -236,13 +291,33 @@ def relative_bank_code(net, slug: str, log=print) -> set[str]:
     return names
 
 
+def code_offsets(net, slug: str) -> dict | None:
+    """Where each function's machine code is in the image the project analysed ({"image": path, "offsets": {function:
+    ROM offset}}). The cartridge itself holds a compressed game's code compressed (a game that unpacks its code into
+    RAM at boot): the project's analysis image, with the code unpacked, is where a function's bytes can be read for
+    what the build works out from them (port/wasm/library_data.py)."""
+    with net.progress.view():
+        proj = net._project(slug)
+    cfg = net.cfg(proj)
+    rom = cfg.get("rom") or {}
+    name = rom.get("donor_analysis_base") or rom.get("file")
+    image = Path(proj["root"]) / name if name else None
+    if image and not image.is_file() and rom.get("file"):
+        image = Path(proj["root"]) / rom["file"]
+    if not image or not image.is_file():
+        return None
+    rows = net.project_store(proj["id"]).all(
+        "SELECT name, rom_offset FROM functions WHERE project_id=? AND rom_offset IS NOT NULL", proj["id"])
+    return {"image": str(image), "offsets": {r["name"]: r["rom_offset"] for r in rows}}
+
+
 def inputs(net, slug: str, log=print) -> dict:
     """What the build takes from the project besides its save: the library the host provides (`leave_out`), library
     code built from ultralib's C (`library_c`), library code's own names (`library_names`), and the recompiled C for
     functions with no C yet (`recomp`)."""
     return {"leave_out": library(net, slug, log) | unverified(net, slug, log) | relative_bank_code(net, slug, log), "library_c": library_c(net, slug),
             "library_names": library_names(net, slug), "recomp": recompiled(net, slug, log),
-            "function_headers": function_headers(net, slug)}
+            "function_headers": function_headers(net, slug), "code_offsets": code_offsets(net, slug)}
 
 
 def function_headers(net, slug: str) -> dict[str, str]:
@@ -301,7 +376,9 @@ def play(net, slug: str, log=print, *, adapter: Path | None = None) -> dict:
     # what the game runs that no function starts, kept beside the project for its next import (runtime_entries)
     from ...consoles.n64.code import RUNTIME_ENTRIES
     env = {**os.environ, "PORT_LIVE": str(port), "PORT_SAVE": str(out / "game.eep"), "PORT_SRAM": str(out / "game.sra"),
-           "PORT_ENTRIES": str(rom.parent / RUNTIME_ENTRIES)}
+           "PORT_FLASH": str(out / "game.fla"), "PORT_ENTRIES": str(rom.parent / RUNTIME_ENTRIES)}
+    if memory := (cfg.get("rom") or {}).get("memory_size"):  # the console the game was meant for (host.c console_memory)
+        env["PORT_MEMSIZE"] = str(memory)
     env.pop("PORT_RT64", None)
     if adapter:
         from ... import toolchains
@@ -339,7 +416,7 @@ def play(net, slug: str, log=print, *, adapter: Path | None = None) -> dict:
                 raise NetworkError(f"{explanation}: see {log_path}")
     except BaseException:
         if proc.poll() is None:
-            proc.terminate()
+            end(proc)
         raise
     with _lock:
         _running[slug] = (proc, url)

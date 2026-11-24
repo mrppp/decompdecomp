@@ -239,6 +239,15 @@ def test_the_port_header_has_the_loops_safe_point():
     assert "static inline void port_recomp_poll(void)" in text and "port_safe_point();" in text
 
 
+def test_a_call_from_the_games_c_into_recompiled_code_is_a_safe_point():
+    """A game thread that loops calling one recompiled function (no call through a pointer inside it) never let the
+    higher-priority thread the retrace woke run, and nothing was drawn: entering recompiled code from the game's C
+    (port_recomp_frame) is a safe point."""
+    text = recomp.BRIDGE_RUNTIME
+    body = text[text.index("static void port_recomp_frame("):]
+    assert "port_safe_point();" in body[:body.index("memset(c, 0")]
+
+
 def test_a_function_named_as_the_c_programs_entry_is_renamed():
     """A racing game names its first C function `main`: as C that's a program's entry, and N64Recomp's output for it
     didn't compile until the port renamed every recompiled function R_<name>."""
@@ -260,6 +269,7 @@ static uint64_t told[4]; static int n;
 uint64_t port_io_store(uint64_t addr, uint64_t value) { (void)addr; told[n++] = value; return 48; }
 uint64_t port_io_load(uint64_t addr) { (void)addr; return 48; }
 void port_safe_point(void) {}
+void port_boot_spin(void) {}
 int main(void) {
     static uint8_t ram[64];
     port_sw(ram, 0xA4500004u, 0xFC0);
@@ -337,3 +347,239 @@ def test_link_branches_set_ra_before_the_condition_and_delay_slot():
     fixed = link_branches(generated)
     assert "ctx->r31 = (gpr)(int32_t)0x80012388u;\n    if (SIGNED(0) < 0)" in fixed
     assert "ctx->r31 = (gpr)(int32_t)0x80012390u;\n    if (SIGNED(0) >= 0)" in fixed
+
+
+def test_link_branches_also_set_ra_for_jal_and_jalr():
+    """A routine that copies its own $ra and ends in `jr $a1` jumped to 0 in the native build: N64Recomp's C call
+    for `jal`/`jalr` never wrote $ra. `jalr $ra` (target and link in one register) and `jalr` are left to the call."""
+    from decompnet.port.wasm.recomp import link_branches
+
+    generated = ("    // 0x800CA2C0: jal         0x800137F4\n    // 0x800CA2C4: nop\n    R_func_800137F4(rdram, ctx);\n"
+                 "    // 0x800CA300: jalr        $t9\n    // 0x800CA304: nop\n    LOOKUP_FUNC(ctx->r25)(rdram, ctx);\n"
+                 "    // 0x800CA400: jalr        $ra\n    LOOKUP_FUNC(ctx->r31)(rdram, ctx);\n"
+                 "    // 0x800CA500: j           0x80001000\n")
+    fixed = link_branches(generated)
+    assert "// 0x800CA2C0: jal         0x800137F4\n    ctx->r31 = (gpr)(int32_t)0x800CA2C8u;" in fixed
+    assert "// 0x800CA300: jalr        $t9\n    ctx->r31 = (gpr)(int32_t)0x800CA308u;" in fixed
+    assert fixed.count("ctx->r31 = (gpr)") == 2  # not `jalr $ra`, not a plain `j`
+
+
+def test_a_games_float_mode_is_fr1_only_when_its_code_uses_odd_registers():
+    """libultra's threads start with FR=0, where `mtc1 $zero,$f5; mtc1 $zero,$f4` makes a double zero: a fabs-like
+    function of a platformer called itself for ever when every frame started in FR=1. A game whose recompiled C does
+    arithmetic on an odd register (N64Recomp's CHECK_FR(ctx, odd): a tank game's `mul.s $f1`) runs with FR=1."""
+    even = "    CHECK_FR(ctx, 2);\n    CHECK_FR(ctx, 12);\n    ctx->f2.d = CVT_D_S(ctx->f12.fl);\n"
+    odd = "    CHECK_FR(ctx, 1);\n    CHECK_FR(ctx, 10);\n    CHECK_FR(ctx, 13);\n"
+    assert not recomp.uses_odd_float_registers([even, "int x;"])
+    assert recomp.uses_odd_float_registers([even, odd]) and recomp.uses_odd_float_registers([odd.replace("1)", "31)")])
+    assert not recomp.uses_odd_float_registers([])
+    assert "%(fr_default)d" in recomp.BRIDGE_RUNTIME
+
+
+def test_a_status_write_keeps_an_odd_register_game_in_fr1():
+    """A game whose recompiled C computes on odd registers has its threads' Status written without the FR bit (a
+    thread's saved Status, as libultra makes it): the write switched the layout to FR=0 and the first `mul.s $f1` hit
+    N64Recomp's CHECK_FR assertion (a shooter, in recompiled func_8029A7D8). The write keeps the game's default."""
+    text = recomp.BRIDGE_RUNTIME
+    write = text[text.index("void cop0_status_write("):text.index("gpr cop0_status_read(")]
+    assert "| %(fr_default)du" in write
+
+
+def test_recompiled_floats_follow_the_games_status_fr_bit(tmp_path):
+    """A tank game's recompiled vector code uses odd single-precision registers (`mul.s $f1`), which N64Recomp's
+    CHECK_FR allows only in FR=1: every frame started in FR=0 and stopped on the first one. A frame now starts from
+    the host's Status, a Status write switches the layout, and switching keeps each odd register's value."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler")
+    text = recomp.BRIDGE_RUNTIME
+    start = text.index("uint32_t port_cop0_status(void);")
+    end = text.index("/* C called by the interpreter can call back")
+    assert "port_recomp_fr(c, ((c->status_reg >> 26) & 1u) | %(fr_default)du);" in text[text.index("static void port_recomp_frame("):]
+    assert "port_recomp_fr(ctx, (((uint32_t)value >> 26) & 1u) | %(fr_default)du);" in recomp.__loader__.get_source(recomp.__name__)
+    (tmp_path / "t.c").write_text(r"""#include <stdint.h>
+#include <stdio.h>
+typedef union { double d; struct { uint32_t u32l; uint32_t u32h; }; uint64_t u64; } fpr;
+typedef struct { fpr f0, f1, f2, f3; uint32_t *f_odd; uint8_t mips3_float_mode; } recomp_context;
+""" + text[start:end].replace("i < 32", "i < 4") + r"""
+uint32_t port_cop0_status(void) { return 0; } void port_cop0_status_set(uint32_t v) { (void)v; }
+int main(void) {
+    recomp_context c = {0}; c.f_odd = &c.f0.u32h;
+    c.f_odd[0] = 0x11111111u; c.f0.u32l = 7;            /* FR=0: $f1 is the upper half of $f0 */
+    port_recomp_fr(&c, 1);
+    printf("%d %X %X ", c.mips3_float_mode, c.f1.u32l, c.f_odd[0]);  /* FR=1: $f1 has its own register */
+    c.f_odd[0] = 0x22222222u; c.f0.u32h = 0x99u;
+    port_recomp_fr(&c, 0);
+    printf("%d %X\n", c.mips3_float_mode, c.f_odd[0]);
+    return 0;
+}
+""")
+    done = subprocess.run([cc, "-w", str(tmp_path / "t.c"), "-o", str(tmp_path / "t")], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    out = subprocess.run([str(tmp_path / "t")], capture_output=True, text=True).stdout.split()
+    assert out == ["1", "11111111", "11111111", "0", "22222222"]
+
+
+def test_a_function_found_by_calls_with_a_branch_past_its_end_is_left_to_the_interpreter(tmp_path):
+    """N64Recomp writes functions it finds by the calls into them (`static_4_80171B34`) with no symbol of the split;
+    one that branches to a label outside itself stopped a port's host build (`undeclared label`) because only named
+    functions were dropped. It goes, and its callers reach it by the address in its name."""
+    folder = tmp_path / "recomp"
+    _output(folder)
+    source = folder / "funcs/funcs_0.c"
+    source.write_text(source.read_text() + (
+        "RECOMP_FUNC void static_4_80171B34(uint8_t* rdram, recomp_context* ctx) {\n"
+        "    if (ctx->r2 == 0) {\n        goto L_80171BB4;\n    }\n    return;\n;}\n"))
+    header = folder / "funcs/funcs.h"
+    header.write_text(header.read_text() + "void static_4_80171B34(uint8_t* rdram, recomp_context* ctx);\n")
+    source.write_text(source.read_text().replace("    return;\n;}\nRECOMP_FUNC void osSendMesg",
+                                                 "    static_4_80171B34(rdram, ctx);\n    return;\n;}\nRECOMP_FUNC void osSendMesg", 1))
+    out = tmp_path / "build"
+    recomp.prepare(folder, out, "", [], [], _header(), {}, lambda *a: None)
+    text = (out / "rec_funcs_0.c").read_text()
+    assert "RECOMP_FUNC void R_static_4_80171B34" not in text and "L_80171BB4" not in text
+    assert 'port_recomp_missing(0x80171B34u, "static_4_80171B34"' in (out / "bridges.c").read_text()
+
+
+def _two_overlays(tmp_path):
+    """Two overlays the game loads into one slot (one address, two places in the ROM), and a function of its own."""
+    image = tmp_path / "rom.z64"
+    words = [0x27BDFFE0, 0xAFBF001C, 0x00000000, 0x03E00008, 0x24020001, 0x24020002, 0x00000000, 0x00000000]
+    other = [0x3C048008, 0x8C83A590, 0x8C82A590, 0x00641821, 0x0043102B, 0x03E00008, 0x00000000, 0x00000000]
+    blob = bytearray(0x1000)
+    for at, ws in ((0x100, words), (0x200, other), (0x300, words[:4] + [0x24020009, 0, 0, 0])):
+        for i, w in enumerate(ws):
+            blob[at + 4 * i:at + 4 * i + 4] = w.to_bytes(4, "big")
+    image.write_bytes(bytes(blob))
+    folder = tmp_path / "recomp"
+    (folder / "funcs").mkdir(parents=True)
+    (folder / "recomp.json").write_text("{}")
+    (folder / "syms.toml").write_text(
+        '[[section]]\nname = "slot_a"\nrom = 0x100\nvram = 0x80126480\nsize = 0x20\n\nfunctions = [\n'
+        '    { name = "func_80126480_a", vram = 0x80126480, size = 0x20 },\n]\n\n'
+        '[[section]]\nname = "slot_b"\nrom = 0x200\nvram = 0x80126480\nsize = 0x20\n\nfunctions = [\n'
+        '    { name = "func_80126480_b", vram = 0x80126480, size = 0x20 },\n]\n\n'
+        '[[section]]\nname = "code"\nrom = 0x300\nvram = 0x80001000\nsize = 0x20\n\nfunctions = [\n'
+        '    { name = "func_80001000", vram = 0x80001000, size = 0x20 },\n]\n')
+    (folder / "funcs/funcs.h").write_text('#include "recomp.h"\n' + "".join(
+        f"void {n}(uint8_t* rdram, recomp_context* ctx);\n" for n in ("func_80126480_a", "func_80126480_b", "func_80001000")))
+    body = "    // 0x80126480: jr $ra\n    return;\n;}\n"
+    (folder / "funcs/funcs_0.c").write_text(
+        '#include "recomp.h"\n#include "funcs.h"\n\n' + "".join(
+            f"RECOMP_FUNC void {n}(uint8_t* rdram, recomp_context* ctx) {{\n{body}"
+            for n in ("func_80126480_a", "func_80126480_b", "func_80001000")))
+    return folder, image, words, other
+
+
+def test_functions_sharing_an_address_between_overlays_are_guarded_by_their_code(tmp_path):
+    """A tank game's main thread spun in one overlay's delay routine while another overlay was loaded in the slot:
+    the recompiler wrote both overlays' functions at one address and the call by address ran the first listed. Only
+    functions whose addresses another part of the ROM shares get the check (a function of its own doesn't)."""
+    folder, image, words, other = _two_overlays(tmp_path)
+    guards = recomp.overlay_guards(folder, image, {"func_80126480_a", "func_80126480_b", "func_80001000"})
+    assert set(guards) == {"func_80126480_a", "func_80126480_b"}
+    assert guards["func_80126480_a"] == (0x80126480, 8, recomp.code_hash(words))
+    assert guards["func_80126480_b"] == (0x80126480, 8, recomp.code_hash(other))
+    assert recomp.overlay_guards(folder, None, {"func_80126480_a"}) == {}  # no ROM to read: no guards
+
+
+def test_a_guarded_function_runs_what_ram_holds_or_the_interpreter(tmp_path):
+    folder, image, words, other = _two_overlays(tmp_path)
+    header = tmp_path / "recomp.h"
+    header.write_text(_header().read_text())
+    host = tmp_path / "host.c"
+    host.write_text("")
+    out = tmp_path / "build"
+    recomp.prepare(folder, out, "", [], [host], header, {}, lambda *a: None, image=image)
+    rec = (out / "rec_funcs_0.c").read_text()
+    code = f"port_recomp_guard(0x80126480u, 8u, 0x{recomp.code_hash(words):08X}u)"
+    assert code in rec and "port_recomp_other(0x80126480u, R_func_80126480_a, rdram, ctx)" in rec
+    assert rec.count("port_recomp_guard(") == 2  # (the function of its own has none)
+    bridges = (out / "bridges.c").read_text()
+    assert f"{{0x80126480u, 8u, 0x{recomp.code_hash(other):08X}u, R_func_80126480_b}}" in bridges
+    assert "if (port_recomp_shared((uint32_t)vram) && port_mips_has_code((uint32_t)vram))" in bridges
+    assert "int port_recomp_guard(" in (out / "funcs.h").read_text()
+    # RECOMP_FUNC is weak: a stub bridges.c defines for a name a recompiled file defines overrides its real body. A
+    # puzzle game's overlays at one address (all but the first listed) then ran as empty functions and the main loop
+    # reloaded the overlays for ever.
+    for name in ("func_80126480_a", "func_80126480_b"):
+        assert f"RECOMP_FUNC void R_{name}(" in "".join(p.read_text() for p in out.glob("rec_funcs_*.c"))
+        assert f"void R_{name}(uint8_t* rdram, recomp_context* ctx) {{ (void)rdram;" not in bridges
+
+
+def test_the_ram_hash_in_c_is_the_roms_hash_in_python(tmp_path):
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler")
+    start = recomp.LOOKUPS.index("static uint32_t port_recomp_ram_hash")
+    function = recomp.LOOKUPS[start:recomp.LOOKUPS.index("\n}\n", start) + 3]
+    words = [0x27BDFFE0, 0xAFBF001C, 0x03E00008, 0x24020001]
+    (tmp_path / "hash.c").write_text(
+        "#include <stdint.h>\n#include <stdio.h>\n"
+        f"static const uint32_t ram[] = {{{', '.join(hex(w) for w in words)}}};\n"
+        "uint32_t port_mips_lw(uint32_t a) { return ram[(a - 0x80001000u) / 4]; }\n" + function +
+        'int main(void) { printf("%08X\\n", port_recomp_ram_hash(0x80001000u, 4)); return 0; }\n')
+    subprocess.run([cc, "-o", str(tmp_path / "hash"), str(tmp_path / "hash.c")], check=True)
+    done = subprocess.run([str(tmp_path / "hash")], capture_output=True, text=True, check=True)
+    assert int(done.stdout, 16) == recomp.code_hash(words)
+
+
+def test_every_function_of_a_slot_the_game_fills_at_run_time_is_guarded(tmp_path):
+    """A puzzle game's main thread spun in the first function of a raw slot that no other overlay's listed function
+    overlapped, while the game had loaded another overlay there: the guard covers every function of a section named
+    as a raw slot, and of sections whose addresses overlap another's, not only functions that overlap in the table."""
+    image = tmp_path / "rom.z64"
+    blob = bytearray(0x1000)
+    for at, w in ((0x100, 0x27BDFFE0), (0x120, 0x03E00008), (0x200, 0x3C048008)):
+        blob[at:at + 4] = w.to_bytes(4, "big")
+    image.write_bytes(bytes(blob))
+    folder = tmp_path / "recomp"
+    folder.mkdir()
+    (folder / "syms.toml").write_text(
+        '[[section]]\nname = "main"\nrom = 0x400\nvram = 0x80001000\nsize = 0x20\n\nfunctions = [\n'
+        '    { name = "func_80001000", vram = 0x80001000, size = 0x20 },\n]\n\n'
+        # a raw slot alone, with two functions, none overlapping another section's
+        '[[section]]\nname = "raw_slot_00"\nrom = 0x100\nvram = 0x80300000\nsize = 0x40\n\nfunctions = [\n'
+        '    { name = "func_80300000", vram = 0x80300000, size = 0x20 },\n'
+        '    { name = "func_80300020", vram = 0x80300020, size = 0x20 },\n]\n\n'
+        # two sections of one address range with other bytes (function boundaries differ)
+        '[[section]]\nname = "ovl_a"\nrom = 0x200\nvram = 0x80400000\nsize = 0x40\n\nfunctions = [\n'
+        '    { name = "func_80400000", vram = 0x80400000, size = 0x20 },\n]\n\n'
+        '[[section]]\nname = "ovl_b"\nrom = 0x240\nvram = 0x80400000\nsize = 0x40\n\nfunctions = [\n'
+        '    { name = "func_80400020", vram = 0x80400020, size = 0x20 },\n]\n')
+    names = {"func_80001000", "func_80300000", "func_80300020", "func_80400000", "func_80400020"}
+    guards = recomp.overlay_guards(folder, image, names)
+    assert set(guards) == names - {"func_80001000"}  # (the game's own code at a fixed address has none)
+    assert guards["func_80300000"][0] == 0x80300000 and guards["func_80300020"][0] == 0x80300020
+
+
+def test_a_call_at_a_tlb_mapped_address_finds_the_code_at_its_window():
+    """A game maps overlay code at 0x0F000000 with osMapTLB and calls through a table of such addresses: `recompiled
+    code called 0F000000, where no function is`. get_function names the address through the host's TLB windows first,
+    as the interpreter does for its reads."""
+    text = recomp.LOOKUPS
+    body = text[text.index("recomp_func_t *get_function(int32_t vram) {"):]
+    head = body[:body.index("unsigned lo = 0")]
+    assert "port_tlb_canon((uint32_t)vram)" in head and "port_tlb_n" in head
+    assert "uint32_t port_tlb_canon(uint32_t a);" in text[:text.index("recomp_func_t *get_function(")]
+
+
+def test_a_function_that_raises_a_syscall_is_left_to_the_interpreter():
+    """An overlay game's thunks are `syscall N` words answered by its own exception handler: recompiled C has no
+    exception to take (the host printed 'reached a syscall' and did nothing, so every call into an overlay did
+    nothing), the interpreter runs such a function from RAM."""
+    thunk = ("RECOMP_FUNC void func_80088310(uint8_t* rdram, recomp_context* ctx) {\n"
+             "    // 0x80088310: syscall     5\n    recomp_syscall_handler(rdram, ctx, 0x80088310);\n    return;\n;}\n")
+    plain = ("RECOMP_FUNC void func_80088320(uint8_t* rdram, recomp_context* ctx) {\n"
+             "    ctx->r2 = 1;\n    return;\n;}\n")
+    assert recomp.unfinished([thunk + plain]) == {"func_80088310"}
+
+
+def test_a_call_into_the_games_c_starts_the_v0_word_from_the_callers_v0():
+    """`void f(void) {}` is `jr $ra; nop`: $v0 is what the caller had. A loader polled `while (!send(...))` through
+    such a stub and stopped for ever on the 0 the port's register word held."""
+    from decompnet.port.wasm import recomp
+
+    runtime = recomp.BRIDGE_RUNTIME
+    call = runtime.index("port_calls[lo].invoke(")
+    assert "STORE_W(16, 0x%(regs)Xu, ctx->r2);" in runtime[:call][-300:]

@@ -822,6 +822,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Machine drafts (m2c, Ghidra for x86) | ✓ | ✓ | ✓ | — | ✓ Ghidra | ✓ | ✓ (m2c `gba-gcc-c`) | ✓ | ✓ Ghidra | ✓ Ghidra | — (no assembly to read) | by architecture |
 | Draft cleanup stage (record views, gbi macros, m2c's byte steps, table cursors as indexes) | ✓ | ✓ m2c path | ✓ m2c path | — | — Ghidra drafts planned | ✓ m2c path | ✓ m2c path | ✓ m2c path | — Ghidra drafts planned | — Ghidra drafts planned | — (no assembly to read) | m2c drafts |
 | Drafts from a close matched look-alike (`twin_drafts`) | ✓ | ✓ not run yet | ✓ not run yet | — | — | ✓ not run yet | — | — project-mode alignment planned | — project-mode alignment planned | — | — project-mode alignment planned | — |
+| Matched neighbours in the brief and the skill's orient (callers, callees, file neighbours, shared globals, look-alikes, with their C; in the skill, also matched functions sharing the mismatched region's instruction shape, with their C there) | ✓ | ✓ not run yet | ✓ not run yet | — | — | ✓ not run yet | — | — no cross-references in project mode | — no cross-references in project mode | — | — no cross-references in project mode | — |
 | Draft result type from the exits and callers (`draft_return_type`, on: the callers decide where the exits cannot; 5 better / 7 worse of 20 fires, 2 exact) | ✓ reader | ✓ reader | ✓ reader | — PPC reader planned | — | ✓ reader | — ARM reader planned | — PPC reader planned | — x86 reader planned | — x86 reader planned | — ARM reader planned | — |
 | Callers and the result type they show (`get_callers`, the brief's line, `callers.py`) | ✓ stored callees | ✓ not run yet | ✓ not run yet | — | — | ✓ not run yet | — ARM reader planned | — project callees not stored | — project callees not stored | — | — project callees not stored | — |
 | Row-coverage ranking of combinations (`prove_chain.py --combine`, `pair_row_coverage`, off: measured no gain) | ✓ ROM | ✓ not run yet | ✓ not run yet | — | — | ✓ not run yet | — | — judge rows exist; project judge worker planned | — | — | — | — |
@@ -874,6 +875,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Your own compiler (Setup: another build of one it has) | ✓ | ✓ | ✓ | ✓ your SDK | — | ✓ | ✓ | — | ✓ your Visual C++, for 32-bit games (64-bit ones build with the pack's 2017) | ✓ your XDK | — | the project's own build |
 | Compiler ranges and suggestions | ✓ | ✓ | ✓ | ✓ (ps3dev GCC, your SDK's) | — | ✓ | — | from scratch: per source file (`try_compiler`, Settings); else the project's build | per source file (`try_compiler`, Settings) | per source file (`try_compiler`, Settings): Visual C++ 7.0 / 7.1, your XDK's own | from scratch: per source file (`try_compiler`, Settings); else the project's build | the project's build |
 | Verified cleanup of rare compiler profiles | ✓ ROM mode | ✓ ROM mode | ✓ ROM mode | — | — | ✓ ROM mode | — | — | — | — | — | — |
+| Deep Permuter detects a near-match's compiler (`profile_detection`: its saved C under every installed profile, matched neighbours, the compiler map, code habits; told and tried first) | ✓ demo; copies of three real games | ✓ shared ROM path, unchecked | ✓ shared ROM path, unchecked | ✓ judge and neighbours, unchecked (code habits: MIPS only) | — | ✓ shared ROM path, unchecked | — | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build |
 | Flag search (`search_flags`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | — (the project's flags only) | per source file (/Oy- on 32-bit, /O1, /Ob1) | per source file | — (the project's flags only) | the project's build |
 | Compiler map and the judge's survey | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | ✓ per source file, Rich header | the XDK build's compiler (no Rich header: one per game) | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | — |
 | Range checks: a range applies after its neighbours confirm it | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ from scratch: per source file; else the project's build | ✓ over source files | ✓ | ✓ from scratch: per source file; else the project's build | — |
@@ -1183,9 +1185,50 @@ fingerprints but not the relocation alignment the names come from (as for the si
 yet. The result-type reader (`Arch.return_contract`) is MIPS only; x86, PPC and ARM readers would let
 `draft_return_type` run there, and the callers' verdict (`app/call_evidence.py`, MIPS only: `Arch.call_sites`) would do the same. On the N64 game
 measured the exits alone gained nothing; the callers decide where they cannot, and it is on
-(docs/learnings/finding/return-type-from-callers.md). Project mode stores no callees, so it has no `get_callers` yet.
+(docs/learnings/finding/return-type-from-callers.md). Project mode stores no callees, so it has no `get_callers` yet,
+and no matched-neighbours section in the brief either (`app/matched_neighbours.py` reads the ROM cross-references,
+the MIPS instruction look-alikes and, for the shape of a mismatched region, the functions' assembly text); GBA, PS3 and
+PS4 have no look-alike reader for it. Project mode would need its objects' disassembly stored per function for the
+shape search; the brief does not run the shape search yet (it has no candidate's rows when it is written).
+
+### Float constants written as literals beyond MIPS ROM projects
+
+m2c reads a float constant from the compiler's literal pool through a global (`extern f32 D_8000930C;`); the library's
+`float_literal_global` writes the literal (`500.0f`) from the word the app reads in the ROM
+(`app/float_literal_words.py`, docs/learnings/finding/float-literal-through-global.md). It reaches every MIPS ROM
+console with a float unit (N64, PS2, PSP: a `lwc1` through `$at` or `$gp`); the PS1 has no float unit, so it has
+nothing to find. Planned: PowerPC's `lfs` from the small data (`@sda21`) and x86's `fld` from a constant need their
+processors' load readers (GameCube/Wii, Windows PC, Xbox), and project mode needs the word from the unit's original
+object rather than a ROM; doubles need both words proved before the literal is written.
+
+### Call arguments and return values from the target's registers beyond MIPS
+
+Library families that read which register the target's code fills to fix a call or a return m2c got wrong:
+`missing_call_argument_local` (an argument the target computes into `$a0`-`$a3` and the draft left off, taken from the
+local that already holds it, the callee's declaration from its matched C: the app passes `callees`,
+docs/learnings/finding/missing-call-argument-local.md) and `returned_register_local` (the local in the register the
+epilogue copies into `$v0`, docs/learnings/finding/returned-register-local.md) and `untouched_argument_parameter` (a
+middle argument register the target never writes: the caller's own incoming argument passed on, the caller's signature
+widened, docs/learnings/finding/untouched-argument-parameter.md). They reach every MIPS console, ROM and project mode alike
+(N64, PS1, PS2, PSP). Planned: PowerPC (`r3`-`r10` and `r3` for the result, GameCube/Wii) and x86 (the pushes before a
+`call` and `eax`, Windows PC, Xbox) need their processors' call-setup readers, and ARM (DS, GBA) `r0`-`r3`.
 
 ## Recently done
+
+- **The Deep Permuter detects which compiler built a near-match.** An N64 game built with KMC GCC 2.7.2 had eight
+  near-matches stuck at score 10 that were SN GCC 2.8.1 code. Under SN their saved C was exact, or one edit away. The
+  first sweep tried one compiler per family, and SN and KMC are both GCC. It also listened only for an exact match.
+  Now, for a saved best within 300 of a match, the sweep scores that C under every installed profile of the console
+  with the judge (cached per source and profile, counted against the compile allowance). It tries first the profiles
+  that the function's matched neighbours, the compiler map, its moves and its code habits point to. The code habits
+  now include three that tell one GCC from another: zeros copied between registers, float literals loaded from
+  memory, and globals loaded through their own address register (docs/learnings/finding/kmc-272-versus-sn-281-code-habits.md).
+  It then tries the best toolchain's `-mips2` and flag variants. An exact pair goes through the usual recheck and
+  suggestion. A clearly better profile (half the score or less), or a better one that three or more matched
+  neighbours were judged with, is recorded for that C. It goes into the function's notes, the run log, and a
+  words-only suggestion. The permuter probes every candidate under that profile first and climbs under it. Nothing
+  changes a function's compiler by itself (`app/profile_detection.py`). ROM projects only (see "Compiler detection
+  for project mode").
 
 - **Scores follow the flow, not the instruction count (score version 3).** On a large function one instruction added
   or removed shifted every later branch (and jump to the function's own symbol), and each one cost 10 or, for a
@@ -2281,6 +2324,16 @@ reuse the saved map. See [ROM Explorer](docs/ROM_EXPLORER.md) for support and li
   the time against 62% for the rest, because agents guessed the layouts.
 
 ## Next
+
+### Compiler detection for project mode
+
+The Deep Permuter's compiler detection (`app/profile_detection.py`) scores a near-match's saved C under every
+installed profile of a ROM project's console. Project mode does not get it yet. There, each source file has its own
+compiler (`Console.file_compiler`, `set_file_compiler`), and a fork's build owns its flags, so the sweep can't judge a
+function alone under another compiler. Next: score the unit under the compilers the console offers per file (the
+`try_compiler` path, `app/filecompilers.py`), and use the files around it as the neighbours. Offer a file compiler
+change as the same review-only suggestion. Every project-mode console: GameCube, Wii, Windows PC, Xbox, DS. PS4 and
+GBA ROM projects have no compiler choice to detect yet.
 
 ### Deep passes that climb under a closer compiler profile
 

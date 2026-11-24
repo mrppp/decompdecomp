@@ -32,6 +32,7 @@ from . import (
     deep_resume,
     deep_throughput,
     draft_repairs,
+    float_literal_words,
     library_registry,
     permuter_focus,
     permuter_local,
@@ -172,6 +173,7 @@ class Search(Permuter):
         self.trace_variants = True
         self.recipe_counts = {}
         self.measurement_counts = {}
+        self.phase_tally = {}  # phase -> [tested, improvements, exact matches, score gained, ms compiling], this run only
         self.recipe_wins = []
         self.recipe_fn = fn['id'] if fn is not None else None
         self.recipe_project = fn['project_id'] if fn is not None else None
@@ -278,6 +280,7 @@ class Search(Permuter):
                 'best_score': self.best, 'best_percent': percent(self.best), 'improvements': self.improvements,
                 'extensions': self.extensions, 'extension_max': EXTEND_MAX if self.extendable else 0,
                 'local_search': self.local_status, 'reviewed_seeds':self.reviewed_seed_result,
+                'phases': self.phase_summary(),
                 'allocation_trials':self.allocation_trials,
                 'allocation_diagnostic_compiles':self.allocation_diagnostic_compiles,
                 'efficiency':self.efficiency.snapshot(detail=detail),
@@ -336,6 +339,13 @@ class Search(Permuter):
                 values[6] += int(score == 0)
                 values[8] += best - score
             values[7] += elapsed_ms
+            tally = self.phase_tally.setdefault(phase, [0, 0, 0, 0, 0])
+            tally[0] += 1
+            tally[4] += elapsed_ms
+            if score is not None and score < best:
+                tally[1] += 1
+                tally[2] += int(score == 0)
+                tally[3] += best - score
         if outcome == 'tested' and score is not None and score < best:
             self.last_outcome = 'improved'
             counts[3] += 1
@@ -348,6 +358,12 @@ class Search(Permuter):
             self.log(f'Improved with {family}: score {best:,} → {score:,}; verified and saved.')
         elif sum(sum(v[:3]) for v in self.recipe_counts.values()) >= 64:
             self.flush_recipes()
+
+    def phase_summary(self):
+        """Where this run's candidates and wins came from, by phase: the evidence for how to split the budget between
+        the targeted repairs and the random probe (each row: tested, improvements, matches, score gained, seconds)."""
+        return {phase: {'tested': t, 'improvements': i, 'matches': m, 'score_gain': g, 'seconds': round(ms/1000, 1)}
+                for phase, (t, i, m, g, ms) in self.phase_tally.items()}
 
     def flush_recipes(self):
         sweeps = getattr(self.net, 'deep_sweeps', None)
@@ -549,7 +565,17 @@ class Search(Permuter):
         flags = ()
         if any('flags' in item.needs for item in library_registry.runnable('local', arch)):
             flags = [] if self.net.fork_slug(proj['slug']) else compiler_for(self.net.cfg(proj), fn['vram'], fn).get('flags', [])
-        calls += library_registry.local_calls(library_registry.draft_context(source, name, header, arch, asm, flags))
+        # (the callees' matched C only when a declared repair asks for it: a missing call argument's prototype)
+        callees = ''
+        if any('callees' in item.needs for item in library_registry.runnable('local', arch)):
+            callees = draft_repairs.capture_followup_repairs.callee_evidence(self.net, proj, fn, source)
+        # (the target's jump tables only when a declared repair asks for them: which arm a case enters)
+        tables = []
+        if any('tables' in item.needs for item in library_registry.runnable('local', arch)):
+            tables = switch_tables.read(self.net, proj, fn)
+        calls += library_registry.local_calls(library_registry.draft_context(source, name, header, arch, asm, flags,
+                                                                             float_literal_words.read(self.net, proj, fn),
+                                                                             callees, tables))
         register = permuter_focus.classify(rows, arch) == 'register'
         if register:
             calls.append((L + 'identical_float_guard.variants', (source, name, header, arch)))
@@ -815,7 +841,8 @@ class Search(Permuter):
             labels = {}
             try:
                 found = draft_repairs.variants(parent, fn['name'], proj['arch'], dict(fn).get('asm') or '', flags,
-                                               labels, limit=None, header=header)
+                                               labels, limit=None, header=header,
+                                               words=None if fork else float_literal_words.read(self.net, proj, fn))
             except Exception:  # noqa: BLE001 - a family that fails on an edited source must not end the search
                 return []
             return [(labels.get(child, 'local_repair'), child) for child in found]
@@ -1511,7 +1538,8 @@ class Search(Permuter):
             args = (source,fn['name'],proj['arch'],fn['asm'] or '',flags)
             options = dict(limit=None,header=header,tables=switch_tables.read(self.net,proj,fn),
                 callees=draft_repairs.capture_followup_repairs.callee_evidence(self.net,proj,fn,source),
-                entry_scope=draft_repairs.promoted_entry_repairs.scope(self.net,proj,fn))
+                entry_scope=draft_repairs.promoted_entry_repairs.scope(self.net,proj,fn),
+                words=float_literal_words.read(self.net,proj,fn))
             # A fresh winner may no longer need an earlier lifetime wrapper. Generate this
             # small inverse pass before the broad proposal pool, sharing all ordinary budgets.
             from . import generation_calls
@@ -1838,7 +1866,8 @@ class Search(Permuter):
                                 and residual_followups.kind(parent_rows,measured_rows,proj['arch'])):
                             followup_labels = {}
                             followup = draft_repairs.variants(candidate,fn['name'],proj['arch'],fn['asm'] or '',flags,
-                                followup_labels,limit=None,header=header,entry_scope=draft_repairs.promoted_entry_repairs.scope(self.net,proj,fn))
+                                followup_labels,limit=None,header=header,entry_scope=draft_repairs.promoted_entry_repairs.scope(self.net,proj,fn),
+                                words=float_literal_words.read(self.net,proj,fn))
                             selected = residual_followups.select([(followup_labels[c],c) for c in followup
                                 if c not in self.local_seen and c not in queue],parent_rows,measured_rows,proj['arch'])
                             if selected:
@@ -2370,7 +2399,10 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
         search.compiler_profiles = deep_profiles.selected(net, proj, compiler_profiles, fn)
         for profile in search.compiler_profiles:
             log('Selected profile: '+profile['toolchain']+' '+' '.join(profile['flags']))
-        log('Compiler profiles per candidate: '+str(len(search.compiler_profiles))+". The function's own settings first, then the project default; other profiles ranked by matched-function usage. Each profile test uses compile allowance.")
+        from .profile_detection import detected
+        lead = ('The compiler profile detection found for this C first, then the function\'s own settings'
+                if detected(net, proj, fn) else "The function's own settings first")
+        log('Compiler profiles per candidate: '+str(len(search.compiler_profiles))+f". {lead}, then the project default; other profiles ranked by matched-function usage. Each profile test uses compile allowance.")
     if sweeps:
         search.record_improvement = lambda score: sweeps.improvement(fn, score)
     search.report()
@@ -2608,6 +2640,9 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
         export_report=repair_export(net,net.project_row(slug),{name},state,log,
                                     budget=min(4,max(0,max_variants-search.tested)),deadline=search.deadline)
         search.tested+=export_report['tested']
+    for phase, row in search.phase_summary().items():
+        log(f"Phase {phase}: {row['tested']:,} tested, {row['improvements']} improved"
+            + (f", {row['matches']} exact" if row['matches'] else '') + f", score gain {row['score_gain']:,}, {row['seconds']}s compiling.")
     log(f'{reason}: {search.tested} candidates tested, {search.skipped} cached misses skipped, {search.rejected} invalid calls skipped. Verified improvements are saved immediately.')
     result = {'function': name, 'reason': reason, 'tested': search.tested, 'skipped': search.skipped,
               'rejected': search.rejected, 'refinement_rounds': search.refinement_rounds,

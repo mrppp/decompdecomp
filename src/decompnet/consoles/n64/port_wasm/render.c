@@ -2084,7 +2084,13 @@ static Sprite s2d_sprite_tile(uint32_t sp) {
 }
 
 #include "render_gpu.h"
-static void s2d_sprite(uint32_t sp) { /* an unrotated rectangle, scaled by the sprite's own scale */
+static float obj_mtx[6]; /* the 2D matrix, set below */
+static void s2d_sprite_rotated(uint32_t sp);
+/* An unrotated rectangle, scaled by the sprite's own scale. `through_mtx` (G_OBJ_RECTANGLE_R and G_OBJ_LDTX_RECT_R:
+   "R" for the matrix) places it through the 2D matrix too: its position and size go through A and D and the X, Y
+   translation (a rotated matrix takes the sprite's triangles). A game that lays its whole 2D layer out around a
+   centre (objX, objY negative, X, Y the centre) drew every object into the screen's top left corner without it. */
+static void s2d_sprite_at(uint32_t sp, int through_mtx) {
     Sprite o = s2d_sprite_tile(sp);
     int x = (int16_t)rd16(sp), y = (int16_t)rd16(sp + 8), sw = rd16(sp + 2), sh = rd16(sp + 10);
     int iw = rd16(sp + 4), ih = rd16(sp + 12), flags = R[sp + 23];
@@ -2093,8 +2099,19 @@ static void s2d_sprite(uint32_t sp) { /* an unrotated rectangle, scaled by the s
     int dsdx = sw, dtdy = sh, s = 0, t = 0; /* the scale is texels a pixel (u5.10), the rectangle's step (s5.10) */
     if (flags & 0x01) { s = (o.iw << 5) - 1; dsdx = -dsdx; } /* G_OBJ_FLAG_FLIPS */
     if (flags & 0x10) { t = (o.ih << 5) - 1; dtdy = -dtdy; } /* G_OBJ_FLAG_FLIPT */
-    s2d_rect(0, x, y, x + (int)(((int64_t)iw << 7) / sw), y + (int)(((int64_t)ih << 7) / sh), s, t, dsdx, dtdy);
+    int w = (int)(((int64_t)iw << 7) / sw), h = (int)(((int64_t)ih << 7) / sh);
+    if (through_mtx) {
+        float A = obj_mtx[0], B = obj_mtx[1], C = obj_mtx[2], D = obj_mtx[3];
+        if (fabsf(B) > 1e-6f || fabsf(C) > 1e-6f || A <= 0 || D <= 0) { s2d_sprite_rotated(sp); return; }
+        if (A != 1.0f) { dsdx = (int)(dsdx / A); w = (int)(w * A); }
+        if (D != 1.0f) { dtdy = (int)(dtdy / D); h = (int)(h * D); }
+        x = (int)(x * A + obj_mtx[4] * 4.0f);
+        y = (int)(y * D + obj_mtx[5] * 4.0f);
+    }
+    s2d_rect(0, x, y, x + w, y + h, s, t, dsdx, dtdy);
 }
+static void s2d_sprite(uint32_t sp) { s2d_sprite_at(sp, 0); }
+static void s2d_sprite_r(uint32_t sp) { s2d_sprite_at(sp, 1); }
 /* The 2D matrix (uObjMtx, G_OBJ_MOVEMEM at index 0, 24 bytes): A, B, C, D (s15.16) and X, Y (s10.2). */
 static float obj_mtx[6] = {1, 0, 0, 1, 0, 0};
 static void s2d_matrix_load(uint32_t a, int sub) { /* the whole uObjMtx, or its uObjSubMtx (X, Y and the scales) */
@@ -2229,10 +2246,12 @@ static void s2dex(uint8_t op, uint32_t w0, uint32_t w1) {
     }
     switch (op) {
     case 0x02: s2d_sprite_rotated(phys(w1)); break;
-    case 0x01: case 0xDA: s2d_sprite(phys(w1)); break; /* the rectangles: no rotation (their scale is the sprite's) */
+    case 0x01: s2d_sprite(phys(w1)); break; /* the rectangle: no matrix (its scale is the sprite's) */
+    case 0xDA: s2d_sprite_r(phys(w1)); break; /* the rectangle through the 2D matrix */
     case 0x05: s2d_load(phys(w1)); break;
     case 0x06: s2d_load(phys(w1)); s2d_sprite_rotated(phys(w1) + 24); break;
-    case 0x07: case 0x08: s2d_load(phys(w1)); s2d_sprite(phys(w1) + 24); break;
+    case 0x07: s2d_load(phys(w1)); s2d_sprite(phys(w1) + 24); break;
+    case 0x08: s2d_load(phys(w1)); s2d_sprite_r(phys(w1) + 24); break;
     case 0xDC: s2d_matrix(w0, phys(w1)); break;
     case 0x09: s2d_bg(phys(w1), 1); break;
     case 0x0A: s2d_bg(phys(w1), 0); break;
@@ -2447,7 +2466,7 @@ static void save_png(const char *path, const uint8_t *rgb, int w, int h) { /* un
    osViSetSpecialFeatures change it: the frame's width in memory, its pixel size, how many lines it shows, and the
    filters the VI runs as it shows them. Without a mode the frame's size is guessed from its width (320 x 240, or
    640 x 480). A game that draws at 400 x 300 was shown as 400 x 480, its frame read past its end. */
-static struct { int known, width, bpp, lines; float yscale; int gamma, gamma_dither, divot, dedither; } vi;
+static struct { int known, width, bpp, lines; float yscale; int gamma, gamma_dither, divot, dedither, black; } vi;
 void port_vi_mode(uint32_t mode) {
     R = port_memory();
     uint32_t a = 0x80000000u | (mode & 0x1FFFFFFF);
@@ -2465,6 +2484,12 @@ void port_vi_mode(uint32_t mode) {
     vi.divot = (ctrl & 0x10) != 0; vi.dedither = (ctrl & 0x10000) != 0;
     (void)xscale;
 }
+/* osViBlack: libultra starts the VI blanked (osCreateViManager) and a game un-blanks it once its first frame is drawn,
+   and blanks it again around a change of mode; while it's blanked the screen is black whatever the buffer holds. Not
+   honoured, every frame the game handed over before it had drawn into the buffer showed the memory's leftovers
+   (green, or the last screen's pixels in the new mode's layout) for a few frames at each change of screen. */
+void port_vi_black(int on) { vi.black = on != 0; }
+int port_vi_blanked(void) { return vi.black; }
 void port_vi_yscale(float s) { if (s > 0) vi.yscale = s; }
 void port_vi_features(uint32_t f) {
     if (f & 0x01) vi.gamma = 1;
@@ -2597,8 +2622,9 @@ void port_frame_shown(uint32_t fb, unsigned long n) {
     if (w > MAXW) w = MAXW;
     if (h > MAXH) h = MAXH;
     if (h < 1) h = 1;
+    if (addr >= 0x800000) return; /* no frame in RDRAM to show (the subtraction below would wrap to a giant height) */
     if ((size_t)addr + (size_t)w * h * bytes > 0x800000) h = (int)((0x800000 - addr) / ((uint32_t)w * bytes));
-    if (gpu && gpu_present(addr, w, h, vi.gamma)) return; /* the GPU's frame, shown by the page */
+    if (!vi.black && gpu && gpu_present(addr, w, h, vi.gamma)) return; /* the GPU's frame, shown by the page */
     uint8_t *rgb = malloc((size_t)w * h * 3);
     uint32_t base = 0x80000000u | addr;
     static uint8_t of5[32], of8[256]; /* each channel's value as unpack5551 and unpack8888 give it, times 255 */
@@ -2615,10 +2641,13 @@ void port_frame_shown(uint32_t fb, unsigned long n) {
             rgb[i * 3] = of5[(c >> 11) & 31]; rgb[i * 3 + 1] = of5[(c >> 6) & 31]; rgb[i * 3 + 2] = of5[(c >> 1) & 31];
         }
     }
-    if (vi.dedither && bytes == 2) vi_dedither(rgb, w, h, base);
-    vi_filter(rgb, w, h, base, bytes);
-    if (vi.divot) vi_divot(rgb, w, h, base, bytes);
-    if (vi.gamma) vi_gamma(rgb, w, h);
+    if (vi.black) memset(rgb, 0, (size_t)w * h * 3);
+    else {
+        if (vi.dedither && bytes == 2) vi_dedither(rgb, w, h, base);
+        vi_filter(rgb, w, h, base, bytes);
+        if (vi.divot) vi_divot(rgb, w, h, base, bytes);
+        if (vi.gamma) vi_gamma(rgb, w, h);
+    }
     port_live_frame(rgb, w, h);
     if (save) {
         char path[1024];
