@@ -1537,7 +1537,11 @@ class Manager:
     def _room_away(self, s: Session) -> bool:
         """In a room whose host is away (or that hasn't let us in yet): wait, don't fail."""
         link = self.net.links.get(s.slug)
-        if link is None or (not link.error and time.time() - link.last_ok <= ROOM_STALE):
+        # The heartbeat's answer counts as contact (last_contact): last_ok moves only with work through the room, so
+        # 30 s without a claim or result sent helpers waiting on a host that answered every 2 s, and waiting helpers
+        # send less work (4 of 10 on one member at once).
+        last = max(link.last_ok, getattr(link, "last_contact", 0.0) or 0.0) if link is not None else 0.0
+        if link is None or (not link.error and time.time() - last <= ROOM_STALE):
             return False
         why = f"waiting for the room's host: {link.error or 'not reachable right now'}"
         if s.state != "waiting" or s.why != why:

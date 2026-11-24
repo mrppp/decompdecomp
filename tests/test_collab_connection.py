@@ -351,3 +351,21 @@ def test_the_rooms_server_never_looks_for_a_websockets_library():
     source = inspect.getsource(rooms)
     config = source[source.index("uvicorn.Config(collab.host_app"):]
     assert 'ws="none"' in config[:config.index("))") + 2]
+
+
+def test_a_room_member_whose_heartbeat_answers_doesnt_wait_for_the_host():
+    """last_ok moves only with work through the room: 30 s without a claim sent members' helpers waiting on a host that
+    answered every heartbeat. A heartbeat's answer counts; an error still makes them wait."""
+    import time
+    from types import SimpleNamespace
+
+    from decompnet.app import agents
+    link = SimpleNamespace(error="", last_ok=time.time() - 120, last_contact=time.time())
+    s = SimpleNamespace(slug="game", state="working", why="", push=lambda *a: None,
+                        stop=SimpleNamespace(wait=lambda *a: None))
+    manager = SimpleNamespace(net=SimpleNamespace(links={"game": link}), _set=lambda *a, **k: None)
+    assert agents.Manager._room_away(manager, s) is False
+    link.last_contact = time.time() - 120
+    assert agents.Manager._room_away(manager, s) is True
+    link.last_contact, link.error = time.time(), "host connection temporarily unavailable (HTTP 530)"
+    assert agents.Manager._room_away(manager, s) is True
