@@ -566,6 +566,36 @@ def import_cmd(args) -> int:
 AGENTS_WAIT_SECONDS = 30.0
 
 
+def permuter_cmd(args) -> int:
+    """The running app's deep pass (the permuter over near misses), from the command line, as its window does."""
+    running = _state(home_dir() / ".decomp" / "server.json")
+    if running is None:
+        print(f"{edition.NAME} isn't running for {home_dir()}: start it (`decomp`) first", file=sys.stderr)
+        return 1
+    body = {"slug": args.project, "action": args.action}
+    if args.action == "start":
+        body.update({"minutes": args.minutes, "loop": args.loop, "function_order": "smart"})
+    try:
+        if args.action == "status":
+            import urllib.parse
+            out = _call(running, "/api/permuter/pass?" + urllib.parse.urlencode({"slug": args.project}), None,
+                        timeout=60)
+        else:
+            out = _call(running, "/api/permuter/pass", body, timeout=120)
+    except urllib.error.HTTPError as e:
+        try:
+            message = json.loads(e.read() or b"{}").get("error") or str(e)
+        except ValueError:
+            message = str(e)
+        print(f"{edition.NAME} refused: {message}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"{edition.NAME} didn't answer: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(out, indent=1)[:2000] if args.action == "status" else f"deep pass {args.action}: ok")
+    return 0
+
+
 def agents_cmd(args) -> int:
     """The running app's helpers, from the command line: list them, start new ones, restart stopped or paused ones.
     It asks the app as the window does (server.json's secret, as `decomp stop` and `decomp import`): the helpers are
@@ -745,6 +775,11 @@ def main(argv: list[str] | None = None) -> int:
     im.add_argument("--toolchain", help="the compiler to start with (default: the app finds it)")
     im.add_argument("--yes", action="store_true", help="confirm it's your own legally obtained copy without asking")
     im.add_argument("--no-wait", action="store_true", help="start the import and return (the app shows its progress)")
+    pm = sub.add_parser("permuter", help="start, stop or show the running app's deep pass (the permuter) on a project")
+    pm.add_argument("action", choices=["start", "stop", "status"])
+    pm.add_argument("project", help="the project's slug")
+    pm.add_argument("--minutes", type=int, default=5, help="minutes per function (start; default 5)")
+    pm.add_argument("--loop", action="store_true", help="keep going round the near misses (start)")
     ag = sub.add_parser("agents", help="list, start, stop or restart the running app's helpers on a project")
     ag_sub = ag.add_subparsers(dest="action", required=True)
     ag_list = ag_sub.add_parser("list", help="the project's helpers: id, state, agent, model, why")
@@ -797,7 +832,7 @@ def main(argv: list[str] | None = None) -> int:
     limits.raise_open_file_limit()
     limits.no_core_dumps()
     return {"setup": setup, "stop": stop, "shortcut": shortcut, "update": update_cmd, "import": import_cmd,
-            "agents": agents_cmd, "commit": repository_cmd, "push": repository_cmd,
+            "agents": agents_cmd, "permuter": permuter_cmd, "commit": repository_cmd, "push": repository_cmd,
             "install-info": install_info, "hosted-export": hosted_export,
             "judge-worker": judge_worker, "hosted-link": hosted_link,
             "hosted-publish": hosted_publish}.get(args.cmd, run)(args)
