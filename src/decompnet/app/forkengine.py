@@ -5206,6 +5206,11 @@ class ForkEngine:
         units = fp.units_for(source)
         if own is None or not units:
             raise NetworkError(f"{source} isn't a source file whose compiler this project lets you choose")
+        if (game := console.keeps_game_compiler(fp)) and compiler != game:
+            # (range checks built whole files with another compiler under the tree's exclusive lock, every tool
+            # waited 45 s and more, and a restart left the file on the tested compiler: a game built with one known
+            # compiler has nothing to find there)
+            raise NetworkError(f"this game was built with {game} alone: {compiler} can't be what built {source}")
         text = (fp.root / source).read_text(errors="replace", encoding="utf-8")
         with self._tree(proj).exclusive(), self._units_locked(proj, [u.name for u in units]):
             before: dict[str, float] = {}
