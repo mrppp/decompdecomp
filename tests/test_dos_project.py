@@ -509,5 +509,5 @@ def test_functions_built_on_watcom_instruction_bodies_never_match():
                                  {"func_00000100": 100.0, "func_00000200": 100.0, "func_00000300": 100.0}, [], {})
         d = Fake(Path(tmp))._without_asm_bodies(unit, d)
     assert not d.matched and d.match_percent < 100 and d.asm_bodies == ["helper_aux"]
-    assert d.unit_scores == {"func_00000100": 80.0, "func_00000200": 100.0, "func_00000300": 80.0}
+    assert d.unit_scores == {"func_00000100": 0.0, "func_00000200": 100.0, "func_00000300": 0.0}
     assert "hand-written assembly" in d.literals_note()

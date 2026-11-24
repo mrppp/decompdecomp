@@ -1391,10 +1391,11 @@ class ForkProject:
                          project=self.root if unit.mappings else None, unit=unit.name)
         return self._without_asm_bodies(unit, d)
 
-    # The score a function made of hand-written assembly gets at best: never a match, and below the judge's 90 and the
-    # near-miss ranks (at 99.9 every helper was sent to them, best score 1, and none could write them in C: no match
-    # at all in the next 90 minutes on one game)
-    ASM_CAPPED = 80.0
+    # The score a function made of hand-written assembly gets: 0, as if never tried. At 99.9 every helper was sent to
+    # them (best score 1) and none could write them in C; at 80 a small one still scored 80 on the size-scaled scale,
+    # ahead of real functions scoring thousands. No match on one game for over two hours. Rewritten in C (no body
+    # left), a function scores what it compiles to again.
+    ASM_CAPPED = 0.0
 
     def _without_asm_bodies(self, unit: Unit, d: objdiff.FunctionDiff) -> objdiff.FunctionDiff:
         """`d` with every function that is or calls a `#pragma aux NAME = ...` instruction body (Watcom's inline
@@ -1409,12 +1410,12 @@ class ForkProject:
         if not bodied:
             return d
         for name in bodied:
-            if (score := d.unit_scores.get(name)) is not None and score >= 100:
-                d.unit_scores[name] = self.ASM_CAPPED
+            if d.unit_scores.get(name) is not None:
+                d.unit_scores[name] = min(d.unit_scores[name], self.ASM_CAPPED)
         if d.symbol in bodied:
             d.asm_bodies = sorted(bodied[d.symbol])
-            if d.match_percent is not None and d.match_percent >= 100:
-                d.match_percent = self.ASM_CAPPED
+            if d.match_percent is not None:
+                d.match_percent = min(d.match_percent, self.ASM_CAPPED)
         return d
 
     # ------------------------------------------------------------------ linking (dtk-template projects)
