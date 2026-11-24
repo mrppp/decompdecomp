@@ -1495,6 +1495,12 @@ class ForkEngine:
                     # matches doesn't: the queue and briefs would say it's done
                     if status != "matched" and old["best_source"] and old["best_score"] and old["status"] != "matched":
                         score = old["best_score"] if score is None else min(score, old["best_score"])
+                    if old["status"] == "matched" and status != "matched" and uname in broken:
+                        # a unit that doesn't build right now (a helper's edit half done) says nothing about its
+                        # matched functions, whose C is committed: they stay matched. Reopening them reopened 70 on one
+                        # game in ten minutes, every report a helper's edit was in progress, most matched again minutes
+                        # later. A unit that builds and no longer matches still reopens them.
+                        status, score = "matched", old["best_score"]
                     # only what changed: SQLite writes a row's pages even when its values are the same, and a
                     # GameCube game's 34,000 functions rewritten on every sync were most of what the app wrote
                     if (old["size"], old["n_insns"], old["status"], old["best_score"], self._meta(old), old["vram"]) != \
