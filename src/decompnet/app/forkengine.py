@@ -152,7 +152,23 @@ def _take_out(now: str, trial: str, before: str) -> str | None:
 
 
 def _strip_comments(code: str) -> str:
+    # (continued lines joined first: `#pragma aux \` then the body's name on the next line slipped past _CHEAT)
+    code = re.sub(r"\\[ \t]*\r?\n", " ", code)
     return _REGVAR.sub(" ", _LINKAGE_DECL.sub(" ", re.sub(r"//[^\n]*|/\*.*?\*/", " ", code, flags=re.S)))
+
+
+def _asm_body_calls(fp, text: str) -> dict[str, int]:
+    """How often `text` calls each of the project's `#pragma aux NAME = ...` instruction bodies (in any of its C files
+    or headers): helpers wired functions to bodies another file defines, which no compile_and_diff text showed."""
+    from ..forks.project import asm_body_names
+    names = asm_body_names(Path(fp.root))
+    if not names:
+        return {}
+    found: dict[str, int] = {}
+    for m in re.finditer(r"\b(\w+)\s*\(", _strip_comments(text)):
+        if m.group(1) in names:
+            found[m.group(1)] = found.get(m.group(1), 0) + 1
+    return found
 
 
 def _rewrite(path: Path, text: str) -> None:
@@ -3638,6 +3654,10 @@ class ForkEngine:
         meta = self._meta(fn)
         if len(source) > 64 * 1024:
             raise NetworkError("source too large")
+        if (calls := _asm_body_calls(fp, source)):
+            raise NetworkError(f"{', '.join(sorted(calls))} {'is' if len(calls) == 1 else 'are'} hand-written assembly "
+                               "(#pragma aux ... = ...): a function that calls one never counts as matched, so nothing "
+                               "was compiled. Write it in C.")
         if _CHEAT.search(_strip_comments(source)):
             raise NetworkError("inline assembly, asm functions and asm includes aren't allowed (nor a Watcom "
                                "`#pragma aux name = ...` instruction body): a match has to come from C/C++. A #pragma "
@@ -4779,6 +4799,11 @@ class ForkEngine:
         proj, fp, cfg = self.get(slug)
         p = fp.safe_path(path, write=True)
         self.net.bump_generation(proj["id"])  # (a header or shared file: compiles may come out differently now)
+        added = {n: c for n, c in _asm_body_calls(fp, new).items() if c > _asm_body_calls(fp, old).get(n, 0)}
+        if added:
+            raise NetworkError(f"{', '.join(sorted(added))} {'is' if len(added) == 1 else 'are'} hand-written assembly "
+                               "(#pragma aux ... = ...): a function that calls one never counts as matched. Write the "
+                               "function in C instead; removing such calls is fine.")
         if _CHEAT.search(_strip_comments(new)):
             raise NetworkError("inline assembly, asm functions and asm includes aren't allowed (nor a Watcom "
                                "`#pragma aux name = ...` instruction body: write the function in C; a #pragma aux "

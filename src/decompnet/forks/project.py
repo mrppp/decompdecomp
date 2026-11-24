@@ -287,15 +287,18 @@ _ASM_BODY = re.compile(r"^[ \t]*#[ \t]*pragma[ \t]+aux[ \t]+(?:\([ \t]*\w+[ \t]*
 _DEFINITION = re.compile(r"^[A-Za-z_][\w \t\*]*?\b(\w+)[ \t]*\([^;{}()]*(?:\([^()]*\)[^;{}()]*)*\)[ \s]*\{", re.M)
 
 
-def asm_bodied(text: str) -> dict[str, set[str]]:
+def asm_bodied(text: str, elsewhere: set[str] | frozenset = frozenset()) -> dict[str, set[str]]:
     """{function: the `#pragma aux NAME = ...` instruction bodies it is or calls} for the C in `text` (comments and
     strings aside). A body named after a function makes that function one."""
     import re as _re
     clean = _re.sub(r"//[^\n]*|/\*.*?\*/", lambda m: " " * len(m.group(0)), text, flags=_re.S)
-    bodies = set(_ASM_BODY.findall(clean))
+    # (a body's name can follow `#pragma aux \` on the next line: joined, the same length, so spans stay put)
+    clean = _re.sub(r"\\([ \t]*\r?\n)", lambda m: " " * len(m.group(0)), clean)
+    own = set(_ASM_BODY.findall(clean))
+    bodies = own | set(elsewhere)  # (`elsewhere`: bodies other files define, which this one's functions may call)
     if not bodies:
         return {}
-    found: dict[str, set[str]] = {name: {name} for name in bodies}
+    found: dict[str, set[str]] = {name: {name} for name in own}
     pattern = _re.compile(r"\b(" + "|".join(map(_re.escape, sorted(bodies))) + r")\b")
     for m in _DEFINITION.finditer(clean):
         name, depth, i = m.group(1), 0, m.end() - 1
@@ -308,6 +311,32 @@ def asm_bodied(text: str) -> dict[str, set[str]]:
                     found.setdefault(name, set()).update(used)
                 break
     return found
+
+
+_BODY_NAMES: dict[str, tuple[tuple, set[str]]] = {}
+
+
+def asm_body_names(root: Path) -> set[str]:
+    """Every `#pragma aux NAME = ...` instruction body's name in the project's C files and headers (cached on their
+    modification times)."""
+    files = sorted([*root.glob("src/**/*.c"), *root.glob("include/**/*.h")])
+    try:
+        key = tuple((str(f), f.stat().st_mtime_ns) for f in files)
+    except OSError:
+        key = None
+    hit = _BODY_NAMES.get(str(root))
+    if key is not None and hit and hit[0] == key:
+        return hit[1]
+    names: set[str] = set()
+    for f in files:
+        try:
+            found = asm_bodied(f.read_text(errors="replace", encoding="utf-8"))
+        except OSError:
+            continue
+        names.update(n for n, used in found.items() if used == {n})
+    if key is not None:
+        _BODY_NAMES[str(root)] = (key, names)
+    return names
 
 
 class ForkProject:
@@ -1406,7 +1435,7 @@ class ForkProject:
             text = (self.root / unit.source).read_text(errors="replace", encoding="utf-8") if unit.source else ""
         except OSError:
             return d
-        bodied = asm_bodied(text)
+        bodied = asm_bodied(text, asm_body_names(self.root))
         if not bodied:
             return d
         for name in bodied:
