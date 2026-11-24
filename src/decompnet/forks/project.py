@@ -1391,7 +1391,10 @@ class ForkProject:
                          project=self.root if unit.mappings else None, unit=unit.name)
         return self._without_asm_bodies(unit, d)
 
-    ASM_CAPPED = 99.9  # the score a function made of hand-written assembly gets at best (never a match)
+    # The score a function made of hand-written assembly gets at best: never a match, and below the judge's 90 and the
+    # near-miss ranks (at 99.9 every helper was sent to them, best score 1, and none could write them in C: no match
+    # at all in the next 90 minutes on one game)
+    ASM_CAPPED = 80.0
 
     def _without_asm_bodies(self, unit: Unit, d: objdiff.FunctionDiff) -> objdiff.FunctionDiff:
         """`d` with every function that is or calls a `#pragma aux NAME = ...` instruction body (Watcom's inline

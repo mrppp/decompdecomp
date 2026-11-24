@@ -341,6 +341,35 @@ class Dos(Console):
         if scratch.write_tools(Path(fp.root)) and (version := self._version(fp)):
             fp.run(["python", "tools/configure.py", version], log=lambda *_: None, timeout=120)
         self.restore_compiler_tests(fp, log)
+        self.rerank_asm_bodied(net, slug, fp, log)
+
+    def rerank_asm_bodied(self, net, slug: str, fp, log=print) -> int:
+        """Open functions built on `#pragma aux NAME = ...` bodies keep a best score no better than ForkProject's cap
+        (ASM_CAPPED): scores saved before the cap (1, 2, 3: almost matched) ranked them first for every helper.
+        Returns how many."""
+        from ...app.forkengine import scaled
+        from ...forks.project import asm_bodied
+        names = set()
+        for path in Path(fp.root).glob("src/**/*.c"):
+            try:
+                names.update(asm_bodied(path.read_text(errors="replace", encoding="utf-8")))
+            except OSError:
+                continue
+        if not names:
+            return 0
+        store = net.project_store(slug)
+        proj_id = net.project_row(slug)["id"]
+        changed = 0
+        with store.tx() as db:
+            for r in db.execute("SELECT id, name, n_insns, best_score FROM functions WHERE project_id=? AND "
+                                "status='open'", (proj_id,)).fetchall():
+                floor = scaled(fp.ASM_CAPPED, r["n_insns"] or 1)
+                if r["name"] in names and r["best_score"] is not None and r["best_score"] < floor:
+                    db.execute("UPDATE functions SET best_score=? WHERE id=?", (floor, r["id"]))
+                    changed += 1
+        if changed:
+            log(f"{changed} functions built on hand-written assembly ranked as the hard functions they are")
+        return changed
 
     def restore_compiler_tests(self, fp, log=print) -> list[str]:
         """At start, nothing is mid-test: a file whose compiler differs from the last commit's (dos_compilers_map) is a
