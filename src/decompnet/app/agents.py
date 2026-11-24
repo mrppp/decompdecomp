@@ -2217,7 +2217,9 @@ class Manager:
         except NetworkError as error:
             raise Fatal('Local helper authentication failed: '+connection_failure(error, token)+'. No model request was started.') from error
         try:
-            asyncio.run(asyncio.wait_for(check(), timeout=15))
+            # 90 s, not 15: with a busy app (a dozen helpers here and a room member's claims) the authenticated check
+            # took 55-85 s, and Claude helpers ended session after session before asking the model anything
+            asyncio.run(asyncio.wait_for(check(), timeout=90))
         except Exception as error:
             detail = f'Tool connection check failed during {phase} after {time.monotonic()-began:.1f}s: '+connection_failure(error, token)
             # Context-manager cleanup can wrap permanent errors inside an exception group.
