@@ -614,6 +614,11 @@ def agents_cmd(args) -> int:
             print(f"started {len(ids)} {args.agent} helper{'s' if len(ids) != 1 else ''} on {args.project}: "
                   + ", ".join(map(str, ids)))
             return 0
+        if args.action == "stop":
+            for helper in args.ids:
+                ask("/api/agents/stop", {"id": str(helper)})
+                print(f"stopped {helper}")
+            return 0
         # restart: the ones named, else every stopped or paused one on the project (--paused: paused only)
         chosen = list(args.ids) or [h["id"] for h in helpers(args.project)
                                     if h["state"] == "paused" or (h["state"] == "stopped" and not args.paused)]
@@ -740,7 +745,7 @@ def main(argv: list[str] | None = None) -> int:
     im.add_argument("--toolchain", help="the compiler to start with (default: the app finds it)")
     im.add_argument("--yes", action="store_true", help="confirm it's your own legally obtained copy without asking")
     im.add_argument("--no-wait", action="store_true", help="start the import and return (the app shows its progress)")
-    ag = sub.add_parser("agents", help="list, start or restart the running app's helpers on a project")
+    ag = sub.add_parser("agents", help="list, start, stop or restart the running app's helpers on a project")
     ag_sub = ag.add_subparsers(dest="action", required=True)
     ag_list = ag_sub.add_parser("list", help="the project's helpers: id, state, agent, model, why")
     ag_list.add_argument("project", help="the project's slug")
@@ -753,6 +758,9 @@ def main(argv: list[str] | None = None) -> int:
     ag_restart.add_argument("project", help="the project's slug")
     ag_restart.add_argument("ids", nargs="*", help="the helpers' ids (default: every stopped or paused one)")
     ag_restart.add_argument("--paused", action="store_true", help="only paused ones, not ones stopped by hand")
+    ag_stop = ag_sub.add_parser("stop", help="stop helpers, as their Stop button does")
+    ag_stop.add_argument("project", help="the project's slug")
+    ag_stop.add_argument("ids", nargs="+", help="the helpers' ids")
     co = sub.add_parser("commit", help="commit a project's saved progress to its save repository (the running app does it)")
     co.add_argument("project", help="the project's slug")
     co.add_argument("--push", action="store_true", help="push to its origin after committing")
