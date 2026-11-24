@@ -3952,6 +3952,13 @@ class ForkEngine:
         if current:
             compiler = own
         game = console.keeps_game_compiler(fp)
+        if game and own == game and not current:
+            # (each test built the file with another compiler under its lock: Watcom 9.5 ran to the 60 s limit on one
+            # game's big files, every compile in them waited, and helpers tested again and again functions only
+            # hand-written assembly had "matched": no match at all for two hours)
+            raise NetworkError(f"this game was built with {game} alone, and {unit.source} is built with it: another "
+                               "compiler can't produce the game's code, so there's nothing to test. Work on the C "
+                               "(declarations, types, statement order) with compile_and_diff.")
         held_to_game = bool(game) and own == game and keep_match
         if held_to_game:
             keep_match = False  # tested, never switched: the game was built with one compiler
