@@ -151,6 +151,11 @@ def _take_out(now: str, trial: str, before: str) -> str | None:
     return done.stdout.decode("utf-8")
 
 
+def wanted_is_not_game(compiler: str, game: str) -> bool:
+    """Whether a try_compiler request asks for something other than moving the file back to the game's compiler."""
+    return compiler.strip().lower() != game.lower()
+
+
 def _strip_comments(code: str) -> str:
     # (continued lines joined first: `#pragma aux \` then the body's name on the next line slipped past _CHEAT)
     code = re.sub(r"\\[ \t]*\r?\n", " ", code)
@@ -3556,6 +3561,16 @@ class ForkEngine:
                 threading.Thread(target=self._report_best, args=(link, agent, name, source, res["score"]), daemon=True).start()
         return res
 
+    @staticmethod
+    def _committed_compiler(fp, source: str) -> str | None:
+        """The file's compiler in the last commit's dos_compilers_map (None: not mapped there, the game's own)."""
+        try:
+            done = subprocess.run(["git", "show", "HEAD:.decomp.wtf.json"], cwd=fp.root, capture_output=True,
+                                  text=True, timeout=30)
+            return (json.loads(done.stdout).get("dos_compilers_map") or {}).get(source) if done.returncode == 0 else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+
     def _hold_for_try(self, slug: str, function: str, agent: Agent) -> int | None:
         """Claim an open function nobody holds for one quick try; its id, or None (held already, or matched)."""
         fn = self._fn(slug, function)
@@ -3972,7 +3987,10 @@ class ForkEngine:
         if current:
             compiler = own
         game = console.keeps_game_compiler(fp)
-        if game and own == game and not current:
+        # (judged by the file's compiler at the last commit too: a test the app was restarted during leaves the file on
+        # the tested compiler until the next start's clean-up, and "already on another one" let more tests through)
+        committed = self._committed_compiler(fp, unit.source) if game else None
+        if game and (own == game or committed in (None, game)) and wanted_is_not_game(compiler, game) and not current:
             # (each test built the file with another compiler under its lock: Watcom 9.5 ran to the 60 s limit on one
             # game's big files, every compile in them waited, and helpers tested again and again functions only
             # hand-written assembly had "matched": no match at all for two hours)
