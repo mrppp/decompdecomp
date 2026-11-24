@@ -18,6 +18,7 @@ headers and the defines of the build the game's copy matched (`flags`): its vers
 from __future__ import annotations
 
 import re
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 
@@ -50,13 +51,61 @@ def index(folder: str) -> dict[str, Path]:
     return out
 
 
+MACRO = re.compile(r"^[ \t]*#[ \t]*define[ \t]+(\w+)\([^)]*\)[ \t]+\(?[ \t]*(?:\([^)]*\)[ \t]*)?(\w+)[ \t]*\(", re.M)
+
+
+@lru_cache(maxsize=1)
+def macro_targets(folder: str) -> dict[str, str]:
+    """{macro: the ultralib function its expansion calls} from the library's headers: a game's C says `alHeapAlloc(...)`
+    and the compiled code calls `alHeapDBAlloc`, a name the game's source text never holds."""
+    known = index(folder)
+    out = {}
+    for path in sorted(Path(folder, "include").rglob("*.h")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for macro, target in MACRO.findall(text):
+            if target in known and macro not in known:
+                out.setdefault(macro, target)
+    return out
+
+
+def with_macro_targets(names: set, folder: Path) -> set:
+    """`names` plus the functions the library's macros among them expand to (`macro_targets`)."""
+    return set(names) | {target for macro, target in macro_targets(str(folder)).items() if macro in names}
+
+
 def extract(path: Path, name: str) -> str:
     """The file with only `name` of its exported functions: its directives, declarations and static helpers kept."""
     kept = []
     for chunk, defines, static in _items(path.read_text(encoding="utf-8", errors="replace")):
         if defines is None or static or defines == name:
             kept.append(chunk)
-    return "".join(kept)
+    # ultralib declares some helpers `static` in a prototype and defines them without it (`_bnkfPatchBank`): the
+    # definition is then internal to the file, and the unit made for the function exported nothing, so its callers
+    # stayed unresolved. The unit is that function's own file now: its prototype is not static.
+    text = re.sub(rf"^([ \t]*)static\s+([^;{{}}]*\b{re.escape(name)}\s*\([^;{{}}]*\)\s*;)", r"\1\2", "".join(kept),
+                  flags=re.M)
+    return _unstatic_headers(text, path, name)
+
+
+def _unstatic_headers(text: str, path: Path, name: str) -> str:
+    """The same for a prototype in one of the library's own headers beside the file (`#include "sndp.h"` declares
+    `static ALMicroTime _sndpVoiceHandler(...)`): that header's text goes in place of the include, with `static`
+    dropped from this one prototype, so the function the unit defines is exported (stubbed, it returned 0 and the
+    synthesizer's loop over its callbacks never ended). The compiler finds the header's own includes beside the
+    file (`flags`: -I the file's folder)."""
+    prototype = re.compile(rf"^([ \t]*)static\s+([^;{{}}]*\b{re.escape(name)}\s*\([^;{{}}]*\)\s*;)", re.M)
+
+    def inline(m: re.Match) -> str:
+        try:
+            header = (path.parent / m.group(1)).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return m.group(0)
+        patched, changed = prototype.subn(r"\1\2", header)
+        return patched if changed else m.group(0)
+    return re.sub(r'^[ \t]*#[ \t]*include[ \t]+"([^"]+)"', inline, text, flags=re.M)
 
 
 def flags(folder: Path, path: Path, build: str) -> list[str]:
@@ -94,6 +143,50 @@ def source(name: str, hint: dict, fingerprint: str | None = None) -> tuple[Path,
         return None
     # the game's build: GCC's libgultra first (the decompdecomp's own N64 games), its ROM build before the debug one
     return path, sorted(builds, key=lambda b: ("gultra" not in b, "_d" in b))[0]
+
+
+CALLEE = re.compile(r"\b([A-Za-z_]\w*)\b")  # (called or its address taken: a handler is passed as a pointer)
+
+
+def game_callees(units: dict[str, tuple[str, list[str]]], folder: Path, skip, texts) -> dict[str, tuple[str, list[str]]]:
+    """`units` plus the ultralib functions the GAME's own C names (calls or takes the address of) that nothing
+    provides (`skip`), built with the flags most of `units` use (the same build of the library). A game's own `alInit`
+    called `alSynNew`, which no unit calls and the project had not set aside: nothing defined it, the link stubbed it
+    ("not implemented, skipped") and the audio never started. With no unit there is no known build of the library:
+    each callee is built with ultralib's default one (the project set nothing aside, and a game's own `alHeapAlloc`,
+    which is `alHeapDBAlloc`, then reached a stub and the game's audio setup went on with a null pointer)."""
+    known = index(str(folder))
+    names = set()
+    for text in texts:
+        names.update(CALLEE.findall(text))
+    names = with_macro_targets(names, folder)
+    common = Counter(tuple(flag) for _, flag in units.values()).most_common(1)[0][0] if units else None
+    out = dict(units)
+    for callee in sorted(names & known.keys()):
+        file = f"{callee}.c"
+        if file not in out and not skip(callee):
+            out[file] = (extract(known[callee], callee), list(common or flags(folder, known[callee], "")))
+    return out
+
+
+def with_callees(units: dict[str, tuple[str, list[str]]], folder: Path, skip) -> dict[str, tuple[str, list[str]]]:
+    """`units` plus the ultralib functions they call that nothing else provides (`skip(name)` says what does: the
+    game's own C, the host, its recompiled or interpreted functions). A unit is one function, so a synthesizer
+    function set aside as ultralib's own called `alFilterNew` and its neighbours, which library detection hadn't
+    set aside: nothing defined them, the link stubbed them ("not implemented, skipped") and the audio thread never
+    finished a frame, so it kept the CPU from the game's main thread for ever. Each callee is built with the flags of
+    the unit that calls it (the same build of the library); what it calls is added in turn."""
+    out = dict(units)
+    known = index(str(folder))
+    pending = list(out.items())
+    while pending:
+        _, (text, flag) = pending.pop()
+        for callee in sorted(with_macro_targets(set(CALLEE.findall(text)), folder)):
+            file = f"{callee}.c"
+            if callee in known and file not in out and not skip(callee):
+                out[file] = (extract(known[callee], callee), flag)
+                pending.append((file, out[file]))
+    return out
 
 
 def units(net, slug: str) -> dict[str, tuple[str, list[str]]]:

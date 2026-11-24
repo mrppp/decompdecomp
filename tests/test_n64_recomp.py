@@ -345,3 +345,54 @@ def test_review_can_add_a_function_outside_the_declared_code_ranges(project):
     assert recompile_review.add(net, "game", 1.0, [start], _review_log())["added"] == [
         {"name": "func_80000440", "vram": start}]
     assert net.project_store(proj["id"]).one("SELECT 1 FROM functions WHERE vram=?", start)
+
+
+def test_a_local_label_is_not_a_function_for_the_recompiler():
+    """A split listed `.L8010E8C8` (a branch target inside a function) as a function: its `void R_.L8010E8C8(...)`
+    declaration stopped the port's recompiled C from compiling. Only names C can spell are recompiled."""
+    from decompnet.consoles.n64 import recomp
+
+    assert recomp.is_c_name("func_80001000") and recomp.is_c_name("_osSetIntMask")
+    assert not recomp.is_c_name(".L8010E8C8") and not recomp.is_c_name("$L1") and not recomp.is_c_name("a.b")
+
+
+def test_a_saved_recompile_with_a_local_label_is_rebuilt(tmp_path):
+    """Results made before local labels were kept out declared `void .L8010E8C8(...)`; load() gives them up so the
+    next Play recompiles instead of failing the host build again."""
+    folder = recomp.folder(tmp_path)
+    folder.mkdir(parents=True)
+    (folder / "recomp.json").write_text('{"files": 1}')
+    syms = ('[[section]]\nname = "a"\nrom = 0x1000\nvram = 0x80000400\nsize = 0x100\n\nfunctions = [\n'
+            '    { name = "func_80000400", vram = 0x80000400, size = 0x10 },\n]\n')
+    (folder / "syms.toml").write_text(syms)
+    assert recomp.load(tmp_path) == {"files": 1}
+    (folder / "syms.toml").write_text(syms.replace('"func_80000400"', '".L80000400"'))
+    assert recomp.load(tmp_path) is None
+
+
+def test_a_function_in_overlapping_sections_is_listed_once():
+    """A relocatable slot's raw section spanned a code section the split also lists: both listed the function, N64Recomp
+    wrote its C twice and the host build stopped on `redefinition of R_func_...`. The narrowest section owns it."""
+    import tomllib
+
+    segments = [{"name": "raw_slot", "rom_start": 0x1000, "rom_end": 0x3000, "vram": 0x80300000},
+                {"name": "code_80301100", "rom_start": 0x2100, "rom_end": 0x2108, "vram": 0x80301100}]
+    split = [{"name": "func_80301100", "rom": 0x2100, "vram": 0x80301100, "size": 8},
+             {"name": "func_80300000", "rom": 0x1000, "vram": 0x80300000, "size": 8}]
+    sections = tomllib.loads(recomp.symbols(segments, split))["section"]
+    where = {fn["name"]: sec["name"] for sec in sections for fn in sec["functions"]}
+    assert where == {"func_80301100": "code_80301100", "func_80300000": "raw_slot"}
+    assert sum(len(sec["functions"]) for sec in sections) == 2
+
+
+def test_a_saved_recompile_listing_a_function_twice_is_rebuilt(tmp_path):
+    """Results made while overlapping sections each listed a function define it twice: load() gives them up."""
+    folder = recomp.folder(tmp_path)
+    folder.mkdir(parents=True)
+    (folder / "recomp.json").write_text('{"files": 1}')
+    one = ('[[section]]\nname = "%s"\nrom = 0x1000\nvram = 0x80000400\nsize = 0x100\n\nfunctions = [\n'
+           '    { name = "func_80000400", vram = 0x80000400, size = 0x10 },\n]\n')
+    (folder / "syms.toml").write_text(one % "a")
+    assert recomp.load(tmp_path) == {"files": 1}
+    (folder / "syms.toml").write_text(one % "a" + "\n" + one % "b")
+    assert recomp.load(tmp_path) is None

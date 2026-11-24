@@ -24,6 +24,8 @@ read a function's status.
     setup.py env HOLDER                                 print `export UV_PROJECT_ENVIRONMENT=... DECOMP_HOME=... DECOMP_PORT=...`
                                                         for the session (eval it; the token is never printed)
     mcp.py HOLDER TOOL [JSON]                           (its own script) call any app MCP tool over this session's connection
+    handoff.py HOLDER --tried "idea: score" ...         (its own script) the hand-off note via add_note, then release_function
+                                                        with the claim token and `setup.py release`
     setup.py release HOLDER                             after `release_function`: the renewal stops renewing the released
                                                         function and never claims it again
     setup.py reclaim HOLDER [FUNC] [--random] [--max-size N]
@@ -65,6 +67,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claimlost  # noqa: E402
 import judge  # noqa: E402  (the app's connection file, and its window API for creating a connection)
 
+ORIENT_SECONDS = 180  # each orientation script after a claim; a slow app must not hold the session's start
+ORIENT_SCRIPTS = (
+    # the saved best and its scaffolding-stripped form, judged (plain_best.py): both places a chain can start from
+    ("plain_best.py", lambda info, out: ["--slug", info["slug"], "--function", info["function"], "--out-dir", str(out)]),
+    # the closest matched functions with the start of their C (neighbours.py): callers, callees, the file's neighbours
+    # (with the saved best plain_best.py wrote: also those sharing the mismatched region's instruction shape)
+    ("neighbours.py", lambda info, out: ["--slug", info["slug"], "--function", info["function"],
+                                         "--source", str(Path(out) / "best.c")]),
+    # every call of the saved best against its callee's matched C, the header and the target's call sites
+    # (signatures.py): a stray or missing argument is fixed at the call, not by respelling the code around it
+    ("signatures.py", lambda info, out: ["--slug", info["slug"], "--function", info["function"]]),
+)
 RENEW_SECONDS = 300  # a claim lapses after about ten minutes; renewing at half that leaves room for one miss
 HOLDER_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 HOLDER_MAX = 40
@@ -621,6 +635,24 @@ def env_lines(holder):
     return "export " + " ".join(f"{name}={shlex.quote(value)}" for name, value in values.items() if value)
 
 
+def orient(info, root, run=subprocess.run, write=print):
+    """What the agent reads first, printed right after the claim: each ORIENT_SCRIPTS entry run with the session's
+    python and environment, its output under the summary. Best effort: a failure or timeout is one line, never an
+    error, so the claim and the renewal stand."""
+    out = Path(root) / "start"
+    env = dict(os.environ, UV_PROJECT_ENVIRONMENT=info.get("venv") or str(Path(root) / "venv"),
+               DECOMP_HOME=info.get("home") or os.environ.get("DECOMP_HOME", ""), DECOMP_WINDOW="0", DECOMP_TRAY="0")
+    for script, arguments in ORIENT_SCRIPTS:
+        command = [info.get("python") or sys.executable, str(Path(__file__).resolve().parent / script),
+                   *arguments(info, out)]
+        try:
+            done = run(command, capture_output=True, text=True, timeout=ORIENT_SECONDS, env=env)
+            text = (done.stdout or "").strip() or (done.stderr or "").strip()[-400:]
+        except (OSError, subprocess.TimeoutExpired) as error:
+            text = f"(skipped: {error})"
+        write(f"--- {script}\n{text}")
+
+
 def alive(pid):
     """Is `pid` still our renewal? (a recycled pid must never be signalled). A zombie (exited, not yet reaped) is gone."""
     try:
@@ -785,6 +817,8 @@ def start(args):
     print(f"mcp      {url} (connection {info['connection_name']}, scoped to {args.slug}; token in {root / 'connection.json'}, mode 0600)")
     print(f"python   {info['python']}   (fast_judge.py, passes.py and prove_chain.py: {Path(__file__).parent})")
     print(f"renewal  pid {info['renew_pid']} (every {args.interval // 60} min); end with: setup.py stop {holder}")
+    if not args.no_sync:  # tests build no venv
+        orient(info, root)
     return 0
 
 

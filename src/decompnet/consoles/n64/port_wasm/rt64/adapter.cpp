@@ -5,13 +5,23 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <sys/mman.h>
 #include <memory>
+#include <string>
+#include <vector>
+
+#include <objc/message.h>
+#include <objc/runtime.h>
 
 #include "hle/rt64_application.h"
+#include "rhi/rt64_render_hooks.h"
+#include "plume_metal.h"
 #include "ultramodern/ultramodern.hpp"
 #include "lightweightsemaphore.h"
 #include "adapter.h"
 #include "presentation.h"
+#include "png_dump.h"
 
 /* The compatibility host owns the game's threads. Only ultramodern's VI state is used by this adapter. */
 std::atomic_bool exited{false};
@@ -19,10 +29,93 @@ moodycamel::LightweightSemaphore graphics_shutdown_ready;
 bool ultramodern::is_game_started() { return false; }
 void run_thread_function(uint8_t *, uint64_t, uint64_t, uint64_t) { std::abort(); }
 
+/* PORT_RT64_FRAMES=<folder> (PORT_RT64_FRAME_EVERY=n: every nth frame): what RT64 actually presented, saved as PNG
+ * (frame_NNNNN.png, 8-bit RGB). The window can't be captured from outside (it belongs to the game's own process and
+ * needs the screen-recording permission), so the evidence that a port renders under RT64 comes from here. RT64 draws
+ * each presented frame into the swap chain's drawable; its draw hook runs after that, and the drawable (made
+ * readable: the layer's framebufferOnly is turned off in open) is blitted into a shared buffer that the next frame's
+ * hook writes out, once the GPU has finished it (the present queue waits for each frame's commands before it
+ * presents). Unset, none of this runs. */
+namespace {
+const char *frames_dir;
+unsigned frames_every = 1, frames_seen, frames_written;
+RenderDevice *hook_device;
+std::unique_ptr<RenderBuffer> readback;
+uint32_t readback_w, readback_h;
+bool readback_pending;
+
+void hook_init(RenderInterface *, RenderDevice *device) {
+    hook_device = device;
+}
+
+void hook_draw(RenderCommandList *list, RenderFramebuffer *framebuffer) {
+    if (!frames_dir || !hook_device) return;
+    // The previous frame's copy is finished: write it out.
+    if (readback_pending && readback) {
+        char name[32];
+        std::snprintf(name, sizeof name, "/frame_%05u.png", frames_written++);
+        const uint8_t *pixels = static_cast<const uint8_t *>(readback->map(0, nullptr));
+        if (pixels) {
+            png_dump::write(std::string(frames_dir) + name, pixels, readback_w, readback_h, size_t(readback_w) * 4);
+            readback->unmap(0, nullptr);
+        }
+        readback_pending = false;
+    }
+    if (frames_seen++ % frames_every) return;
+    auto *target = static_cast<MetalFramebuffer *>(framebuffer);
+    if (target->colorAttachments.empty()) return;
+    MTL::Texture *texture = target->colorAttachments[0].getTexture();
+    if (!texture || texture->pixelFormat() != MTL::PixelFormatBGRA8Unorm) return;
+    const uint32_t w = uint32_t(texture->width()), h = uint32_t(texture->height());
+    if (!readback || w != readback_w || h != readback_h) {
+        readback = hook_device->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(w) * h * 4));
+        readback_w = w;
+        readback_h = h;
+    }
+    auto *metal_list = static_cast<MetalCommandList *>(list);
+    auto *buffer = static_cast<MetalBuffer *>(readback.get());
+    metal_list->checkActiveBlitEncoder();
+    metal_list->activeBlitEncoder->copyFromTexture(texture, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(w, h, 1),
+                                                   buffer->mtl, 0, uint64_t(w) * 4, uint64_t(w) * h * 4);
+    readback_pending = true;
+}
+
+void enable_frame_readback(void *layer) {
+    frames_dir = std::getenv("PORT_RT64_FRAMES");
+    if (!frames_dir || !*frames_dir) {
+        frames_dir = nullptr;
+        return;
+    }
+    if (const char *every = std::getenv("PORT_RT64_FRAME_EVERY"))
+        frames_every = std::max(1, std::atoi(every));
+    // A drawable can only be copied from when its layer isn't framebuffer-only.
+    reinterpret_cast<void (*)(void *, SEL, bool)>(objc_msgSend)(layer, sel_registerName("setFramebufferOnly:"), false);
+    RT64::SetRenderHooks(hook_init, hook_draw, nullptr);
+}
+}
+
 namespace {
 constexpr uint32_t rdram_size = 0x800000;
+// RT64 masks every RDP address with 0xFFFFFF (rt64_rdp.h RDP_ADDRESS_MASK) and indexes its RDRAM with the result, so
+// the view it reads spans 16 MB, not the console's 8 MB. The host keeps the MIPS stacks of recompiled and interpreted
+// code in KSEG0 just above the 8 MB (physical 0x800000 and up), where a game's locals (a palette, a vertex list built
+// on the stack) can be what a display list points at.
+constexpr uint32_t snapshot_size = 0x1000000;
 constexpr uint32_t physical_mask = 0x1FFFFFFF;
-std::array<uint8_t, rdram_size> memory;
+// RT64 computes some RDRAM indexes from display-list fields without bounding them. The bytes past the 16 MB it is
+// given are reserved address space that reads as zero (4 GB and a margin, lazily backed), so a stray index reads
+// zeros instead of faulting the host: a fault inside RT64 is taken by the game's wasm trap handler and showed up as a
+// bogus "out-of-bounds" stop of a game thread.
+struct Ram {
+    uint8_t *base = nullptr;
+    uint8_t *data() { return base; }
+    static constexpr size_t size() { return snapshot_size; }
+    void reserve() {
+        if (base) return;
+        void *p = mmap(nullptr, (size_t(1) << 32) + (size_t(1) << 28), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
+        base = p == MAP_FAILED ? nullptr : static_cast<uint8_t *>(p);
+    }
+} memory;
 std::array<uint8_t, 0x1000> dmem, imem;
 std::array<uint8_t, 0x40> header;
 std::array<uint32_t, 8> dpc;
@@ -37,11 +130,19 @@ auto *vi() {
 }
 
 void snapshot(const uint8_t *rdram) {
-    for (uint32_t i = 0; i < rdram_size; ++i)
-        memory[i ^ 3] = rdram[i];
+    // The game's memory is big-endian bytes; RT64 reads each word byte-swapped (memory[i ^ 3]): one swap per word.
+    for (uint32_t i = 0; i < snapshot_size; i += 4) {
+        uint32_t word;
+        std::memcpy(&word, rdram + i, 4);
+        word = __builtin_bswap32(word);
+        std::memcpy(memory.data() + i, &word, 4);
+    }
 }
 
 int open(void *window, void *layer) {
+    memory.reserve();
+    if (!memory.base) { std::fprintf(stderr, "RT64 RDRAM mapping failed\n"); return 0; }
+    enable_frame_readback(layer);
     RT64::Application::Core core{};
     core.window = {window, layer};
     core.HEADER = header.data();
@@ -102,7 +203,19 @@ void task(const uint8_t *rdram, uint32_t ucode, uint32_t ucode_data, uint32_t di
     snapshot(rdram);
     app->state->rsp->reset();
     app->interpreter->loadUCodeGBI(ucode, ucode_data, true);
-    if (!app->interpreter->hleGBI) return;
+    // A microcode RT64's database does not know (a game's own Fast3D build, switched to for some tasks) gives no GBI,
+    // or one with no commands: its display-list loop then reads on, past the list, until the host faults or hangs
+    // (Glover, Frogger 2, Flying Dragon: the crash surfaced as a bogus game-thread trap, the picture stayed black).
+    // The task is left to the host's own RDP, whose writes RT64 presents from game memory.
+    const auto *gbi = app->interpreter->hleGBI;
+    if (!gbi || gbi->ucode == RT64::GBIUCode::Unknown) {
+        static std::vector<uint32_t> reported;  // each such microcode is named once, though a game may alternate two
+        if (std::find(reported.begin(), reported.end(), ucode) == reported.end()) {
+            reported.push_back(ucode);
+            std::fprintf(stderr, "RT64 does not know the microcode at %08X: its tasks are drawn by the host's RDP\n", ucode);
+        }
+        return;
+    }
     app->processDisplayLists(memory.data(), display_list, 0, true);
     static bool first = true;
     if (first) {

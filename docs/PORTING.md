@@ -208,6 +208,29 @@ full scanout from game memory when RT64 has cached only part of the framebuffer 
 missing lower portion of the picture in a matched SDL3 and Metal replay of a retail race.
 Broader retail renderer accuracy, RT64 exports, and other desktop platforms remain open.
 
+The host reports an Expansion Pak console (osMemSize 8 MB) to every game: it maps 8 MB of RAM anyway, and a game that
+needs the pak shows "N64 Expansion Pak not installed" and goes no further on 4 MB (a 32 MB platform game stayed on that
+screen; with 8 MB it plays its intro). A project that was built for 4 MB sets `rom.memory_size` to 4 (or the host's
+`PORT_MEMSIZE=4`) and keeps the console it expects.
+
+What RT64 draws can be saved without a screenshot (the game's window can't be captured from outside, and the host's own
+`PORT_FRAMES` dumps come from the software renderer, which shows black for games RT64 draws fine and the reverse):
+`PORT_RT64_FRAMES=<folder>` (`PORT_RT64_FRAME_EVERY=n`) makes the adapter copy each frame RT64 presented, read back
+from its swap chain, into `frame_NNNNN.png` (8-bit RGB, window-sized). It costs nothing when unset. The adapter's draw
+hook blits the drawable (its layer is made readable) into a shared buffer that the next frame's hook writes out.
+This is the evidence that a game renders under RT64 to a menu: a run of a project through Play with the variable set.
+
+RT64 identifies a graphics microcode by hashing its text and data against a database, and interprets only the ones it
+knows. A game's own Fast3D build, or one it switches to for some tasks (a racing game's F3DEX2 with changes, two
+retail platformers' second microcode), is unknown to it: RT64 gets no GBI, or one with no commands, and its display-list
+loop reads on past the list until the host faults or hangs. A fault inside RT64 is taken by the game's wasm trap
+handler, so it looked like a game thread stopping on "out-of-bounds access", with a black picture. The adapter now
+leaves such a task to the host's own RDP and RT64 presents the result from game memory ("RT64 does not know the
+microcode at ..." is printed once for each); a game whose every task is of that kind (a racing game's title screen)
+renders through that path alone. RT64 also indexes its RDRAM with 24-bit masked addresses, so it is given a 16 MB view
+(the host's stacks live just above the console's 8 MB) backed by a larger zero-filled reservation: a stray index reads
+zeros.
+
 ROM offsets the game uses as numbers (where an archive starts in the cartridge) and the values the N64's boot leaves
 in low memory for libultra are defined by Compile for PC too (`port/fixed_symbols.py`): offsets as symbols at those
 addresses, boot values with what the boot would leave, the TV system from the game code's country.
@@ -263,6 +286,16 @@ header's entry address, and the host leaves what each chip's code leaves, which 
 of the boot code copied into RAM to run from (RAM 0x200 on), the RSP's memories filled (and 6103 or 6105 in the
 first word of its instruction memory) and osCicId. The cartridge also reads directly at 0xB0000000. A racing game
 missing any of these turned its screen upside down, mirrored its tracks or paused in its world.
+A game that pages its code in as it runs (a shooter linking its program at a virtual base and loading 4 KB pages from the
+cartridge when they fault) works on the host through a model of the TLB (the 32 entries the game writes, its Wired
+register, tlbwr replacing only the slots above it) and of the exception libultra's kernel would deliver: a fetch from a
+page an entry covers with the valid bit clear is TLB Invalid, and when the game registered a pager for OS_EVENT_FAULT
+the host fills the faulting OSThread, points `__osFaultedThread` at it (an address found in the game's own handler),
+posts the fault event and parks the thread until the pager clears the thread's fault flag (`port_tlb_fault`); the
+pager's `__osGetTLBHi` and `osUnmapTLB` read and clear entries of that table. The interpreter keeps the virtual address
+of code it reached through a window (its program counter is the frame in RAM, which is where the rest of the port finds
+functions), so the next page of the code is the next virtual page's frame, and a call made from it returns to a virtual
+`$ra`. `PORT_TLB_TRACE=1` prints every entry the game writes.
 The hand-written library code most games keep in assembly (`bzero`, `bcopy`, `bcmp`, the TLB, status-register and
 interrupt helpers, `osGetCount`) is the host's by its library name: the build renames a call by a function's
 automatic name to the name library detection found (`play.library_names`). What only one game needs, such as
@@ -416,6 +449,11 @@ The host is the console's (`PortKit.wasm`; N64: `consoles/n64/port_wasm/host.c`)
   gamepad layout; closing the window quits. With no ROM named, the window asks for one (`port_live_rom`). Where SDL3
   can't open it falls back to `PORT_LIVE`'s browser view, or stops (exit 5) rather than run unseen. Windows has no SDL3
   here yet;
+- the VI's blanking (`osViBlack`; `port_vi_black` in render.c): libultra starts the VI blanked and a game un-blanks it
+  once its first frame is drawn and blanks it around a change of mode, so the leftovers of a buffer it hasn't drawn
+  into yet never reach the screen. The port ignored it and showed them for a few frames at each change of screen (a
+  flat green frame at the start, noise and sheared text between a 320 x 240 screen and a 640 x 480 one);
+  `PORT_SWAP_LOG=file` (or `-`) lists each frame the VI was handed with the graphics task it came after;
 - the RSP and RDP in software (`render.c`): each graphics task's display list is drawn into the game's own frame
   buffer, by the microcode the task loads (Fast3D, F3DEX, F3DEX2 and S2DEX by the signature in its data; Rare's
   F3DDKR, which has none, by its data's CRC), and `PORT_FRAMES=folder` saves the frames shown as PNG.
@@ -536,6 +574,85 @@ uv run python tools/n64_frame_compare.py baserom.z64 --port port/wasm/build/game
 ```
 
 Both frames come from the same renderer, so a difference is the game running differently, not the drawing.
+`tools/n64_vi_compare.py ROM --port BUILD --input @script` checks the VI's blanking against the console's: the
+emulator's video plugin logs the VI's registers (`EMU_VI_LOG`; osViBlack blanks by writing 0 to the horizontal video
+register, the status stays), the port's `PORT_SWAP_LOG` says when it blanked, and the two lists of blanks must agree in
+number and length. On a racing game they did: six blanks of 25, 25, 21, 25, 25 and 21 graphics tasks on both sides
+(where each began differed for three of them: a menu advanced hundreds of tasks apart between runs). On the console the
+screen is black at those moments; before the port honoured osViBlack it showed the buffer's leftovers instead.
+`--tolerance PIXELS` on `tools/n64_frame_compare.py` also reports the share of pixels with no equal pixel within that many
+pixels of the other side's picture, which separates a scene drawn the same but a little apart from one drawn
+differently. On a racing game: the paused starting grid and the first frames of the race, 29 to 30 percent of pixels
+differing exactly, had 0.06 to 0.19 percent with no match within 1 to 3 pixels (the same picture, a pixel or so apart);
+a later moving scene stayed at 31 percent within 3 pixels and 11 percent within 16: the camera and the cars were
+somewhere else on the track, game state that had drifted, not a drawing difference.
+`tools/n64_task_diff.py CONSOLE_DUMP PORT_DUMP` says where two pictures of one task differ: the task's display list
+is traced on each side and compared with its pointers masked, so what's left is values the game computed. A racing
+game paused on its starting grid (the pad released, one START: the scene stands still on both sides, whatever the timing)
+ran 168 commands on each side and only one differed, the horizon's fill rectangle by one pixel. The emulator's `--break`
+on the function that wrote it (`drawPanelFill`) showed the console's own horizon settling from 146 to 140 over about 200
+retraces at the race start, then holding while paused: the port was paused nine retraces later in that settling, so
+the difference was when START landed, not a drawing or logic fault. A moving scene can't be matched by task or retrace
+number, but a scene held still by a pause or a menu can, and a difference there is found to the command.
+The functions a game's `.original` file names run from the original instructions: N64Recomp translates them where the
+build has it (Play), and the interpreter runs them everywhere else. Until the interpreter's own list of what it leaves
+alone stopped including them, a build with no recompiler (the command-line build, and the browser export, which has
+none) stubbed them to nothing while saying the interpreter ran them: a racing game's wheel rotation and its menu's quad
+allocator did nothing in a browser export (`applyPackedRotation: not implemented, skipped` in the page's console).
+`PORT_VTIME=1` makes the native host's time virtual: the retrace fires when every game thread is waiting (or only the
+lowest-priority thread, the console's idle spin, is left) and the clock the game reads (osGetTime, the count register,
+the audio interface's drain) advances a retrace at a time, a microsecond per read within one. A run is the same
+whatever the machine's load (two runs of one retrace-timed input script had the same RAM at retrace 600 and 1,500, the
+same graphics tasks, swaps and DMAs) and takes less than the real time (2,000 retraces in 29 seconds). It showed what
+the console and the port have apart: counted in retraces, a racing game's video-mode blanks last 42, 27, 12 and 76 on the
+console and about 10 in the port, though they are the same 25, 25 and 21 graphics tasks on both: the console spends two
+to seven retraces on a frame where the port, with no CPU time to spend, spends one, so a scene is the same by game frame
+and not by retrace. `EMU_VI_LOG` lines now carry the retrace (`vi V`) as well as the task.
+`PORT_VTIME_TRACE=file` replays the console's own pacing: the emulator's `EMU_TASK_LOG=file` writes the retrace the console was at when
+it started each graphics task, and the port, as each of those tasks starts, moves its virtual clock to that retrace and fires the
+retraces it is short of when the game next goes idle (they queue for it as they did while the console was busy). On a racing
+game the port's retrace count matched the console's within two or three retraces from the race start on (task 3,190: 2,095 against
+2,098, where the constant cost per task tried before was 1,298 and 86), which no model of the game's adaptive frame rate was
+needed for. The paused race grid still read 139 against the console's 140 in the horizon's fill rectangle (shift-tolerant
+mismatch 0.06 to 0.14 percent within 1 to 3 pixels), so the horizon's step isn't a function of the retrace count alone.
+Moving race frames with the console's pacing replayed (`PORT_VTIME_TRACE`, the same input timed in graphics tasks on both
+sides, `n64_frame_compare.py --tolerance 3`), a racing game's race at ten windows from task 6,000 to 14,000: the first
+(tasks 6,000 to 6,010) matched the emulator to the pixel (0.00 percent differing); the other windows differed exactly by 17 to
+38 percent but had 0.00 to 6.25 percent of pixels with no match within 3 pixels in eight of the nine (the same picture a pixel or
+three apart), and 8.8 to 12.6 percent at tasks 10,000 and 14,000, where the backdrop had scrolled about ten pixels: the car's
+heading had drifted a little from the console's, as an uncontrolled car's does after collisions. Before the replay the
+same windows were 29 to 44 percent differing exactly and 11 to 31 percent unmatched within 3 pixels. So a moving scene is drawn
+as the console draws it; what differs is where the car and camera are.
+What was left of the moving-race difference was the pause, not the drawing. The route's START presses (a pause every 160
+graphics tasks) land a few frames apart on the two sides, because the game pauses a frame or two after the pad is read and the
+replay's retraces still differ by two or three, and the car stops at a scroll offset that differs by ten pixels (the backdrop's
+texture rectangle at x 154 on the console and 143 in the port, display lists otherwise identical). With the same route but no
+START after the race has begun (A only), a racing game's race at seven windows from task 6,000 to 14,000 matched the
+emulator to the pixel at three (8,000, 12,000 and 14,000: 0.00 percent differing), to 0.02 percent within 3 pixels at a fourth
+(10,000, a pixel or two of scroll), and differed by 4.3 to 8.1 percent within 3 pixels at the three earliest (6,000 to 6,500, the
+race's first seconds, still near the last pause presses). A moving scene is drawn exactly as the console draws it.
+What `PORT_VTIME` did and didn't settle for a racing game, with the same retrace-timed input on both sides: the port's
+video-mode blanks fell at the console's graphics tasks within one frame (485, 521, 632 against 485, 521, 637; the race
+start at 2,727 and 2,773 exactly), where the wall-clock port had been hundreds of tasks apart, so the two run the same
+screens in the same order. The retraces between those events still differ (task 2,773 to 3,194 took 216 retraces on the
+console and 169 in the port), because the console adapts its frame rate to how long its frames take (2.57 retraces a
+frame there, the port 2). Charging each graphics task a fixed virtual time (tried, 3 to 6 ms) doesn't reproduce that: below
+about 3.8 ms nothing changes, above 4 ms the game drops to one retrace a frame, so a cost per task was not kept.
+Pausing the port at as many retraces after the race start as the console had brought a paused race grid from 29 percent
+of pixels differing exactly to 3.3 percent with no match within 3 pixels, 167 of its 168 display-list commands equal
+(the one that differs is the horizon's fill rectangle, whose value follows the car's pitch as it settles and moves from
+133 to 138 to 117 as the pause moves by 30 retraces); an exact match there needs the car's physics to reach the same
+state at the same retrace, which the port's pacing doesn't yet give.
+`tools/n64_frame_scan.py FOLDER` needs no emulator: it looks through the frames a port saved (`PORT_FRAMES=FOLDER
+PORT_FRAME_EVERY=1`, `PORT_SWAP_LOG=file` to name each frame's graphics task) for static, flat-colour frames and runs of
+black, the ways a buffer shown before the game drew it looks. Moving scenes can't be compared pixel for pixel by task
+number: the runs drift (the console drops frames, the port doesn't), so a race differs by a few pixels of scroll even
+at the same task; menus, the title and scripted still scenes match to the pixel.
+Each frame dump has a `NAME.task` beside it, the 64-byte task the RSP was given (the emulator's from DMEM, the port's from
+its RAM): a game keeps its own copy of the task wherever it likes, so scanning RAM for one finds nothing in some games,
+and something that only looks like a task in others. The tool draws that task, and pairs the two sides' pictures when each
+drew one at a different frame-buffer address. `--frames` takes runs (`4000-4011`), as only some of a game's tasks (about
+one in five in a racing game) draw the picture. A menu and a first 3D scene of a racing game matched to the pixel.
 `--frames` compares the game's own frames instead of retraces: the nth graphics task it hands over, the RAM written
 as it is handed over (the emulator's video plugin, `EMU_FRAME_DUMP`; the port's `PORT_FRAME_DUMPS`) and the input
 timed the same way (`EMU_INPUT_CLOCK` / `PORT_INPUT_CLOCK=frames`). Neither clock makes the runs one: the console

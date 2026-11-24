@@ -146,6 +146,44 @@ def void_result(body, cret):
     return convert(body, 950, "%v0", "i32", cret)
 
 
+ZERO_V0 = f"  store i32 0, ptr {V0}, align 4"
+
+
+def forward_results(lines):
+    """In a function the C declares void, every call that returns a value leaves it in the $v0 word, as the call's
+    result stays in $v0 on MIPS until something else writes it. Only a call right before `ret void` did, so a void
+    function that took the result of its first call and then branched (`t = alloc(); if (t) align(t); return;`,
+    which gcc leaves with `alloc`'s result or `align`'s in $v0) gave 0 to every caller that used the value: a
+    game's heap allocator returned a null pointer to all of its callers and the game never drew. A void function
+    with no such call still leaves 0, as before."""
+    starts = [i for i, line in enumerate(lines) if line.startswith("define ")]
+    if not starts:
+        return lines
+    out = lines[:starts[0]]
+    for begin, end in zip(starts, starts[1:] + [len(lines)]):
+        out.extend(_forward_function(lines[begin:end]))
+    return out
+
+
+def _forward_function(lines):
+    if not lines or not re.match(r"define [^@]*\bvoid @", lines[0]):
+        return lines
+    calls = [i for i, line in enumerate(lines) if RESULT.match(line) and "@llvm." not in line]
+    if not calls:
+        return lines
+    out = []
+    for i, line in enumerate(lines):
+        if line == ZERO_V0:
+            continue  # the function's value comes from its calls
+        out.append(line)
+        if i in calls:
+            pre = []
+            w = convert(pre, 30_000_000 + i, RESULT.match(line).group(1), RESULT.match(line).group(2), "i32")
+            out.extend(pre)
+            out.append(f"  store i32 {w}, ptr {V0}, align 4")
+    return out
+
+
 REPORT = None
 CALLER = [""]
 
@@ -270,6 +308,37 @@ def byval_size(types, arg_text):
     return types.layout(m.group(1))[0] if (m and types) else 0
 
 
+def _is_word(t):
+    return t == "ptr" or re.fullmatch(r"i(8|16|32)", t) is not None
+
+
+def pad_indirect(line, im, close, current, out_lines):
+    """A call through a pointer that passes fewer than four word arguments passes the rest from $a0-$a3 as they
+    stand, as the MIPS call did: the caller's own arguments there, else the register words. The game's C runs a
+    function by a C call through the pointer, and whatever the callee declares past what the call passes was
+    garbage from the host's registers: a game's heap wrappers (`void f(void) { vtable->init(); }`, matched as
+    drafts, where a0 and a1 pass straight through) started the allocator from nothing and every block it gave
+    out was a wild pointer."""
+    raw = split_top(line[im.end():close])
+    types = [parse_arg(a)[0] for a in raw]
+    if (len(raw) >= 4 or "..." in im.group(1) or "sret" in line or "byval" in line
+            or not all(_is_word(t) for t in types)):
+        return line
+    extra = []
+    for i in range(len(raw), 4):
+        if i < len(current) and _is_word(current[i][0]):
+            INDIRECT[0] += 1
+            pre = []
+            w = convert(pre, 10_000_000 + INDIRECT[0] * 1000 + 500 + i, current[i][1], current[i][0], "i32")
+            out_lines.extend(pre)
+        else:
+            INDIRECT[0] += 1
+            w = f"%port_ia{INDIRECT[0]}_{i}"
+            out_lines.append(f"  {w} = load i32, ptr {reg(i)}, align 4")
+        extra.append(f"i32 {w}")
+    return line[:close] + (", " if raw else "") + ", ".join(extra) + line[close:]
+
+
 def adapt(text, report=None, types=None, byval=None):
     global REPORT
     REPORT = report
@@ -301,7 +370,13 @@ def adapt(text, report=None, types=None, byval=None):
     void_function = False
     for line in text.split("\n"):
         stripped = line.lstrip()
-        if void_function and stripped == "ret void" and out_lines and VOID_CALL.match(out_lines[-1]):
+        if void_function and stripped == "ret void" and out_lines and out_lines[-1].startswith("define "):
+            # an empty void function (`void f(void) {}`, the machine code's `jr $ra; nop`): $v0 is what the caller
+            # left there, on the console and so here: the register words start from the caller's registers
+            # (port_recomp_decomp). A loader polling `while (!send(..)) ;` through such a stub (a puzzle game's
+            # message call, compiled out) stopped for ever on the 0 this used to store.
+            pass
+        elif void_function and stripped == "ret void" and out_lines and VOID_CALL.match(out_lines[-1]):
             # a void function that ends with a call to another void function: $v0 is what that callee left there
             # (a racing game's start-yaw helper ended with a void atan2 wrapper whose angle its caller took; storing
             # 0 here turned every car round at the start). The callee has already stored it.
@@ -341,6 +416,7 @@ def adapt(text, report=None, types=None, byval=None):
                     w = convert(pre, 10_000_000 + INDIRECT[0] * 1000, v, t, "i32", "zeroext" in a)
                     out_lines.extend(pre)
                     out_lines.append(f"  store i32 {w}, ptr {reg(i)}, align 4")
+            line = pad_indirect(line, im, close_i, current, out_lines)
         cm = re.search(r"\bcall ([^@]*?)@([\w.$]+)\(", line)
         if not cm or cm.group(2) not in sigs or stripped.startswith(("define", "declare")):
             out_lines.append(line)
@@ -443,4 +519,4 @@ def adapt(text, report=None, types=None, byval=None):
         newcall = re.sub(r"(\bcall [^@(]*?)\s*\([^@]*\)\s*@" + re.escape(tname), r"\1 @" + tname, newcall)
         out_lines.extend(loads)
         out_lines.append(newcall)
-    return "\n".join(out_lines + [t[1] for t in thunks.values()])
+    return "\n".join(forward_results(out_lines) + [t[1] for t in thunks.values()])
