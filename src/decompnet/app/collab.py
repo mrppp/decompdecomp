@@ -817,7 +817,9 @@ class Link:
 
     def _req(self, method: str, path: str, data: dict | None = None) -> dict:
         headers = {"authorization": f"Bearer {self.token}", "x-room": self.room}
-        quick={'timeout':httpx.Timeout(5,connect=3)} if path in ('/collab/claim','/collab/release','/collab/best','/collab/leave') else {}
+        # 30 s, not 5: a source-tree host chooses the claimed function's candidate and checks its files, which a busy
+        # host took longer than 5 s for, and each ReadTimeout sent a member's helper waiting on a host that answered
+        quick={'timeout':httpx.Timeout(30,connect=5)} if path in ('/collab/claim','/collab/release','/collab/best','/collab/leave') else {}
         try:
             if method == "GET":
                 r = self.client.get(f"{self.url}{path}", params={**(data or {}), "room": self.room}, headers=headers, **quick)
