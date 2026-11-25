@@ -224,19 +224,31 @@ class Opencode(Agent):
     def seed_database(self, target: Path) -> None:
         """opencode 2 keeps provider sign-ins and API keys (OpenCode Go, NVIDIA, ...) in its database, not in
         auth.json as 1.x did, so a helper's own empty database knew no provider and every model failed at once with
-        `provider.no-route: Model unavailable`. The first session of a helper starts from a copy of the user's."""
+        `provider.no-route: Model unavailable`. The first session of a helper starts from the user's: its whole
+        schema and every table's rows but the conversations. A whole copy gave each new helper the user's history
+        too, 6.9 GB of it apiece on one desktop, which filled the disk four helpers at a time."""
         source = self.user_database()
-        if target.exists() or not source.is_file():
+        # A helper's database also keeps every session it has run, and those from before this left the history
+        # out hold the user's: past the limit it starts again, which is only done between its sessions.
+        outgrown = target.is_file() and target.stat().st_size > HELPER_DATABASE_LIMIT
+        if (target.exists() and not outgrown) or not source.is_file():
             return
         partial = target.with_name(target.name + ".seed")
         try:
             partial.unlink(missing_ok=True)
-            with sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30) as src, \
-                    sqlite3.connect(partial, timeout=30) as dst:
-                src.backup(dst)
+            src = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30)
+            dst = sqlite3.connect(partial, timeout=30)
+            try:
+                copy_without_history(src, dst)
+            finally:
+                src.close()
+                dst.close()
+            if outgrown:  # the old database's write-ahead log would be replayed into the new one
+                for suffix in ("-wal", "-shm"):
+                    target.with_name(target.name + suffix).unlink(missing_ok=True)
             partial.replace(target)
         except (sqlite3.Error, OSError):
-            partial.unlink(missing_ok=True)  # the session then starts empty, as before
+            partial.unlink(missing_ok=True)  # a new helper's session then starts empty, as before
 
     def parse(self, event: dict, state: dict) -> list[tuple[str, str] | None]:
         t = event.get("type")
@@ -329,6 +341,45 @@ class Opencode(Agent):
 
 
 OPENCODE = Opencode()
+
+
+# A helper's own sessions took 170 MB in three days on one desktop; a copy of its user's history was 6.9 GB.
+HELPER_DATABASE_LIMIT = 1 << 30
+HISTORY_ROOTS = ("session", "session_v2")  # a conversation, in OpenCode 1's tables and in 2's
+
+
+def history_tables(db: sqlite3.Connection, tables: list[str]) -> set[str]:
+    """The session tables and every table that refers to one, directly or through another (a message's parts):
+    read from the foreign keys, so a table a later OpenCode hangs off a session is left behind with the rest."""
+    refers = {t: {row[2] for row in db.execute(f'PRAGMA foreign_key_list("{t}")')} for t in tables}
+    history = {t for t in tables if t in HISTORY_ROOTS}
+    while more := {t for t in tables if t not in history and refers[t] & history}:
+        history |= more
+    return history
+
+
+def copy_without_history(src: sqlite3.Connection, dst: sqlite3.Connection) -> None:
+    """The user's database into an empty one: the same schema, and the rows of every table but the conversations'."""
+    schema = src.execute("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL "
+                         "AND name NOT LIKE 'sqlite_%' ORDER BY type = 'table' DESC, rowid").fetchall()
+    tables = [name for kind, name, _ in schema if kind == "table"]
+    skip = history_tables(src, tables)
+    dst.execute(f"PRAGMA page_size = {int(src.execute('PRAGMA page_size').fetchone()[0])}")
+    with dst:
+        for kind, name, sql in schema:
+            if kind != "table":
+                continue
+            dst.execute(sql)
+            if name in skip:
+                continue
+            columns = len(src.execute(f'PRAGMA table_info("{name}")').fetchall())
+            dst.executemany(f'INSERT INTO "{name}" VALUES ({", ".join("?" * columns)})',
+                            src.execute(f'SELECT * FROM "{name}"'))
+        for kind, _, sql in schema:  # indexes, triggers and views once the rows are in
+            if kind != "table":
+                dst.execute(sql)
+        for pragma in ("user_version", "application_id"):
+            dst.execute(f"PRAGMA {pragma} = {int(src.execute(f'PRAGMA {pragma}').fetchone()[0])}")
 
 
 def _strip_jsonc(text: str) -> str:
