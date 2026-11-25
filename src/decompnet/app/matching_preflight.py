@@ -60,6 +60,16 @@ def _run(net, proj, fn, log, check, max_profiles):
                                     if {'-fschedule-insns', '-fschedule-insns2'} <= set(flags)), None)
             if paired_schedule and paired_schedule not in focused:
                 focused.append(paired_schedule)
+    if dict(proj).get('arch') == 'mips':
+        # The same compiler with the other floating-point register model, when the target's FP registers or the
+        # diff's rows (only FP register rows) point to it (fp_fingerprints); its exact result is review-only below.
+        from . import fp_fingerprints
+        if fp := fp_fingerprints.probe(own, bytes(dict(fn).get('target') or b''), instruction_rows(evidence(net, fn['id'], None)),
+                                       bool(dict(proj).get('big_endian', 1))):
+            focused.insert(0, fp)
+        # ... and with another scheduling setting when the diff is only the order of the same instructions
+        from . import scheduler_fingerprints
+        focused[:0] = scheduler_fingerprints.probes(own, instruction_rows(evidence(net, fn['id'], None)))
     for flags in focused+captured(net,proj,own)+debug+prioritized(proj, fn, own)+neighbours(net, proj, fn, own):
         if flags not in choices:choices.append(flags)
     # Other candidates retain the existing optimization-first exploration order.
@@ -91,6 +101,13 @@ def _run(net, proj, fn, log, check, max_profiles):
     # do/while, the counter-compare guard and a pointer-local store, joined with the profile without strength
     # reduction (the real loop alone scored 4924 under the old profile, the profile alone nothing: one function 325 -> 255).
     paired = [*paired, *real_loop_unreduced.probes(proj, named, own, context['header'] if context else '')]
+    # A diff of only address-split rows (the target builds a symbol's address in `$at`, ours splits it, or the reverse): the
+    # profile with another small-data threshold, alone and with the small externs declared as arrays (small_data_fingerprints).
+    if dict(proj).get('arch') == 'mips':
+        from . import small_data_fingerprints
+        paired = [*small_data_fingerprints.pairs(own, instruction_rows(evidence(net, fn['id'], None)), fn['best_source'],
+                                                 fn['name'], context['header'] if context else '', dict(fn).get('asm') or ''),
+                  *paired]
     # Preserve this tiny joint frontier independently of isolated source scores.
     probes[1:1] = [(list(flags),source) for flags,source in paired]
     if (own['toolchain'] == 'gcc-2.7.2-kmc' and '-fno-strength-reduce' in own['flags']):
@@ -154,6 +171,22 @@ def _run(net, proj, fn, log, check, max_profiles):
                             inferred.insert(0, sqrt)
                             item['sqrt_probe'] = sqrt
                         item['inferred'] = inferred
+                    if index == 0 and not exact and own['toolchain'] != 'gcc-2.7.2-kmc' and dict(proj).get('arch') == 'mips':
+                        from . import fp_fingerprints
+                        if fp := fp_fingerprints.probe(own, bytes(dict(fn).get('target') or b''),
+                                                       instruction_rows(getattr(diff, 'rows', [])),
+                                                       bool(dict(proj).get('big_endian', 1))):
+                            item['inferred'] = [fp]
+                        # (and the same compiler with another scheduling setting, for a diff of only instruction order)
+                        from . import scheduler_fingerprints
+                        if scheduled := scheduler_fingerprints.probes(own, instruction_rows(getattr(diff, 'rows', []))):
+                            item['inferred'] = [*item.get('inferred', []), *scheduled]
+                    if index == 0 and not exact and diff is not None and dict(proj).get('arch') == 'mips':
+                        from . import small_data_fingerprints
+                        if combined := small_data_fingerprints.pairs(own, instruction_rows(getattr(diff, 'rows', [])), source,
+                                                                     fn['name'], context['header'] if context else '',
+                                                                     dict(fn).get('asm') or ''):
+                            item['paired'] = [[list(flags), text] for flags, text in combined]
                     if index == 0 and item['link'] and dict(proj).get('arch') == 'mips':
                         from decomprepair.aligned_relocation_names import replacement
                         item['relocation_source'] = replacement(source, getattr(diff, 'rows', ()),
@@ -170,6 +203,9 @@ def _run(net, proj, fn, log, check, max_profiles):
                     inferred = [(variant, source) for variant in item['inferred']]
                     probes[1:] = halfword + inferred + [probe for probe in probes[1:]
                                                         if probe not in halfword and probe not in inferred]
+                if index == 0 and item.get('paired'):
+                    joined = [(list(flags), text) for flags, text in item['paired']]
+                    probes[1:] = joined + [probe for probe in probes[1:] if probe not in joined]
                 if index == 0 and item.get('jump_profiles'):
                     jump_probes = [(flags, source) for flags in item['jump_profiles']]
                     for child in item.get('jump_sources', ()):
@@ -233,7 +269,14 @@ def _run(net, proj, fn, log, check, max_profiles):
         # Another worker may have improved the C during probing. Never apply an old-source hypothesis.
         if (current['status'] == 'open' and current['best_source'] == fn['best_source']
                 and net._comparison_digest(fresh,current,current['best_source'],candidates)==input_digest):
-            review_only = '-ffast-math' in best['flags'] and '-ffast-math' not in own['flags']
+            from .fp_fingerprints import is_fp_variant
+            from .scheduler_fingerprints import is_scheduler_variant
+            from .small_data_fingerprints import is_small_data_variant
+            # (KMC's scheduling variants are the older, proven route: kmc_variants)
+            review_only = (('-ffast-math' in best['flags'] and '-ffast-math' not in own['flags'])
+                           or is_fp_variant(own['flags'], best['flags'])
+                           or is_small_data_variant(own['flags'], best['flags'])
+                           or (own['toolchain'] != 'gcc-2.7.2-kmc' and is_scheduler_variant(own['flags'], best['flags'])))
             result['review_only'] = review_only and best['exact']
             if (best['exact'] and not review_only and net.auto_adjusts(fresh)
                     and best.get('source', fn['best_source']) == fn['best_source']):

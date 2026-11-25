@@ -241,12 +241,47 @@ def _unit_size(type_text: str) -> int | None:
     return _FIELD_TYPES.get(" ".join(w for w in words if w not in ("unsigned", "signed")))
 
 
-def _plain_bytes(unit) -> list[str] | None:
+_STRUCT_OPEN = re.compile(r"^\s*(?:typedef\s+)?(struct|union)\b[^;]*\{\s*$")
+_MEMBER = re.compile(r"^\s*((?:(?:unsigned|signed|const|volatile)\s+)*\w+(?:\s+(?:long|int|short|char))?)\s*(\*+)?\s*(\w+)((?:\[[^\]]+\])*)\s*;")
+
+
+def _lead_bytes(lines: list[str], at: int) -> int | None:
+    """Where the bitfield at lines[at] starts in its struct, in bytes, when every member before it is a plain scalar,
+    pointer or array of them (None otherwise). A console compiler packs a bitfield right after the member before it
+    (a `u16` then bytes declared as `u32 x : 8` start two bytes into the word), not at a fresh unit."""
+    j, members = at - 1, []
+    while j >= 0 and not _STRUCT_OPEN.match(lines[j]):
+        members.append(lines[j])
+        j -= 1
+    if j < 0 or _STRUCT_OPEN.match(lines[j]).group(1) != "struct":
+        return None
+    offset = 0
+    for line in reversed(members):
+        if not line.strip() or line.strip().startswith(("//", "/*")):
+            continue
+        m = _MEMBER.match(line)
+        if not m or ":" in line.split(";")[0]:
+            return None
+        type_text, star, count = m.group(1), m.group(2), 1
+        for dim in re.findall(r"\[([^\]]+)\]", m.group(4)):
+            try:
+                count *= int(dim, 0)
+            except ValueError:
+                return None
+        words = [w for w in type_text.split() if w not in ("const", "volatile")]
+        size = 4 if star else _SCALAR_SIZE.get(" ".join(w for w in words if w not in ("unsigned", "signed")) or "int")
+        if size is None:
+            return None
+        offset = -(-offset // size) * size + size * count
+    return offset
+
+
+def _plain_bytes(unit, start_bits: int = 0) -> list[str] | None:
     """A partly used unit's fields as plain members, when each is a whole byte or halfword at its own alignment:
     the members declared after them then fill the unit's spare bytes, as IDO lays them out. `int cmd:8;` then three
     `unsigned char`s is libultra's Gsetcolor: closed with a zero-width field it took a word of its own, the struct
     grew to 12 bytes, Gfx to 16, and a packed shooter's text rectangles read padding as their texture coordinates."""
-    out, at = [], 0
+    out, at = [], start_bits
     for m in unit:
         width = int(m.group(5))
         if width not in (8, 16) or at % width:
@@ -256,6 +291,77 @@ def _plain_bytes(unit) -> list[str] | None:
         out.append(f"{m.group(1)}{'signed' if signed else 'unsigned'} {kind} {m.group(4) or f'_pad{at}'};{m.group(6)}")
         at += width
     return out
+
+
+_STACK_LOCAL = re.compile(r"^([ \t]+)((?:unsigned |signed )?\w+(?: \*+|\*+ | ))(sp([0-9A-Fa-f]+))(?:\[(0x[0-9A-Fa-f]+|\d+)\])?;[ \t]*$")
+_DECLARATION = re.compile(r"^[ \t]+(?:(?:unsigned|signed|struct|const|volatile) )*\w+[ \t*]+\w+(?:\[[^\]]*\])?;[ \t]*$")
+_SCALAR_SIZE = {"char": 1, "s8": 1, "u8": 1, "int8_t": 1, "uint8_t": 1, "s16": 2, "u16": 2, "short": 2,
+                "int16_t": 2, "uint16_t": 2, "s32": 4, "u32": 4, "f32": 4, "int": 4, "float": 4, "int32_t": 4,
+                "uint32_t": 4, "s64": 8, "u64": 8, "f64": 8, "double": 8, "int64_t": 8, "uint64_t": 8,
+                "unsigned char": 1, "signed char": 1, "unsigned short": 2, "unsigned int": 4, "unsigned long": 4}
+
+
+def contiguous_stack_locals(text: str) -> str:
+    """m2c names a function's stack locals by their stack offset (`sp10`, `sp30`), and the console's compiler kept
+    them where the offsets say: a call that is handed `sp10` and reads past it (a 0x28-byte record built as a name
+    buffer `char sp10[0x20]` with two words after it, `s32 sp30[2]`) reads the next locals. clang places locals
+    where it likes, so the record's words were stack junk: an all-star baseball game's table of exports got
+    entries whose handler was the bytes of a string, and it called 0x64000000. Locals that are neighbours in the
+    frame (one ends where the next begins) are declared as one struct, so they stay neighbours."""
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        n = 0
+        while i + n < len(lines) and (_STACK_LOCAL.match(lines[i + n]) or _DECLARATION.match(lines[i + n])):
+            n += 1
+        run = lines[i:i + n]
+        found = [(k, m) for k, line in enumerate(run) if (m := _STACK_LOCAL.match(line))]
+        if len(found) < 2:
+            i += max(n, 1)
+            continue
+        members = []
+        for k, m in found:
+            kind = " ".join(m.group(2).replace("*", " * ").split())
+            size = 4 if "*" in kind else _SCALAR_SIZE.get(kind)
+            if size is None:  # a type it can't size: the run is left as it was
+                members = None
+                break
+            members.append((int(m.group(4), 16), size * (int(m.group(5), 0) if m.group(5) else 1), size, k, m))
+        if members is None:
+            i += n
+            continue
+        members.sort(key=lambda member: member[0])
+        chains, chain = [], [members[0]]
+        for member in members[1:]:
+            if member[0] == chain[-1][0] + chain[-1][1] and (member[0] - chain[0][0]) % member[2] == 0:
+                chain.append(member)
+            else:
+                chains.append(chain)
+                chain = [member]
+        chains.append(chain)
+        replaced, renamed = {}, {}
+        for chain in (c for c in chains if len(c) > 1):
+            frame = f"_frame_{chain[0][0]:X}"
+            declared = "".join(f" {m.group(2).rstrip()} {m.group(3)}{'[' + m.group(5) + ']' if m.group(5) else ''};"
+                               for *_, m in chain)
+            first = min(k for *_, k, _m in chain)
+            for *_, k, m in chain:
+                replaced[k] = f"{chain[0][4].group(1)}struct {{{declared} }} {frame};" if k == first else None
+                renamed[m.group(3)] = f"{frame}.{m.group(3)}"
+        if not renamed:
+            i += n
+            continue
+        merged = [replaced.get(k, line) for k, line in enumerate(run) if replaced.get(k, line) is not None]
+        lines[i:i + n] = merged
+        i += len(merged)
+        # the function's body to its closing brace in the first column: the locals' names are its own
+        end = i
+        while end < len(lines) and lines[end] != "}":
+            end += 1
+        pattern = re.compile(r"\b(" + "|".join(sorted(map(re.escape, renamed), key=len, reverse=True)) + r")\b")
+        for j in range(i, end):
+            lines[j] = pattern.sub(lambda hit, names=renamed: names[hit.group(1)], lines[j])
+    return "\n".join(lines)
 
 
 def big_endian_bitfields(text: str) -> str:
@@ -275,6 +381,26 @@ def big_endian_bitfields(text: str) -> str:
             result.append(lines[i])
             i += 1
             continue
+        # the run's first bytes may share a unit with the member before it: a `u16` then five `u32 x : 8` has two of
+        # them in that word, and starting every unit fresh split them four and one, a struct a word too big
+        first_size = _unit_size(run[0].group(2))
+        lead = _lead_bytes(lines, i) if first_size else None
+        if first_size and lead and lead % first_size:
+            room, head = (first_size - lead % first_size) * 8, []
+            for m in run:
+                if sum(int(h.group(5)) for h in head) + int(m.group(5)) > room:
+                    break
+                head.append(m)
+            plain = _plain_bytes(head, (lead % first_size) * 8) if any(m.group(4) for m in head) else None
+            if plain is None or (len(head) < len(run) and sum(int(h.group(5)) for h in head) != room):
+                result.extend(m.group(0) for m in run)  # not whole bytes, or a gap before the next unit: as it was
+                i += len(run)
+                continue
+            result.extend(plain)
+            i += len(head)
+            run = run[len(head):]
+            if not run:
+                continue
         units, unit, used, size = [], [], 0, 0
         for m in run:
             width, field_size = int(m.group(5)), _unit_size(m.group(2))
@@ -490,7 +616,7 @@ def gather(repo: Path, out: Path, leave_out=(), function_headers=None, *, ensure
         header = f"common_{unit}.h" if unit and f"common_{unit}.h" in headers else "common.h"
         if not re.search(r'^#include "common(_\w+)?\.h"', text, re.M):
             text = f'#include "{header}"\n' + text
-        _write(out / "src" / name, big_endian_bitfields(ido_c(text)))
+        _write(out / "src" / name, contiguous_stack_locals(big_endian_bitfields(ido_c(text))))
     # By name in any case: on a case-insensitive disk (macOS, Windows) a file an old save wrote as SelectStateReset.c
     # is the one just written as selectStateReset.c, and deleting it as stale deleted that function's C
     if not chosen or ensure_host_import:  # standalone leaves may have no host imports of their own
@@ -998,6 +1124,16 @@ def place_all(out: Path, lls: list[Path], functions: set, zig, env: dict, log, s
     return _parallel(lls, place, log, "functions", step)
 
 
+def void_result_callees(calls: Path) -> set[str]:
+    """The functions the build's calls.json (port/wasm/calls.py) says a caller takes a result from though their
+    C declares them void."""
+    try:
+        found = json.loads(Path(calls).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {r["callee"] for records in found.values() for r in records if r.get("kind") == "void-result"}
+
+
 def build(repo: Path, *, console: str = "n64", log=print, steps=STEPS, leave_out=(), universal: bool = False,
           library_c=None, library_names=None, recomp=None, function_headers=None, ensure_host_import=False,
           runtime_image=None, code_offsets=None) -> Path:
@@ -1015,10 +1151,28 @@ def build(repo: Path, *, console: str = "n64", log=print, steps=STEPS, leave_out
     from ...app.recompile import build_turn
     recomp_turn = build_turn(recomp["folder"], log) if recomp else nullcontext()
     with build_turn(repo / "port" / "wasm" / "build", log, resource="native port build"), recomp_turn:
-        return _build(repo, console=console, log=log, steps=steps, leave_out=leave_out, universal=universal,
-                      library_c=library_c or {}, library_names=library_names or {}, recomp=recomp,
-                      function_headers=function_headers, ensure_host_import=ensure_host_import, runtime_image=runtime_image,
-                      code_offsets=code_offsets)
+        def run(extra):
+            from ...app.saves import _source_file
+            return _build(repo, console=console, log=log, steps=steps,
+                          leave_out=set(leave_out) | {_source_file(n) for n in extra}, universal=universal,
+                          library_c=library_c or {}, library_names=library_names or {}, recomp=recomp,
+                          function_headers=function_headers, ensure_host_import=ensure_host_import,
+                          runtime_image=runtime_image, code_offsets=code_offsets)
+        state = repo / "port" / "wasm" / "void_result.txt"
+        known = set(state.read_text(encoding="utf-8").split()) if state.is_file() else set()
+        program = run(known)
+        # A function whose C is declared void while a caller takes its result: a machine draft of a function that
+        # returns a pointer in $v0 (`lw $v0, ...; jr $ra; sw $zero, 4($v0)`) compiles to the same bytes as the void
+        # draft, but in WebAssembly its callers' result is nothing (0): a file open took its error branch at once
+        # and the game never read the cartridge. The original's own code, which the recompiler translates, returns it.
+        found = void_result_callees(program.parent / "calls.json") - known
+        if found:
+            log(f"{len(found)} functions whose C returns nothing while their callers use a result run as the "
+                "original's code instead")
+            known |= found
+            _write(state, "\n".join(sorted(known)) + "\n")
+            program = run(known)
+        return program
 
 
 def _build(repo: Path, *, console: str, log, steps, leave_out, universal: bool = False, library_c=None,

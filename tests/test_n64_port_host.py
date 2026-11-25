@@ -425,6 +425,38 @@ int main(void) {
     assert done.stdout.split() == ["80747080", "80400010", "80100010", "80747080", "80347080", "80500000"]
 
 
+def test_a_store_of_the_games_own_into_a_windows_spelling_keeps_the_window_at_its_physical_address(tmp_path):
+    """A loader that copies its tables with stores (not a transfer) to 0x80200000, under a window at virtual 0x200000 onto
+    physical 0, destroyed the copy of the window's code made at the spelling and the interpreter then ran the tables as
+    code (a break and garbage at 0x802012E0). The store, made through the KSEG0 name, keeps the window at its physical
+    address like a transfer does; the span of such spellings (port_spell_*) names where to look, and the span of the
+    kept windows (port_real_*) is where a jump goes to the physical alias."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    text = HOST.read_text()
+    code = text[text.index("static struct { uint32_t entry, target, bss, bss_size; int tv; } boot;"):
+                text.index("/* the console's RAM as the boot leaves it")]
+    source = tmp_path / "t.c"
+    source.write_text(_BOOT_HARNESS + code + """
+int main(void) {
+    port_tlb_write(0x1FE000, 0x00200000, 2u, 1u); /* 0x200000 -> physical 0, spelled at 0x80200000 */
+    printf("%08X %08X %08X %08X\\n", port_spell_lo, port_spell_len, port_real_lo, port_real_len);
+    printf("%08X\\n", port_tlb_canon(0x002012A0u));
+    port_tlb_spell_store(0x802012A0u);
+    printf("%08X %08X %08X\\n", port_spell_len, port_real_lo, port_real_len);
+    printf("%08X %08X\\n", port_tlb_canon(0x002012A0u), port_tlb_call(0x80201CB0u));
+    return 0;
+}
+""")
+    subprocess.run([cc, "-o", str(tmp_path / "t"), str(source)], check=True, capture_output=True)
+    done = subprocess.run([str(tmp_path / "t")], capture_output=True, text=True, check=True)
+    assert done.stdout.split() == ["80200000", "00100000", "FFFFFFFF", "00000000",   # spelled: watched, none kept
+                                   "802012A0",                                     # read at the spelling
+                                   "00000000", "80200000", "00100000",             # kept: nothing watched, the span kept
+                                   "800012A0", "80001CB0"]                         # read at, and a jump goes to, the alias
+
+
 def test_a_call_spelled_in_kseg0_beyond_the_ram_names_the_high_windows_virtual_address(tmp_path):
     """A game that pages its code in at 0x15xxxxxx (4 KB pages) has calls the project spelled `func_85016170`: the
     `jal 0x05016170` made from KSEG0 code took its top four bits from there. No console has RAM at 0x85016170, and
@@ -451,6 +483,38 @@ int main(void) {
     subprocess.run([cc, "-o", str(tmp_path / "t"), str(source)], check=True, capture_output=True)
     done = subprocess.run([str(tmp_path / "t")], capture_output=True, text=True, check=True)
     assert done.stdout.split() == ["85016170", "15016170", "802CE170", "B5016170", "85016170"]
+
+
+def test_code_reached_by_its_frames_name_gets_the_virtual_page_that_maps_it(tmp_path):
+    """A paging game maps consecutive virtual code pages onto frames far apart (virtual 0x15082000 on physical 0x2FA000,
+    the next page 0x15083000 on 0x300000). The project names that code by the frame (`func_802FA...`), so the
+    interpreter entered it with no virtual pc and ran on into the next FRAME at the page's end: another function's
+    bytes, and a loop around the call spun for ever. The frame's virtual address is told by the page that maps it; a
+    frame the game also maps inside a large window of all of RAM (virtual 0x10000000 onto physical 0) is told by the
+    page, a frame no high window maps is not told, and two pages of one size mapping it are ambiguous."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    text = HOST.read_text()
+    code = text[text.index("static struct { uint32_t entry, target, bss, bss_size; int tv; } boot;"):
+                text.index("/* the console's RAM as the boot leaves it")]
+    source = tmp_path / "t.c"
+    source.write_text(_BOOT_HARNESS + code + """
+int main(void) {
+    printf("%08X ", port_tlb_virtual_of(0x802FAD80u));                  /* no window yet */
+    /* a big window: two 4 MB pages, virtual 0x10000000 -> physical 0 and 0x400000 */
+    port_tlb_write(0x007FE000u, 0x10000000, (0u << 6) | 2, (0x400000u >> 12 << 6) | 2);
+    port_tlb_write(0, 0x15082000, (0x2FA000u >> 12 << 6) | 2, 1u);       /* a code page onto frame 0x2FA000 */
+    printf("%08X %08X ", port_tlb_virtual_of(0x802FAD80u), port_tlb_virtual_of(0x80300010u));
+    port_tlb_write(0, 0x25082000, (0x2FA000u >> 12 << 6) | 2, 1u);       /* a second page of the same size: ambiguous */
+    printf("%08X %08X\\n", port_tlb_virtual_of(0x802FAD80u), port_tlb_virtual_of(0x90000000u));
+    return 0;
+}
+""")
+    subprocess.run([cc, "-o", str(tmp_path / "t"), str(source)], check=True, capture_output=True)
+    done = subprocess.run([str(tmp_path / "t")], capture_output=True, text=True, check=True)
+    # (a frame only the big window maps is told by it: the window is contiguous, so the code sees no difference)
+    assert done.stdout.split() == ["00000000", "15082D80", "10300010", "00000000", "00000000"]
 
 
 def test_a_page_mapped_at_virtual_zero_is_read_at_its_physical_address(tmp_path):
@@ -753,6 +817,7 @@ static int si_register(uint32_t a, int w, uint32_t v, uint32_t *r) { (void)a; (v
 static int pi_register(uint32_t a, int w, uint32_t v, uint32_t *r) { (void)a; (void)w; (void)v; (void)r; return 0; }
 static int flash_in_use; static uint32_t save_offset(uint32_t b) { return (b & 0x1FFFFFFFu) - 0x08000000u; }
 static uint32_t port_flash_read(uint32_t o) { (void)o; return 0; } static void port_flash_command(uint32_t c) { (void)c; }
+static uint32_t dpc_start, dpc_end, dpc_cur, dpc_start_word, dpc_end_word; static int dpc_start_valid; static void dpc_run(void) {}
 """ + _function(HOST.read_text(), "rom32") + "\n" + _function(HOST.read_text(), "open_bus") + "\n" + _function(HOST.read_text(), "port_io_load") + "\n" + _function(HOST.read_text(), "port_io_store") + """
 int main(void) {
     rom[0x578] = 0x34; rom[0x579] = 0x21; rom[0x57A] = 0x89; rom[0x57B] = 0x65;
@@ -1075,6 +1140,8 @@ static uint8_t rom[] = {0, 1, 2, 3, 4, 5};
 static size_t rom_size = sizeof rom;
 static int cart_io_busy;
 static int interrupts;
+static unsigned long dmas, vi_count;
+#define LOG(...) ((void)0)
 enum { EV_PI = 8 };
 static void post_event(int event) { assert(event == EV_PI); interrupts++; }
 #define SHADOW_STACKS 0x10000000u
@@ -1253,7 +1320,10 @@ uint32_t port_tlb_alias(uint32_t a) { (void)a; return 0; }
 uint32_t port_tlb_jump(uint32_t slot, uint32_t imm) { return (slot & 0xF0000000u) | imm; }
 uint32_t port_tlb_call(uint32_t a) { return a; }
 uint32_t port_tlb_spelled(uint32_t a) { return a; }
+uint32_t port_spell_lo = 0xFFFFFFFFu, port_spell_len, port_real_lo = 0xFFFFFFFFu, port_real_len; /* (no window to watch or keep here) */
+void port_tlb_spell_store(uint32_t a) { (void)a; }
 uint32_t port_tlb_virtual(uint32_t a) { return a; }
+uint32_t port_tlb_virtual_of(uint32_t a) { (void)a; return 0; }
 void port_tlb_write(uint32_t pm, uint32_t hi, uint32_t lo0, uint32_t lo1) { (void)pm; (void)hi; (void)lo0; (void)lo1; }
 void port_tlb_set(unsigned i, uint32_t pm, uint32_t hi, uint32_t lo0, uint32_t lo1) { (void)i; (void)pm; (void)hi; (void)lo0; (void)lo1; }
 uint32_t port_tlb_probe(uint32_t hi) { (void)hi; return 0x80000000u; }
@@ -1370,6 +1440,7 @@ def test_the_64dd_registers_read_as_open_bus_on_a_console_with_none(tmp_path):
     assert "if (dd_range(dev)) { wbe32(data, open_bus(dev & ~3u)); return 0; }" in text
     assert "if (addr >= 0xA5000000u && addr < 0xA8000000u) { wbe32(IO_SCRATCH, open_bus((uint32_t)addr & ~3u))" in text
 
+
 def test_virtual_time_advances_a_retrace_at_a_time_and_reads_move_it_a_microsecond(tmp_path):
     """PORT_VTIME: the clock the game reads (osGetTime, the count register, the audio interface) is the retrace count's,
     not the wall clock's, so a run is the same on a loaded machine; reads within one retrace still advance it, by a
@@ -1412,6 +1483,24 @@ def test_the_rdp_command_status_reads_idle_so_a_game_polling_it_gets_on():
     assert "addr == DPC_BASE + 0x0Cu ? 0x80u : 0u" in load  # status: CBUF_READY alone; clock and busy counters 0
     store = text[text.index("uint64_t port_io_store("):text.index("/* ---------------------------------------------------------------- VI */")]
     assert "addr == DPC_BASE + 0x0Cu" in store  # the status write is a command, nothing to keep
+
+
+def test_a_command_list_the_game_gives_the_rdp_is_drawn_and_raises_the_dp_event():
+    """A scheduler that draws without an RSP task calls osDpSetNextBuffer: DPC_START, then DPC_END (0xA4100000/04).
+    The registers were plain memory, so the list was never drawn and the DP event the scheduler waited for never came:
+    a game's second list stalled it for ever (one graphics task, then nothing). Writing DPC_END now draws
+    [current, end) with the software RDP and raises the DP interrupt at a full sync (command 0x29)."""
+    text = HOST.read_text()
+    store = text[text.index("uint64_t port_io_store("):text.index("/* ---------------------------------------------------------------- VI */")]
+    assert "addr == DPC_BASE) { dpc_start" in store and "addr == DPC_BASE + 4u) { dpc_end" in store and "dpc_run();" in store
+    load = text[text.index("uint64_t port_io_load("):text.index("uint64_t port_io_store(")]
+    assert "addr >= DPC_BASE && addr < DPC_BASE + 0x0Cu" in load  # start, end and current read back
+    run = text[text.index("static void dpc_run(void)"):text.index("static int dd_range(")]
+    assert "port_render_rdp_list(cmds, bytes)" in run and "if (sync) rcp_raise(EV_DP)" in run
+    assert "if (id == 0x29) sync = 1;" in run
+    render = (HOST.parent / "render.c").read_text()
+    assert "void port_render_rdp_list(const uint8_t *cmds, size_t bytes)" in render
+    assert "port_rdp_replay(cmds, bytes, NULL, 0)" in render
 
 
 def test_a_first_function_that_loops_in_the_games_own_code_after_starting_threads_is_the_idle_thread():
@@ -1562,6 +1651,9 @@ def test_the_console_reports_the_expansion_pak_unless_the_project_says_otherwise
         return subprocess.run([str(tmp_path / "t")], check=True, capture_output=True, text=True, env=env).stdout.strip()
     assert [run(None), run("8"), run("4"), run("0x400000"), run("garbage")] == ["800000", "800000", "400000", "400000", "800000"]
     assert "wbe32(0x80000318, console_memory());" in text
+    # the boot chip's RAM test leaves the same total at 0x800003F0 too (a real console's RAM word at that address
+    # matched the reference emulator's dump; the port left it 0)
+    assert "wbe32(0x800003F0, console_memory());" in text
 
 
 def test_the_host_includes_setjmp_only_outside_the_browser_build():
@@ -1628,3 +1720,111 @@ int main(int argc, char **argv) {
     subprocess.run([cc, "-o", str(tmp_path / "t"), str(source)], check=True, capture_output=True)
     out = subprocess.run([str(tmp_path / "t"), str(trace)], check=True, capture_output=True, text=True).stdout.split()
     assert out == ["1", "2", "2299", "0", "1", "0"]
+
+
+def test_the_interpreter_can_trace_chosen_addresses_and_say_where_it_is():
+    """PORT_PC_TRACE=addr,... prints the registers each time the interpreter executes one of the addresses (a game's
+    coroutine switch, its dispatcher), and PORT_SAMPLE prints the interpreter's pc: how a game's own control flow is
+    followed when it can't be stepped."""
+    mips = (Path(__file__).resolve().parents[1] / "src/decompnet/consoles/n64/port_wasm/mips.c").read_text()
+    host = (Path(__file__).resolve().parents[1] / "src/decompnet/consoles/n64/port_wasm/host.c").read_text()
+    assert "PORT_PC_TRACE" in mips and "pc_trace(&c, pc)" in mips and "port_interp_pc = pc" in mips
+    assert "interpreter pc: %08X" in host
+
+
+def test_the_compiled_c_reads_a_low_window_above_the_modules_data_as_ram(tmp_path):
+    """A game maps a page pair at virtual 0x200000 (1 MB pages onto physical 0 and 0x100000) and keeps a class table at
+    virtual 0x43CAE0 in another window: its compiled C read the raw wasm address and got zeros, so a method slot read
+    as null and the call died ('called 00000000'). The loads and stores ask the window table for a window above the
+    module's own data (port_wasm_floor, 1 MB: the stack and the data sit below it), and get the RAM it maps."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    text = HOST.read_text()
+    code = text[text.index("static struct { uint32_t entry, target, bss, bss_size; int tv; } boot;"):
+                text.index("/* the console's RAM as the boot leaves it")]
+    source = tmp_path / "t.c"
+    source.write_text(_BOOT_HARNESS + code + """
+int main(void) {
+    port_tlb_write(0x1FE000, 0x200000, 0x1F, 0x401F); /* 1 MB pages, valid: physical 0 and 0x100000 */
+    printf("%u %08X %08X %08X %08X %08X\\n", port_tlb_hi, port_tlb_wasm(0x200010), port_tlb_wasm(0x300010),
+           port_tlb_wasm(0x0FFFF0), port_tlb_wasm(0x400000), port_tlb_wasm(0x9000C));
+    return 0;
+}
+""")
+    subprocess.run([cc, "-o", str(tmp_path / "t"), str(source)], check=True, capture_output=True)
+    done = subprocess.run([str(tmp_path / "t")], capture_output=True, text=True, check=True)
+    # the window's two halves at their spelling (the bytes are copied there), nothing below the floor or past the windows
+    assert done.stdout.split() == ["1", "80200010", "80300010", "000FFFF0", "00400000", "0009000C"]
+
+
+def test_seeds_the_console_used_are_replayed_in_order_then_the_game_s_own(tmp_path):
+    """PORT_SEED_REPLAY: a port-only override of a game's seeding function passes its seed through port_seed_replay, which gives the
+    next number of the recorded file (the seeds the console's game was given) while there are any and the seed passed in after them."""
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    source = tmp_path / "t.c"
+    source.write_text("""#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+typedef uint32_t u32;
+struct w2c_env { int unused; };
+static unsigned long seed_calls; /* host.c's counter for PORT_SEED_LOG, defined before the function */
+""" + _function(HOST.read_text(), "w2c_env_port_seed_replay") + """
+int main(void) {
+    printf("%u %u %u %u\\n", w2c_env_port_seed_replay(0, 7), w2c_env_port_seed_replay(0, 8), w2c_env_port_seed_replay(0, 9),
+           w2c_env_port_seed_replay(0, 10));
+    return 0;
+}
+""")
+    subprocess.run([cc, "-o", str(tmp_path / "t"), str(source)], check=True, capture_output=True)
+    seeds = tmp_path / "seeds.txt"
+    seeds.write_text("4000000000\n123\n")
+    env = {**os.environ, "PORT_SEED_REPLAY": str(seeds)}
+    assert subprocess.run([str(tmp_path / "t")], env=env, check=True, capture_output=True, text=True).stdout.split() == [
+        "4000000000", "123", "9", "10"]
+    env.pop("PORT_SEED_REPLAY")
+    assert subprocess.run([str(tmp_path / "t")], env=env, check=True, capture_output=True, text=True).stdout.split() == [
+        "7", "8", "9", "10"]
+
+
+def test_the_rdp_start_and_end_registers_read_back_the_word_a_game_wrote():
+    """A game's startup writes 0x12345678 to DPC_START and reads it back: a register self-test. The registers keep
+    only 24 bits when the RDP runs a list, but a read gave the masked word, so the test failed and the game stopped
+    after its first graphics task (a military shooter: 2 graphics tasks, then hundreds without the fix). The words
+    are kept as written for the readback; the masked copies run the list."""
+    text = HOST.read_text()
+    load = text[text.index("uint64_t port_io_load("):text.index("uint64_t port_io_store(")]
+    assert "addr == DPC_BASE ? dpc_start_word : addr == DPC_BASE + 4u ? dpc_end_word : dpc_cur" in load
+    store = text[text.index("uint64_t port_io_store("):text.index("/* ---------------------------------------------------------------- VI */")]
+    assert "dpc_start_word = (uint32_t)value;" in store and "dpc_end_word = (uint32_t)value;" in store
+    assert "dpc_start = (uint32_t)value & 0x00FFFFF8u;" in store  # the list still runs from the masked address
+
+
+def test_the_games_window_raises_itself_when_it_opens():
+    """The game program isn't an app bundle, so its window opened behind the app that started it (and a capture or
+    a player saw the app, not the game): the window code asks SDL to raise it, forcing the raise on macOS."""
+    text = (KIT / "window" / "sdl.c").read_text()
+    assert "SDL_FORCE_RAISEWINDOW" in text and "SYM(RaiseWindow)" in text
+    # raised right after each of the two places the window is created
+    assert text.count("sdl.RaiseWindow(window)") >= 2
+
+
+def test_a_game_that_stops_on_a_call_to_nothing_still_writes_the_memory_dump_it_was_asked_for():
+    """PORT_DUMPBIN is how a port's memory is set beside the reference emulator's. It was written only when the run
+    ended in its time limit, so a game that died (port_trace) left no dump to look at."""
+    text = HOST.read_text(encoding="utf-8")
+    assert 'getenv("PORT_DUMPBIN")' in _function(text, "dump_memory_if_asked")
+    assert "dump_memory_if_asked();" in _function(text, "main")
+    unix_trace = text[text.index("void port_trace(void) {\n    dump_memory_if_asked();"):]
+    assert unix_trace.startswith("void port_trace(void) {\n    dump_memory_if_asked();")
+
+def test_a_game_that_reads_the_cartridge_through_the_pi_registers_is_counted():
+    """A game's own PI manager starts its transfers by writing the PI registers: the summary said '0 DMAs' of one that
+    read its file table that way, which looked like a game that never loaded anything. They are counted and logged
+    (PORT_DMA_LOG) as osPiStartDma's are, and a transfer the host could not do says so."""
+    text = HOST.read_text()
+    start = text.index("case 0xA460000Cu:")
+    body = text[start:start + 2500]
+    assert "dmas++;" in body and "NOT DONE" in body

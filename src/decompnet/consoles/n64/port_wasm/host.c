@@ -56,6 +56,7 @@ static void wbe32(uint32_t a, uint32_t v) { v = __builtin_bswap32(v); memcpy(M +
 static void wbe16(uint32_t a, uint16_t v) { v = __builtin_bswap16(v); memcpy(M + gv(a), &v, 2); }
 uint8_t *port_memory(void) { return M; } /* for the renderer (render.c) */
 void port_render_task(uint32_t task); /* render.c: a graphics task's display list, drawn into the game's frame buffer */
+void port_render_rdp_list(const uint8_t *cmds, size_t bytes); /* render.c: a list the game gives the RDP itself */
 
 /* ---------------------------------------------------------------- the game's functions by address */
 
@@ -460,9 +461,10 @@ static int block_on(uint32_t mq, uint32_t flag, int (*ready)(uint32_t)) {
    host itself: a retrace, a completed task) and every receive started, to see what a game's threads say to each other
    when none of them draws (a handshake that spins, a queue nobody posts to) */
 static int msg_log(void) { static int on = -1; if (on < 0) on = getenv("PORT_MSGLOG") != NULL; return on; }
+static unsigned long vi_count; /* (defined with the VI below: the message log says which retrace a message was sent at) */
 static int32_t put(uint32_t mq, uint32_t msg, uint32_t flag, int jam) {
     pthread_mutex_lock(&lock);
-    if (msg_log()) fprintf(stderr, "MSG t%d send %08X msg %08X flag %u valid %d/%d\n", self ? self->number : -1, mq, msg, flag, (int)be32(mq + Q_VALID), (int)be32(mq + Q_COUNT));
+    if (msg_log()) fprintf(stderr, "MSG t%d send %08X msg %08X flag %u valid %d/%d vi %lu\n", self ? self->number : -1, mq, msg, flag, (int)be32(mq + Q_VALID), (int)be32(mq + Q_COUNT), vi_count);
     if (block_on(mq, flag, has_room) < 0) { pthread_mutex_unlock(&lock); return -1; }
     uint32_t count = be32(mq + Q_COUNT), first = be32(mq + Q_FIRST), valid = be32(mq + Q_VALID), buf = be32(mq + Q_MSG);
     if (jam) {
@@ -491,7 +493,7 @@ u32 w2c_env_osJamMesg(struct w2c_env *e, u32 mq, u32 msg, u32 flag) { (void)e; r
 u32 w2c_env_osRecvMesg(struct w2c_env *e, u32 mq, u32 msg, u32 flag) {
     (void)e;
     pthread_mutex_lock(&lock);
-    if (msg_log()) fprintf(stderr, "MSG t%d recv %08X flag %u valid %d\n", self ? self->number : -1, mq, flag, (int)be32(mq + Q_VALID));
+    if (msg_log()) fprintf(stderr, "MSG t%d recv %08X flag %u valid %d vi %lu\n", self ? self->number : -1, mq, flag, (int)be32(mq + Q_VALID), vi_count);
     if (block_on(mq, flag, has_mesg) < 0) { pthread_mutex_unlock(&lock); return (u32)-1; }
     uint32_t count = be32(mq + Q_COUNT), first = be32(mq + Q_FIRST), buf = be32(mq + Q_MSG);
     if (msg) wbe32(msg, be32(buf + 4 * first));
@@ -572,6 +574,8 @@ static int save_dma(uint32_t dest, uint32_t cart, uint32_t size, uint32_t write)
     if (dest < 0x80000000u || size > end - dest) return -1;
     return flash_in_use ? port_flash_dma(dest, save_offset(cart), size, write) : port_sram_dma(dest, save_offset(cart), size, write);
 }
+static unsigned long dmas; /* (the count below, also of a game's own PI manager's transfers through the registers) */
+static unsigned long vi_count;
 static int pi_register(uint32_t addr, int write, uint32_t value, uint32_t *read) {
     static uint32_t dram, cart;
     switch (addr) {
@@ -601,9 +605,15 @@ static int pi_register(uint32_t addr, int write, uint32_t value, uint32_t *read)
         if (boot && dest >= BOOT_STACK_SIZE) end = 0;
         if (save_window(cart)) { save_dma(dest, cart, size, 0); post_event(EV_PI); return 1; }
         uint32_t offset = cart & 0x0FFFFFFEu;
-        if (cart >= 0x10000000u && cart < 0x1FC00000u && dest < end
-                && size <= end - dest && (uint64_t)offset + size <= rom_size)
-            memcpy(M + dest, rom + offset, size);
+        int copied = cart >= 0x10000000u && cart < 0x1FC00000u && dest < end
+                && size <= end - dest && (uint64_t)offset + size <= rom_size;
+        if (copied) memcpy(M + dest, rom + offset, size);
+        /* a game's own PI manager reads the cartridge through these registers: counted and logged as the host's own
+           osPiStartDma is (the summary said "0 DMAs" of a game that read its files this way), and a transfer the
+           host could not do says so */
+        dmas++;
+        if (dmas <= 20 || dmas % 500 == 0 || getenv("PORT_DMA_LOG"))
+            LOG("DMA %lu (retrace %lu): ROM %06X -> %08X, %X bytes%s", dmas, vi_count, offset, dest, size, copied ? "" : " (NOT DONE)");
         post_event(EV_PI);
         return 1;
     }
@@ -615,6 +625,34 @@ static int pi_register(uint32_t addr, int write, uint32_t value, uint32_t *read)
    (the 64DD support some cartridges carry) reads the status register at 0x05000508 and, finding a nonzero word,
    returns at once with "no 64DD"; answered with 0 it built its disk manager and waited for it for ever (a racing
    game's main thread spun on the manager's reply). */
+/* The RDP's own command list (osDpSetNextBuffer, a scheduler that draws without an RSP task): DPC_START names where the
+   list begins, and writing DPC_END starts the RDP, which draws [current, end) and, at a full sync (command 0x29), raises
+   the DP interrupt the game's scheduler waits for. With these registers plain memory the list was never drawn and the
+   DP event never came: a racing-style game's scheduler waited for ever after its second list. */
+static uint32_t dpc_start, dpc_end, dpc_cur;
+static uint32_t dpc_start_word, dpc_end_word; /* the words as written: what a self-test of the registers reads back */
+static int dpc_start_valid;
+static void rcp_raise(int event);
+static void dpc_run(void) {
+    if (dpc_start_valid) { dpc_cur = dpc_start; dpc_start_valid = 0; }
+    uint32_t from = dpc_cur & 0x00FFFFF8u, to = dpc_end;
+    if (to <= from || to - from > 0x100000u || to > 0x00800000u) { dpc_cur = to > from ? from : dpc_cur; return; }
+    const uint8_t *cmds = M + gv(0x80000000u + from);
+    size_t bytes = to - from;
+    int sync = 0;
+    for (size_t at = 0; at + 8 <= bytes;) { /* the list's commands: length by opcode, a full sync raises the interrupt */
+        uint32_t id = cmds[at] & 0x3Fu, words = 2;
+        if (id >= 0x08 && id <= 0x0F) words = 8 + (id & 4 ? 16 : 0) + (id & 2 ? 16 : 0) + (id & 1 ? 4 : 0);
+        else if (id == 0x24 || id == 0x25) words = 4;
+        if (id == 0x29) sync = 1;
+        at += words * 4;
+    }
+    static int said;
+    if (said++ < 3) LOG("the game gave the RDP a command list: %06X to %06X (%s)", from, to, sync ? "ends in a full sync" : "no full sync");
+    port_render_rdp_list(cmds, bytes);
+    dpc_cur = to;
+    if (sync) rcp_raise(EV_DP);
+}
 static int dd_range(uint32_t bus) { bus &= 0x1FFFFFFFu; return bus >= 0x05000000u && bus < 0x08000000u; }
 static uint32_t open_bus(uint32_t bus) { return (bus & 0xFFFFu) * 0x10001u; }
 uint64_t port_io_load(uint64_t addr) {
@@ -625,6 +663,10 @@ uint64_t port_io_load(uint64_t addr) {
         return IO_SCRATCH + (addr & 3);
     }
     if (addr == SP_STATUS) { wbe32(IO_SCRATCH, 1); return IO_SCRATCH; } /* halted: a task finishes at once */
+    if (addr >= DPC_BASE && addr < DPC_BASE + 0x0Cu) { /* the list the RDP was given: start, end, and where it is (done) */
+        wbe32(IO_SCRATCH, addr == DPC_BASE ? dpc_start_word : addr == DPC_BASE + 4u ? dpc_end_word : dpc_cur);
+        return IO_SCRATCH;
+    }
     if (addr >= DPC_BASE + 0x0Cu && addr < DPC_BASE + 0x20u) {
         /* The RDP's command registers: the host draws a task when it starts, so the RDP is always idle. A game that
            writes the status (clear XBUS DMEM DMA) and polls bit 0 until it drops (libultra's osDpSetStatus users)
@@ -653,6 +695,8 @@ uint64_t port_io_store(uint64_t addr, uint64_t value) {
         return IO_SCRATCH + 4;
     }
     if (addr == SP_STATUS) return IO_SCRATCH + 4; /* a command (clear halt, set a signal): nothing to keep */
+    if (addr == DPC_BASE) { dpc_start_word = (uint32_t)value; dpc_start = (uint32_t)value & 0x00FFFFF8u; dpc_start_valid = 1; return IO_SCRATCH + 4; }
+    if (addr == DPC_BASE + 4u) { dpc_end_word = (uint32_t)value; dpc_end = (uint32_t)value & 0x00FFFFF8u; dpc_run(); return IO_SCRATCH + 4; }
     if (addr == DPC_BASE + 0x0Cu) return IO_SCRATCH + 4; /* a command to the RDP's status: nothing to keep (see port_io_load) */
     if (port_ai_register((uint32_t)addr, 1, (uint32_t)value, NULL) || si_register((uint32_t)addr, 1, (uint32_t)value, NULL)
             || pi_register((uint32_t)addr, 1, (uint32_t)value, NULL))
@@ -810,7 +854,7 @@ u32 w2c_env_osPiStartDma(struct w2c_env *e, u32 mb, u32 pri, u32 dir, u32 dev, u
     if (dir != 0) LOG("osPiStartDma: a write to the cartridge (%08X), ignored", dev);
     else if (offset + (uint64_t)size > rom_size) LOG("osPiStartDma: %08X+%X is past the ROM's end", dev, size);
     else memcpy(M + dram, rom + offset, size);
-    if (dmas <= 20 || dmas % 500 == 0) LOG("DMA %lu: ROM %06X -> %08X, %X bytes", dmas, offset, dram, size);
+    if (dmas <= 20 || dmas % 500 == 0 || getenv("PORT_DMA_LOG")) LOG("DMA %lu (retrace %lu): ROM %06X -> %08X, %X bytes", dmas, vi_count, offset, dram, size);
     if (mb) { wbe32(mb + 8, dram_given); wbe32(mb + 12, dev); wbe32(mb + 16, size); }
     if (mq) put(mq, mb, 0, 0);
     return 0;
@@ -921,6 +965,21 @@ static void dp_deliver(int force) {
     (void)force;
 #endif
 }
+#ifndef PORT_WEB
+/* PORT_ORDER_LOG=addr: a thread that says, with the retrace and graphics-task counts, each time the word at `addr` changes, so the order of a game's
+   state updates and its graphics tasks can be set beside the emulator's (a watch on the word and a break on osSpTaskStartGo): docs/PORTING.md. */
+static void *order_watch(void *arg) {
+    uint32_t addr = (uint32_t)(uintptr_t)arg;
+    uint32_t last = be32(addr);
+    for (;;) {
+        uint32_t now = be32(addr);
+        if (now != last) { fprintf(stderr, "ORDER change %08X -> %08X vi %lu task %lu\n", last, now, vi_count, gfx_tasks); last = now; }
+        usleep(20);
+    }
+    return NULL;
+}
+#endif
+static unsigned long seed_calls; /* (counted in port_seed_replay below) */
 void w2c_env_osSpTaskStartGo(struct w2c_env *e, u32 task) {
     (void)e;
     uint32_t type = be32(task);
@@ -932,6 +991,8 @@ void w2c_env_osSpTaskStartGo(struct w2c_env *e, u32 task) {
         if (vtrace[gfx_tasks] > vi_target) vi_target = vtrace[gfx_tasks];
     }
 #endif
+    if (type == 1 && getenv("PORT_SEED_LOG")) fprintf(stderr, "SEEDS task %lu calls %lu\n", gfx_tasks, seed_calls);
+    if (type == 1 && getenv("PORT_ORDER_LOG")) fprintf(stderr, "ORDER task %lu vi %lu\n", gfx_tasks, vi_count);
     if (type == 1) ram_dumps("PORT_FRAME_DUMPS", gfx_tasks, task);
     if (type == 1) {
 #ifndef PORT_WEB
@@ -941,6 +1002,14 @@ void w2c_env_osSpTaskStartGo(struct w2c_env *e, u32 task) {
         port_render_task(task);
     }
     if (type == 2) port_audio_task(task);
+    { /* the first task of each type, whatever the count: a game's own task types (not 1 or 2) count as audio above */
+        static unsigned seen_types;
+        if (type < 32 && !(seen_types & (1u << type))) {
+            seen_types |= 1u << type;
+            LOG("first RSP task of type %u: flags %X, ucode %08X, data %08X (%X bytes)", type, be32(task + 4), be32(task + 16),
+                be32(task + 48), be32(task + 52));
+        }
+    }
     if (gfx_tasks + audio_tasks <= 4) LOG("RSP task type %u flags %X: data %08X, %X bytes", type, be32(task + 4), be32(task + 48), be32(task + 52));    if (type == 1 && gfx_tasks == 2 && getenv("PORT_TASK")) {
         uint32_t ud = be32(task + 24) & 0x1FFFFFFF, uds = be32(task + 28), dl = be32(task + 48) & 0x1FFFFFFF;
         fprintf(stderr, "gfx task: ucode %08X (%X), ucode data %08X (%X), data %08X\n",
@@ -1346,6 +1415,23 @@ void w2c_env_osMapTLB(struct w2c_env *e, u32 index, u32 pm, u32 va, u32 even, u3
 }
 u32 w2c_env_memcpy(struct w2c_env *e, u32 d, u32 s, u32 n) { (void)e; memmove(M + d, M + s, n); return d; }
 u32 w2c_env_memset(struct w2c_env *e, u32 d, u32 c, u32 n) { (void)e; memset(M + d, (int)c, n); return d; }
+/* PORT_SEED_REPLAY=file: the seeds a game's random-number generator was given on the console, one number a line, in the order its
+   seeding function was called (the emulator's break on that function reports its argument). A port-only override of that function
+   (port/wasm/src/) passes the seed it was given through port_seed_replay: the next number from the file while there are any, the
+   seed itself after them. A game that seeds from the clock (osGetTime) gets the console's draws, where the port's clock, which
+   isn't the console's cycle count, would send each one elsewhere. */
+static unsigned long seed_calls; /* PORT_SEED_LOG: how many seeds the game has asked for, said at each graphics task */
+u32 w2c_env_port_seed_replay(struct w2c_env *e, u32 fallback) {
+    (void)e;
+    seed_calls++;
+#ifndef PORT_WEB
+    static FILE *file; static int tried;
+    if (!tried) { const char *path = getenv("PORT_SEED_REPLAY"); tried = 1; if (path) file = fopen(path, "r"); }
+    unsigned long seed;
+    if (file && fscanf(file, "%lu", &seed) == 1) return (u32)seed;
+#endif
+    return fallback;
+}
 u32 w2c_env_strlen(struct w2c_env *e, u32 p) { (void)e; return (u32)strlen((char *)M + p); }
 /* The rest of the C library's string and memory functions the kit counts as the host's (port.py _LIBC): left out of the build
    as the game's own copies, so one the host doesn't define was a stub returning 0: every strncmp said "equal" and every
@@ -1494,7 +1580,13 @@ static int tlb_spelling_in_use(uint32_t lo, uint32_t size) {
     return 0;
 }
 unsigned port_tlb_n;
-unsigned port_tlb_hi; /* windows at 0x00800000 up: the game's compiled C reads them as aliases of RAM (port_tlb_wasm) */
+unsigned port_tlb_hi; /* windows the game's compiled C reads as aliases of RAM (port_tlb_wasm): at 0x00800000 up, and low ones above the module's own data */
+/* The module's own low memory: its stack and data sit below `--global-base` plus its data (build.py LINK_FLAGS: 1 MB, and
+   the data after it, `__data_end`). A game's low TLB window above that (a code and data page pair at virtual 0x200000)
+   names RAM the compiled C would otherwise read as zeros: a class table's function pointers, behind a method slot
+   the game calls, read as null. main() raises the floor to the module's data end. */
+uint32_t port_wasm_floor = 0x00100000u;
+static uint32_t wasm_lo = 0xFFFFFFFFu, wasm_hi; /* the span of the windows port_tlb_wasm answers for */
 /* A low window shows the same RAM at two names: the console reads a table at virtual 0x00102330 from physical 0x2330
    (a jump table of a function the project has no C for: the bytes were copied to the boot image at the physical
    address, and nothing wrote them where the port spells the virtual address, 0x80102330). The words of the
@@ -1511,6 +1603,7 @@ static void tlb_mirror(uint32_t lo, uint32_t size, uint32_t phys) {
 }
 /* pm: the page mask register (PM_1M is 0x1FE000), va the pair's virtual address, even/odd the physical addresses of
    its two pages (-1: not mapped) */
+static void tlb_spell_span(void);
 static void tlb_map(uint32_t pm, uint32_t va, uint32_t even, uint32_t odd) {
     uint32_t size = ((pm >> 13) + 1) << 12;
     if ((pm & ~0x01FFE000u) || size > 0x1000000u) return;
@@ -1534,6 +1627,7 @@ static void tlb_map(uint32_t pm, uint32_t va, uint32_t even, uint32_t odd) {
             for (unsigned j = 0; j < port_tlb_n; j++)
                 if (tlb_win[j].lo + tlb_win[j].size == lo && tlb_win[j].phys + tlb_win[j].size == phys && tlb_win[j].size < 0x01000000u && tlb_win[j].real == real) {
                     tlb_win[j].size += size;
+                    if (tlb_win[j].lo + tlb_win[j].size > wasm_hi && (tlb_win[j].lo >= 0x00800000u || tlb_win[j].lo >= port_wasm_floor)) wasm_hi = tlb_win[j].lo + tlb_win[j].size;
                     phys = 0xFFFFFFFFu;
                     break;
                 }
@@ -1542,8 +1636,13 @@ static void tlb_map(uint32_t pm, uint32_t va, uint32_t even, uint32_t odd) {
         if (i == port_tlb_n && port_tlb_n == TLB_WINDOWS) return;
         tlb_win[i].lo = lo; tlb_win[i].size = size; tlb_win[i].phys = phys; tlb_win[i].real = real;
         if (i == port_tlb_n) port_tlb_n++;
-        if (lo >= 0x00800000u) port_tlb_hi = 1;
+        if (lo >= 0x00800000u || lo >= port_wasm_floor) {
+            port_tlb_hi = 1;
+            if (lo < wasm_lo) wasm_lo = lo;
+            if (lo + size > wasm_hi) wasm_hi = lo + size;
+        }
     }
+    tlb_spell_span();
 }
 /* The interpreter's `tlbwi`/`tlbwr`: the registers the game's own code wrote (a game that sets its TLB up in its
    first C function, with mtc0 and a tlbwi, as the entry routine's osMapTLB-style call does for others). An EntryLo
@@ -1710,6 +1809,37 @@ void port_tlb_physical_use(uint32_t a, uint32_t size) {
             if (getenv("PORT_TLB_TRACE")) fprintf(stderr, "window %08X + %X: the game's own data is at its spelling (%08X): kept at physical %08X from now on\n", tlb_win[i].lo, tlb_win[i].size, a, tlb_win[i].phys);
         }
     }
+    tlb_spell_span();
+}
+/* The span of the console's memory the windows not kept at their physical address are spelled at (0x80000000 | virtual).
+   A store of the game's own into it, through a KSEG0 name and not the window's virtual one, is data of its own at the
+   spelling, as a transfer there is (port_tlb_physical_use): a game whose loader copies its tables with stores, under a
+   window at virtual 0x200000 onto physical 0, had its code (at the physical alias) read as those tables. */
+uint32_t port_spell_lo = 0xFFFFFFFFu, port_spell_len;
+/* and the span of the spellings of the windows kept at their physical address: a jump there goes to the physical alias
+   (port_tlb_call), as the console runs the window's code, not what sits at the spelling */
+uint32_t port_real_lo = 0xFFFFFFFFu, port_real_len;
+static void tlb_spell_span(void) {
+    uint32_t lo = 0xFFFFFFFFu, hi = 0, rlo = 0xFFFFFFFFu, rhi = 0;
+    for (unsigned i = 0; i < port_tlb_n; i++) {
+        if (tlb_win[i].lo >= 0x00800000u || tlb_win[i].lo == tlb_win[i].phys || tlb_win[i].lo < 0x00001000u) continue;
+        uint32_t s = 0x80000000u | tlb_win[i].lo;
+        if (tlb_win[i].real) {
+            if (s < rlo) rlo = s;
+            if (s + tlb_win[i].size > rhi) rhi = s + tlb_win[i].size;
+        } else {
+            if (s < lo) lo = s;
+            if (s + tlb_win[i].size > hi) hi = s + tlb_win[i].size;
+        }
+    }
+    port_spell_lo = lo;
+    port_spell_len = hi > lo ? hi - lo : 0;
+    port_real_lo = rlo;
+    port_real_len = rhi > rlo ? rhi - rlo : 0;
+}
+void port_tlb_spell_store(uint32_t a) {
+    port_tlb_physical_use(a, 4);
+    tlb_spell_span();
 }
 uint32_t port_tlb_spelled(uint32_t a) {
     if (!port_tlb_n || a < 0x80000000u || a >= 0x80800000u) return a;
@@ -1738,6 +1868,28 @@ uint32_t port_tlb_virtual(uint32_t a) {
     }
     return found ? (nibble << 28) | v : a;
 }
+/* The virtual address the code in a physical frame has, for code the interpreter reached by the frame's KSEG0 name (a
+   `jal 0x802FA000` the project spelled from the physical address: the name a high window's code has, whatever page
+   of it the game brought there). The next page of that code is the next VIRTUAL page, which the game's TLB maps to
+   any frame (a paging game puts consecutive pages in frames far apart): running on into the next frame ran another
+   function's bytes, and a loop around the call spun for ever. Only a high window's frame is told (lo at 8 MB or
+   more: the split names those by the physical address). A frame the game maps twice, as a page of its code and
+   inside a large window that mirrors all of RAM (virtual 0x10000000 onto physical 0), is told by the page: the large
+   window is contiguous, so the code it runs sees no difference, and the page is the one the pager set up. Two
+   pages of the same size mapping it are ambiguous. */
+uint32_t port_tlb_virtual_of(uint32_t a) {
+    if (!port_tlb_n || a < 0x80000000u || a >= 0x80800000u) return 0;
+    uint32_t p = a & 0x1FFFFFFFu, v = 0, best = 0xFFFFFFFFu;
+    for (unsigned i = 0; i < port_tlb_n; i++) {
+        if (tlb_win[i].lo < 0x00800000u || tlb_win[i].lo >= 0x80000000u) continue;
+        if (p >= tlb_win[i].phys && p - tlb_win[i].phys < tlb_win[i].size) {
+            uint32_t c = tlb_win[i].lo + (p - tlb_win[i].phys);
+            if (tlb_win[i].size < best) { best = tlb_win[i].size; v = c; }
+            else if (tlb_win[i].size == best && v != c) v = 0; /* two equal windows: which one is unknown */
+        }
+    }
+    return v;
+}
 uint32_t port_tlb_call(uint32_t a) {
     if (!port_tlb_n || a < 0x80000000u || a >= 0x80800000u) return a;
     uint32_t v = a & 0x7FFFFFFFu;
@@ -1750,9 +1902,14 @@ uint32_t port_tlb_call(uint32_t a) {
    build writes (port/wasm/bemem.py) ask here once a window high in the virtual space exists, and read the same RAM at
    its KSEG0 spelling. Windows in the low 8 MB are left alone: the module's own low memory lives there. */
 uint32_t port_tlb_wasm(uint32_t a) {
-    for (unsigned i = 0; i < port_tlb_n; i++)
-        if (tlb_win[i].lo >= 0x00800000u && a >= tlb_win[i].lo && a - tlb_win[i].lo < tlb_win[i].size)
-            return 0x80000000u | (tlb_win[i].phys + (a - tlb_win[i].lo));
+    if (a < wasm_lo || a >= wasm_hi) return a; /* (the stack and the module's data are below every window) */
+    for (unsigned i = 0; i < port_tlb_n; i++) {
+        if (a < tlb_win[i].lo || a - tlb_win[i].lo >= tlb_win[i].size) continue;
+        if (tlb_win[i].lo >= 0x00800000u) return 0x80000000u | (tlb_win[i].phys + (a - tlb_win[i].lo));
+        /* a low window above the module's data is named as the interpreter and the DMA name it (port_tlb_canon): its
+           spelling 0x80000000 | virtual, or the physical address where the window was kept there */
+        if (tlb_win[i].lo >= port_wasm_floor) return port_tlb_canon(a);
+    }
     return a;
 }
 /* The address a `j`/`jal` at the (delay slot) address `slot` goes to, given its 26-bit field `imm` (already shifted).
@@ -1838,6 +1995,8 @@ static int read_boot(void) {
     port_tlb_n = 0;
     memset(tlb_ent, 0, sizeof tlb_ent);
     port_tlb_hi = 0;
+    wasm_lo = 0xFFFFFFFFu;
+    wasm_hi = 0;
     boot.entry = boot_entry();
     /* a call is the game's first function when only a `break` follows it; one with more code after it is a helper
        (a fill, a TLB setup) the routine returns from */
@@ -1926,6 +2085,7 @@ static int boot_memory(void) {
     wbe32(0x80000308, 0xB0000000);    /* osRomBase */
     wbe32(0x8000030C, 0);             /* osResetType: cold */
     wbe32(0x80000318, console_memory()); /* osMemSize */
+    wbe32(0x800003F0, console_memory()); /* the boot chip's RAM test also leaves the size here (the console's RDRAM total) */
     for (unsigned i = 0; i < port_tlb_n; i++) LOG("TLB: virtual %08X + %X is physical %08X", tlb_win[i].lo, tlb_win[i].size, tlb_win[i].phys);
     LOG("boot: image at %08X, BSS %08X + %X, first C function %08X, %s", boot.entry, boot.bss, boot.bss_size,
         boot.target, boot.tv == 0 ? "PAL" : boot.tv == 2 ? "MPAL" : "NTSC");
@@ -2023,16 +2183,17 @@ static void vtrace_load(const char *path) {
 }
 #endif
 /* The audio interface can drain several buffers between VI interrupts. Give the game a chance to refill them. */
-static void wait_retrace(void) {
-    if (vtime) { /* PORT_VTIME: when every game thread is waiting (or after 3 s of wall time, for one that spins) */
-        uint64_t limit = monotonic_us() + 3000000;
+/* PORT_VTIME: run until every game thread is waiting (three samples in a row), or `wall_us` of wall time has passed (a thread that spins).
+   Returns whether the threads went idle. The virtual clock is not touched. */
+static int vtime_idle(uint64_t wall_us, int strict) {
+        uint64_t limit = monotonic_us() + wall_us;
         int idle = 0;
         while (idle < 3 && monotonic_us() < limit) {
             pthread_mutex_lock(&lock);
             /* no thread running, or only the idle thread: a console spins in its lowest-priority thread until an
                interrupt switches away, so a lone ready thread no other thread ranks below is the CPU with nothing to do */
             int none = booted && running == NULL;
-            if (booted && running) {
+            if (booted && running && !strict) { /* (strict: a thread just woken by the message is not the CPU with nothing to do) */
                 unsigned ready = 0;
                 int lowest = 1;
                 for (PortThread *p = threads; p; p = p->next) {
@@ -2046,6 +2207,11 @@ static void wait_retrace(void) {
             if (none) dp_deliver(1); /* the RCP finishes while the CPU has nothing to do */
             usleep(none ? 100 : 50);
         }
+    return idle >= 3;
+}
+static void wait_retrace(void) {
+    if (vtime) { /* PORT_VTIME: when every game thread is waiting (or after 3 s of wall time, for one that spins) */
+        int idle = vtime_idle(3000000, 0) ? 3 : 0;
         if (idle < 3) {
             vtime_forced++;
             if (vtime_forced <= 3 || vtime_forced % 100 == 0) {
@@ -2102,7 +2268,9 @@ static void rom_byte_order(uint8_t *b, size_t n) {
 #endif
 /* PORT_SAMPLE: once a second, where the running game thread is (a backtrace for atos) */
 static void sample_handler(int sig) { (void)sig; port_trace(); }
+extern uint32_t port_interp_pc;
 static void sample(void) {
+    fprintf(stderr, "interpreter pc: %08X\n", port_interp_pc);
     pthread_mutex_lock(&lock);
     PortThread *r = running;
     pthread_t t = r ? r->host : 0;
@@ -2199,6 +2367,18 @@ static void *watchdog(void *arg) {
     _exit(0);
     return NULL;
 }
+/* PORT_DUMPBIN=addr,len,file: memory as bytes at the end of the run, for comparing with the ROM's or with the
+   reference emulator's dump. It also runs when the game stops on a call to nothing (port_trace), so a run that
+   dies has its memory to read. */
+static void dump_memory_if_asked(void) {
+    const char *spec_env = getenv("PORT_DUMPBIN");
+    if (!spec_env) return;
+    char spec[512]; snprintf(spec, sizeof spec, "%s", spec_env);
+    char *a = strtok(spec, ","), *n = strtok(NULL, ","), *path = strtok(NULL, ",");
+    FILE *f = a && n && path ? fopen(path, "wb") : NULL;
+    if (f) { fwrite(M + strtoul(a, NULL, 16), 1, strtoul(n, NULL, 0), f); fclose(f); }
+}
+
 int main(int argc, char **argv) {
     if (SIGUSR1) signal(SIGUSR1, sample_handler);
     if (argc < 2) port_live_app(argv[0]); /* an exported app, opened from the Finder: its settings beside it */
@@ -2221,6 +2401,7 @@ int main(int argc, char **argv) {
     wasm2c_game_instantiate(&game, &env);
 #endif
     M = game.w2c_memory.data;
+    if (game.w2c_0x5F_data_end > port_wasm_floor) port_wasm_floor = (game.w2c_0x5F_data_end + 0xFFFu) & ~0xFFFu;
     LOG("memory: %llu MB, ROM %zu bytes", (unsigned long long)game.w2c_memory.size >> 20, rom_size);
     /* as the console's boot does: the game's code and data from the cartridge at their addresses, and the values
        the boot leaves in low memory for libultra */
@@ -2232,6 +2413,10 @@ int main(int argc, char **argv) {
         pthread_t guard;
         watchdog_seconds = seconds;
         if (pthread_create(&guard, NULL, watchdog, NULL) == 0) pthread_detach(guard);
+    }
+    if (getenv("PORT_ORDER_LOG")) {
+        pthread_t watcher;
+        if (pthread_create(&watcher, NULL, order_watch, (void *)(uintptr_t)strtoul(getenv("PORT_ORDER_LOG"), NULL, 16)) == 0) pthread_detach(watcher);
     }
     boot_active = 1;
     if (!setjmp(boot_jmp)) boot_call();
@@ -2247,17 +2432,20 @@ int main(int argc, char **argv) {
         retrace();
         /* the retraces the console had while it worked on a frame (PORT_VTIME_TRACE), fired as the game goes idle:
            they queue for it as they did there */
-        while (vtime && vi_count < vi_target) retrace();
+        /* each catch-up retrace gets the game's threads run to idle (20 ms of wall time at most) before the next, without the virtual clock moving
+           again: fired back to back a frame's retraces queue together on the game's VI queue, and the logic they pace runs in bursts the
+           console's did not. PORT_VTIME_BURST=1: back to back. */
+        static int burst = -1;
+        if (burst < 0) burst = getenv("PORT_VTIME_BURST") && atoi(getenv("PORT_VTIME_BURST")) != 0;
+        while (vtime && vi_count < vi_target) {
+            if (!burst) vtime_idle(20000, 1);
+            retrace();
+        }
         if (vtime && vi_target) vnext_us = ((uint64_t)vi_count + 1) * (unsigned)retrace_us();
         port_live_pump();
         if (getenv("PORT_SAMPLE") && frame % 10 == 5) sample();
     }
-    if (getenv("PORT_DUMPBIN")) { /* addr,len,file: memory as bytes at the end, for comparing with the ROM's */
-        char spec[512]; snprintf(spec, sizeof spec, "%s", getenv("PORT_DUMPBIN"));
-        char *a = strtok(spec, ","), *n = strtok(NULL, ","), *path = strtok(NULL, ",");
-        FILE *f = a && n && path ? fopen(path, "wb") : NULL;
-        if (f) { fwrite(M + strtoul(a, NULL, 16), 1, strtoul(n, NULL, 0), f); fclose(f); }
-    }
+    dump_memory_if_asked();
     if (getenv("PORT_DUMP")) { /* addr,len: memory as text at the end */
         uint32_t a = (uint32_t)strtoul(getenv("PORT_DUMP"), NULL, 16);
         int n = strchr(getenv("PORT_DUMP"), ',') ? atoi(strchr(getenv("PORT_DUMP"), ',') + 1) : 256;
@@ -2281,6 +2469,7 @@ void port_trace(void) { fprintf(stderr, "(no backtrace on Windows)\n"); }
 #include <mach-o/dyld.h>
 #endif
 void port_trace(void) {
+    dump_memory_if_asked();
     void *frames[24];
     int n = backtrace(frames, 24);
 #ifdef __APPLE__
