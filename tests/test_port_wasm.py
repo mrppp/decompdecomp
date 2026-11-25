@@ -279,6 +279,48 @@ def test_bitfields_get_the_consoles_bits():
     assert big_endian_bitfields(padding) == padding  # padding alone may start mid-unit: as it was
 
 
+def test_bytes_that_share_a_word_with_the_member_before_them_stay_in_it():
+    """A `u16` then five bytes declared `u32 x : 8` put two of them in the u16's word under the console's compiler.
+    Every run was started on a fresh word, so they split four and one, the struct grew from 28 to 32 bytes, and the
+    array of them an intro cutscene's tracks live in had a stride four bytes too long: its object pointers were
+    overwritten by the next fields and the port faulted on the first object it used."""
+    from decompnet.port.wasm.build import big_endian_bitfields
+    text = ("typedef struct {\n    s32 unk0;\n    f32 unk4;\n    u16 unk14;\n    u32 unk16 : 8;\n"
+            "    u32 unk17 : 8;\n    u32 unk18 : 8;\n    u32 unk19 : 8;\n    u32 unk1A : 8;\n} TrackSound;\n")
+    lines = [line.strip() for line in big_endian_bitfields(text).splitlines()]
+    assert lines[3:6] == ["u16 unk14;", "unsigned char unk16;", "unsigned char unk17;"]
+    assert lines[6:] == ["u32 : 8;", "u32 unk1A : 8;", "u32 unk19 : 8;", "u32 unk18 : 8;", "u32 : 0;", "} TrackSound;"]
+    # the same bytes after a word-sized member start a fresh word, as before
+    fresh = big_endian_bitfields("struct F {\n    s32 a;\n    u32 b : 8;\n    u32 c : 8;\n};\n")
+    assert "unsigned char" not in fresh
+
+
+def test_stack_locals_that_touch_in_the_frame_stay_one_record():
+    """m2c names stack locals by their offset: `char sp10[0x20]` and `s32 sp30[2]` are one 0x28-byte record the
+    console's compiler built in the frame, and a callee that is handed `sp10` and reads past it reads the words
+    after. clang lays locals out as it likes, so an all-star baseball game's export table got entries whose
+    handler was stack junk."""
+    from decompnet.port.wasm.build import contiguous_stack_locals
+    text = ("void func_80025984(s32 arg0, s32 arg1, s32 arg2) {\n    char sp10[0x20];\n    s32 sp30[2];\n"
+            "    s32 sp50;\n\n    func_8001A888(sp10, arg0);\n    sp30[0] = arg1;\n    sp30[1] = arg2;\n"
+            "    func_8002668C(&D_80086990, sp10);\n    sp50 = 1;\n}\n")
+    out = contiguous_stack_locals(text)
+    assert "struct { char sp10[0x20]; s32 sp30[2]; } _frame_10;" in out
+    assert "func_8001A888(_frame_10.sp10, arg0);" in out
+    assert "_frame_10.sp30[1] = arg2;" in out
+    assert "func_8002668C(&D_80086990, _frame_10.sp10);" in out
+    assert out.count("sp30[2];") == 1 and "    s32 sp50;" in out  # a local that doesn't touch them stays alone
+    # a gap between locals (the frame has room the function never names) keeps them apart, and a function with
+    # one local, or none, is as it was
+    apart = "void f(void) {\n    s32 sp10;\n    s32 sp18;\n    g(&sp10, &sp18);\n}\n"
+    assert contiguous_stack_locals(apart) == apart
+    single = "void f(void) {\n    char sp10[8];\n    g(sp10);\n}\n"
+    assert contiguous_stack_locals(single) == single
+    # the rename stops at the function's end: a later function's own `sp10` is not this one's
+    two = text + "void h(void) {\n    s32 sp10;\n    sp10 = 1;\n}\n"
+    assert two.endswith(contiguous_stack_locals(two)[-len("void h(void) {\n    s32 sp10;\n    sp10 = 1;\n}\n"):])
+
+
 def test_a_struct_passed_by_value_keeps_every_word_the_caller_passed():
     """A loader's C declared its by-value block 640 bytes; its caller passed 708, and on MIPS the loader read the
     words past 640 from the caller's stack. The thunk copied 640: the last texture name was cut short."""
@@ -1147,3 +1189,20 @@ def test_a_call_by_another_spelling_of_a_defined_name_goes_to_it(tmp_path):
     two.write_text("define void @fooBarBaz() {\n  ret void\n}\ndefine void @foo_bar_baz() {\n  ret void\n}\n"
                    "declare void @FOO_BAR_BAZ()\n")
     assert renames([two], []) == {}
+
+
+def test_a_function_whose_c_returns_nothing_but_whose_caller_uses_a_result_is_found(tmp_path):
+    """A machine draft of a function that returns a pointer in $v0 can be declared void and still match its bytes;
+    in WebAssembly its callers' result is then nothing, and a file open took its error branch at once (a golf game
+    never read its cartridge). The build records those callees (calls.json's void-result) and builds again without
+    their C, so the original's own code returns the pointer."""
+    from decompnet.port.wasm.build import void_result_callees
+
+    calls = tmp_path / "calls.json"
+    calls.write_text(json.dumps({
+        "func_80094C24": [{"callee": "func_80092B44", "caller": "func_80094C24", "kind": "void-result"},
+                          {"callee": "func_80092B44", "caller": "func_80094C24", "kind": "extra-arguments",
+                           "declared": 0, "passed": 2}],
+        "func_80001000": [{"callee": "func_80002000", "caller": "func_80001000", "kind": "missing-arguments"}]}))
+    assert void_result_callees(calls) == {"func_80092B44"}
+    assert void_result_callees(tmp_path / "none.json") == set()

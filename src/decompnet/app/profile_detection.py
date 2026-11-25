@@ -41,6 +41,7 @@ STRONG_SHARE = 2 / 3  # ... and at least this share of the neighbours read
 MAX_PROFILES = 16
 REFINE = 4  # more flag sets tried for the toolchain that scored best (refinements)
 SIGNATURE = 'profile-detection-v1:'
+_ROWS: dict = {}  # saved_rows' answers
 
 
 def _flags(flags) -> list[str]:
@@ -111,7 +112,14 @@ def _mapped(net, proj, fn, own) -> dict | None:
 
 def evidence(net, proj, cfg, fn, own) -> tuple[list[dict], dict, Counter, int]:
     """(profiles the evidence points to, best first; key -> what points to each; neighbour votes; neighbours read)."""
-    from . import compiler_fingerprints, move_fingerprints
+    from .. import consoles
+    from . import (
+        compiler_fingerprints,
+        fp_fingerprints,
+        move_fingerprints,
+        scheduler_fingerprints,
+        small_data_fingerprints,
+    )
     reasons: dict[tuple, list[str]] = {}
     ordered: list[dict] = []
 
@@ -132,6 +140,15 @@ def evidence(net, proj, cfg, fn, own) -> tuple[list[dict], dict, Counter, int]:
     row = _row(fn)
     if row.get('target') and 'arch' in proj.keys() and proj['arch'] == 'mips':  # (habits are read from MIPS code)
         try:
+            # (each compiler with the other floating-point register model, the function's own and every installed one at
+            # its default flags: SN GCC's own default is -mfp64, and its code the game's was -mfp32: fp_fingerprints)
+            big_endian = bool(proj['big_endian']) if 'big_endian' in proj.keys() else True
+            others = ({'toolchain': c.id, 'flags': list(consoles.default_flags(cfg, c.id))}
+                      for c in consoles.of(cfg).compilers if c.automatic and c.id != own['toolchain'])
+            # (another compiler only when its default names a floating-point model: the flag is one it knows)
+            for base in [own, *(b for b in others if any(f in fp_fingerprints.FP_FLAGS for f in b['flags']))]:
+                if flags := fp_fingerprints.probe(base, bytes(row['target']), (), big_endian):
+                    add({'toolchain': base['toolchain'], 'flags': flags}, fp_fingerprints.why(base['flags'], bytes(row['target']), ()))
             for profile in move_fingerprints.profiles(net, proj, cfg, fn, own):
                 add(profile, 'its register moves are written the way that compiler writes them')
             floor = compiler_fingerprints.own_agreement(proj, fn, own)
@@ -140,7 +157,83 @@ def evidence(net, proj, cfg, fn, own) -> tuple[list[dict], dict, Counter, int]:
                     add(profile, f'its code habits agree with that compiler better ({agree:+d} against {floor:+d})')
         except Exception:  # noqa: BLE001 - habits only order the profiles; the judge decides
             pass
+    if 'arch' in proj.keys() and proj['arch'] == 'mips':
+        try:
+            # (the same compiler with another scheduling setting, when only the order of the saved C's instructions differs)
+            for flags in scheduling_variants(net, proj, fn, own):
+                add({'toolchain': own['toolchain'], 'flags': flags},
+                    scheduler_fingerprints.why(own['flags'], saved_rows(net, proj, fn, own)))
+        except Exception:  # noqa: BLE001 - this only orders the profiles; the judge decides
+            pass
+    if 'arch' in proj.keys() and proj['arch'] == 'mips':
+        try:
+            # (the same compiler with another small-data threshold, when the diff is only an address built in `$at` on one side)
+            for flags in small_data_variants(net, proj, fn, own):
+                add({'toolchain': own['toolchain'], 'flags': flags},
+                    small_data_fingerprints.why(own['flags'], saved_rows(net, proj, fn, own)))
+        except Exception:  # noqa: BLE001 - this only orders the profiles; the judge decides
+            pass
     return ordered, reasons, votes, read
+
+
+def saved_rows(net, proj, fn, own) -> list:
+    """The diff rows of the function's saved C under its own settings: the last diff the app kept for it, else one judge
+    compile of the saved C (cached per source and settings), else none."""
+    from .repair_ranking import evidence, instruction_rows
+    row = _row(fn)
+    key = (row.get('id'), hashlib.sha256((row.get('best_source') or '').encode()).hexdigest(), _key(own))
+    if key in _ROWS:
+        return _ROWS[key]
+    rows = instruction_rows(evidence(net, row['id'], None)) if 'id' in row else []
+    if not rows and row.get('best_source') and hasattr(net, '_judge_with'):
+        try:
+            _, diff, _ = net._judge_with(proj, fn, own['toolchain'], list(_flags(own['flags'])), row['best_source'])
+            rows = instruction_rows(getattr(diff, 'rows', []) or [])
+        except Exception:  # noqa: BLE001 - no rows: the profiles are ordered by the other evidence
+            rows = []
+    if len(_ROWS) > 256:
+        _ROWS.clear()
+    _ROWS[key] = rows
+    return rows
+
+
+def scheduling_variants(net, proj, fn, own) -> list[list[str]]:
+    """The function's own flags with another scheduling setting (scheduler_fingerprints), when the diff of its saved C
+    is only instruction order and the registers that follow. The diff is read (a judge compile) only when the profile
+    has such a variant."""
+    from . import scheduler_fingerprints
+    if not scheduler_fingerprints.variants(own['flags']) or not near_match(fn):
+        return []
+    return scheduler_fingerprints.probes(own, saved_rows(net, proj, fn, own))
+
+
+def small_data_variants(net, proj, fn, own) -> list[list[str]]:
+    """The function's own flags with another `-G` (small_data_fingerprints), when the diff of its saved C is only
+    address-split rows. The diff is read (a judge compile) only when the profile names a `-G`."""
+    from . import small_data_fingerprints
+    if small_data_fingerprints.threshold(own['flags']) is None or not near_match(fn):
+        return []
+    return small_data_fingerprints.probes(own, saved_rows(net, proj, fn, own))
+
+
+def small_data_pairs(net, proj, fn, own) -> list[tuple[dict, str]]:
+    """[(profile, C)]: the saved C with its small externs widened, under each other `-G` the diff points to. These are
+    what the saved C alone cannot show (it scored worse under the profile: the globals the target splits stayed small)."""
+    from . import small_data_fingerprints
+    row = _row(fn)
+    flag_sets = small_data_variants(net, proj, fn, own)
+    if not flag_sets:
+        return []
+    header = ''
+    try:
+        header = net._context(proj['id'], row['unit'])['header']
+    except Exception:  # noqa: BLE001 - without the header the library's own checks decide
+        pass
+    out = []
+    for flags in flag_sets:
+        out += [({'toolchain': own['toolchain'], 'flags': flags}, child)
+                for child in small_data_fingerprints.widened(flags, row['best_source'], row['name'], header, row.get('asm') or '')]
+    return out
 
 
 def candidates(net, proj, fn, base) -> tuple[list[dict], dict, Counter, int]:

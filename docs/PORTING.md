@@ -458,6 +458,12 @@ The host is the console's (`PortKit.wasm`; N64: `consoles/n64/port_wasm/host.c`)
   buffer, by the microcode the task loads (Fast3D, F3DEX, F3DEX2 and S2DEX by the signature in its data; Rare's
   F3DDKR, which has none, by its data's CRC), and `PORT_FRAMES=folder` saves the frames shown as PNG.
   2D screens draw correctly; the 3D path draws a racing game's races, textured.
+  `tools/n64_frame_scan.py` searches the saved frames for what looks wrong without an emulator: static, one flat
+  colour, runs of black, a picture streaked sideways (a texture read with the wrong stride or width) and a frame
+  with only its top drawn. A finding names its graphics task for `tools/n64_frame_compare.py --frames`.
+  The Porting tab's *Scan for rendering faults* (`port/render_scan.py`) does it in one click: it runs the port headless
+  (`PORT_VTIME=1`, the controller script in the Scan settings, every nth frame), scans the frames, and lists what it
+  flagged, with pictures, in the side drawer; the frames are deleted afterwards.
 
 #### Functions with no C yet
 
@@ -580,6 +586,60 @@ register, the status stays), the port's `PORT_SWAP_LOG` says when it blanked, an
 number and length. On a racing game they did: six blanks of 25, 25, 21, 25, 25 and 21 graphics tasks on both sides
 (where each began differed for three of them: a menu advanced hundreds of tasks apart between runs). On the console the
 screen is black at those moments; before the port honoured osViBlack it showed the buffer's leftovers instead.
+Widened, with the port primed (`--prime-save`) and the console's pacing replayed: a racing game's race at 23 windows from graphics
+task 3,000 to 14,000 in steps of 500, 22 matched the emulator to the pixel (0.00 percent of pixels differing) and one (task
+10,500) differed by 48 percent exactly (25 percent with no match within 3 pixels), the backdrop's scroll about 25 pixels
+off at that one moment and exact again at 10,000 and 11,000. Each window is one graphics task's picture (the sky and mountain
+backdrop's), one route, one track.
+The one window of 23 that didn't match (task 10,500, 48 percent differing, then exact again at 11,000) is not a drawing or physics
+difference. Read from the dumps, the object whose position and look-at floats had been tracked is the chase camera (the console's
+writes to it come from `update_camera` and `updateChaseCamera`): through task 10,430 both sides have it at the same place, and
+by 10,460 both have moved it, 1,474 units apart. `updateChaseCamera` picks the camera's next track node with a random skip
+(`rand_seed(osGetTime())`, then `rand_next15() % 6`), so the camera cut goes where the clock's value at that moment sends it,
+and the console's cycle count and the port's virtual time are not the same number. Shifting every input event by two tasks
+left the episode unchanged. A game that seeds its random numbers from the clock will differ from the emulator wherever
+it draws on them, however exact the rest is; matching it means giving the port the clock value the console read at that call.
+What the emulator's blank save is, found: the game keeps a copy of its whole EEPROM in RAM (a racing game's at 0x800C70D0, 512
+bytes), and the console's copy (read from its RAM dump at task 600) has the same table as the port's but its first eight bytes
+differ (a time-seeded stamp, `4078d9de` on the console, `e62d8986` in the port) and so does one counter byte (`0x0C` against `0x00`).
+A fresh port started with exactly the console's 512 bytes as its `game.eep` reproduced the console's car position to the unit at
+tasks 3,400 and 6,000, where one started from no save, an all-zero or all-0xFF save, a 16 Kbit chip or no chip at all (every
+EEPROM call and the PIF's EEPROM channel answering as an absent device) did not. `--console-save` on
+`tools/n64_frame_compare.py` does it: a run of the script gives the port a save to look for, the game's copy is found in the
+console's RAM at `--save-at` (default frame 600) by the save's body past its header, and the console's bytes become the port's
+`game.eep` (from a fresh `--work`, three windows at tasks 3,000, 6,000 and 8,000 matched to the pixel, 0.00 percent differing).
+The sweep with `--console-save` from a fresh `--work` (a racing game's race at 23 windows, graphics tasks 3,000 to 14,000 in steps of
+500): 19 matched the emulator to the pixel (3,000 to 10,000 and 11,000 to 12,500, 0.00 percent differing), four did not: 10,500 (48
+percent, the clock-seeded random camera cut described above) and 13,000, 13,500 and 14,000 (17, 26 and 28 percent), where the chase
+camera, at the same place on both sides at 12,500, was 8 and 43 units apart at 13,000 and 3 and 476 at 14,000, a drift from after the
+cut and not a second jump. (With the save of a run of the script, `--prime-save`, the same sweep had matched at 22 of 23: the 13,000 and
+later windows then agreed; which windows agree after a clock-seeded random draw is not something the port controls.)
+Clock-seeded randomness can be replayed. `tools/n64_record_seeds.py ROM ADDRESS --input @script --vis N --out seeds.txt` records the
+argument the emulator's game gave its seeding function (the break on its address: `rand_seed(osGetTime())` in a racing game, 2,391
+calls through its first 7,142 retraces, mostly a spawn timer's, 87 the chase camera's); the port, with `PORT_SEED_REPLAY=seeds.txt`,
+gives those to a port-only override of that function (`port/wasm/src/rand_seed.c`, which stores what `port_seed_replay(seed)`
+returns, the host's: the next recorded number while there are any, the seed passed in after them). The call order was the same on both
+sides (the port's call 1,565, at task 10,450, was the console's first chase-camera seed). Race windows 3,000 to 14,000 in steps of 500,
+from the console's own save: 22 of 23 matched the emulator to the pixel (13,000, 13,500 and 14,000, 17 to 28 percent off without the
+replay, now 0.00), the one that doesn't being task 10,500: the chase camera was at (-162,621, -2,263, -172,450) in the port with
+and without the replay and at (-164,095, -2,322, -172,490) on the console, so that cut is not decided by the seed alone (the
+track-node list ahead of the player, or the player's own position, are what is left to look at).
+Why task 10,500 still differs with the seeds replayed: the camera cut's node is the one nearest to the player at the moment of the call
+(then advanced by `rand_next15() % 6`, which agrees: the generator's state was one call apart at the dump, no more), and the player is
+moving then (about 750 units over tasks 10,430 to 10,460, the same on both sides at every dump). The console's first
+chase-camera call is at retrace 5,320, in the frame that starts at graphics task 10,445; the port's call with the same index (its
+1,565th seed, the console's first chase-camera one) was at task 10,450, a frame later. So the port's call falls a frame later against
+the player's movement, and the nearest node differs: a one-frame phase offset inside a respawn sequence, which aligning the two runs
+by graphics task (the replay's grain) cannot see. It is not the seed, the player's position at the dumps, or the draw.
+`--prime-save` on `tools/n64_frame_compare.py` runs the port once through the input script first, so the compared run starts
+from the save (`game.eep`, in `--work`) that run wrote. It matters: on a racing game a port started from no save, from an all-zero
+or all-0xFF one, or from the save of a short boot had its car launch slower than the emulator's (and stay 2,000 and more
+units behind it until both stopped at the same wall), which looked like a difference in the game's physics. Started from the
+save of a full run of the script the port's car was at the console's position to the unit at every task sampled (3,400 and
+6,000 among them, three runs in a row), and the race matched the emulator to the pixel at seven of eight windows (tasks 5,000,
+6,000, 6,100, 6,500, 7,000, 8,000 and 14,000: 0.00 percent differing; 10,000: 0.02 percent within 3 pixels). Why the emulator's
+blank save acts like that one, and the port's blank one doesn't, is not known; until it is, compare moving scenes from a primed
+save, and read a car-position difference from an unprimed run with that in mind.
 `--tolerance PIXELS` on `tools/n64_frame_compare.py` also reports the share of pixels with no equal pixel within that many
 pixels of the other side's picture, which separates a scene drawn the same but a little apart from one drawn
 differently. On a racing game: the paused starting grid and the first frames of the race, 29 to 30 percent of pixels
@@ -631,6 +691,18 @@ START after the race has begun (A only), a racing game's race at seven windows f
 emulator to the pixel at three (8,000, 12,000 and 14,000: 0.00 percent differing), to 0.02 percent within 3 pixels at a fourth
 (10,000, a pixel or two of scroll), and differed by 4.3 to 8.1 percent within 3 pixels at the three earliest (6,000 to 6,500, the
 race's first seconds, still near the last pause presses). A moving scene is drawn exactly as the console draws it.
+Where the moving-race difference comes from, for a racing game with the console's pacing replayed and the same input (A only after
+the race starts): not the drawing and not the timing (the port's retrace count at tasks 2,727 to 6,500 was within two of the
+console's), but how far the car has travelled. Reading the car object's position out of the dumps (the object is found in the
+port's dump by its position floats), the two cars stand at the same place on the grid through task 3,400 (z within 24 units), then
+the console's accelerates harder: tasks 3,400 to 3,600 it covers 687 units to the port's 116, to 4,000 4,234 against 2,530, and it
+stays about 2,000 to 2,570 units (twenty-five to thirty frames of travel) ahead until both cars reach the same wall and stop,
+within a few units of each other, by task 7,000. That ahead-by-a-constant is why the picture is exact on straight road and
+exact again once both are stopped, and 28 pixels off (the backdrop's scroll, from the car's yaw) where the road bends and the
+console gets there first. Some of the car object's orientation-like floats already differ at task 3,400 (a value of
+-0.21 on the console, +0.16 in the port). The stick and buttons are fed the same way on both sides (zero stick, the same events).
+Why the console launches harder is not known (a clock the physics reads, or float arithmetic in the engine and the tyres, are
+the candidates).
 What `PORT_VTIME` did and didn't settle for a racing game, with the same retrace-timed input on both sides: the port's
 video-mode blanks fell at the console's graphics tasks within one frame (485, 521, 632 against 485, 521, 637; the race
 start at 2,727 and 2,773 exactly), where the wall-clock port had been hundreds of tasks apart, so the two run the same
@@ -747,3 +819,178 @@ Repeated helper definitions kept as saved compilation context receive identities
 module. Each caller retains its own helper body; a real owner file retains the public function. Address-taken
 uses keep the original console address, and private context is not promoted as a public runtime implementation.
 This avoids duplicate symbols without selecting an arbitrary helper variant or relaxing the linker.
+
+
+## Check pictures (Porting tab)
+
+The comparison described above is a button: Check pictures (app/picture_check.py, engine port/frame_compare.py, the same
+code as tools/n64_frame_compare.py). It builds the port, runs the ROM in the reversing emulator through a controller
+script timed in the game's own frames, takes the console's RAM at about a dozen moments (each a graphics task and the one
+after it) and does the same in the port, which starts from the console's own save and replays the console's pacing
+(`EMU_TASK_LOG` and `PORT_VTIME_TRACE`). Both are drawn by the port's renderer; the Porting tab counts the pictures that
+are identical, the same within the allowed shift (a scene caught a frame apart), and those that differ, and its drawer shows
+each differing picture as console, port and difference. What it can't do: the emulator draws nothing, so blank frames and
+the browser build still have no pixel reference; a game that needs its own seeds replayed (a port-only override, `PORT_SEED_REPLAY`)
+still shows those pictures as differences until it has one.
+
+### What a per-task picture can't tell (a second route's car-selection screen)
+
+Frame 1204 of a menu route differed by 63% between the console and the port, and the cause was not a rendering fault.
+The two display lists were word for word the same except for addresses (the console's heap and the port's lay buffers and
+textures out differently), and the textures they sample held the same bytes at their own addresses. What differed was the
+rest of the colour buffer. A task draws only part of a picture (here the 3D car) over what the buffer held, and the
+emulator draws nothing, so its RAM holds noise where earlier tasks drew the menu text, while the port's holds the text.
+Drawing the tasks before it too, each side's earlier pictures put back into the next task's RAM (`frames(..., carry)`),
+made the buffer drawn within the window match the emulator's to the pixel (0.00% differing). The other buffer, whose
+earlier pictures were drawn before the window began, still shows the noise: a window's first half only rebuilds the
+buffers (`compare_run` draws it and does not compare it), and Check pictures takes windows of 24 tasks. Single sampled tasks
+can also draw nothing at all (a route's 19 samples every 300 frames did), hence windows rather than points.
+
+Check pictures on a menu route, four windows of 24 tasks (600, 2392, 4184 and 5976): the first window's three pictures matched the
+emulator to the pixel (0.00% differing), and the other three drew no picture at all by the comparison's rule, which skips a colour
+image whose address is also the depth image's. Those tasks (a menu's later tasks, 250 triangles each, identical in size on both
+sides) set both images to address 0 in the renderer's own account of the list (`SetColorImage` and `SetDepthImage` 0, 320x480), so
+what the game draws there is not judged: a gap, not a match. Whether address 0 is the game's own render target or a segment the
+harness doesn't have (the renderer starts each task with no state from the tasks before it) is not settled; until it is, "neither
+side drew a picture" in Check pictures means "nothing was compared here", and a window with only those is no evidence.
+
+**What the RDP keeps between tasks, and what the emulator never wrote.** The windows that "set both images to address 0" were
+not the game's doing: the RDP keeps its colour image, depth image, scissor and modes from one task to the next (a menu
+and a race set the colour image in an earlier task than the ones that draw into it), and a renderer started fresh for each task
+has none of it. `frame_compare.Renderer` is one process drawing a window's tasks in turn (the harness without arguments reads
+"dump task" lines), so those tasks draw into their buffers. Beside the colour images the depth buffer is carried too: without it
+a race frame on the console was sky and hills only, the road and cars failing a depth test against the noise the emulator left
+(12-17% of the picture differing instead of 77%). Pictures are paired by the order a task draws them, since the console and the
+port lay their two buffers out at different addresses, and compared only where the console's tasks in the window drew (a
+background drawn before the window is noise on its side): a picture's `covered_pct` says how much. What is still not judged
+well: a pixel blended over earlier history (a translucent menu layer) depends on a background the emulator never made, so those
+differ whatever the port does. On a race window the remaining difference is the opponent's car: the same frame on both sides
+except that car, which is drawn a little apart, a divergence of the game's own state (its opponent's position), not of the renderer.
+
+**A lead for the race frame's one remaining difference (not yet traced to a function).** At task 615 of a menu-to-race route the
+console and the port draw the same frame except the opponent's white and blue car, whose pixels are two to three times darker
+on the port. The display lists are the same but for addresses and the triangles' shade words differ: the shade comes from the
+vertex data the car's list loads (`G_VTX`, 32 vertices), whose positions are the same on both sides while the colour/normal
+field of every one of the port's vertices is `46 52 45 45` (the ASCII "FREE", the allocator's fill for unused memory), where the
+console's hold distinct bytes. So the port's code for that car never writes the field the lighting reads, or writes it
+somewhere else: a difference of the game's own state, found only because the pictures could now be compared. Where to look next:
+who writes that field on the console (`emulator.run(watches=...)` on a vertex's colour word in a run that reaches the task; the
+address moves between runs, so take it from a dump of the same run), and whether that function runs in the port.
+
+**Correction to the lead above.** Putting the console's value of that field into every one of the port's vertices for the
+tasks of the frame (tasks 609 to 615, each vertex load paired with the console's by order) did not bring the car closer: the
+picture differed 18.5% from the console's instead of 16.65%. So "the port never writes the lighting field" is not shown to be the
+cause. What is known: the field holds leftover memory on both sides (text fragments on the console, the allocator's fill on the
+port: nothing in the game writes it for that model), so the shading of that car depends on what the heap held before, which
+differs between the two. Whether the car is lit by that field at all, and which tasks draw it, is not established.
+
+**The menu's second task matches too (0.00%).** The 47-73% that a menu's second task showed was the comparison, not the port. The
+console's buffers before a window hold noise where the game had drawn, so the console's side is now started from the port's
+buffers as they were at the window's first task (a second pass of `compare_run`: both sides then draw the window over the same
+background, and a difference is the window's own drawing). That alone left the lower half wrong: the first task of a pair draws 240 lines,
+the second 480, and carrying the first task's shorter picture on replaced the seeded lower half with the console's noise. Carrying now
+keeps the tail of what was there. On the menu route, windows at tasks 2392, 4184 and 5976 are 0.00% differing at every compared task
+(both buffers, both tasks of each frame); the race window's later tasks are still 12-17% (the opponent car, above).
+
+**The opponent car: where the difference starts (still not fixed).** Taking the console's whole vertex data into the port's for a task of the race window leaves 99.7% of the RDP commands equal, and the matrices are all equal (0 of 19 differ). What still differs are values the game builds into the display list: a render-mode word (`c8113078` on the console, `c8104b70` in the port), four triangles, and the environment colour that lights the car (`c3c3c3` on the console, `fefefe` in the port). A watch on the console's display-list word shows that colour written every frame by one function (func_80016B3C, called with 0xC300 as the intensity): it averages 12 bytes sampled from a byte array (a light map read at the car's position), scales them to 0..255 and clamps. The console's average gives 0xC3; the port's gives 0xFF, so the 12 bytes the port reads differ, from the array's contents or from the position they are taken at. The player's car, lit by the same code, matches. Next: read those 12 samples in both runs (their addresses are the function's `lbu` at 0x80017518) and see whether the indexes or the bytes differ.
+
+**The opponent car: one branch, not three differences.** `func_80016B3C` sets a brightness and the mode flags for the object it draws:
+the player's car (`obj == gGame->unk24`) takes the light-map average, any other car with the shade mode at 2 and the flag byte at
+`stream_state + 0x7678` zero takes `if (func_8007BA1C(obj) == 0xFF) { flags &= ~2; bright = 0xC4; } else bright = 0xFF`.
+Recorded at the function's entry, the opponent's calls have exactly that state (object 0x802A5000, `gGame->unk24` 0x80159640, shade
+mode 2, flag 0), and the console's display list holds the 0xC4 result (env colour `c3c3c3`: 0xFF * 0xC4 >> 8) and the render-mode word
+`flags &= ~2` gives (`c8113078`). The port's holds env `fefefe` (bright 0xFF) and `c8104b70`: so the two differences found earlier are one:
+the port does not take the `== 0xFF` branch. `func_8007BA1C` itself returns 0xFF in the port for those calls (run through PORT_CALL, at its entry
+and at the call site's state, six calls each, matching the console), so what differs is the port's `func_80016B3C` reaching or testing it. The port's
+source for that function is the project's decompiled C (`src/code_80012114/func_80016B3C.c`), whose branch conditions read the same as the
+original's; the next step is a trace inside the port's run of that function (which condition fails), or the port's function run
+through behaviour comparison against the recompiled one with the opponent's recorded state.
+
+**The opponent car, and the one-frame offset: the port's game state leads the console's by about a logic frame at the same graphics task.** The values
+the sight-cone test reads (the track's saved line points at 0x800A1860..0x800A1874, set each logic frame) change in the console's RAM at graphics
+tasks 603, 608, 613, 618 and in the port's at 604, 609, 614, 619, and each value the console holds from task 603 to 607 the port already holds at task 600
+to 603: the port's logic is four tasks (of a five-task frame) ahead of the console's at the same task number. The tasks that draw before the
+logic update (a frame's first task: the background) match to the pixel, and the ones that draw after it (the cars, with the sight-cone test
+at a threshold) are a frame apart: the opponent's brightness branch reads a result of 0xFF on the console's state and 0x3C on the port's
+(`objInsideSightCone` run through PORT_CALL on each side's own RAM; the opponent's object address is not the same in the two
+runs, so run it on the console's recorded call for that object). This is the same kind of difference as a camera cut one frame off, and the
+likely place to look is the timing of the RSP/RDP completion events and when the game's logic thread starts its next frame (host.c: `rcp_raise`, delivered from the
+tick when every game thread waits in virtual time, within 400 microseconds otherwise), against what the emulator does.
+
+**The completion delay is not the cause (tested).** With `PORT_RCP_RETRACES=1` (a task's SP and DP interrupts held one retrace after it starts, host.c) the sight-cone line points still change at
+the port's tasks 604, 609, 614, 619 and the console's 603, 608, 613, 618, and the race window's later tasks differ as before (12-18%). So when the RSP/RDP interrupts arrive does
+not move the game's logic against the graphics tasks; the lead of about a logic frame is somewhere else: how many logic updates the game has run when
+it hands over its nth task (the console's first retraces, its loading, the scheduler's frame skips), which the trace of the retrace at each task start should replay
+but evidently does not for the logic thread's own timing. The next experiments: log the port's and the emulator's retrace count at each logic update (a break on the function that updates the line points) and compare them task by task.
+
+**Holding retraces at the console's count did not move the logic either (tested).** `PORT_VTIME_HOLD` (host.c, on with `PORT_VTIME_TRACE`: no retrace past the one a task started at until
+the game has started that task) left the race window exactly as it was (614-616 and 619-621 at 12-17%) and the line points still change at the port's tasks 604, 609, 614, 619 and the
+console's 603, 608, 613, 618. The console updates them every 3 retraces (watch on the line points: retraces 482, 485, 488...) and starts tasks 603-607 at retrace 542, so the port's
+logic is not simply running on more retraces. Still untested: the retrace count at each logic update in the port (a log in the host when the game writes the line points), and
+whether the game's logic is paced by something else the console has, such as its audio interface or a timer the port's virtual time does not replay.
+
+**Raising the console's retraces before a task starts, from the thread that starts it, stalls the game (tried, reverted).** The change (host.c, `retrace()` called in `osSpTaskStartGo` until
+the retrace the console was at) left the game's line points unchanged after task 600 and every compared picture 95-100% different: the game does not run when its retraces are fired from inside the
+call that starts a task. A way to give the threads the retraces before the task would have to let them run first (a yield, or the retraces raised by the host's loop with the game held in
+`osSpTaskStartGo` until they have been handled), which is not what was tried.
+
+**Waiting for the game's threads to idle between the catch-up retraces stalls the game too (tried, reverted).** The port's message log shows a frame's catch-up retraces
+fired back to back (three sends on the game's VI queue, then the receivers), where the console's threads ran between them. Calling `wait_retrace()` before each catch-up
+retrace (host.c, `PORT_VTIME_BURST`) left the game's line points unchanged after task 600 and every compared picture 95-100% different, as raising the retraces from
+inside `osSpTaskStartGo` had: both change how many virtual clock periods pass per retrace (`wait_retrace` advances `vnext_us` and the virtual clock each call), so the
+game's timers see a different time. A version that gives the threads time between retraces without advancing the clock again is untried. The message log
+also shows the port's queues sit at other addresses than the console's for the dynamically allocated ones (only the static queues at 0x800B4xxx match), so the two logs
+compare by the static queues and the order of operations on them.
+
+**Four host timing changes for the logic lead, none of which helped, are removed.** The delay of the RSP/RDP interrupts (`PORT_RCP_RETRACES`), the hold of retraces at the console's count
+(`PORT_VTIME_HOLD`) and pacing the catch-up retraces with a brief wait for the game's threads to idle without moving the clock (`PORT_VTIME_BURST`) each left the race window as it was (the
+line points still change at the port's tasks 604, 609, 614, 619 and the console's 603, 608, 613, 618; the opponent's frames 12-18% different), and two earlier tries (raising the retraces from inside
+`osSpTaskStartGo`, `wait_retrace` before each catch-up retrace) stalled the game. host.c is back to the code before them. The logic lead is not a matter of when the host raises
+retraces or the RSP/RDP interrupts; what remains untried is the order of the game's own threads (the message logs: the port's `PORT_MSGLOG`, the emulator's breaks on osSendMesg/osRecvMesg at 0x8008D4A0 and 0x8008D090, compared by
+the static queues at 0x800B4xxx) and whether the console's game does work the port's skips between retraces.
+
+**What the message logs show (retraces 536-551 of a menu-to-race route; `PORT_MSGLOG` with the retrace count against the emulator's breaks on osSendMesg/osRecvMesg/osJamMesg).** Compared on the static
+queues (0x800B4xxx; the dynamically allocated ones sit at other addresses in the two runs, and the interrupt-sent messages, the host's `t-1` sends, are not calls the emulator's breaks see):
+the console's game does work at every retrace (about 43 operations at the retraces a task starts, 11-17 at the ones between), the port's does it at the task retraces only (53-57 operations there,
+0-3 between). The VI queue (0x800B42E4) shows why: the console's consumer receives each retrace's message at that retrace; the port's holds two messages together (`send ... valid 1/12`)
+and receives them back to back at the second, so two of every three retraces' work happens a retrace late, at the next task start. Those pairs are the catch-up retraces fired when a task starts. Pacing the catch-up
+retraces with a wait for the threads to idle (tried, removed) did not change when the line points change, but the message log was not looked at then: whether the pairs disappeared is not known. Checking that
+(the same pacing, then `PORT_MSGLOG`, looking for `valid 1/12` on the VI queue) is the cheap next step, and the result would say whether the lag is the batching or something else.
+
+**Fixed: the VI messages are no longer batched; the logic lead is unchanged.** With the catch-up retraces paced by a strict idle (no game thread running, 20 ms at most: `vtime_idle(..., 1)` in host.c, `PORT_VTIME_BURST=1` for the old
+back-to-back firing) the port's VI queue never holds two messages (0 of 101 sends from retrace 500 to 600) and the game does work at every retrace (6-18 operations a retrace on the static queues against the console's 11-17), as the
+console's does. The race window is exactly as before: the line points change at the port's tasks 604, 609, 614, 619 and the console's 603, 608, 613, 618, and the opponent's frames are 12-18% different. So the late handling of two of three
+retraces was real but is not what puts the port's logic a frame ahead. Kept because it makes the port's pacing match the console's. What remains untried: compare the two message logs operation by operation inside one frame (the
+order of the sends and receives on the static queues, which this only counted), since the same counts can come in another order.
+
+**What the numbers say about the logic lead (tasks 600-623 of a menu-to-race route).** The task numbering is not offset: matching each task's display-list size (the `.task` sidecars) of the console against the port's gives the same
+sequence at shift 0 (2816, 272, 88, 680, 5312 bytes, a five-task frame) and no other shift. The one task whose list differs is the fifth of each frame, the one that draws the cars: 5312 bytes on the console, 5328 in the port (two more
+commands, the render-mode pair the opponent's `flags &= ~2` branch changes), and the pictures that differ are that task and the next two (the cars carried on). In that task the port's line points are the next frame's values and
+the console's are the current frame's: the console's logic update for frame k+1 runs after the cars' list of frame k is built (it first shows in its RAM at the frame's fourth task, 603, 608...), the port's before it (604, 609...). So
+what differs is the order of two things inside a frame, the logic update and the building of the cars' display list, not the retrace count or the task numbering. The game's seeding function is also called once a frame
+on both sides and the port's count is one call ahead at the same task (`PORT_SEED_LOG`, against the emulator's breaks on `rand_seed`), the same one-frame lead. Replaying the console's seeds in order keeps the
+draws aligned (each call gets the console's next seed), but a draw that depends on when in the frame it is made would still differ.
+
+**The console's order inside a frame (breaks on the two functions, `emulator.run(breaks=[0x8007B2A4, 0x80016B3C])`, retraces 536-551, one frame every 3 retraces).** Each frame calls, in this order:
+`checkNearPoint(player)` (the function that writes the line points at 0x800A1860, called with the player's object), `draw_object_dl(opponent)`, `checkNearPoint(player)` twice, `draw_object_dl(player)`. So the line points the sight-cone
+test reads while the opponent's list is built are the ones the first `checkNearPoint` of that frame has just written. The port's order has not been traced: an lldb run with breakpoints on the generated functions
+(`w2c_game_checkNearPoint0x2E1`, `w2c_game_draw_object_dl0x2E1`, a callback writing the retrace count) set both but logged no hits from a live run (the process launched from lldb's batch mode did not report exiting), which is the thing to
+fix first. With that, the order and the retrace of each call in the port set against the console's lines above would say which call is early.
+
+**Delivering the RSP/RDP interrupts at the next OS message call (tried, reverted).** The order trace (console: a frame's five graphics tasks, an audio task, then the line-point update;
+port: the update between the fourth and fifth task) suggested the interrupts, held to the host's tick, let the logic thread run in the gap the console's scheduler handler would have filled.
+Raising them at the next `osSendMesg`/`osRecvMesg` of any thread (host.c `rcp_at_next_call`) changed the game's pacing altogether instead: with the console's trace, task 600 came at retrace 169 (the console's: 539),
+about three graphics tasks a retrace, and the line points never changed in the log's span. So the game's own sequence (what it waits for between tasks) depends on the interrupts' timing more than this change allows for;
+the console's ordering is still unexplained, and the port's `PORT_ORDER_LOG` (`ORDER task n vi v`, `ORDER change old -> new`) against the emulator's watch on the word plus a break on `osSpTaskStartGo` (0x8008DF0C) is the way to test the next idea.
+
+**Who runs when: the console's threads, and the second try that changed the pacing (reverted).** The emulator's running thread (`__osRunningThread`, 0x800A2520, read from the RDRAM recorded at each break) at each `osSpTaskStartGo` and each line-point update:
+the scheduler starts the graphics tasks from threads at priority 113 and 115, the game's main thread (priority 5) runs `checkNearPoint`. So the five tasks of a frame start back to back (each interrupt runs the scheduler again before the main thread gets the CPU) and the logic runs after them. The
+port holds the interrupts until its host tick and counts the lone main thread as idle, so the logic ran between the fourth and fifth task. Two ways of raising the interrupts earlier (at the next OS message call of any thread; when a thread is about to wait)
+both changed the game's pacing altogether: with the console's trace, graphics task 610 came at retrace 170 where the console's is 545, and the line points never changed in the log's span. The
+interrupts' timing is tied to something in the host's virtual time (the tick that decides every thread is idle, and the retrace catch-up) that these changes break. Next: find what in `wait_retrace`/`vtime_idle` the earlier delivery
+upsets (log `vtime_forced`, the 3 s wall-time fallbacks: a game whose threads never idle waits 3 s a retrace), then deliver at the block with that fixed.
+
+**Delivering a task's interrupts when its starter next waits (the third try, reverted).** Only the thread that started the task, when it next has to wait, got the RSP and RDP interrupts, the narrowest form of "the scheduler runs again before the logic" the
+host allows. The pacing broke the same way: with the console's trace, graphics task 608 at retrace 170 (the console's: 545), no change of the line points in the log. Three ways of delivering the interrupts earlier have now each
+changed what the game waits for between tasks, not only when the logic runs. The log with the original delivery (`ORDER task 618 vi 536`, the line points changing between tasks 618 and 619) is the baseline.
+Further work on the order inside a frame needs a different lever than the interrupt timing: the game's own message flow (which reply the main thread waits for between tasks) from the port's `PORT_MSGLOG`.

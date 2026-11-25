@@ -4,24 +4,82 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from ... import toolchains
 
 
+def _crc_tool(root: Path) -> None:
+    """Public N64 projects fix the ROM's checksum with tools/n64crc, which their `make dependencies` compiles next to
+    a whole IDO build. Compile just that one file when it's missing, so the final link step has its tool (a
+    failure here stays silent: the project's own error then says what it lacks)."""
+    source, tool = root / "tools" / "n64crc.c", root / "tools" / "n64crc"
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if source.is_file() and not tool.exists() and cc:
+        try:
+            subprocess.run([cc, str(source), "-o", str(tool)], capture_output=True, timeout=120,
+                           stdin=subprocess.DEVNULL, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def _wrap_foreign_ido(project) -> None:
+    """On a Mac a project's own copy of IDO is usually a Linux program (its CI's) its build can't run ("Exec format
+    error"). Replace each such `cc` driver, once, with a script that runs the installed IDO of the version its
+    path names (5.3 or 7.1); the original is kept beside it as cc.linux. Only drivers that are Linux ELF files
+    are touched, so a project's own Mac build, or its own makefile's redirect, stays as it was."""
+    if sys.platform != "darwin":
+        return
+    done = project.root / ".decomp-wtf" / "build-tools" / ".ido-wrapped"
+    tools = project.root / "tools"
+    if done.exists() or not tools.is_dir():
+        return
+    for driver in tools.glob("**/cc"):
+        if len(driver.relative_to(tools).parts) > 5 or driver.is_symlink() or not driver.is_file():
+            continue
+        try:
+            with open(driver, "rb") as f:
+                if f.read(4) != b"\x7fELF":
+                    continue
+        except OSError:
+            continue
+        version = re.search(r"(?<!\d)(5)[._](3)(?!\d)|(?<!\d)(7)[._](1)(?!\d)", str(driver.relative_to(tools)))
+        if not version:
+            continue
+        tid = "ido-" + ("5.3" if version[1] else "7.1")
+        if toolchains.installed(tid) is None:
+            continue  # compiler installation and license acceptance stay in Setup
+        source = toolchains.require(tid) / "cc"
+        if not source.is_file():
+            continue
+        driver.rename(driver.with_name("cc.linux"))
+        driver.write_text(f'#!/bin/sh\nexec "{source}" "$@"\n', encoding="utf-8")
+        driver.chmod(0o755)
+    done.parent.mkdir(parents=True, exist_ok=True)
+    done.write_text("", encoding="utf-8")
+
+
 def command(project, argv: list[str]) -> list[str]:
     if os.name == "nt":
         return argv  # these compiler binaries run inside WSL on Windows
-    if Path(argv[0]).name not in ("make", "gmake") or any(a.startswith("IDO=") for a in argv[1:]):
+    _wrap_foreign_ido(project)
+    if Path(argv[0]).name not in ("make", "gmake") or any(a.startswith(("IDO=", "CC=")) for a in argv[1:]):
         return argv
     makefile = project.root / "Makefile"
     if not makefile.is_file():
         return argv
+    _crc_tool(project.root)
     text = makefile.read_text(encoding="utf-8", errors="replace")
-    declared = re.search(r"^IDO\s*[:?]?=\s*([^\s#]+)", text, re.M)
+    # The variable is usually IDO; some projects name it CC, indented inside an if/else (a community decomp of a
+    # racing game builds its compiler in tools/ and picks it with `CC := ...` under `else`). A command-line
+    # value beats the makefile's own assignment, so one override reaches both spellings.
+    declared = re.search(r"^[ \t]*(IDO|CC)[ \t]*[:?]?=[ \t]*([^\s#]*/(?:5\.3|7\.1)/(?:[^\s#]*/)?cc)[ \t]*(?:#.*)?$", text, re.M)
     if not declared:
         return argv
-    path = declared[1]
+    name, path = declared[1], declared[2]
     # Resolve only unique literal declarations (usually TOOLS := tools), never Make functions or conditions.
     for variable in re.findall(r"\$\((\w+)\)", path):
         values = set(re.findall(rf"^{re.escape(variable)}\s*[:?]?=\s*([^\s#$]+)\s*$", text, re.M))
@@ -45,4 +103,4 @@ def command(project, argv: list[str]) -> list[str]:
         alias.symlink_to(source, target_is_directory=True)
     if not alias.is_symlink() or alias.resolve() != source.resolve():
         return argv
-    return [*argv, "IDO=" + (alias / "cc").relative_to(project.root).as_posix()]
+    return [*argv, name + "=" + (alias / "cc").relative_to(project.root).as_posix()]
