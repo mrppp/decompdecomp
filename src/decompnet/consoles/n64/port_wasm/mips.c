@@ -109,6 +109,7 @@ uint32_t port_tlb_canon(uint32_t a);
 uint32_t port_tlb_alias(uint32_t a);
 uint32_t port_tlb_jump(uint32_t slot, uint32_t imm); /* the target of a j/jal: top bits from the window's virtual base */
 uint32_t port_tlb_virtual(uint32_t a); /* a KSEG0 spelling beyond the RAM of a high window's virtual address: that address */
+uint32_t port_tlb_virtual_of(uint32_t a); /* the virtual address of the code in a high window's physical frame (0: none or two) */
 uint32_t port_tlb_call(uint32_t a); /* a call spelled against KSEG0 that a window kept at its physical address maps */
 uint32_t port_tlb_spelled(uint32_t a); /* the project's name (0x80000000 | virtual) for code such a window holds */
 void port_tlb_write(uint32_t pm, uint32_t entry_hi, uint32_t lo0, uint32_t lo1);
@@ -122,7 +123,13 @@ int port_tlb_fault(uint32_t epc, uint32_t badvaddr, uint32_t cause); /* host.c: 
    KSEG2/KSEG3 space) */
 HOT uint32_t mapped(uint32_t a) { return __builtin_expect(a - 0x80000000u >= 0x40000000u && port_tlb_n, 0) ? port_tlb_canon(a) : a; }
 HOT uint8_t *at_load(uint32_t a) { a = mapped(a); return M + (a >= 0xA0000000u ? (uint32_t)port_io_load(a) : a); }
-HOT uint8_t *at_store(uint32_t a, uint64_t v) { a = mapped(a); return M + (a >= 0xA0000000u ? (uint32_t)port_io_store(a, v) : a); }
+extern uint32_t port_spell_lo, port_spell_len, port_real_lo, port_real_len;
+void port_tlb_spell_store(uint32_t a); /* host.c: the game's own data at the spelling of a window */
+HOT uint8_t *at_store(uint32_t a, uint64_t v) {
+    if (__builtin_expect(a - port_spell_lo < port_spell_len, 0)) port_tlb_spell_store(a); /* (a KSEG0 name of memory a window is spelled at) */
+    a = mapped(a);
+    return M + (a >= 0xA0000000u ? (uint32_t)port_io_store(a, v) : a);
+}
 HOT uint32_t lw(uint32_t a) { uint32_t v; memcpy(&v, at_load(a), 4); return __builtin_bswap32(v); }
 /* An instruction: where a window's code was never written at its spelling (zero words), the bytes at its physical
    address (the boot chip's image, a decompressed program). A block of four zero words, so a nop alone is no hole. */
@@ -711,7 +718,7 @@ static __thread struct { uint32_t from, to, ra, sp; } jumps[JUMP_HISTORY];
 static __thread unsigned jump_n;
 static void jump_history(const char *why, uint32_t pc) {
     static int said;
-    if (tracing < 3 || said++ >= 4) return;
+    if (tracing < 3 || said++ >= 16) return;
     fprintf(stderr, "interpreter: %s at %08X; the last jumps (from -> to, $ra, $sp):\n", why, pc);
     for (unsigned i = 0; i < JUMP_HISTORY && i < jump_n; i++) {
         unsigned k = (jump_n - 1 - i) % JUMP_HISTORY;
@@ -946,6 +953,29 @@ static int step(Cpu *c, uint32_t pc, uint32_t op, uint32_t *target) {
 #undef LIKELY
 }
 
+/* PORT_PC_TRACE=addr,addr,...: a line with the registers each time the interpreter executes an instruction at one of the
+   addresses (a function's entry, a call site): how a game's own control flow (its coroutines, its dispatchers) is followed. */
+static uint32_t pc_trace_at[8];
+static int pc_trace_n = -1;
+static void pc_trace(const Cpu *c, uint32_t pc) {
+    for (int i = 0; i < pc_trace_n; i++)
+        if (pc_trace_at[i] == pc) {
+            fprintf(stderr, "pc %08X: a0=%08X a1=%08X a2=%08X a3=%08X sp=%08X ra=%08X v0=%08X t0=%08X s0=%08X s1=%08X s2=%08X s3=%08X\n",
+                    pc, (uint32_t)c->r[4], (uint32_t)c->r[5], (uint32_t)c->r[6], (uint32_t)c->r[7], (uint32_t)c->r[29],
+                    (uint32_t)c->r[31], (uint32_t)c->r[2], (uint32_t)c->r[8], (uint32_t)c->r[16], (uint32_t)c->r[17],
+                    (uint32_t)c->r[18], (uint32_t)c->r[19]);
+            return;
+        }
+}
+static void pc_trace_init(void) {
+    pc_trace_n = 0;
+    const char *e = getenv("PORT_PC_TRACE");
+    while (e && *e && pc_trace_n < 8) {
+        pc_trace_at[pc_trace_n++] = (uint32_t)strtoul(e, (char **)&e, 16);
+        if (*e == ',') e++;
+    }
+}
+
 /* PORT_INTERP_STATS=1: the instructions interpreted so far and their rate, printed every 16 M (the host ends with
    _exit, so there is no later moment to print at): how the interpreter's speed is measured. */
 static void interp_stats(unsigned long n) {
@@ -967,13 +997,18 @@ static void interp_stats(unsigned long n) {
 
 /* Run the function at `entry` with the registers `r` and float registers `f` as o32 left them ($sp, $ra: the
    caller's sentinel, set by port_mips_enter), until it returns. */
+uint32_t port_interp_pc;
 void port_mips_run(uint32_t entry, uint64_t *regs, uint32_t *fregs) {
     if (!M) M = port_memory();
     if (tracing < 0) tracing = getenv("PORT_INTERP_TRACE") ? atoi(getenv("PORT_INTERP_TRACE")) : 0;
+    if (pc_trace_n < 0) pc_trace_init();
     entry = port_tlb_virtual(entry);
     /* an entry at a mapped virtual address (a callback pointer into a window): its virtual pc is kept from the first
        instruction, as for a jump into a window, so a branch lands on the next virtual page, not the next frame */
     uint32_t entry_virtual = (entry - 0x80000000u >= 0x40000000u && port_tlb_n && mapped(entry) != entry) ? entry : 0;
+    /* an entry at the spelling of a window kept at its physical address is the code the console runs at the window's
+       virtual address: its jumps keep the virtual top bits (a `jal 0x00201634` made from physical 0x1C60 is virtual) */
+    if (!entry_virtual && __builtin_expect(entry - port_real_lo < port_real_len, 0)) entry_virtual = entry & 0x7FFFFFFFu;
     entry = port_tlb_call(mapped(entry));
     port_note_entry(entry);
     if (tracing) fprintf(stderr, "interpreter: %08X (%08X, %08X, %08X, %08X)\n", entry, (uint32_t)regs[4],
@@ -990,6 +1025,7 @@ void port_mips_run(uint32_t entry, uint64_t *regs, uint32_t *fregs) {
        which is what the rest of the port finds functions by): the next instruction of a page is the next virtual
        page's, not the next frame in RAM (a game that pages its code in puts consecutive pages in any frames). */
     uint32_t vpc = entry_virtual;
+    if (!vpc && port_tlb_n) vpc = port_tlb_virtual_of(entry); /* (code entered by its frame's name: its virtual address) */
     unsigned long steps = 0;
     int zeros = 0;
     unsigned fault_n = 0;
@@ -1031,6 +1067,12 @@ void port_mips_run(uint32_t entry, uint64_t *regs, uint32_t *fregs) {
                 }
             }
         }
+        /* code running at the spelling of a window that has since been kept at its physical address (the game's own data
+           arrived at the spelling, and the copy of the code made there is gone) goes on from the window's alias */
+        if (__builtin_expect(pc - port_real_lo < port_real_len, 0)) {
+            if (!vpc) vpc = pc & 0x7FFFFFFFu;
+            pc = port_tlb_call(pc);
+        }
         uint32_t op = fetch(pc), target = 0;
         if (op == 0 && ++zeros > 64) { /* a run of nothing: no code there (no ROM loaded where it was looked for) */
             fprintf(stderr, "interpreter: no instructions at %08X (from %08X): the function returns at once\n", pc, entry);
@@ -1038,6 +1080,7 @@ void port_mips_run(uint32_t entry, uint64_t *regs, uint32_t *fregs) {
             break;
         }
         if (op) zeros = 0;
+        if (__builtin_expect(pc_trace_n, 0)) pc_trace(&c, pc);
         if ((op >> 26) == 0 && (op & 63) == 12 && fetch(0x80000180u)) {
             /* syscall: an exception, taken as the console takes it. The game installed its own handler at the general
                exception vector (libultra's osInitialize copies a jump to __osException there), and a game's handler
@@ -1132,6 +1175,16 @@ void port_mips_run(uint32_t entry, uint64_t *regs, uint32_t *fregs) {
             vpc = nv;
             target = mapped(nv ? nv : target);
             if (nv && target == nv) vpc = 0; /* not mapped: the fetch faults, as before */
+            /* a jump to the spelling of a window kept at its physical address runs the code there (the project spelled
+               a call `0x80201CB0` for what the console runs at virtual 0x00201CB0, physical 0x1CB0), at that virtual pc */
+            if (__builtin_expect(target - port_real_lo < port_real_len, 0)) {
+                if (!vpc) vpc = target & 0x7FFFFFFFu;
+                target = port_tlb_call(target);
+            }
+            /* a jump or call to code in a high window's frame by the frame's name (the project spells those calls by
+               the physical address): the code's virtual address is that window's, so its next page is the next
+               virtual page and not the next frame */
+            if (!vpc && port_tlb_n) vpc = port_tlb_virtual_of(target);
         }
         if (tracing >= 3) {
             unsigned k = jump_n++ % JUMP_HISTORY;
@@ -1162,7 +1215,9 @@ void port_mips_run(uint32_t entry, uint64_t *regs, uint32_t *fregs) {
     counted:
         if (!(++steps & 0xFFFF)) { /* a thread spinning here gives the others their turn */
             interp_stats(0x10000);
+            port_interp_pc = pc; /* (PORT_SAMPLE prints it: where the interpreted game code is) */
             if (tracing > 1) fprintf(stderr, "interpreter: %08X still running, at %08X after %lu instructions\n", entry, pc, steps);
+            if (tracing >= 3 && steps >= (1ul << 22) && !(steps & (steps - 1))) jump_history("a thread still running", pc); /* (a spin: what it was called from, at each power of two) */
 #ifndef PORT_WEB
             port_boot_spin();
 #endif
@@ -1265,7 +1320,10 @@ void port_mips_copy_in(uint64_t *r, int slot, uint32_t from, int words) {
    runs through a window never started its threads' work. */
 int port_mips_has_code(uint32_t address) {
     if (!M) M = port_memory();
-    address = mapped(address);
+    /* the code at a name the project spells against a window kept at its physical address is at the physical alias
+       (the entry below goes there: port_tlb_call): asked at the spelling, a function the recompiler couldn't
+       translate looked empty and was skipped as a stub, and a game whose main thread called it never moved on */
+    address = port_tlb_call(mapped(address));
     if (address < 0x80000400u || address >= 0x80800000u || (address & 3)) return 0;
     return fetch(address) != 0 || fetch(address + 4) != 0;
 }

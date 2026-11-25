@@ -155,7 +155,7 @@ class Pool:
         self.background=background
         self.executor = Executor(max_workers=count, purpose='Repair proposal generation',thread_name_prefix='deep-proposals')
         self.capacity = threading.BoundedSemaphore(count*2)
-        self.idle = []  # workers between requests, taken by whichever thread runs the next one
+        self.idle = []  # open workers no request holds: a worker belongs to the pool, not to a thread
         self.workers = []
         self.lock = threading.RLock()
         self.cache = OrderedDict()
@@ -165,21 +165,8 @@ class Pool:
         self.submitted = 0
         self.running = 0
 
-    def _borrow(self):
-        """An idle worker, or a new one: never one per thread."""
-        with self.lock:
-            while self.idle:
-                worker = self.idle.pop()
-                if not worker.closed.is_set():
-                    return worker
-            if self.stop.is_set():raise RuntimeError('Proposal generation stopped')
-            worker = Worker()
-            self.workers = [w for w in self.workers if not w.closed.is_set()]+[worker]
-            return worker
-
     def work(self, request, check):
         with self.lock:self.running += 1
-        worker = None
         try:
             def checkpoint():
                 from .purpose_work import checkpoint as check_owner
@@ -187,26 +174,30 @@ class Pool:
                 if self.stop.is_set():raise RuntimeError('Proposal generation stopped')
                 check()
             for attempt in range(RETRIES+1):
-                # A worker is borrowed for one request and handed back, not kept per thread: the executor replaces
-                # its threads, and each new thread started a process while the old thread's stayed open, idle, until
-                # the pass ended. One game's six-lane pass left 457 of them (13 GB) after five hours.
-                worker = self._borrow()
+                # A worker per *thread* leaked: the executor lends its threads back after a few idle seconds and
+                # borrows others, so every new thread started a process (~50 MB each) and the old ones stayed up
+                # until the pool closed: hundreds of them, tens of GB, in half an hour of a deep search.
+                with self.lock:
+                    worker = None
+                    while self.idle and worker is None:
+                        worker = self.idle.pop()
+                        if worker.closed.is_set():worker = None
+                if worker is None:
+                    worker = Worker()
+                    with self.lock:
+                        self.workers = [w for w in self.workers if not w.closed.is_set()]+[worker]
                 try:
-                    return worker.run(request,checkpoint)
+                    result = worker.run(request,checkpoint)
                 except WorkerStopped:  # (run closed it: the next try starts a fresh one)
                     if attempt == RETRIES:raise
                     log.info('Asking a fresh proposal worker again (attempt %d of %d)',attempt+2,RETRIES+1)
+                    continue
+                with self.lock:
+                    if not self.stop.is_set() and not worker.closed.is_set():self.idle.append(worker);return result
+                worker.close()
+                return result
         finally:
-            surplus = None
-            with self.lock:
-                self.running -= 1
-                if worker is not None and not worker.closed.is_set():
-                    if self.stop.is_set() or len(self.idle) >= self.count:
-                        surplus = worker
-                    else:
-                        self.idle.append(worker)
-            if surplus is not None:
-                surplus.close()
+            with self.lock:self.running -= 1
 
     def submit(self, args, kwargs, check):
         if self.background:kwargs = {**kwargs, '_background':True}
@@ -284,6 +275,4 @@ class Pool:
     def close(self):
         self.stop.set()
         self.executor.shutdown(wait=True,cancel_futures=True)
-        with self.lock:
-            workers, self.workers, self.idle = self.workers, [], []
-        for worker in workers:worker.close()
+        for worker in self.workers:worker.close()
