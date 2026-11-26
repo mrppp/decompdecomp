@@ -1313,9 +1313,11 @@ def test_the_smart_order_is_the_one_a_pass_always_used():
     assert deep_sweep.order_functions(rows, details, 'smart') == deep_sweep.closeness_order(rows, details)
 
 
-def test_a_pass_starts_at_2500_candidates_and_remembers_which_functions_to_search_first(sweep, monkeypatch):
+def test_a_pass_starts_at_750_candidates_looping_and_remembers_which_functions_to_search_first(sweep, monkeypatch):
     obj, net, calls, path = sweep
-    assert deep_sweep.DEFAULT_VARIANTS == 2500 and obj.config('game')['max_variants'] == 2500
+    assert deep_sweep.DEFAULT_VARIANTS == 750 and obj.config('game')['max_variants'] == 750
+    # (every later loop doubles it, so no function is held to the first budget)
+    assert obj.config('game')['loop'] is True
     assert obj.config('game')['function_order'] == 'smart'
     with pytest.raises(NetworkError, match='which functions to search first'):
         obj.start('game', function_order='newest')
@@ -1368,3 +1370,21 @@ def test_the_pair_search_widens_with_stalled_passes_and_is_capped():
     assert search.pair_scale == 1.0
     search.escalate(2)
     assert search.pair_scale == 2.0 and search.seconds == 60 and search.limit == 10
+
+
+def test_status_sends_the_first_rewrite_rows_and_the_export_all_of_them(sweep, monkeypatch):
+    """A long pass has tens of thousands of rewrite families; the window asked for them all every few seconds (12 MB, 5 s)."""
+    from decompnet.app import deep_sweep
+    obj, net, _, _ = sweep
+    monkeypatch.setattr(deep_sweep, 'REWRITE_ROWS_SENT', 3)
+    fn = net._function('f0', 'game')
+    for i in range(5):
+        obj.record_recipes(fn['id'], {f'rewrite_{i}': [i + 1, 0, 0, i, 0, 0]}, [])
+    shown, full = obj.status('game'), obj.status('game', full=True)
+    assert len(shown['recipes']) == 3 and shown['recipes_total'] == 5
+    assert [r['family'] for r in shown['recipes']] == [r['family'] for r in full['recipes']][:3]
+    assert len(full['recipes']) == 5
+    obj.record_recipes(fn['id'], {'rewrite_late': [1, 0, 0, 9, 0, 0]}, [])
+    assert obj.status('game')['recipes_total'] == 5  # cached for a few seconds: the window does not need the last trial
+    obj.reset_metrics('game')
+    assert obj.status('game')['recipes_total'] == 0  # a reset shows at once

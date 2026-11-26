@@ -204,12 +204,12 @@ class GuiMixin:
             return base | {'overview_pending':True, 'instructions':cfg.get('instructions') or '',
                            'priority':cfg.get('priority',[]), 'spend':cfg.get('spend'),
                            'save_folder':str(saves.save_folder(self, slug)), 'missing':missing,
-                           'suggestions':[], 'boundaries':[], 'compiler_ranges':base.get('compiler_ranges') or self._range_rows(cfg),
+                           'suggestions':[], 'boundaries':[], 'proposals':0, 'compiler_ranges':base.get('compiler_ranges') or self._range_rows(cfg),
                            'auto_commit':match_commits.status(self, proj), 'auto_push':auto_push.status(self, proj), 'score_commits':score_commits.status(self, proj),
                            'auto_compiler':self.auto_adjusts(proj), 'progress_syncing':self.progress.syncing(slug),
                            'progress_sync':self.progress.status(slug)}
         last = self.project_store(proj['id']).one("SELECT MAX(created_at) AS t FROM events WHERE project_id=?", proj["id"])["t"]
-        from .. import function_profile_suggestions
+        from .. import agent_proposals, function_profile_suggestions
         cfg = self.cfg(proj)
         from ..view_snapshots import cache
         revision = self.project_store(proj['id']).one('SELECT map_revision FROM project_totals WHERE project_id=?', proj['id'])
@@ -246,9 +246,11 @@ class GuiMixin:
                                        and not re.search(r"does not match|doesn't compile", s["check"] or "")
                                        and function_profile_suggestions.actionable(self, proj, s)],
                        "boundaries": [r for r in cfg.get("boundaries", []) if r["status"] == "open"],
+                       # (what agents proposed for you to approve: agent_proposals, listed in its drawer)
+                       "proposals": agent_proposals.pending_count(self, proj),
                        # (a fork whose files each have a compiler says its own: DS)
                        "compiler_ranges": base.get("compiler_ranges") or self._range_rows(cfg),
-                       "auto_compiler": self.auto_adjusts(proj)}
+                       "auto_compiler": self.auto_adjusts(proj), "released": consoles.released_year(cfg) or None}
 
     # The live poll's overview, kept between polls (engine.live). It is rebuilt when one of the project's cheap change
     # counters moves (live_overview_key) or after LIVE_OVERVIEW_TTL; what lives only in memory (autopilot, permuter,
@@ -441,7 +443,7 @@ class GuiMixin:
             "donor_layout": self.is_rom(proj) and console.donor_layout,
             "missed_functions": self.is_rom(proj) and type(console).missed_functions is not consoles.Console.missed_functions,
             **console.project_facts(),
-            "compilers": [c.id for c in console.compilers],
+            "compilers": [c.id for c in console.compilers_for(cfg)],
             "rom": {k: cfg["rom"].get(k) for k in ("title", "game_code", "region", "size", "sha1", "byte_order", "compiler_guess")}
                    | {"title": console.display_title(cfg["rom"].get("title", ""), cfg["rom"])},
             "compiler": {"toolchain": compiler_id, "name": consoles.compiler_name(compiler_id),

@@ -118,8 +118,8 @@ class Renderer:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
 
-    def draw(self, dump: Path, task: int, kept: dict[int, bytes] | None = None):
-        """The images one task draws, as the module's `draw`, from the state the tasks before it left."""
+    def _run(self, dump: Path, task: int):
+        """One task drawn: its recorded commands and the RAM after, or None when it fails to draw."""
         try:
             self.proc.stdin.write(f"{dump} {task:x}\n")
             self.proc.stdin.flush()
@@ -131,30 +131,60 @@ class Renderer:
         try:
             if answer != "ok" or not cmds.exists() or not after.exists():
                 return None
-            return _images(cmds.read_bytes(), after.read_bytes(), kept)
+            return cmds.read_bytes(), after.read_bytes()
         finally:
             for f in self.dir.glob(f"{self.count:06d}.*"):
                 f.unlink(missing_ok=True)  # 8 MB each: only the pictures are kept
 
+    def draw(self, dump: Path, task: int, kept: dict[int, bytes] | None = None):
+        """The images one task draws, as the module's `draw`, from the state the tasks before it left."""
+        done = self._run(dump, task)
+        return None if done is None else _images(*done, kept)
 
-def _images(data: bytes, mem: bytes, kept: dict[int, bytes] | None) -> dict[int, tuple[int, int, list]]:
-    drawn = {}
+    def draw_picture(self, dump: Path, task: int, kept: dict[int, bytes] | None = None):
+        """The largest picture one task draws, as (width, lines, RGB bytes), or None when it fails to draw or draws none:
+        the live viewer's, which converts one image instead of every one."""
+        done = self._run(dump, task)
+        if done is None:
+            return None
+        data, mem = done
+        best = None
+        for addr, width, siz, lines in _colour_images(data, mem, kept):
+            if best is None or width * lines >= best[1] * best[3]:
+                best = (addr, width, siz, lines)
+        if best is None:
+            return None
+        addr, width, siz, lines = best
+        return width, lines, rgb_bytes(mem, addr, width, siz, lines)
+
+
+def _colour_images(data: bytes, mem: bytes, kept: dict[int, bytes] | None) -> list[tuple[int, int, int, int]]:
+    """The colour images a task drew to as (address, width, pixel size, lines), whole inside `mem`; `kept` takes their
+    bytes and the depth buffers' as drawn (for the next task to start from)."""
+    drawn = []
     depth = {w[1] & 0xFFFFFF for w in commands(data) if w[0] >> 24 & 0x3F == 0x3E}  # z images: cleared as colour
-    for addr, width, siz, lines in images(data):
+    found = images(data)
+    for addr, width, siz, lines in found:
         if addr in depth:
             continue
-        if addr + width * lines * (4 if siz == 3 else 2) <= len(mem):
-            drawn[addr] = (width, lines, rgb(mem, addr, width, siz, lines))
+        size = width * lines * (4 if siz == 3 else 2)
+        if addr + size <= len(mem):
+            drawn.append((addr, width, siz, lines))
             if kept is not None:
-                kept[addr] = mem[addr:addr + width * lines * (4 if siz == 3 else 2)]
+                kept[addr] = mem[addr:addr + size]
     if kept is not None:
         # the depth buffer too: the emulator writes no depth either, and what is drawn tests against it (a menu's frame
         # was sky only on the console, the road and cars failing a depth test against noise)
-        shape = next(((w, h) for _, w, _, h in images(data)), None)
+        shape = next(((w, h) for _, w, _, h in found), None)
         for addr in depth - {0}:
             if shape and addr + shape[0] * shape[1] * 2 <= len(mem):
                 kept[addr] = mem[addr:addr + shape[0] * shape[1] * 2]
     return drawn
+
+
+def _images(data: bytes, mem: bytes, kept: dict[int, bytes] | None) -> dict[int, tuple[int, int, list]]:
+    return {addr: (width, lines, rgb(mem, addr, width, siz, lines))
+            for addr, width, siz, lines in _colour_images(data, mem, kept)}
 
 
 def draw(program: Path, dump: Path, task: int, work: Path,
@@ -278,6 +308,30 @@ def rgb(mem: bytes, addr: int, width: int, siz: int, lines: int) -> list[tuple[i
             v = mem[addr + i * 2] << 8 | mem[addr + i * 2 + 1]
             out.append(((v >> 11 & 31) << 3, (v >> 6 & 31) << 3, (v >> 1 & 31) << 3))
     return out
+
+
+def _plane(table) -> bytes:
+    return bytes(table(i) for i in range(256))
+
+
+_R = _plane(lambda h: h >> 3 << 3)                    # a 5551 pixel's high byte: red
+_G_HIGH, _G_LOW = _plane(lambda h: (h & 7) << 5), _plane(lambda lo: lo >> 6 << 3)  # green is split over both bytes
+_B = _plane(lambda lo: (lo >> 1 & 31) << 3)           # the low byte: blue
+
+
+def rgb_bytes(mem: bytes, addr: int, width: int, siz: int, lines: int) -> bytes:
+    """`rgb`'s picture as flat R,G,B bytes, made a plane at a time (a frame of it was most of the live viewer's time)."""
+    n = width * lines
+    out = bytearray(3 * n)
+    if siz == 3:
+        raw = mem[addr:addr + 4 * n]
+        out[0::3], out[1::3], out[2::3] = raw[0::4], raw[1::4], raw[2::4]
+    else:
+        raw = mem[addr:addr + 2 * n]
+        high, low = raw[0::2], raw[1::2]
+        green = int.from_bytes(high.translate(_G_HIGH), "big") | int.from_bytes(low.translate(_G_LOW), "big")
+        out[0::3], out[1::3], out[2::3] = high.translate(_R), green.to_bytes(n, "big"), low.translate(_B)
+    return bytes(out)
 
 
 def png(path: Path, pixels: list[tuple[int, int, int]], width: int, height: int) -> None:
@@ -407,6 +461,7 @@ def run_console(rom: Path, points: list[int], inputs: str, folder: Path, clock: 
                            extra_env=extra_env, **seeding)
         if seeds_at:
             (folder / "seeds.txt").write_text("".join(f"{int(h.args[0]) & 0xFFFFFFFF}\n" for h in run.hits))
+            (folder / "seed_vis.txt").write_text("".join(f"{h.vi}\n" for h in run.hits))
     else:
         emulator.run(rom, max(points) + 1, inputs=inputs, dumps=dumps, stop=stop, extra_env=extra_env)
     return {n: p for n, p in dumps.items() if p.exists()}
@@ -448,15 +503,109 @@ def difference(a: list, b: list) -> list:
 
 
 
+PROBE_SECONDS = 24  # virtual seconds the probe run lasts: a run of 10 reached only task 408 on one route, before the first seeding call
+
+
+def seed_offset(port_calls: dict[int, int], task_vi: dict[int, int], seed_vis: list[int], first: int = 200, last: int = 700) -> int:
+    """How many more seeding calls the port has made than the console's game at the same graphics task, early in the run: the usual
+    difference over the tasks from `first` to `last` (a call made a hair after a task starts is a gap of zero at an odd task, and the logic lead's
+    drift grows later; an extra call the port makes at boot is the same gap at nearly every task). port_calls: {task: calls
+    so far} (PORT_SEED_LOG), task_vi: {task: the console's retrace at its start} (the trace), seed_vis: the retrace of each of the console's calls.
+    Replaying the console's seeds in order from the port's call k hands it the console's call k: one call too many in the port hands every later draw the
+    previous seed (a race start's opponents were other cars than the console's until a seed was added at the front: 0.00% at every task)."""
+    import bisect
+    gaps = []
+    for n in sorted(port_calls):
+        if first <= n <= last and n in task_vi:
+            mine, theirs = port_calls[n], bisect.bisect_right(seed_vis, task_vi[n])
+            if mine or theirs:  # before either has called there is nothing to be ahead by
+                gaps.append(mine - theirs)
+    import statistics
+    return int(statistics.median_low(gaps)) if gaps else 0  # a call made a hair after a task starts shows as a gap of zero at the odd task: the usual one counts
+
+
+def _shifted(seeds: list[str], shift: int) -> list[str]:
+    return ([seeds[0]] * shift + seeds) if shift > 0 and seeds else seeds[-shift:] if shift < 0 else seeds
+
+
+def shift_inputs(text: str, shifts: dict[str, int], after: int = 0) -> str:
+    """An input script ("task:BUTTON,..." ) with each press of a button moved by `shifts[button]` tasks from task `after` on, and
+    the release that follows it moved with it. The console and the port take a controller edge a different number of tasks after
+    it is given (found on a racing game: START 5 tasks on the console and 6 on the port, A 10 on the console and 6 on the port), a
+    difference of the game's own state that no single delay of the script absorbs; the picture window after each edge shows which
+    button needs which shift (docs/PORTING.md)."""
+    out, moved = [], 0
+    for item in text.split(","):
+        frame, button = item.split(":", 1)
+        frame = int(frame)
+        if frame >= after:
+            if button != "-":
+                moved = shifts.get(button.split("+")[0], 0)
+            frame += moved
+        out.append(f"{max(frame, 0)}:{button}")
+    return ",".join(out)
+
+
+def align_seeds(game: Path, rom: Path, inputs: str, work: Path, pace_log: Path, env: dict[str, str], stop=lambda: False) -> int:
+    """Shift work/seeds.txt so the port's k-th seeding call gets the console's k-th seed. Short runs of the port in a scratch folder (its
+    save is a copy) count its seeding calls at each graphics task for each candidate shift until one keeps going to task 600 (its call counts do not depend on
+    the file's contents, only on the game running on), and the gap between those counts and the console's is the shift made: a seed file out of line leaves a game at a few hundred of a thousand graphics tasks, which a single
+    probe cannot measure (it reaches no first call; found on a route where a probe of the raw file logged 196 tasks and no gap). Returns the shift made
+    (+n: n copies of the first seed put in front)."""
+    import re
+    import tempfile
+    seeds_file, vis_file = work / "seeds.txt", work / "seed_vis.txt"
+    if not seeds_file.exists() or not vis_file.exists() or not pace_log.exists():
+        return 0
+    task_vi: dict[int, int] = {}
+    for line in pace_log.read_text().split("\n"):
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            task_vi[int(parts[0])] = int(parts[1])
+    vis = [int(x) for x in vis_file.read_text().split()]
+    original = seeds_file.read_text().split()
+    probe_file = work / "seeds_probe.txt"
+    probe_env = {**os.environ, **env, "PORT_SEED_LOG": "1", "PORT_SEED_REPLAY": str(probe_file), "PORT_INPUT_CLOCK": "frames"}
+    if inputs:
+        probe_env["PORT_INPUT"] = inputs
+    for key in ("PORT_RAM_DUMPS", "PORT_FRAME_DUMPS"):
+        probe_env.pop(key, None)
+    best = (0, 0)  # (tasks reached, shift) when nothing keeps step
+    for shift in (1, 0, 2, -1, 3):
+        if stop():
+            break
+        probe_file.write_text("".join(f"{x}\n" for x in _shifted(original, shift)))
+        with tempfile.TemporaryDirectory(prefix="seed-probe-") as scratch:
+            if (work / "game.eep").exists():
+                shutil.copy(work / "game.eep", Path(scratch) / "game.eep")
+            try:
+                done = subprocess.run([str(game.resolve()), str(rom.resolve()), str(PROBE_SECONDS)], cwd=scratch, env=probe_env,
+                                      capture_output=True, text=True, timeout=300)
+            except subprocess.TimeoutExpired:
+                continue
+        calls = {int(m.group(1)): int(m.group(2)) for m in re.finditer(r"SEEDS task (\d+) calls (\d+)", done.stderr)}
+        reached = max(calls) if calls else 0
+        if reached > best[0]:
+            best = (reached, shift)
+        if reached >= 600:  # a run that kept going counts its calls: its gap to the console's is the shift the file needs
+            best = (reached, seed_offset(calls, task_vi, vis, last=reached))
+            break
+    probe_file.unlink(missing_ok=True)
+    shift = best[1]
+    if shift:
+        seeds_file.write_text("".join(f"{x}\n" for x in _shifted(original, shift)))
+    return shift
+
+
 def compare_run(game: Path, rom: Path, points: list[int], inputs: str, work: Path, out: Path, *, tolerance: int = 3,
-                pace: bool = True, seeds_at: int | None = None, stop=lambda: False,
+                pace: bool = True, seeds_at: int | None = None, port_shifts: dict[str, int] | None = None, after: int = 0, stop=lambda: False,
                 progress=lambda text, done, total: None) -> list[dict]:
     """The port's pictures against the console's at the game's graphics tasks `points` (counted from 1), both run with
     `inputs` (timed in graphics tasks) and drawn by the port's renderer. One entry for each task and picture:
     {"task", "image", "width", "lines", "differ_pct", "beyond_pct", "near_pct", "file"} (the side-by-side PNG in `out`:
     console, port, their difference x4), or {"task", "missing": "console"|"port"|"size"} when a side drew nothing or another size.
     What makes the two runs one (found on a racing game, docs/PORTING.md): the port starts from the console's own save
-    (console_save), and with `pace` its clock replays the retrace the console was at for each task (PORT_VTIME_TRACE)."""
+    (console_save), `port_shifts` (button: tasks, from task `after`) moves the port's presses of a button, and with `pace` its clock replays the retrace the console was at for each task (PORT_VTIME_TRACE)."""
     out.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
     early = min(600, max(points))
@@ -479,8 +628,17 @@ def compare_run(game: Path, rom: Path, points: list[int], inputs: str, work: Pat
     progress("Running the port", 3, 4)
     pacing = {"PORT_VTIME": "1", "PORT_VTIME_TRACE": str(pace_log)} if pace and pace_log.exists() else {}
     if seeds_at and (work / "seeds.txt").exists():  # a game that seeds from the clock draws the console's numbers
+        align_seeds(game, rom, inputs, work, pace_log, pacing, stop)
         pacing["PORT_SEED_REPLAY"] = str(work / "seeds.txt")
-    port = run_port(game, rom, sorted(set(points)), inputs, work, "frames", stop=stop, extra_env=pacing)
+    wanted = sorted(set(points))
+    port: dict[int, Path] = {}
+    for attempt in range(3):
+        # The port's virtual time waits for its threads to idle in wall-clock time, so a loaded computer (a load average of 12 to 40 while other
+        # jobs ran) leaves it at a few hundred of a thousand graphics tasks, differently each time: the same run on a quiet one reached all of them.
+        port = run_port(game, rom, wanted, shift_inputs(inputs, port_shifts, after) if port_shifts else inputs, work, "frames", stop=stop, extra_env=pacing)
+        if len(port) * 2 >= len(wanted) or stop():
+            break
+        progress(f"The port stalled ({len(port)} of {len(wanted)} frames reached): running it again", 3, 4)
     results: list[dict] = []
     runs: list[list[int]] = []  # the consecutive tasks taken at each moment
     for n in points:

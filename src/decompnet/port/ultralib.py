@@ -51,6 +51,90 @@ def index(folder: str) -> dict[str, Path]:
     return out
 
 
+def _plain(chunk: str) -> str:
+    """A definition without comments and spacing, to tell two files' copies of one helper apart from a real difference."""
+    return re.sub(r"\s+", "", re.sub(r"/\*.*?\*/|//[^\n]*", "", chunk, flags=re.S))
+
+
+@lru_cache(maxsize=1)
+def _scan(folder: str) -> tuple[dict[str, dict[Path, str]], dict[Path, set[str]]]:
+    """({static function: {file: its body without comments and spacing}}, {file: every function it defines})."""
+    copies: dict[str, dict[Path, str]] = {}
+    defined: dict[Path, set[str]] = {}
+    for path in sorted(Path(folder, "src").rglob("*.c")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for chunk, name, static in _items(text):
+            if name:
+                defined.setdefault(path, set()).add(name)
+                if static:
+                    copies.setdefault(name, {})[path] = _plain(chunk)
+    return copies, defined
+
+
+def static_index(folder: str) -> dict[str, Path]:
+    """{function: its C file} of the functions ultralib's C defines `static`, for the ones one file alone defines, or
+    several files define with the same body (the audio library's `_getVol` is in env.c and n_env.c: whichever the
+    game links, the unit is the same). A name two files define differently is ambiguous (`by_neighbours` may still
+    tell). `index` leaves them out on purpose: a unit takes its file's static helpers along, and a callee built apart
+    from its caller would be a second copy. Only `source` reads this, for a function library detection names that no
+    exported definition has: the sequence player's `__handleMIDIMsg`, `read8`, `_handleEvent`."""
+    return {name: next(iter(copies)) for name, copies in _scan(folder)[0].items() if len(set(copies.values())) == 1}
+
+
+def by_neighbours(folder: str, name: str, neighbours) -> Path | None:
+    """The file of a static function several files define differently, told by the game's other library functions: the
+    C sequence player's csplayer.c and the audio library's env.c both have a `_getVol` (and seqplayer.c and csplayer.c
+    a `__setUsptFromTempo`), and a game that links the one has the rest of that file's functions too. The file with
+    the most of the game's other names wins, when it wins alone: a game with only the helper says nothing."""
+    copies, defined = _scan(folder)
+    scores = sorted(((len((defined[path] - {name}) & set(neighbours)), path) for path in copies.get(name, {})),
+                    key=lambda item: -item[0])
+    if scores and scores[0][0] > 0 and (len(scores) == 1 or scores[0][0] > scores[1][0]):
+        return scores[0][1]
+    return None
+
+
+OBJECT_MACRO = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+([A-Za-z_]\w*)[ \t]*(?:/[*/].*)?$", re.M)
+
+
+@lru_cache(maxsize=1)
+def macros(folder: str) -> dict[str, set[str]]:
+    """{name: the names an object-like `#define name other` of ultralib's headers and files gives it}, conditions
+    ignored: `fsin` is `__sinf` in sinf.c, `_init_lpfilter` is `init_lpfilter` in synthInternals.h and `spInit` is
+    `spXInit` or `spX2Init` in sp.h, so the symbol a game's copy has is not the name the C defines."""
+    out: dict[str, set[str]] = {}
+    for sub in ("include", "src"):
+        for path in sorted(Path(folder, sub).rglob("*")):
+            if path.suffix in (".h", ".c"):
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                for name, other in OBJECT_MACRO.findall(text):
+                    if name != other:
+                        out.setdefault(name, set()).add(other)
+    return out
+
+
+@lru_cache(maxsize=1)
+def alias_index(folder: str) -> dict[str, Path]:
+    """{symbol: the C file whose function the macros (`macros`) give that name}, for a symbol no definition has."""
+    defined = {**static_index(folder), **index(folder)}
+    out = {}
+    for name, path in defined.items():
+        for other in sorted(macros(folder).get(name, ())):
+            if other not in defined:
+                out.setdefault(other, path)
+    return out
+
+
+def _folder_of(path: Path) -> Path | None:
+    return next((p for p in path.parents if (p / "include").is_dir() and (p / "src").is_dir()), None)
+
+
 MACRO = re.compile(r"^[ \t]*#[ \t]*define[ \t]+(\w+)\([^)]*\)[ \t]+\(?[ \t]*(?:\([^)]*\)[ \t]*)?(\w+)[ \t]*\(", re.M)
 
 
@@ -103,8 +187,15 @@ def prototype(definition: str) -> str:
 def extract(path: Path, name: str) -> str:
     """The file with only `name` of its exported functions: its directives, declarations and static helpers kept."""
     kept, dropped = [], []
+    folder = _folder_of(path)
+    named = {n for n, others in macros(str(folder)).items() if name in others} if folder else set()
     for chunk, defines, static in _items(path.read_text(encoding="utf-8", errors="replace")):
-        if defines is None or static or defines == name:
+        if static and (defines == name or defines in named):
+            # a function the file defines `static` that library detection found in a game: the unit built for it
+            # exports it (the game's other code, or the port's, calls it by name now)
+            head, brace, body = chunk.partition("{")
+            kept.append(re.sub(r"\bstatic\s+", "", head, count=1) + brace + body)
+        elif defines is None or static or defines == name or defines in named:
             kept.append(chunk)
         else:
             kept.append(None)
@@ -141,11 +232,14 @@ def _unstatic_headers(text: str, path: Path, name: str) -> str:
     return re.sub(r'^[ \t]*#[ \t]*include[ \t]+"([^"]+)"', inline, text, flags=re.M)
 
 
-def flags(folder: Path, path: Path, build: str) -> list[str]:
-    """ultralib's own preprocessor flags (makefiles/gcc.mk) for `build` (`2.0I/libgultra_rom`)."""
+def flags(folder: Path, path: Path, build: str, name: str = "") -> list[str]:
+    """ultralib's own preprocessor flags (makefiles/gcc.mk) for `build` (`2.0I/libgultra_rom`). `name`: the F3DEX2
+    sprite and S2DEX2 functions (`spX2Init`, `guS2D2EmuBgRect1Cyc`) are the same files built as spriteex2.c and
+    us2dex2_emu.c do, with F3DEX_GBI_2 defined first."""
     m = BUILD.fullmatch(build)
     version, debug, rom = (m[1], m[4] == "_d", m[4] == "_rom") if m else ("L", False, True)
     return ["-nostdinc", "-D_LANGUAGE_C", "-D_MIPS_SZLONG=32", "-D__USE_ISOC99", "-DF3DEX_GBI",
+            *(["-DF3DEX_GBI_2"] if re.match(r"spX2|guS2D2", name) else []),
             f"-DBUILD_VERSION=VERSION_{version}", f'-DBUILD_VERSION_STRING="2.0{version}"',
             "-D_DEBUG" if debug else "-DNDEBUG", *(["-D_FINALROM"] if rom else []),
             "-I", str(folder / "include"), "-I", str(folder / "include" / "compiler" / "gcc"),
@@ -164,13 +258,15 @@ def _builds() -> dict[str, list[str]]:
     return out
 
 
-def source(name: str, hint: dict, fingerprint: str | None = None) -> tuple[Path, str] | None:
+def source(name: str, hint: dict, fingerprint: str | None = None, neighbours=()) -> tuple[Path, str] | None:
     """(ultralib's file, the build) for a function library detection found as ultralib's own build (`hint`: its
-    identity), or None: no ultralib installed, another library's code, or a name ultralib's C doesn't define."""
+    identity), or None: no ultralib installed, another library's code, or a name ultralib's C doesn't define.
+    `neighbours`: the names of the game's other library functions, which tell a helper two files define differently."""
     folder = root()
     if folder is None or not any(c.startswith(CORPUS) for c in hint.get("corpora") or []):
         return None
-    path = index(str(folder)).get(name)
+    path = (index(str(folder)).get(name) or static_index(str(folder)).get(name)
+            or alias_index(str(folder)).get(name) or (by_neighbours(str(folder), name, neighbours) if neighbours else None))
     builds = _builds().get(hint.get("fingerprint") or fingerprint or "", [])
     if path is None or not builds:
         return None
@@ -257,5 +353,5 @@ def units_from(wanted: dict, folder: Path) -> dict[str, tuple[str, list[str]]]:
     for name, (file, build) in sorted(wanted.items()):
         path = folder / file
         if path.is_file():
-            out[f"{name}.c"] = (extract(path, name), flags(folder, path, build))
+            out[f"{name}.c"] = (extract(path, name), flags(folder, path, build, name))
     return out

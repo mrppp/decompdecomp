@@ -830,11 +830,9 @@ sudo dnf install ./decompdecomp-*.x86_64.rpm       # Fedora
 chmod +x decompdecomp-*-x86_64.AppImage && ./decompdecomp-*-x86_64.AppImage   # any other distribution
 ```
 
-On **Windows**, download and open `decompdecomp-<version>-windows-x64-setup.exe` from the [releases](https://github.com/RetroReversing/decompdecomp/releases). Setup
-installs the Microsoft Edge WebView2 Runtime and .NET Framework 4.8 when they are missing, then opens the
-app installer. It may ask for administrator permission and needs an internet connection to download missing
-Microsoft components. The app installer lets you choose where decompdecomp goes and whether to add a
-desktop shortcut (selected by default); it always adds a shortcut to Start.
+On **Windows**, download `decompdecomp-<version>-windows-x64-portable.zip` from the [releases](https://github.com/RetroReversing/decompdecomp/releases), extract it
+and open `decompdecomp.exe`. Keep its bundled folders next to it. It needs .NET Framework 4.8 and the Microsoft
+Edge WebView2 Runtime, both already part of current Windows 10 and 11.
 
 To install from source with [uv](https://docs.astral.sh/uv/getting-started/installation/) instead, open a new PowerShell window and run:
 
@@ -1388,11 +1386,18 @@ use the usual order, and every match still passes the ordinary judge.
 For a longer search of one function, open its drawer and expand **Deep permuter · this function**.
 Choose a time limit and maximum candidate compiles, then select **Run deep permuter**.
 
-Deep searches give targeted repairs most of the initial budget. A short random probe
-can earn more time and candidate trials by improving the score. If targeted repairs
-paused for that probe, the search gives them any remaining budget when it ends.
+Deep searches give targeted repairs most of the initial budget. Every verified improvement
+earns the whole budget again, so a function that keeps getting closer keeps being searched,
+and after a round that improved it the search passes all run again on the new C. The search
+ends a full budget after its last improvement, or when a round changes nothing. If targeted
+repairs paused for the random probe, the search gives them any remaining budget when it ends.
 The current diff prioritises relevant repair families and limits speculative
 storage, declaration order and global type trials.
+
+A search also learns from earlier matches. When the same statement-sized change made two different matches (a load
+made `volatile`, two declarations swapped), it is saved as a repair rule in the home's `.decomp/repair-rules` folder
+(`mined_*.json`), and later searches try those first. Rules only propose C: the judge still decides. Delete a file to
+drop its rule; it is not written again.
 
 **Threads per function** runs independent candidate paths concurrently; targeted repairs are divided
 between workers and random paths use different seeds. The project pass also has **Functions at a time**

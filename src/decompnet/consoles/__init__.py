@@ -52,6 +52,7 @@ class Compiler:
     guess: str = ""  # what read_game calls it when a program looks built by it ("KMC", "EEGCC-2.95.2")
     target: str = ""  # processor for compiler versions that differ within one console (PC x86 and x64)
     automatic: bool = True  # routine comparisons; experimental profiles remain available by explicit selection
+    released: int = 0  # the year its build first existed (0: not recorded); a project that names its game's year never uses a newer one
 
 
 @dataclass(frozen=True)
@@ -493,6 +494,14 @@ class Console:
     def after_import(self, net, slug: str, *, chosen: bool, log=print) -> None:
         """Work a new project gets once (`chosen`: the user picked its compiler)."""
 
+    def profile_probes(self, facts) -> list[dict]:
+        """Per-function compiler profiles worth judging an open function's saved C under, from what its target shows
+        (app/profile_probe.py: `facts` has the profile it is judged under, its instruction words, the diff, its library
+        identity and the profiles its matched neighbours use): [{"toolchain", "flags", "family", "why"}], the likeliest
+        first, none when nothing points anywhere. Rules that depend only on the processor's flags (a MIPS GCC's `-mfp32`,
+        `-G`) are in the app; what is this console's own (which older or library compiler its games mixed in) is here."""
+        return []
+
     sdk_assembly_sizes: tuple[int, ...] = ()
 
     def sdk_assembly_identity(self, code: bytes, big_endian: bool = True) -> dict | None:
@@ -513,6 +522,12 @@ class Console:
         """A library routine told by the structures it writes, for a build no fingerprint table has (the port asks:
         `identify(builtin=True)`; display names stay exact-match). {"name", "corpus", "evidence"} or None."""
         return None
+
+    def sdk_without_source(self, corpora) -> bool:
+        """Whether a detected library routine (`corpora`: the signature collections that name it) is from a library
+        no public source builds, so neither a port nor anybody else can have its C from there: it's set aside as SDK
+        code on the detection alone (app/sdk_assembly._lead), not left to agents."""
+        return False
 
     def scan_sdk(self, net, proj, job=None) -> None:
         """Optional binary SDK evidence, refreshed by the shared background naming task.
@@ -617,11 +632,23 @@ class Console:
         """Processor target for project compilers, or empty when all compilers apply."""
         return ""
 
-    def project_compilers(self, fp) -> list[Compiler]:
-        """Compilers able to build this project's target."""
+    def project_compilers(self, fp, cfg: dict | None = None) -> list[Compiler]:
+        """Compilers able to build this project's target (and, with its settings, not newer than the game)."""
         target = self.target(fp)
-        return [compiler for compiler in self.compilers
+        return [compiler for compiler in (self.compilers_for(cfg) if cfg is not None else self.enabled_compilers())
                 if not target or not compiler.target or compiler.target == target]
+
+    def compilers_for(self, cfg: dict) -> tuple[Compiler, ...]:
+        """The console's compilers a project may use: none released after the year its settings give for the game
+        (`released`, set in the project's Settings). A game built in 1998 was not built with a 2009 compiler, and a
+        6-instruction function that matches both says nothing about which one."""
+        year = released_year(cfg)
+        return tuple(c for c in self.compilers if (not year or not c.released or c.released <= year)
+                     and not toolchains.is_disabled(c.id))
+
+    def enabled_compilers(self) -> tuple[Compiler, ...]:
+        """`compilers` without the ones the user disabled in Compilers & tools."""
+        return tuple(c for c in self.compilers if not toolchains.is_disabled(c.id))
 
     def file_compiler(self, fp, source: str) -> str | None:
         """The compiler (one of `compilers`) the project builds a source file with, when its build lets each file have
@@ -930,6 +957,23 @@ def game_in(folder: Path) -> Path:
 def compiler(compiler_id: str) -> tuple[Console, Compiler] | None:
     """The console a compiler belongs to, and its entry there."""
     return next(((c, k) for c in CONSOLES for k in c.compilers if k.id == compiler_id), None)
+
+
+def released_year(cfg: dict) -> int:
+    """The year a project's game came out (its `released` setting), 0 when it hasn't been given."""
+    try:
+        return max(0, int(cfg.get("released") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def too_new(cfg: dict, compiler_id: str) -> str:
+    """Why a project may not use a compiler (released after its game), or "" when it may."""
+    year, found = released_year(cfg), compiler(compiler_id)
+    if year and found and found[1].released > year:
+        return (f"{found[1].name} came out in {found[1].released}, after this game ({year}), so the game was not built "
+                "with it. Change the game's release year in its compiler settings if that is wrong.")
+    return ""
 
 
 def compiler_name(compiler_id: str) -> str:

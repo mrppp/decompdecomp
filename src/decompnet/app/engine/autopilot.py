@@ -371,7 +371,12 @@ class AutopilotMixin:
             db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fid, agent.id, now, now + 300))
         try:
             from ..return_repair_autopilot import run as return_repair
-            if repair_only:return 'match' if return_repair(self,agent,proj,fn) else 'skip'
+            if repair_only:
+                if return_repair(self,agent,proj,fn):return 'match'
+                from ..profile_probe_autopilot import run as profile_probe
+                if profile_probe(self,agent,proj,fn):return 'match'
+                from ..store_order_autopilot import run as store_order
+                return 'match' if store_order(self,agent,proj,fn) else 'skip'
             if not _draft_pipeline.get() and return_repair(self, agent, proj, fn):
                 return 'match'
             ctx = self._context(proj["id"], fn["unit"])
@@ -382,7 +387,8 @@ class AutopilotMixin:
             input_key = draft_reports.key(plan, ctx['header'], data_asm, fn)
             previous = draft_reports.read(self, fid, project_id=proj['id'])
             external_inputs = own.get('cmd') or own.get('ro_paths') or any(flag.startswith(('-I','-include','-imacros')) for flag in own.get('flags',[]))
-            if not retry_draft and not external_inputs and previous.get('key') == input_key and previous.get('complete'):
+            if (not retry_draft and not external_inputs and previous.get('key') == input_key and previous.get('complete')
+                    and draft_reports.tried_everything(previous)):
                 return 'skip'
             target_asm = self._asm_text(fn, proj)
             # Eligibility is known before any generation. Reuse this exact captured
@@ -393,14 +399,15 @@ class AutopilotMixin:
                 # Reuse that receipt instead of immediately repeating failed m2c.
                 previous = draft_reports.read(self, fid, project_id=proj['id'])
             data_key = hashlib.sha256((data_asm or '').encode()).hexdigest()
-            report = {'key': input_key, 'seed_key':plan, 'data_key':data_key, 'compiled': False, 'scored': False, 'matched': False, 'trials': 0, 'failures': []}
+            report = {'key': input_key, 'seed_key':plan, 'data_key':data_key, 'repairs': draft_reports.repairs(), 'compiled': False, 'scored': False, 'matched': False, 'trials': 0, 'failures': []}
             from .briefs import DRAFT_NOTE
             prefix = DRAFT_NOTE+'\n'
             seed_row = self.project_store(proj['id']).one('SELECT seed_key FROM functions WHERE id=?',fid)
             if (seed and seed.startswith(prefix) and seed_row and seed_row['seed_key'] == plan
                     and previous.get('data_key',data_key) == data_key):
                 draft = seed[len(prefix):].removeprefix(seeds.M2C_MACROS+'\n')
-            elif not retry_draft and previous.get('seed_key') == plan and previous.get('failures'):
+            elif (not retry_draft and previous.get('seed_key') == plan and previous.get('failures')
+                    and previous.get('repairs') == draft_reports.repairs()):
                 report['failures'] = previous['failures']
                 draft = None
             else:
@@ -455,12 +462,22 @@ class AutopilotMixin:
                     # judged beside the raw draft, which stays the stored seed (app/draft_cleanup.py)
                     for family, source in draft_cleanup.cleaned(draft, fn['name'], proj['arch'], target_asm, ctx['header']):
                         candidates.append((family, f"{note}{seeds.with_m2c_macros(source)}\n"))
+                # m2c's untyped fields as members of a record per pointer: beat every other candidate on 13 of 60
+                # drafts of one N64 game's matched functions, 2 of them exact
+                from decomprepair import m2c_field_record_view
+                for family, source in m2c_field_record_view.variants(draft, fn['name'])[:1]:
+                    candidates.append((family, f"{note}{seeds.with_m2c_macros(source)}\n"))
                 from ..capture_followup_repairs import callee_evidence
                 from ..recent_capture_repairs import variants as captured_variants
                 known_callees=callee_evidence(self,proj,fn,draft)
                 for family,source in captured_variants(draft,fn['name'],'mips' if (seeds.m2c_target(toolchain) or '').startswith('mips') else '',target_asm,ctx['header'],known_callees):
                     if family in ('overlay_callee_alias','argument_home_slot','untouched_argument_forwarding'):
                         candidates.append((family,f"{note}{seeds.with_m2c_macros(source)}\n"))
+                from .. import cheap_draft_repairs
+                if cheap_draft_repairs.enabled(self.cfg(proj)):
+                    # the families that matched drafts in seconds of search, now before an agent's turns (app/cheap_draft_repairs.py)
+                    for family, source in cheap_draft_repairs.variants(draft, fn['name'], proj['arch'], target_asm, ctx['header'], own.get('flags', [])):
+                        candidates.append((family, f"{note}{seeds.with_m2c_macros(source)}\n"))
                 for canonical in (False,True):
                     if array := m2cfix.stack_array(draft,fn['name'],canonical):
                         family = 'stack_array_indexed' if canonical else 'stack_array'

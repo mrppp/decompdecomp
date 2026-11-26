@@ -16,6 +16,7 @@
 - boot_gzip.py, boot_raw_deflate.py, boot_brs.py, boot_refpack.py: compressed programs placed by the boot loader.
 - boot_mapping.py: returning TLB boot stubs separated from code with a strongly supported later load mapping.
 - sdk_assembly.py: exact self-contained libultra body fingerprints, classified before C claims.
+- profile_probes.py: the per-function compiler profiles its open functions are judged under automatically (SN 2.7.2 builds, KMC for libultra).
 - port.py: its port kit, libultraship and Torch: what they replace and which graphics microcode they render.
 - emulator/: the reversing emulator (mupenRE, built from source), its `Console.emulator` part: the user's ROM run
   headless with memory dumps and breakpoints (watch_in_emulator).
@@ -33,11 +34,15 @@ from pathlib import Path
 
 from ...rom import Picked, RomError
 from .. import EXPORT, RECOMMENDED, ROM, Compiler, Console
-from . import emulator, recomp, sdk_assembly, sdk_linked, sdk_shapes
+from . import emulator, profile_probes, recomp, sdk_assembly, sdk_linked, sdk_shapes
 from .port import KIT as PORT_KIT
 
 # Store only a digest of the entire body, including the return delay slot.
 _MUL64_LOW_FIRST_SHA256 = "3de77e7c110a869794ff2998de80fb3fd6e4a7fc046d21378dc764a11b1676d0"
+
+
+# a signature collection of the n_audio library: the built-in table or an indexed SDK archive
+_N_AUDIO = re.compile(r"\bn_audio\b|\blibg?n_audio", re.I)
 
 
 class Nintendo64(Console):
@@ -57,25 +62,25 @@ class Nintendo64(Console):
     mode = ROM
     layout = "splat"
     compilers = (
-        Compiler("gcc-2.7.2-kmc", "KMC GCC 2.7.2", "many third-party N64 games", guess="KMC"),
-        Compiler("ido-7.1", "IDO 7.1", "most later first-party N64 games", guess="IDO"),
-        Compiler("ido-5.3", "IDO 5.3", "early N64 games (1996-97)"),
-        Compiler("sn-n64-281", "SN64 GCC 2.8.1", "SN Systems toolchains used by some third-party games"),
-        Compiler("sn-n64-272-0001", "SN64 GCC 2.7.2 (0001)", "earlier SN Systems N64 toolchains"),
-        Compiler("sn-n64-272-0001-as0004", "SN64 GCC 2.7.2 (0001 + 0004 assembler)", "SN 2.7.2 games whose doubles load with ldc1"),
-        Compiler("sn-n64-272-0004", "SN64 GCC 2.7.2 (0004)", "preserved SN compiler and assembler build"),
-        Compiler("sn-n64-272-0006", "SN64 GCC 2.7.2 (0006)", "later SN 2.7.2 build used in some boot code"),
-        Compiler("gcc-2.8.1-pm-sn-as", "GCC 2.8.1 + SN ASN64 2.56", "GCC code generation with original SN assembly"),
-        Compiler("gcc-2.8.1-pm", "GCC 2.8.1 (PM matching)", "patched GCC with its paired GNU assembler"),
-        Compiler("gcc-egcs-2.91.66", "EGCS 1.1.2 / GCC 2.91.66", "later iQue rebuild toolchains"),
-        Compiler("sn-n64-272-970404", "Reconstructed SN64 GCC 2.7.2 (970404)", "reconstructed SN codegen with compatibility assembly"),
-        Compiler("ido-5.3-cxx", "IDO 5.3 C++", "separate SGI C++ frontend; Linux, WSL or macOS VM", automatic=False),
-        Compiler("ido-5.2", "IDO 5.2", "experimental SGI comparison; Linux, WSL or macOS VM", automatic=False),
-        Compiler("ido-6.0", "IDO 6.0", "experimental SGI comparison; Linux, WSL or macOS VM", automatic=False),
-        Compiler("ido-4.1", "IDO 4.1", "experimental early SGI comparison; Linux, WSL or macOS VM", automatic=False),
-        Compiler("mipspro-7.4.4", "MIPSpro 7.4.4", "experimental; retail N64 use unconfirmed; Linux, WSL or macOS VM", automatic=False),
-        Compiler("gcc-egcs-1.1.2-4", "Original EGCS 1.1.2-4", "original Linux release; iQue toolchain comparison"),
-        Compiler("gcc-4.4.0-n64", "GCC 4.4.0 (MIPS64 ELF)", "experimental modern toolchain; Linux, WSL or macOS VM", automatic=False),
+        Compiler("gcc-2.7.2-kmc", "KMC GCC 2.7.2", "many third-party N64 games", guess="KMC", released=1996),
+        Compiler("ido-7.1", "IDO 7.1", "most later first-party N64 games", guess="IDO", released=1996),
+        Compiler("ido-5.3", "IDO 5.3", "early N64 games (1996-97)", released=1995),
+        Compiler("sn-n64-281", "SN64 GCC 2.8.1", "SN Systems toolchains used by some third-party games", released=1998),
+        Compiler("sn-n64-272-0001", "SN64 GCC 2.7.2 (0001)", "earlier SN Systems N64 toolchains", released=1996),
+        Compiler("sn-n64-272-0001-as0004", "SN64 GCC 2.7.2 (0001 + 0004 assembler)", "SN 2.7.2 games whose doubles load with ldc1", released=1996),
+        Compiler("sn-n64-272-0004", "SN64 GCC 2.7.2 (0004)", "preserved SN compiler and assembler build", released=1996),
+        Compiler("sn-n64-272-0006", "SN64 GCC 2.7.2 (0006)", "later SN 2.7.2 build used in some boot code", released=1996),
+        Compiler("gcc-2.8.1-pm-sn-as", "GCC 2.8.1 + SN ASN64 2.56", "GCC code generation with original SN assembly", released=1998),
+        Compiler("gcc-2.8.1-pm", "GCC 2.8.1 (PM matching)", "patched GCC with its paired GNU assembler", released=1998),
+        Compiler("gcc-egcs-2.91.66", "EGCS 1.1.2 / GCC 2.91.66", "later iQue rebuild toolchains", released=1999),
+        Compiler("sn-n64-272-970404", "Reconstructed SN64 GCC 2.7.2 (970404)", "reconstructed SN codegen with compatibility assembly", released=1997),
+        Compiler("ido-5.3-cxx", "IDO 5.3 C++", "separate SGI C++ frontend; Linux, WSL or macOS VM", automatic=False, released=1995),
+        Compiler("ido-5.2", "IDO 5.2", "experimental SGI comparison; Linux, WSL or macOS VM", automatic=False, released=1994),
+        Compiler("ido-6.0", "IDO 6.0", "experimental SGI comparison; Linux, WSL or macOS VM", automatic=False, released=1995),
+        Compiler("ido-4.1", "IDO 4.1", "experimental early SGI comparison; Linux, WSL or macOS VM", automatic=False, released=1993),
+        Compiler("mipspro-7.4.4", "MIPSpro 7.4.4", "experimental; retail N64 use unconfirmed; Linux, WSL or macOS VM", automatic=False, released=2001),
+        Compiler("gcc-egcs-1.1.2-4", "Original EGCS 1.1.2-4", "original Linux release; iQue toolchain comparison", released=1999),
+        Compiler("gcc-4.4.0-n64", "GCC 4.4.0 (MIPS64 ELF)", "experimental modern toolchain; Linux, WSL or macOS VM", automatic=False, released=2009),
     )
     kits = ("own-n64",)  # another build of one of its compilers, the user's (kits/owncompiler.py)
     guides = ("mips",)
@@ -228,6 +233,15 @@ class Nintendo64(Console):
                   str(Path(__file__).with_name("libultra_signatures.tsv")),
                   # libultra code the SDK folder lacks, as games that declare 2.0D link it (2.0D-2.0G have no archive)
                   str(Path(__file__).with_name("libultra_2_0d_signatures.tsv")))
+
+    def profile_probes(self, facts):
+        return profile_probes.probes(facts)
+
+    def sdk_without_source(self, corpora):
+        # n_audio (libn_audio / libgn_audio, the app's table or the user's archives): ultralib has none of its C. A
+        # name the ultralib rebuild has too is libultra's own, and goes the usual way.
+        return (any(_N_AUDIO.search(c) for c in corpora)
+                and not any(c.startswith("built in / decompals/ultralib") for c in corpora))
 
     def sdk_assembly_identity(self, code, big_endian=True):
         return sdk_assembly.identify(code, big_endian)

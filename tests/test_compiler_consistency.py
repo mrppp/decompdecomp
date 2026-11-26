@@ -7,6 +7,7 @@ import pytest
 from decompnet.app.engine import RomNetwork
 from decompnet.app.function_names import canonical_source
 from decompnet.network import NetworkError
+from decompnet.project import compiler_for
 
 
 @pytest.fixture
@@ -65,16 +66,22 @@ def test_a_helper_saving_an_attempt_mid_check_does_not_abort_the_change(net, mon
     assert net._function('f84', 'demo')['best_source'] == 'new code'
 
 
-def test_concurrent_match_prevents_publishing_old_verdicts(net, monkeypatch):
-    def regression(*a, **kw):
-        with net.store.tx() as db:
-            db.execute("UPDATE functions SET status='matched', matched_source='x' WHERE name='f84'")
-        return []
+def test_a_match_made_mid_check_is_checked_and_the_change_applied(net, monkeypatch):
+    checked = []
+    def regression(proj, header, only, **kw):
+        names = [f['name'] for f in only]
+        checked.append(names)
+        if len(checked) == 1:
+            with net.store.tx() as db:
+                db.execute("UPDATE functions SET status='matched', matched_source='x' WHERE name='f84'")
+        return [(n, 'mismatch') for n in names if n == 'f84']
     monkeypatch.setattr(net, 'regression_test', regression)
-    with pytest.raises(NetworkError, match='changed during'):
-        net.set_compiler('demo', 'ido-5.3', ['-O1'])
-    assert net.cfg(net.project_row('demo'))['compiler']['flags'] == ['-O2']
-    assert net._function('f84', 'demo')['status'] == 'matched'
+    net.set_compiler('demo', 'ido-5.3', ['-O1'])
+    cfg = net.cfg(net.project_row('demo'))
+    fn = net._function('f84', 'demo')
+    assert cfg['compiler']['flags'] == ['-O1'] and fn['status'] == 'matched'
+    assert compiler_for(cfg, fn['vram'], fn)['flags'] == ['-O2']  # it keeps what it matched with
+    assert checked[1] == ['f84']
 
 
 def test_range_changes_use_the_same_private_validation_and_rebase(net, monkeypatch):
@@ -127,25 +134,35 @@ def cleanup_net(net, monkeypatch):
     return net
 
 
-def test_cleanup_only_moves_exact_matches_and_preserves_sources(cleanup_net, monkeypatch):
+def test_cleanup_removes_a_profile_only_when_every_function_moves(cleanup_net, monkeypatch):
     from decompnet.app import compiler_cleanup
     from decompnet.project import compiler_for
     n = cleanup_net
     before = [tuple(r) for r in n.store.all('SELECT name,status,matched_source FROM functions ORDER BY id')]
     monkeypatch.setattr(n, '_judge_with', lambda proj, fn, tc, flags, source: (fn['name'] == 'f0', None, ''))
+    monkeypatch.setattr(n, 'regression_test', lambda *a, **k: pytest.fail('nothing moved, so nothing to recheck'))
+    out = compiler_cleanup.cleanup(n, 'demo', log=lambda _: None)
+    # f1 cannot leave -O1, so the profile stays and f0 is not moved on its own.
+    assert out['changed'] == [] and out['profiles_after'] == out['profiles_before']
+    assert compiler_for(n.cfg(n.project_row('demo')), 0x80001000)['flags'] == ['-O1']
+    assert before == [tuple(r) for r in n.store.all('SELECT name,status,matched_source FROM functions ORDER BY id')]
+
+
+def test_cleanup_moves_all_functions_of_a_removable_profile(cleanup_net, monkeypatch):
+    from decompnet.app import compiler_cleanup
+    from decompnet.project import compiler_for
+    n = cleanup_net
+    monkeypatch.setattr(n, '_judge_with', lambda proj, fn, tc, flags, source: (True, None, ''))
     checked = []
     def regression(proj, header, only, **kwargs):
         checked.extend(fn['name'] for fn in only)
-        assert compiler_for(n.cfg(proj), only[0]['vram'])['flags'] == ['-O2']
         return []
     monkeypatch.setattr(n, 'regression_test', regression)
     out = compiler_cleanup.cleanup(n, 'demo', log=lambda _: None)
-    assert [r['function'] for r in out['changed']] == ['f0']
-    assert checked == ['f0']
+    assert {r['function'] for r in out['changed']} == {'f0', 'f1'}
+    assert out['profiles_after'] == 1 and 'f0' in checked
     cfg = n.cfg(n.project_row('demo'))
-    assert compiler_for(cfg, 0x80001000)['flags'] == ['-O2']
-    assert compiler_for(cfg, 0x80001010)['flags'] == ['-O1']
-    assert before == [tuple(r) for r in n.store.all('SELECT name,status,matched_source FROM functions ORDER BY id')]
+    assert compiler_for(cfg, 0x80001000)['flags'] == ['-O2'] and compiler_for(cfg, 0x80001010)['flags'] == ['-O2']
 
 
 def test_cleanup_final_guard_rejects_regression(cleanup_net, monkeypatch):
@@ -241,7 +258,7 @@ def test_selected_profile_checks_all_matches_against_only_default(cleanup_net, m
         return fn['name'] == 'f0', SimpleNamespace(score=0), ''
     monkeypatch.setattr(n, '_judge_with', judge)
     monkeypatch.setattr(n, 'regression_test', lambda *a, **k: [])
-    out = compiler_cleanup.cleanup(n, 'demo', rare_limit=1, log=lambda _: None,
+    out = compiler_cleanup.cleanup(n, 'demo', log=lambda _: None,
                                    source_profile={'toolchain': 'ido-5.3', 'flags': ['-O1']})
     assert calls == [('f0', ['-O2']), ('f1', ['-O2'])]
     assert [item['function'] for item in out['changed']] == ['f0']
@@ -329,3 +346,35 @@ def test_parallel_rescore_failure_preserves_settings_and_all_saved_scores(net, m
     assert net.project_row('demo')['config'] == before
     assert net._function('f84','demo')['best_score'] == 20
     assert net._function('f84','demo')['seed'] == 'draft'
+
+
+def test_compare_with_another_profile_is_read_only_then_moves(cleanup_net, monkeypatch):
+    from decompnet.app import compiler_cleanup
+    from decompnet.project import compiler_for
+    n = cleanup_net
+    source = {'toolchain': 'ido-5.3', 'flags': ['-O1']}
+    target = {'toolchain': 'ido-5.3', 'flags': ['-O3']}
+    monkeypatch.setattr(n, '_judge_with', lambda proj, fn, tc, flags, src: (fn['name'] == 'f0', None, ''))
+    monkeypatch.setattr(n, 'regression_test', lambda *a, **k: [])
+    before = n.project_row('demo')['config']
+    out = compiler_cleanup.compare(n, 'demo', source, target, log=lambda _: None)
+    assert out['matches'] == ['f0'] and [f['function'] for f in out['failures']] == ['f1']
+    assert n.project_row('demo')['config'] == before
+    moved = compiler_cleanup.cleanup(n, 'demo', log=lambda _: None, source_profile=source, target_profile=target)
+    assert [item['function'] for item in moved['changed']] == ['f0'] and moved['unchanged'] == 1
+    cfg = n.cfg(n.project_row('demo'))
+    assert compiler_for(cfg, 0x80001000)['flags'] == ['-O3'] and compiler_for(cfg, 0x80001010)['flags'] == ['-O1']
+    with pytest.raises(NetworkError, match='different compiler profile'):
+        compiler_cleanup.compare(n, 'demo', source, source, log=lambda _: None)
+
+
+def test_moving_a_function_with_its_own_setting_changes_that_setting():
+    from decompnet.app import compiler_cleanup
+    from decompnet.project import compiler_for
+    fn = {'name': 'f0', 'vram': 0x80001000, 'rom_offset': 0x40}
+    own = {'vram': 0x80001000, 'function': 'f0', 'toolchain': 'ido-5.3', 'flags': ['-O1']}
+    config = {'compiler': {'toolchain': 'ido-5.3', 'flags': ['-O2']}, 'function_compilers': {'64:2147487744': own}}
+    compiler_cleanup.move_function(config, fn, 0x80001010, ('ido-5.3', ('-O3',)))
+    assert compiler_for(config, fn['vram'], fn)['flags'] == ['-O3'] and not config.get('compiler_ranges')
+    compiler_cleanup.move_function(config, fn, 0x80001010, ('ido-5.3', ('-O2',)))
+    assert config['function_compilers'] == {}

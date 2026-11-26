@@ -16,7 +16,7 @@ from pathlib import Path
 
 from decompnet.hostenv import NO_WINDOW
 
-from . import compile_timing, limits, scoring, toolchains
+from . import compile_timing, limits, m2c_fp64, m2c_jump_tables, m2c_types, scoring, toolchains
 from .elfobj import FunctionObj
 
 # What m2c's --valid-syntax output needs to compile: its unknown types and macros, defined the simplest way that
@@ -30,6 +30,10 @@ typedef s16 M2C_UNK16;
 typedef s32 M2C_UNK32;
 #define M2C_FIELD(expr, type_ptr, offset) (*(type_ptr)((s8 *)(expr) + (offset)))
 #define M2C_BITWISE(type, expr) ((type)(expr))
+#define M2C_BITS_F32(expr) (m2c_bits = (u32)(expr), *(f32 *)&m2c_bits)
+extern u32 m2c_bits;
+#define M2C_PTR_FROM_F32(type, expr) ((type)(m2c_fbits = (expr), *(u32 *)&m2c_fbits))
+extern f32 m2c_fbits;
 #define M2C_ERROR(desc) (0)
 #define M2C_CARRY 0
 #define M2C_OVERFLOW(a) (0)
@@ -498,12 +502,140 @@ def _compilable(source: str | None, name='', asm='', header='', toolchain=None, 
         return source
     from decomprepair import large_switch_drafts
     source = large_switch_drafts.rewrite(source) or source
+    if (toolchain or '').startswith('ido'):
+        # IDO refuses arithmetic on `void *` (GCC 2.x allows it): the names m2c adds to are byte pointers
+        from decomprepair import void_pointer_arithmetic
+        source = void_pointer_arithmetic.rewrite(source, name) or source
+        source = void_pointer_arithmetic.externs(source, name) or source
+        source = denormal_floats_as_words(source)
+        source = ido_pointer_steps(source)
+    source = pointer_bits_as_float(source, name)
+    source = declare_written_arguments(source, name)
+    # a local m2c typed as a function pointer (`M2C_UNK (*sp24)(M2C_UNK, M2C_UNK);`) that the code also steps (`sp24 += 0xC`):
+    # the slot held an address that was both called and walked; the draft keeps the word
+    for pointer in re.findall(r"^[ \t]+[A-Za-z_][\w \t\*]*\(\*(\w+)\)\([^;\n]*\);", source, flags=re.M):
+        if re.search(rf"\b{pointer}\s*[-+]=", source):
+            source = re.sub(rf"^([ \t]+)[A-Za-z_][\w \t\*]*\(\*{pointer}\)\([^;\n]*\);", rf"\1s32 {pointer};", source, flags=re.M)
+        elif re.fullmatch(r"(?:unk)?sp[0-9A-Fa-f]+", pointer):
+            # a stack slot also becomes a `#define` onto the frame (`#define sp24 (*(s32 *)(sp + 0x24))`, added later), which expands
+            # over the declaration's name and leaves a syntax error: the macro is the storage, so the declaration goes, an address
+            # is stored as a word and a call goes through a cast
+            source = re.sub(rf"^[ \t]+[A-Za-z_][\w \t\*]*\(\*{pointer}\)\([^;\n]*\);[ \t]*\n", "", source, flags=re.M)
+            source = re.sub(rf"(?m)^([ \t]*{pointer} = )([A-Za-z_]\w*);", r"\1(s32)\2;", source)
+            source = re.sub(rf"(?<![\w#])(?<!define ){pointer}\(", f"((M2C_UNK (*)()){pointer})(", source)
+    source = re.sub(r"\*[ \t]*(?:NULL|\(\(void \*\)0\))(?![\w])", "0", source)  # (an argument slot nothing set: `*NULL`)
+    source = re.sub(r"^([ \t]*\w+:)[ \t]*\n(?=[ \t]*\})", r"\1;\n", source, flags=re.M)
+    from decomprepair import void_pointer_arithmetic as stores
+    source = stores.stores(source) or source  # a store m2c printed as a call through a cast, which no compiler reads
     if asm:
         from decomprepair import draft_call_recovery
 
         if repaired := draft_call_recovery.variants(source, name, asm, header, toolchain, resolve=resolve):
             return repaired[0][1]
+        # what the recovery left: a call to a code address inside the same overlay slot (`jal .L8033193C_raw_slot_09`)
+        # is named for its label, and `.L...` is no C name: it is a function like the others (`func_<address>`), as the
+        # split names the piece
+        source = re.sub(r"(?<![\w.])\.L([0-9A-Fa-f]{8}(?:_[a-z][a-z0-9]*(?:_[A-Za-z0-9]+)*)?)(?![\w.])", r"func_\1", source)
     return source
+
+
+_DENORMAL = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?e-\d+)f\b")
+
+
+def denormal_floats_as_words(source: str) -> str:
+    """m2c prints the integer 1 passed where a float is expected as `1e-45f`; IDO's assembler can't encode a denormal
+    ("number outside range for single precision") and fails the whole function. The word the original passed is what
+    the draft keeps."""
+    import struct
+
+    def word(m):
+        value = float(m.group(1))
+        if value == 0.0 or abs(value) >= 1.17549435e-38:
+            return m.group(0)
+        return f"M2C_BITS_F32({struct.unpack('>I', struct.pack('>f', value))[0]}U)"
+    return _DENORMAL.sub(word, source)
+
+
+def ido_pointer_steps(source: str) -> str:
+    """IDO refuses what GCC 2.x allows on a `void *` and with a null address:
+    - `void *var_s1;` stepped with `var_s1 += (s32)8;` ("Bad operand type for += or -="): the local is a byte pointer;
+      a stepped slot behind a pointer (`*arg0 += (s32)8;`, `void **arg0`) is written as the cast and add it means.
+    - `var = NULL;` for a local declared as a number ("Constants must have arithmetic type"): a zero."""
+    for name in set(re.findall(r"\b(\w+)\s*[-+]=", source)):
+        source = re.sub(rf"^([ \t]+)void[ \t]*\*[ \t]*{name}[ \t]*;", rf"\1u8 *{name};", source, flags=re.M)
+    source = re.sub(r"(?m)^([ \t]*)\*(\w+)[ \t]*([-+])=[ \t]*(?:\(s32\))?(0x[0-9A-Fa-f]+|\d+);",
+                    lambda m: f"{m[1]}*{m[2]} = (u8 *)*{m[2]} {m[3]} {m[4]};"
+                    if re.search(rf"\bvoid[ \t]*\*\*[ \t]*{m[2]}\b", source) else m[0], source)
+    numbers = set(re.findall(r"^[ \t]*(?:s8|u8|s16|u16|s32|u32|s64|u64|f32|f64|int|float|double)[ \t]+(\w+)[ \t]*[;,=]", source, flags=re.M))
+    return re.sub(r"(\b\w+)([ \t]*=[ \t]*)NULL[ \t]*;", lambda m: f"{m[1]}{m[2]}0;" if m[1] in numbers else m[0], source)
+
+
+def declare_written_arguments(source: str, name: str) -> str:
+    """m2c writes an argument register the signature has no parameter for (`arg3 = temp_a2;` in a three-parameter
+    function: the code moved a value into $a3 for a callee or a later use): a compiler stops at "'arg3' undefined".
+    The register is a local the draft owns."""
+    head = re.search(rf"^[^\n;{{}}]*\b{re.escape(name)}\s*\(([^)]*)\)\s*\{{[ \t]*\n", source, flags=re.M) if name else None
+    if not head:
+        return source
+    known = set(re.findall(r"\barg\d+\b", head.group(1))) | set(re.findall(r"\b[A-Za-z_][\w \t\*]*?\b(arg\d+)\s*[;=,\[]", source[head.end():]))
+    missing = sorted({a for a in re.findall(r"\barg\d+\b", source[head.end():])} - known, key=lambda a: int(a[3:]))
+    if not missing:
+        return source
+    return source[:head.end()] + "".join(f"    s32 {a};\n" for a in missing) + source[head.end():]
+
+
+def pointer_bits_as_float(source: str, name: str) -> str:
+    """`M2C_BITWISE(f32, &local)` (a pointer passed where the callee reads a float) is `(f32)(&local)`, a cast IDO and
+    GCC 2.x refuse: 130 functions of 90 games stopped at "Cast a pointer into a non-integral type". The pointer's bits
+    are what the original passed, so the draft reads them as a float through a word."""
+    # a float read as an address (`M2C_BITWISE(s32 *, temp_fa0)`) and a float load used as a base (`M2C_FIELD(*(f32 *)0x2CF8`):
+    # the word the original held in a pointer, which m2c typed by the load it saw
+    floats = set(re.findall(r"^[ \t]*f32[ \t]+(\w+)[ \t]*;", source, flags=re.M))
+    source = re.sub(r"M2C_FIELD\(([^,\n]*)", lambda m: "M2C_FIELD(" + re.sub(r"\*\(f32 \*\)(0x[0-9A-Fa-f]+)", r"*(u32 *)\1", m.group(1)), source)
+    head = re.search(rf"\b{re.escape(name)}\s*\(([^)]*)\)\s*\{{", source)
+    # a float parameter or local that the code also dereferences (`M2C_FIELD(arg1, f32 *, 4)`): the register held an address
+    # and m2c typed it by another use; the field access reads it as a word, as IDO and GCC 2.x need for a base
+    floaty = floats | set(re.findall(r"\bf32\s+(\w+)\s*[,)]", head.group(1) if head else ""))
+    if floaty:
+        source = re.sub(r"M2C_FIELD\((\w+),", lambda m: f"M2C_FIELD((s32){m[1]}," if m[1] in floaty else m[0], source)
+    if "M2C_BITWISE(" not in source:
+        return source
+    pointers = set(re.findall(r"\*\s*(\w+)\s*(?:,|$)", head.group(1))) if head else set()
+    pointers |= set(re.findall(r"^[ \t]*[\w ]+\*+\s*(\w+)\s*[;=]", source, flags=re.M))
+
+    def arguments(text: str, start: int):
+        """The two arguments of the macro call whose '(' is at `start`, with its end: the second may hold calls."""
+        depth, comma = 0, None
+        for k in range(start, len(text)):
+            if text[k] == "(":
+                depth += 1
+            elif text[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    return (text[start + 1:comma], text[comma + 1:k], k + 1) if comma is not None else None
+            elif text[k] == "," and depth == 1 and comma is None:
+                comma = k
+        return None
+
+    out, at = [], 0
+    for m in re.finditer(r"M2C_BITWISE\(", source):
+        if m.start() < at:
+            continue
+        parts = arguments(source, m.end() - 1)
+        if not parts:
+            continue
+        kind, expr, end = parts[0].strip(), parts[1].strip(), parts[2]
+        lead = re.match(r"\(*\s*(&?)\s*(\w+)", expr)
+        if kind == "f32" and lead and (lead[1] or lead[2] in pointers):
+            new = f"M2C_BITS_F32({expr})"
+        elif re.fullmatch(r"\w+ \*+", kind) and (
+                expr in floats or (lead and lead[2] in floats) or re.search(r"\bf32\b|\d\.\d*f\b", expr)):
+            new = f"M2C_PTR_FROM_F32({kind}, {expr})"
+        else:
+            continue
+        out.append(source[at:m.start()] + new)
+        at = end
+    return "".join(out) + source[at:]
 
 
 def drop_saved_register_reads(source: str) -> str:
@@ -511,6 +643,39 @@ def drop_saved_register_reads(source: str) -> str:
     only conditionally replaces). `saved_reg_s0` is declared nowhere, so no draft with one compiles; the local simply
     stays unset, which is what the original register did."""
     return re.sub(r"^[ \t]*\w+ = saved_reg_\w+;[ \t]*\n", "", source, flags=re.M)
+
+
+_UNSET_DOUBLE = re.compile(r"GLUE_F64\(M2C_ERROR\(/\* Read from unset register \$(f\w+) \*/\), 0U\)")
+_UNSET_REGISTER = re.compile(r"M2C_ERROR\(/\* Read from unset register \$(\w+) \*/\)")
+_UNSET_READ = re.compile(r"\b(?:unk)?sp[0-9A-Fa-f]+\b|\bsaved_reg_\w+\b|\bunset_\w+\b|\bsubroutine_arg\d+\b|(?<![\w.])sp\b")
+_NOT_A_TYPE = {"return", "else", "case", "goto", "do", "sizeof"}
+
+
+def declare_unset_reads(source: str, name: str) -> str:
+    """m2c reads a stack slot or a callee-saved register that nothing in the function set (`sp24` passed on as a
+    callee's seventh argument, `saved_reg_s0 != 0`) and names it without declaring it: 36 of one game's 406
+    functions without a draft failed with an undeclared sp24. The original read whatever the caller left there, so the
+    draft declares it as an unset local: it compiles, and the search decides what the slot really holds."""
+    head = re.search(rf"^[^\n;]*\b{re.escape(name)}\s*\([^)]*\)\s*\{{[ \t]*$", source, flags=re.M)
+    if not head:
+        return source
+    body = source[head.end():]
+    missing = []
+    for found in dict.fromkeys(_UNSET_READ.findall(body)):
+        declared = re.compile(rf"^[ \t]*(?:\w+[ \t]+)+(?:\(\s*\*+|\**){re.escape(found)}\b[^(=\n]*[;=,\[)]", re.M)
+        if not any(m[0].split()[0] not in _NOT_A_TYPE for m in declared.finditer(body)):
+            missing.append(found)
+    if not missing:
+        return source
+    def declaration(found):
+        if found == "sp":  # the frame's own address (`var_t1 = sp;`): a buffer
+            return "    u8 sp[256];\n"
+        # a slot m2c indexes (`&sp10[0]`) is a buffer, not a word
+        if found.startswith("unset_f"):  # a floating-point register nothing set
+            return f"    f32 {found};\n"
+        return f"    s32 {found}[16];\n" if re.search(rf"\b{found}\[", body) else f"    s32 {found};\n"
+    lines = "".join(declaration(found) for found in missing)
+    return source[:head.end()] + "\n" + lines.rstrip("\n") + source[head.end():]
 
 
 MAX_REASON_CHARS = 600  # of m2c's reason for a failure, passed on to an agent
@@ -563,6 +728,7 @@ _DELAY_SLOT_LABEL = re.compile(r"Label \._m2c_(\.?L[0-9A-Fa-f]{8}\w*?)before ref
 
 
 _ENTRY_BRANCH = re.compile(r"Cannot find branch target (\w+)")
+_MISSING_LABEL = re.compile(r"Cannot find branch target (\.L\w+)")
 _BRANCH_LINE = re.compile(r"^[ \t]*(?:/\*.*?\*/[ \t]*)?(?:b[a-z]*|j)[ \t]")
 
 
@@ -584,6 +750,144 @@ def entry_label(asm_text: str, name: str) -> str:
     return "\n".join(out) if placed else asm_text
 
 
+_FLOAT_SAVE = re.compile(r"^[ \t]*(?:/\*.*?\*/[ \t]*)?s(?:wc1|dc1)[ \t]+\$(?:fs\d+f?|f(?:2\d|3[01]))[ \t]*,[ \t]*[-+\w]+\(\$sp\)[ \t]*$",
+                         re.M)
+
+
+def drop_float_saves(asm_text: str) -> str:
+    """The prologue's stores of callee-saved FPU registers (`swc1 $fs0, 0x18($sp)`) removed. A function that keeps a
+    float in $f20..$f31 saves the caller's value first, and m2c reads that register as a use of a register nothing
+    set ("Read from unset register $f20"), so no draft of it compiled (a fifth of one game's drafts that failed to
+    compile). The save is the compiler's, not the C's, so the draft is the same without it."""
+    return _FLOAT_SAVE.sub("", asm_text)
+
+
+_INSN = re.compile(r"^(?:[ \t]*/\*.*?\*/)?[ \t]*([a-z][\w.]*)[ \t]*(.*?)[ \t]*(?:#.*)?$")
+_LABEL_LINE = re.compile(r"^[ \t]*(\.?L\w+):[ \t]*$")
+
+
+def float_unsigned_conversions(asm_text: str) -> str:
+    """IDO's float-to-unsigned conversion is a fenced sequence (`cfc1 $t8, $31` ... a `cvt.w.s` (`cvt.w.d` for a double), a check of the FPU's
+    exception bits, a second `cvt.w.s` of the value less 2^31, `ctc1 $t8, $31`), and m2c reads the control register
+    as an unknown instruction: 124 functions of 60 games had no draft. The whole fence is the C cast, so it is written
+    as the truncation it converts with (`trunc.w.s` and the move to the result register), which m2c reads as a cast."""
+    if "cfc1" not in asm_text:
+        return asm_text
+    lines = asm_text.split("\n")
+    parsed = [(_INSN.match(line) or [None, "", ""]) for line in lines]
+    ops = [(m[1], m[2]) for m in parsed]
+    out, i, changed = [], 0, False
+    while i < len(lines):
+        op, args = ops[i]
+        keep = True
+        if op == "cfc1" and args.replace(" ", "").endswith(",$31"):
+            saved = args.split(",")[0].strip()
+            end = next((j for j in range(i + 1, min(i + 60, len(lines)))
+                        if ops[j][0] == "ctc1" and ops[j][1].replace(" ", "") == f"{saved},$31"), None)
+            if end is not None:
+                inside = range(i, end + 1)
+                names = {m[1] for k in inside if (m := _LABEL_LINE.match(lines[k]))}
+                outside = "\n".join(lines[k] for k in range(len(lines)) if k not in inside)
+                width = next((ops[k][0][-1] for k in inside if ops[k][0] in ("cvt.w.s", "cvt.w.d")), None)
+                convert = next((ops[k][1] for k in inside if ops[k][0] == f"cvt.w.{width}"), None)
+                result = next((re.split(r"\s*,\s*", ops[k][1])[0] for k in inside if ops[k][0] == "andi"), None)
+                if (convert and result and not any(re.search(rf"(?<![\w.]){re.escape(n)}(?!\w)", outside) for n in names)
+                        and "$31" not in "".join(ops[k][1] for k in inside if ops[k][0] not in ("cfc1", "ctc1"))):
+                    fregs = re.split(r"\s*,\s*", convert)
+                    out += [f"trunc.w.{width} {fregs[0]}, {fregs[1]}", f"mfc1 {result}, {fregs[0]}"]
+                    i, keep, changed = end + 1, False, True
+        if keep:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out) if changed else asm_text
+
+
+_MISSING_TABLE = ("jump table is not provided", "jtbl list must not be empty", "a name starting with")
+MISSING_SWITCH_NOTE = ("/* the jump table's data is not in the project: the switch below is cut where its jump was and its "
+                       "cases are not drafted (import the table's bytes, e.g. memory_regions.json for an overlay, and "
+                       "regenerate) */\n")
+
+
+def cut_missing_switches(asm_text: str) -> str:
+    """A `jr $reg` through a table whose bytes the project does not have: m2c refuses the whole function ("jump table
+    is not provided"), so an overlay game's switch functions had no draft at all (about 250 in 20 games). Nothing can
+    invent the case targets, but the rest of the function can be drafted: the jump becomes a return, so the code before
+    it compiles and the cases, which nothing then reaches, are left out. The draft says so in a comment."""
+    return re.sub(r"(?m)^(.*?\bjr[ \t]+)\$(?!ra\b)\w+([ \t]*(?:#.*)?)$", r"\1$ra\2", asm_text)
+
+
+OUTSIDE_BRANCH_NOTE = ("/* a branch below leaves the function (its target is before or after what the project filed as this "
+                       "function): it is drafted as a return, so check where this function really starts and ends */\n")
+_OUTSIDE_TARGET = re.compile(r"\. \+ 4 \+ \(\s*(-?)(0x[0-9A-Fa-f]+|\d+)\s*<<\s*2\s*\)")
+_ASM_OFFSET = re.compile(r"^\s*/\*\s*([0-9A-Fa-f]+)\s+[0-9A-Fa-f]{8}\s+[0-9A-Fa-f]{8}\s*\*/")
+_NOT_INSTRUCTION = re.compile(r"^\s*(?:$|#|//|\.|glabel\b|endlabel\b|dlabel\b|jlabel\b|alabel\b|[\w.$]+:)")
+
+
+def _instruction_offsets(lines: list[str]) -> dict[int, int]:
+    """Each instruction line's byte offset in the function: the disassembler's `/* OFF VRAM WORD */` comment when the
+    text has one, otherwise the count of instruction lines before it times four."""
+    offsets, count = {}, 0
+    for index, line in enumerate(lines):
+        if (found := _ASM_OFFSET.match(line)):
+            offsets[index] = int(found[1], 16)
+        elif not _NOT_INSTRUCTION.match(line):
+            offsets[index] = count * 4
+        else:
+            continue
+        count += 1
+    if offsets and any(_ASM_OFFSET.match(lines[i]) for i in offsets):
+        start = min(offsets.values())  # the comment's offset is from the segment in some splits, not the function
+        offsets = {i: offset - start for i, offset in offsets.items()}
+    return offsets
+
+
+def cut_outside_branches(asm_text: str) -> str:
+    """A branch the disassembler printed as `. + 4 + (offset << 2)`, which m2c cannot parse, so it drafted nothing
+    (blues-brothers-2000: 4 of 6 sampled functions). The disassembler writes that form for a target it gave no label,
+    which is usually one outside the function (the split cut it in the middle of code), but not always: a function
+    re-split by Check again had every branch, in-function ones included, in that form, and drafting them all as returns
+    nested its sequential `if`s and inverted its `&&` (two functions at 10 and 940 matched once the branches were read).
+    A target inside the function gets a label of its own on that instruction; only one outside goes to a label that
+    returns, so the code around it compiles."""
+    if not _OUTSIDE_TARGET.search(asm_text):
+        return asm_text
+    lines = asm_text.split("\n")
+    offsets = _instruction_offsets(lines)
+    at = {offset: index for index, offset in offsets.items()}
+    labels: dict[int, str] = {}
+    outside = False
+    for index, line in enumerate(lines):
+        found = _OUTSIDE_TARGET.search(line)
+        if not found:
+            continue
+        delta = int(found[2], 0) * (-1 if found[1] else 1)
+        target = offsets[index] + 4 + delta * 4 if index in offsets else None
+        if target is not None and target in at:
+            label = labels.setdefault(at[target], f".Lbranch_{target:X}")
+        else:
+            label, outside = ".Loutside_branch", True
+        lines[index] = line[:found.start()] + label + line[found.end():]
+    for index in sorted(labels, reverse=True):
+        lines.insert(index, f"{labels[index]}:")
+    out = "\n".join(lines)
+    return out + "\n.Loutside_branch:\njr $ra\nnop\n" if outside else out
+
+
+def cut_missing_label(asm_text: str, error: str) -> str | None:
+    """A branch to a local label the function's text never defines (the split cut the function short, or data was
+    filed as code): m2c drafts nothing. It becomes a branch to a return, as `cut_outside_branches` does."""
+    found = _MISSING_LABEL.search(error)
+    if not found or ".Loutside_branch" in found[1]:
+        return None
+    label = re.escape(found[1])
+    if re.search(rf"(?m)^[ \t]*{label}:", asm_text):
+        return None
+    cut = re.sub(rf"(?<![\w.]){label}(?!\w)", ".Loutside_branch", asm_text)
+    if cut == asm_text:
+        return None
+    return cut if "\n.Loutside_branch:\n" in cut else cut + "\n.Loutside_branch:\njr $ra\nnop\n"
+
+
 @compile_timing.timed('generation')
 def run_m2c(asm_text: str, name: str, target: str, context_header: str = "", data_asm: str | None = None,
             timeout: float = 20, valid: bool = False, strict: bool = False, options: tuple[str, ...] = ()) -> str | None:
@@ -592,6 +896,11 @@ def run_m2c(asm_text: str, name: str, target: str, context_header: str = "", dat
     m2c refuses a label that a branch-likely handling puts on a delay slot ("refers to a delay slot: add a nop").
     A `nop` before that label is what it asks for and changes nothing the draft shows, so it is added and m2c runs
     again (a function can have several such labels)."""
+    asm_text = float_unsigned_conversions(asm_text)
+    if (cut := cut_outside_branches(asm_text)) != asm_text:
+        drafted = run_m2c(cut, name, target, context_header, data_asm, timeout, valid, strict, options)
+        note = OUTSIDE_BRANCH_NOTE if ".Loutside_branch" in cut else ""
+        return note + drafted if drafted else drafted
     for _ in range(8):
         try:
             return _run_m2c(asm_text, name, target, context_header, data_asm, timeout, valid, strict, options)
@@ -602,6 +911,15 @@ def run_m2c(asm_text: str, name: str, target: str, context_header: str = "", dat
                     raise
                 asm_text = looped
                 continue
+            if "Read from unset register $f" in str(error) and (saved := drop_float_saves(asm_text)) != asm_text:
+                asm_text = saved
+                continue
+            if any(text in str(error) for text in _MISSING_TABLE) and (cut := cut_missing_switches(asm_text)) != asm_text:
+                drafted = _run_m2c(cut, name, target, context_header, data_asm, timeout, valid, strict, options)
+                return MISSING_SWITCH_NOTE + drafted if drafted else drafted
+            if cut := cut_missing_label(asm_text, str(error)):
+                drafted = run_m2c(cut, name, target, context_header, data_asm, timeout, valid, strict, options)
+                return OUTSIDE_BRANCH_NOTE + drafted if drafted else drafted
             found = _DELAY_SLOT_LABEL.search(str(error))
             if not found:
                 raise
@@ -610,7 +928,16 @@ def run_m2c(asm_text: str, name: str, target: str, context_header: str = "", dat
             if padded == asm_text:
                 raise
             asm_text = padded
-    return _run_m2c(asm_text, name, target, context_header, data_asm, timeout, valid, strict, options)
+    drafted = _run_m2c(asm_text, name, target, context_header, data_asm, timeout, valid, strict, options)
+    if drafted is None and not strict and (cut := cut_missing_switches(asm_text)) != asm_text:
+        # a quiet run says nothing of why it failed: ask again for the reason, and draft around a missing table
+        try:
+            _run_m2c(asm_text, name, target, context_header, data_asm, timeout, valid, True, options)
+        except DraftError as error:
+            if any(text in str(error) for text in _MISSING_TABLE):
+                around = _run_m2c(cut, name, target, context_header, data_asm, timeout, valid, strict, options)
+                return MISSING_SWITCH_NOTE + around if around else around
+    return drafted
 
 
 def _run_m2c(asm_text: str, name: str, target: str, context_header: str = "", data_asm: str | None = None,
@@ -619,11 +946,14 @@ def _run_m2c(asm_text: str, name: str, target: str, context_header: str = "", da
         raise ValueError('Unsupported machine-draft option.')
     if not available():
         return None
+    original = asm_text
     if target.startswith('mips-'):
         from .arch.mips import abi_register_names
         from .rom.split import draft_asm
 
-        asm_text = abi_register_names(asm_text)
+        asm_text = m2c_fp64.pair_free(abi_register_names(asm_text))
+        if data_asm:
+            asm_text = m2c_jump_tables.inline_tables(asm_text, data_asm)
         if data_asm:
             asm_text = draft_asm(_mips_table_aliases(asm_text, data_asm), name, data_asm=data_asm)
     if target.startswith("gba"):  # a public GBA decomp (pret style): function macros, pre-UAL load mnemonics
@@ -659,9 +989,24 @@ def _run_m2c(asm_text: str, name: str, target: str, context_header: str = "", da
         errors = [line.strip() for line in out.splitlines()
                   if re.match(r"\s*(?://\s*Error:|Bad function call operand\b)", line)
                   or (valid and re.search(r"\bM2C_ERROR\s*\(", line))]
+        if errors and valid and ("Read from unset register $f" not in out or drop_float_saves(original) == original):
+            # (a prologue's float saves come out of the assembly first, in run_m2c: they are not reads)
+            # a register the code reads before anything set it (an argument past the ones m2c saw, a temporary the caller
+            # left): the original read whatever was there, so the draft reads an unset local
+            replaced = _UNSET_DOUBLE.sub(lambda found: "unset_" + found[1], out)  # (a double whose half nothing set)
+            replaced = _UNSET_REGISTER.sub(lambda found: "unset_" + found[1], replaced)
+            if replaced != out:
+                out = replaced
+                errors = [line.strip() for line in out.splitlines()
+                          if re.match(r"\s*(?://\s*Error:|Bad function call operand\b)", line)
+                          or re.search(r"\bM2C_ERROR\s*\(", line)]
         reason = '\n'.join(errors)[-MAX_REASON_CHARS:]
         if res.returncode != 0 or not out or errors:
             if strict:
                 raise DraftError(reason or (_failure(res) if out or res.stderr or res.returncode else 'm2c produced no C for this function.'))
             return None
-        return drop_saved_register_reads(out) if valid else out
+        if valid and "--no-switches" not in options and "/* irregular */" in out:
+            # a switch m2c could not structure leaves `case` labels outside any `switch`; as gotos it compiles
+            return _run_m2c(original, name, target, context_header, data_asm, timeout, valid, strict,
+                            (*options, "--no-switches"))
+        return m2c_types.repair(declare_unset_reads(drop_saved_register_reads(out), name)) if valid else out

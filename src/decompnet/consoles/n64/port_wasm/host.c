@@ -1094,6 +1094,7 @@ u32 w2c_env_osContStartReadData(struct w2c_env *e, u32 mq) { (void)e; si_done(mq
 static int8_t stick_x, stick_y;
 int port_live_input(uint16_t *buttons, int8_t *x, int8_t *y); /* live.c: the keyboard, with PORT_LIVE */
 void port_live_start(void);
+void port_live_gate(unsigned long next, const uint8_t *ram); /* live.c: PORT_LOCKSTEP parks here before retrace `next` until the viewer allows it */
 void port_live_pump(void); /* live.c: the main thread's turn at the window (PORT_WINDOW), every retrace */
 void port_live_app(const char *argv0); /* live.c: an exported app's settings, when no ROM is named */
 const char *port_live_rom(void);        /* live.c: the ROM the player chooses in the window */
@@ -1141,6 +1142,15 @@ static void script_input(void) {
 void w2c_env_osContGetReadData(struct w2c_env *e, u32 pad) {
     (void)e;
     scripted_input();
+    /* PORT_PAD_LOG=file: "PAD <task> <buttons>" at the first read that returns each change of the pad (the emulator's EMU_PAD_LOG, for
+       finding how many tasks later the game sees an edge on each side) */
+    static uint16_t last_shown = 0xFFFF;
+    if (buttons != last_shown) {
+        last_shown = buttons;
+        const char *path = getenv("PORT_PAD_LOG");
+        FILE *log = path ? fopen(path, "a") : NULL;
+        if (log) { fprintf(log, "PAD %lu %04X\n", (unsigned long)gfx_tasks, buttons); fclose(log); }
+    }
     for (int i = 0; i < 4; i++) {
         wbe16(pad + 6 * i, i == 0 ? buttons : 0);
         M[pad + 6 * i + 2] = i == 0 ? (uint8_t)stick_x : 0; M[pad + 6 * i + 3] = i == 0 ? (uint8_t)stick_y : 0;
@@ -2103,7 +2113,14 @@ static void boot_call(void) {
 #endif
 }
 /* the VI retrace's period: 50 a second for PAL, 60 otherwise */
-static int retrace_us(void) { return boot.tv == 0 ? 20000 : 16667; }
+/* The retrace period in microseconds: PAL 20 ms, NTSC 16.667 ms, or PORT_RETRACE_US (the reversing emulator's own period for a PAL game, read from the count between its
+   retraces, is 992,835 ticks of the 46.875 MHz counter: 21,180 us, not 20,000; the time a game measures between frames, its physics step, then differs by 6% in the port). */
+static int retrace_us(void) {
+    static int override = -1;
+    if (override < 0) override = getenv("PORT_RETRACE_US") ? atoi(getenv("PORT_RETRACE_US")) : 0;
+    if (override > 1000) return override;
+    return boot.tv == 0 ? 20000 : 16667;
+}
 
 #ifdef PORT_WEB
 /* The page's start: the ROM the player chose (in memory the page got from port_web_alloc), then the boot, as main()
@@ -2429,6 +2446,7 @@ int main(int argc, char **argv) {
     /* the VI retrace: 50 a second for PAL, 60 for NTSC */
     for (int frame = 0; seconds <= 0 || (vtime ? (int)(vi_count) : frame) < seconds * 1000000 / retrace_us(); frame++) {
         wait_retrace();
+        port_live_gate(vi_count + 1, M + 0x80000000u);
         retrace();
         /* the retraces the console had while it worked on a frame (PORT_VTIME_TRACE), fired as the game goes idle:
            they queue for it as they did there */

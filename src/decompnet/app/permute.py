@@ -687,6 +687,10 @@ class Permuter:
 
     @buffered
     @batched
+    def _turn_deadline(self, deadline):
+        """Deep search moves this back when an improvement earns it more time; a normal turn keeps its own."""
+        return deadline
+
     def _start_random_window(self):
         pass
 
@@ -841,7 +845,7 @@ class Permuter:
                         job['count'] = BATCH * LINE_FOCUS_OVERGENERATION
                     if hasattr(gen, 'chunks'):
                         if gen._closed.is_set():gen = Generator()
-                        def check_generation(fn=fn):
+                        def check_generation(fn=fn, deadline=deadline):
                             random_safety.checkpoint(self.net, fn)
                             if st.stop.is_set() or time.monotonic() >= deadline or not self._random_budget_available():
                                 raise GenerationStopped()
@@ -917,6 +921,7 @@ class Permuter:
                         discard(self)
                         best, best_src = score, cand
                         st.add(improved=1)
+                        deadline = self._turn_deadline(deadline)
                         if best > 0:
                             best, best_src = self._after_improvement(agent, proj, fn, st, fork, best, best_src)
                         rows = repair_ranking.evidence(self.net, fn['id'], agent.id)
@@ -1123,7 +1128,8 @@ class Permuter:
             identity = tuple(fn[k] for k in ('name', 'vram', 'size', 'unit', 'target', 'relocs'))
             naming = json.loads(fn['meta'] or '{}').get('naming')
             def build_settings(project):
-                cfg = json.loads(project['config'])
+                from ..project import settings
+                cfg = settings(project['config'])  # (shared, read only: parsed once per version, not per candidate)
                 return (compiler_for(cfg, fn['vram'], fn), project['root'], project['arch'], project['big_endian'],
                         tuple(cfg.get(k) for k in ('kind', 'platform', 'big_endian', 'gp')))
             build = build_settings(proj)

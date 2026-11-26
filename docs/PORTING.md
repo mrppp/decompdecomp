@@ -465,6 +465,29 @@ The host is the console's (`PortKit.wasm`; N64: `consoles/n64/port_wasm/host.c`)
   (`PORT_VTIME=1`, the controller script in the Scan settings, every nth frame), scans the frames, and lists what it
   flagged, with pictures, in the side drawer; the frames are deleted afterwards.
 
+#### Bitfield layout check
+
+The console's compiler and clang lay bitfields out differently (a big-endian MIPS compiler gives a unit's first field its
+top bits, wasm32 its bottom ones), so `build.big_endian_bitfields` re-declares them. A run it gets wrong changes the size
+of a struct, and an array of those has the wrong stride: one record's fields overwrite the next one's, far from the code
+that did it (an intro cutscene faulted on a pointer of -1, a title screen was drawn as a strip of two-pixel rows).
+`port/wasm/bitfield_layout.py` compiles every source and header the rewrite changed twice for wasm32, as it was and as
+it is, and the build's log says `layout check: NAME is 32 bytes after the bitfield rewrite, 28 before (in FILE)` for any
+record whose size differs. A warning, not an error: a game that builds goes on building. The rewrite handles bitfields
+on lines of their own, several on one line (`u32 a:8; u32 b:8;`), comma-separated (`unsigned b0 : 1, b1 : 1;`), in an
+inline `struct { ... } bits;`, as `unsigned x : 4;`, after a smaller member that shares their word, and bits that a
+member after them shares (kept in the smallest unit that holds them, the struct as aligned as its declared type).
+Every project in the dev home passes the check (tests/test_bitfield_layout.py has the cases that failed it).
+With the layouts right, files that used to fail to compile (a game's own `audio_ctx_assert_0x5368[offsetof == 0x5368 ? 1 : -1]`
+layout asserts) compile, and a few then meet an LLVM backend error (`Function addresses with offsets not supported`) while
+placing their symbols. A function whose C compiles but cannot be placed runs as the original's code in a second attempt,
+as one clang rejects does (`build._PlaceFallback`).
+
+A struct written on one line with members declared together (`u16 x, y; u32 hi : 24; u32 mode : 6; u32 lo : 2;`) was once
+left in clang's order, which the size check can't see: a game's menu rows kept their old layer and the port drew no briefing
+text (found with Play beside the console: the text boxes' flag word differed from the console's). Each declarator now goes
+on its own line before the reorder.
+
 #### Functions with no C yet
 
 A function the game's C calls (or reaches through a pointer, or starts a thread at) that has no C yet runs from the
@@ -567,6 +590,40 @@ Found on the first game, all things the judge can't see:
 - C that reached locals through the console's stack layout;
 - functions the split had left as data.
 
+### The settings menu (window ports)
+
+The game in its own window (`PORT_WINDOW=1`, `window/sdl.c`) has a standard settings menu: Tab or F1 (a gamepad's Back
+button) opens it over the game, the arrows (d-pad) and Enter (A) work it, Escape (B) closes it, and the game gets no input
+while it is open. Its rows are declared once in `window/settings.h`, header-only C with no dependencies: sections of
+CHOICE and ACTION rows, the shape recomp-ui's runtime overlay takes (`RecompRuntimeUiItem`: sectioned rows with read,
+apply and persist steps), so that overlay can show the same rows. Choices are kept as `KEY=VALUE` lines in
+`PORT_SETTINGS` (`settings.ini` in the app's own folder, beside the saves); a value that isn't one of a row's choices is
+ignored. Today: full screen, scaling (sharp or smooth), the FPS in the title, and volume.
+
+recomp-ui (MIT, Dear ImGui, github.com/RetroPortingToolKit/recomp-ui) is the community's launcher and in-game overlay for
+static recompilation ports. It is not linked in yet: it needs a C++17 toolchain and an ImGui renderer, which the window
+host (SDL3 opened at run time, no headers) doesn't have, so the first menu paints itself with a built-in font into
+SDL's renderer. Planned: a backend that hands `port_settings` to recomp-ui's overlay, and a launcher page in place of
+the ROM chooser. In the RT64 Metal window (macOS) RT64 owns the picture, so the menu goes through the adapter: the host hands it a painter
+(`overlay` in `rt64/adapter.h`, ABI 4, before `open`, which also makes the window's layer copyable), RT64's draw hook calls
+it once per presented frame with the drawable's size, and only the panel's rectangle is blitted, opaque, over the frame
+(so it is in `PORT_RT64_FRAMES`'s saved frames too). An adapter built before the call is refused with the usual
+"different version" message: rebuild it with `tools/build_rt64_adapter.py`. It was built and run on a real
+game: the panel draws over RT64's frame and a changed choice is kept (the Tab key itself was not tried there). The browser build has the same menu (`web/settings.js`: Tab or F1, a gamepad's Back, or the page's Settings button; the
+rows are the window build's, in the same order, and `tests/test_n64_port_web_settings.py` fails if they drift apart). Its
+choices are kept in the browser (not Full screen, which a browser only grants on a click), the menu sits in the element
+that goes full screen so it shows there too, and Scaling applies only once a player has changed it (each renderer keeps
+its own look until then). The Miyoo build still has none: it needs the menu drawn into its SDL 1.2 surface.
+ROADMAP.md's table says so.
+
+recomp-ui's menu model is used when its library is there. `tools/build_recomp_ui.py` builds it from the pinned commit
+`16e2c867e474648e523e2cd21eca813ebe58c795` (three plain C files, the system C compiler, no ImGui or GPU) into the
+toolchains folder (or `DECOMPNET_RECOMP_UI`); with `PORT_RECOMP_UI=<library>` the window host (`window/recomp_ui.h`) turns
+settings.h's rows into recomp-ui's items and takes navigation, pages (Video, Audio, Game), the shared key names and Quit's
+second press from it, while the panel stays settings.h's own, drawing recomp-ui's rows, so the same picture shows over SDL's
+renderer and over RT64. Without the library, or if it can't open, the built-in menu runs and says so in the log. Not yet:
+recomp-ui's own ImGui look (its `render_imgui` needs a GL or RT64 ImGui frame) and bundling the library in an exported app.
+
 ### 5. Play, and check that it runs
 
 A **Play port** button builds and starts it. A headless check runs N frames: it starts, doesn't crash, and the
@@ -580,6 +637,46 @@ uv run python tools/n64_frame_compare.py baserom.z64 --port port/wasm/build/game
 ```
 
 Both frames come from the same renderer, so a difference is the game running differently, not the drawing.
+
+**Side by side, live.** To play both at once, `python -m decompnet.port.wasm.side_by_side ROM --program port/wasm/build/game`
+(or `--port-url` for a port Play already started) opens one page: the port on the left, the console on the right, and
+one keyboard or gamepad for both. The console is mupenRE run in real time (`consoles/n64/emulator/live.py`, `EMU_LIVE`):
+the video plugin writes the console's RAM into a shared file (`live.h`: a seqlock, the task, RAM) as the game hands over each
+graphics task, the input plugin reads the pad from the same file, and the viewer draws each frame with the port's renderer
+(carrying what earlier frames drew, as Check pictures does). Each half shows its own frame count: the two aren't kept in step
+(the port never drops a frame or waits for a load), so they drift. With `--lockstep` (the default when `--program` starts the port;
+a port given by `--port-url` needs `PORT_LOCKSTEP=1 PORT_VTIME=1`) the viewer is the clock instead: the port (live.c's
+`port_live_gate`, before each retrace) and the emulator (the shared file's gate, frontend.c) park at every retrace, the
+viewer reads both RAMs there (`GET /ram?vi=N` on the port, the file's second RAM block on the console), lists the regions that
+differ and the ones that are new at this retrace, latches the page's pad (a tap stays down four retraces) and lets both go on
+one. The port still gets ahead in the game itself (it loads in no time and never drops a frame, the console takes
+retraces for both), so the page has **Port speed**: below 100% the port goes on for only that share of the console's
+retraces, and **held** parks it while the console catches up through a load. The two retrace numbers then differ and are
+both shown, and the RAM compared is each side's as it stands. Neither side has save states (the
+port's N64 threads are the host's threads, so its RAM alone isn't where it is), so **Bookmark** keeps the run instead:
+what each side was given at every retrace (the pad, whether the port went on) and the saves the run started from.
+**Go to bookmark** starts both again on copies of those saves and replays it unpaced (about 3,400 retraces, a game's
+briefing screen, in 15 s), pauses there and says whether each side's RAM is as it was (checksums of every 256-byte
+block). On an unchanged build both were; after a rebuild the port's differ and the run can go another way. The saves
+written after going to a bookmark are the copies', not your own. Play keeps bookmarks and the console's saves in
+`side-by-side/` beside the project's ROM; the command line keeps them with `--keep DIR`. The viewer's console now
+saves there instead of in the emulator's folder in your home, so its first run starts without a save. The page has Pause, Step and the list; `--rate 50` for a PAL game, `--range START-END` (repeatable) to compare only the
+game's own data (the port's exception vectors and its stacks always differ),
+`--emulator-offset` if the two count retraces one apart. Measured on an N64 game's menu: both on the same screen, a Start press
+moved both on together, about 52 retraces a second.
+
+In the app it is the Porting tab's **Play beside the console** button, next to Play (N64 games; `play.play(compare=True)`):
+it builds and starts the port as Play does, in lockstep, starts the emulator and opens the page in the game's window. The
+differing addresses carry the project's names (`gScore+0x4`: its symbols and functions, `play.project_symbols`; on the command
+line `--symbols FILE`), and both sides get the same console memory (the emulator the Expansion Pak when the port has its 8 MB, so
+`osMemSize` is no longer a difference). Stop ends both. **Save screenshot** writes both pictures, their frame counts, the retrace and the difference list as one PNG in
+Downloads, for showing a difference (the port not drawing some text, say).
+The page's **Sound** menu plays the port's sound or the console's
+(an audio plugin, `emulator/audio.c`, copies each buffer the game gives the audio interface into a ring in the shared file; the
+viewer serves it in the format the port's own live view uses). The console's frames are drawn one converted picture at a time
+(`Renderer.draw_picture`, planes instead of pixels): about 23 a second where it was 16, the rest being the software renderer
+itself. Not yet checked: that both sides number retraces alike on more than one game (`--emulator-offset` corrects it)
+(ROADMAP.md).
 `tools/n64_vi_compare.py ROM --port BUILD --input @script` checks the VI's blanking against the console's: the
 emulator's video plugin logs the VI's registers (`EMU_VI_LOG`; osViBlack blanks by writing 0 to the horizontal video
 register, the status stays), the port's `PORT_SWAP_LOG` says when it blanked, and the two lists of blanks must agree in
@@ -742,6 +839,12 @@ function is called with:
 ```bash
 python -m decompnet.consoles.n64.emulator baserom.z64 --vis 2600 --input @race.txt --watch 802A45C8 --from 2400
 ```
+
+A headless run starts without a save and keeps none (EEPROM, SRAM, FlashRAM, Controller Pak), so it is the same run every
+time; so are the console's sides of `tools/n64_frame_compare.py` and Check pictures. To run from a save, give its folder:
+`--saves FOLDER` (`emulator.run(saves=...)`). The run reads and writes the files there, so hand it a copy to run the same
+way again. The emulator's own save folder in your home is not used: before this, headless runs read and wrote it, so a
+measurement in these notes that read "the emulator's save" may have had an earlier run's.
 
 That is how a racing game's backwards start was found. Each car's matrix came from an Euler-angle helper; the
 console passed it a yaw of 0x800, and the port passed 0. The yaw was the `$v0` a void function left for its
@@ -994,3 +1097,78 @@ upsets (log `vtime_forced`, the 3 s wall-time fallbacks: a game whose threads ne
 host allows. The pacing broke the same way: with the console's trace, graphics task 608 at retrace 170 (the console's: 545), no change of the line points in the log. Three ways of delivering the interrupts earlier have now each
 changed what the game waits for between tasks, not only when the logic runs. The log with the original delivery (`ORDER task 618 vi 536`, the line points changing between tasks 618 and 619) is the baseline.
 Further work on the order inside a frame needs a different lever than the interrupt timing: the game's own message flow (which reply the main thread waits for between tasks) from the port's `PORT_MSGLOG`.
+
+**Two more routes through `compare_run` (seeds replayed; windows at tasks 600, 3400, 6190, 8980 of a 9,000-frame run).** A menu-navigation route (`A` pressed every 150 frames): all 41 pictures compared at 0.00% differing, both buffers,
+every task of every window. A route that presses START as well (the race route): the demo race at tasks 600-623 as on the other race route (0.0% at the first task of a frame, 4-6% and 0.5-0.7% with no match within 3 px at the others), but the windows from task 3400 are 43-89% different: at the race start the console's player car
+is a cream Citroën where the port's is red, with other opponents (3406, 3408), and at 8991 the two have the same red car on a road seen from slightly different camera positions. So where START is pressed at a given frame the two games make
+other choices (a livery, the opponents) or are a step apart in a run, consistent with a menu that is a frame ahead in the port (the logic lead above) taking an input at another moment. The other race route (`in_route_nostart2`, no START) matched to within 2% at the same
+windows, which isolates START and the menu's timing as what differs.
+
+**Where the START route first differs.** Windows of 24 tasks along the route (seeds replayed): the menus at tasks 1200-2720 are 0.00% differing at every task except 1.0% at two tasks of the 1800 window; the race windows at 2813-2923 are 0.8-1.7%, the
+opponent-car kind of difference; the windows at 3113-3223 are 60-77% different (30% at the first task of a frame, 0.04% with no match within 3 px: the same picture shifted). So the break is between tasks 2923 and 3113, which holds the route's `A`
+press at frame 3030 (held 50 frames: the accelerator), not the menu presses, which all match. At 3406 the console's player car is seen larger and whiter (closer, or a different moment of the start-line view) than the port's. The first task of each frame
+of those windows matching to within a few thousandths of a percent with a shift left says the two are drawing the same scene a step apart in time, the logic lead's effect on a scene that moves, rather than other models or textures.
+
+**The START route differs from the other race route only by what it does at the race: it pauses it.** The two scripts (`in_route`, `in_route_nostart2`) are the same through frame 2870, and from there `in_route` presses START
+(2870, 3190, 3510, each held 50 frames) where `in_route_nostart2` presses A (the accelerator). The first matches the console to within about 2% at the race windows; the second 43-89% different from the first window after the first START (tasks 3113 on).
+Before it (the menus to 2720, the race grid at 2813-2923) both match, and the menu route's 41 pictures match exactly, so what differs is the pause: what a START held for 50 frames does during the race, a button held across many frames, whose
+first-press and repeat handling is counted in frames or retraces. Seeds are not it: shifting the replayed seeds into line with the port's calls fixed the opponents of the other race route (0.00% at its race start) and left this route as it was.
+Next: look at the pictures at 2870-2930 and 3190-3260 (the pause screen on each side) and what the game reads of the button (`PORT_INPUT` frames: a hold of 50 frames is one press for the game's edge detection, or fifty).
+
+**The START route is exact when its buttons are tapped (3 frames) instead of held (50).** The same route (`in_route`) with each press cut to a 3-frame tap, seeds aligned, windows at tasks 3100, 3400 and 6190 (24 pictures, the race grid, the start and mid-race):
+every picture 0.00% differing, both buffers. The held route was 43-89% different at the same windows. So the race, its cars, camera and opponents are the console's to the pixel; what differs is the game's
+handling of a START held for 50 of the game's frames (10 of its 5-task frames), and A held the same way (the other race route, 2%). A long press that the game measures with a clock (osGetTime, a retrace counter) would take
+the port's virtual time, which is not the console's cycle count, and a pause that begins and ends at another moment leaves the scene at another point, as seen. Where to look: what the game does with a button
+held (a pause toggled, a repeat), via the emulator's watch on the controller data (the `OSContPad` buffer) and the port's `PORT_ORDER_LOG` on the same address.
+
+**The tap route, exact from the race start to frame 9,000.** The START route with every press cut to a 3-frame tap (seeds aligned, the port re-run when it stalls): windows at tasks 3100, 3400, 6190 (24 pictures) and 4200, 5000, 7000, 8000, 8980 (50 pictures,
+the last windows ending at task 9,003): every one of the 74 pictures 0.00% differing, both buffers, every task of every window, across the race grid, the start and the stages after. The runs that compared nothing were the port
+stalling on a loaded computer (a load average of 12-40 while other jobs ran: the port's virtual time waits for its threads to idle in wall-clock time), not seeds or inputs; the same inputs on a quiet one reached task 1,885 in 24 virtual seconds where a loaded one reached 9 to 495.
+So with taps the port matches the console to the pixel over thousands of frames of play; what does not (the held 50-frame presses, the demo race's opponent car at tasks 614-621) is the open part.
+
+**What the held and tapped routes say together (a hypothesis, not yet tested).** Taps: 0.00% over 74 pictures to frame 9,000. The race route that holds `A` (the accelerator) for 50 frames at a time: within 1-2% at the same windows, shifted pictures (not other scenes).
+The route that holds START for 50 frames (a pause held that long): 43-89%. The more a button is held, and the more the game does with it over time, the further the scenes drift: a car accelerating for 50 frames goes a little
+further or less far in the port, and a pause that opens and shuts at slightly other moments leaves the scene elsewhere. That is the signature of a step the game takes from the clock (the time between two frames, read with osGetTime or a
+counter) rather than a fixed step: on the console the time between frames is the cycle count the CPU spent, the port's virtual clock moves by whole retraces, and a tap is too short to show it. To test: the game's clock reads on each side (the emulator's break on
+`osGetTime`, the port's `osGetTime` result at the same frames) and whether the frame-to-frame difference is the same.
+
+**How much the game reads the clock (console, retraces 520-600; `emulator.run(breaks=[0x8008BADC], record=...)` at osGetTime's return, the 64-bit time from the recorded $v0/$v1).** The game reads `osGetTime` 27 times in each heavy retrace
+(the one a task frame starts at) and 6 in each light one, from a handful of callers (0x80014224, 0x800142C4, 0x80014324, 0x8001416C, 0x80013F6C, 0x80013ED0), the timing code around 0x80013ED0-0x80014324. The counter runs at about 1.57 million ticks a retrace,
+and the gaps between consecutive reads range from 130 ticks to 1.8 million (a whole retrace), median about 3,000: it is measuring the cycles its own code takes. The port answers each read from its virtual clock (a retrace's worth
+advanced by whole steps and small sub-steps), so any decision the game takes from these measurements (a detail level, a frame skip, a time step) can come out otherwise there. This makes the clock-step hypothesis for held buttons
+(taps exact, holds drifting) a specific one to test: log the port's `osGetTime` at the same call sites and compare the reads that reach a decision with the console's.
+
+**The retrace period is not what makes held buttons drift (tested).** The emulator's PAL retrace is 992,835 ticks of the 46.875 MHz counter (21,180 us; three retraces, one frame of the game, are 2,978,5xx ticks, constant to a few ticks, which is 625 lines of 3,177
+half-ticks), where the port's PAL retrace is 20,000 us: the time a game measures between frames is 6% longer on the console. With `PORT_RETRACE_US=21180` (the port runs 473 retraces in 10 virtual seconds instead of 500) the 50-frame-hold
+START route's race windows (tasks 3100, 3400, 6190) came out the same to the hundredth of a percent (59-60% at 3113, 80.9% at 3413, 80.4% at 6203). So the game's step does not come from `osGetTime` through the retrace period, and the clock-step hypothesis
+for held buttons is refuted; the 6% period difference is still real and `PORT_RETRACE_US` is kept as a knob (a game that did read the time for a step would feel it). Remaining leads for the held button: the controller read itself (what the game does with
+a button held across frames, via the emulator's watch on the `OSContPad` data and the port's `PORT_ORDER_LOG` on the same address) and the pause (what START held does).
+
+**Shifting the port's controller script by a game frame: the first pause lines up, the later ones do not (tested).** The 50-frame-hold START route's first race window (tasks 3113-3123): the port's script delayed by 5 tasks or by 4: 0.00% at every task (59-69% with the script as given or advanced by 5).
+So at the first START the game registers the press a game frame earlier in the port than in the emulator at the same task number. The windows after the later START presses (3413-3423, 6203-6213, 8993-9003) stay 70-85% different with the same
+delay, so a constant delay of the script does not make the route match: the later presses and releases do not line up the same way (a hold that a game reads on frames can need another delay at each edge), or what the first press did leaves the
+scenes elsewhere. The demo race's opponent car (tasks 614-621, before any START) is 12-18% different with the delayed script as without it: it is not an input effect. So the held-button drift is a controller-timing difference with a frame in it at each edge, a
+test artifact of scheduling presses by graphics-task count against a port whose logic runs a frame ahead, rather than a rendering fault; making the harness give the port each edge at the frame the game reads it (found by the emulator's watch on the controller data and the port's `PORT_ORDER_LOG` on the same address) is the way to compare such a route.
+
+**No delay of the controller edges lines up the hold route's later windows (tested).** With the port's script delayed by 5 tasks before frame 3100, delaying the edges after it by 0, 4, 10 or 15 leaves tasks 3413-3423 at 75-81% (77.4, 77.6, 77.4, 77.7 at 3413).
+Delaying START and `A` edges separately (START +5 with A +0, +10, -5; START +0 with A +5) gives 77-89% at 3413 in every case. So a controller-timing offset, constant or per button or per edge, does not explain those windows; the first pause window (3113, 0.00% with
+a 4- or 5-task delay) is the only one it fixes. What separates the later windows is state built up in between that this does not reach (how long the game stayed paused, the toggles of a START held 50 frames, a car that accelerated for another number of frames). The way
+in is the emulator's watch on the pause flag and the car's position at each frame of 2870-3400 against the port's `PORT_ORDER_LOG` on the same addresses, not further delays of the script.
+
+**The held START route is exact once each button gets its own delay (solved: a test artifact of controller latency).** Sampling the game's pause byte (`*gRaceCtx + 0x384`, with `gRaceCtx` at 0x800A0384) every task on both sides, with the console's save, pacing and seeds, shows when each edge takes effect:
+START at 2870 and 3190 sets the pause 5 tasks later on the console (2875, 3195) and 6 on the port (2876, 3196); `A` at 3030 and 3350 clears it 10 tasks later on the console (3040, 3360) and 6 on the port (3036, 3356). So the port wants START one task earlier and `A` four later,
+which no single delay of the script (tested: 0, 4, 5, 10, 15 for all or one of them) can give. With `compare_run(..., port_shifts={"START": -1, "A": 4}, after=2800)` every task of the windows at 3113, 3413 and 6203 is 0.00% differing, both buffers, where the same route's
+unshifted windows were 43-89%. The earlier "later windows stay 75-89%" results delayed every edge alike, so they could line up only one of the two kinds. To find the shifts for another game or route: write the word that records the effect of the edge (here the pause byte) to
+`console_frames_N.bin`/`port_frames_N.bin` dumps at consecutive tasks around each edge (`compare_run` keeps them in its work folder; `tests` need none) and read the task at which it flips on each side; the difference is that button's shift. Why the console takes `A` 10 tasks and the port 6 (a pause menu that counts retraces, an input queue read at another moment) is not yet explained.
+
+**The console's edge latency changes during the route, so constant per-button shifts hold only for the early windows (measured; retrace timing tried and refuted).** The pause byte on the held START route, unshifted: START at 2870/3190 takes effect 5 tasks later on the console; START at 8950 and `A` at 9110/10390 take 10 (A at 3030/3350 also took 10); the port takes 6 every time.
+With START -1 and A +4 (`port_shifts`) the windows at 3113, 3413 and 6203 are 0.00%, tasks 9006-9009 and 10,500-10,505 are 30-91% differing. Giving the port each edge at the retrace the console was at for that task (`PORT_INPUT_CLOCK=vi` with the console's task-log retraces) is worse, 86-91% already at 3116 and 3416, so the game's wait is not a retrace count the port shares;
+the port's retrace numbering is not the console's boot-relative one. The demo race's tasks 606-625 are 0.00% where a picture is drawn (the opponent-car 12-17% of earlier runs was before seeds were aligned). Open: why the console's latency grows from 5 to 10 tasks (it may be the game's own wait on a counter that the port
+reaches sooner), or a per-edge search of the shifts by picture, which is automatable but costs a port run to each edge.
+
+**Where the edge latency comes from: the pad shows up 4 tasks later on the console, the pause follows the next logic update (measured; a uniform +4 is refuted).** The game's pad table (`*0x800A1B70 + 0x54`, read by `func_80084BF0`) holds START (0x1000) 1 task after the press on the port (2871, 8951) and 5 on the console (2875, 8955). The pause byte is then set by the next run of the pause check (`func_80049294`):
+the port always 5 tasks after the pad, the console 0 after at 2875 and 5 after at 8955. So the console's pad lag is a constant 5 and its logic update has another phase than the port's, the same one-frame logic lead seen at the demo race. Shifting every edge +4 (port pad = console pad) is worse than the per-button shifts: 64-85% differing already at 3116, 3416 and 6206,
+where START -1 and `A` +4 are 0.00% through 6203, so the port's logic phase has to be matched too. Open: a per-edge search of the shifts by picture (one port run to each edge), or the port's logic update at the console's phase.
+
+**Finding when the game first sees each edge, on both sides (`EMU_PAD_LOG`, `PORT_PAD_LOG`).** Each writes `PAD <task> <buttons>` at the first controller read that shows a change of the pad. The console's, on the held START route: START at 2870 shows at 2874, A at 3030 at 3034, START at 8950 at 8954 (earlier presses at 630, 790, 950 show at 632, 792, 952: the lag grows from 2 to 4 tasks over the route); the port's shows each edge on the task it is given.
+The difference per edge is the shift the port's script needs, to be applied with `compare_run(port_shifts=...)` or per edge. Taking it from the logs needs one run of each side; the port stalls under CPU load (a load average of 16-20 kept it at task 520), so run it on a quiet computer.

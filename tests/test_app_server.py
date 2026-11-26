@@ -1930,14 +1930,14 @@ def test_deep_sweep_routes_validate_start_stop_and_status(app, monkeypatch):
     calls = []
     monkeypatch.setattr(net.deep_sweeps, 'start', lambda *args: calls.append(args) or {'job':'sweep','enabled':True})
     monkeypatch.setattr(net.deep_sweeps, 'stop', lambda slug: {'enabled':False,'project':slug})
-    monkeypatch.setattr(net.deep_sweeps, 'status', lambda slug: {'project':slug,'completed':2})
+    monkeypatch.setattr(net.deep_sweeps, 'status', lambda slug, full=False: {'project':slug,'completed':2})
     assert client.get('/api/permuter/pass?slug=example').json()['completed'] == 2
     monkeypatch.setattr(net.deep_sweeps, 'reset_metrics', lambda slug: {'reset':slug})
     assert client.post('/api/permuter/pass', json={'slug':'example','action':'reset-metrics'}, headers={'X-Decomp':'1'}).json() == {'reset':'example'}
     response = client.post('/api/permuter/pass', json={'slug':'example','minutes':7,'max_variants':99,'repeat':True}, headers={'X-Decomp':'1'})
-    assert response.json()['job'] == 'sweep' and calls == [('example',7,99,True,0,1,False,1,False,0,False,'smart')]
+    assert response.json()['job'] == 'sweep' and calls == [('example',7,99,True,0,1,True,1,False,0,False,'smart')]  # (loops unless told otherwise)
     client.post('/api/permuter/pass', json={'slug':'example','threads':2,'threads_per_function':4,'rank_candidates':True}, headers={'X-Decomp':'1'})
-    assert calls[-1] == ('example',5,2500,False,2,1,False,4,False,0,True,'smart')  # (2,500 candidates a function unless told otherwise)
+    assert calls[-1] == ('example',5,750,False,2,1,True,4,False,0,True,'smart')  # (750 candidates a function unless told otherwise)
     assert not client.post('/api/permuter/pass', json={'slug':'example','action':'stop'}, headers={'X-Decomp':'1'}).json()['enabled']
     assert client.post('/api/permuter/pass', json={'slug':'example','repeat':'yes'}, headers={'X-Decomp':'1'}).status_code == 400
     assert client.post('/api/permuter/pass', json={'slug':'example','action':'unknown'}, headers={'X-Decomp':'1'}).status_code == 400
@@ -3174,7 +3174,7 @@ def test_deep_pass_controls_do_not_wait_for_progress_sync(app,monkeypatch):
         db.execute("INSERT INTO projects(slug,name,arch,root,config) VALUES('example','Example','mips','','{}')")
     def blocked(*args,**kwargs):pytest.fail('deep-pass controls must not synchronize the project')
     monkeypatch.setattr(net.progress,'sync',blocked)
-    def snapshot(slug,*args):
+    def snapshot(slug,*args,**kwargs):
         assert net.progress.viewing
         net.project_row(slug)
         return {'job':'local-search'}
@@ -3479,7 +3479,7 @@ def test_starting_compiler_comparison_returns_job_without_saved_file_sync(app, m
     monkeypatch.setattr(net, 'fork_slug', fork)
     monkeypatch.setattr(net, 'run_compiler_comparison', compare)
     monkeypatch.setattr(net.progress, 'sync', lambda *a, **kw:pytest.fail('job startup must not synchronize files'))
-    payload = {'slug':slug,'all_installed':True,'flags_only':True,'auto_apply':True,'untested_only':True}
+    payload = {'slug':slug,'all_installed':True,'flags_only':True,'auto_apply':True,'apply_matches':True,'untested_only':True}
     headers = {'X-Decomp':'1'}
     job = None
     try:
@@ -3501,7 +3501,7 @@ def test_starting_compiler_comparison_returns_job_without_saved_file_sync(app, m
         repeated = client.post('/api/compilermap', json={**payload, 'flags_only':False}, headers=headers).json()
         assert repeated['job'] == job and repeated['scope']['flags_only']
         assert calls == [(slug, {'function':'','untested_only':True,'flags_only':True,
-                                 'used_profiles_only':False,'auto_apply':True})]
+                                 'used_profiles_only':False,'auto_apply':True,'apply_matches':True})]
         if cancel:
             assert client.post('/api/job/cancel', json={'id':job}, headers=headers).json()['cancelled']
         else:release.set()
@@ -4335,3 +4335,26 @@ def test_project_list_marks_a_project_whose_deep_permuter_runs(tmp_path, monkeyp
     assert client.get("/api/projects").json()[0]["deep_permuter"] is True
     jobs.jobs["x"]["state"] = "done"
     assert client.get("/api/projects").json()[0]["deep_permuter"] is False
+
+
+def test_a_long_job_keeps_only_its_recent_log_lines():
+    """A pass that logs a line per function for hours sent 200 MB on every poll and froze the progress bars."""
+    import time
+
+    from decompnet.app import support
+    from decompnet.app.support import Jobs
+    jobs = Jobs()
+
+    def work(log):
+        for i in range(support.JOB_LOG_LINES * 3):
+            log(f"line {i}")
+        return "ok"
+
+    jid = jobs.start("test", work)
+    deadline = time.time() + 10
+    while jobs.jobs[jid]["state"] == "running" and time.time() < deadline:
+        time.sleep(0.01)
+    lines = jobs.jobs[jid]["log"]
+    assert jobs.jobs[jid]["state"] == "done"
+    assert len(lines) <= support.JOB_LOG_LINES * 2
+    assert lines[-1] == f"line {support.JOB_LOG_LINES * 3 - 1}"

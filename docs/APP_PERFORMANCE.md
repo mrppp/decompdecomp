@@ -611,6 +611,33 @@ On 50 KMC GCC 2.7.2 functions of about 109 instructions, the link took 1.33 ms b
 extraction 1.22 ms and 0.67 ms; the link results (code, relocations, verdicts, problems) were identical with and
 without it. A compile of such a function takes about 20 ms, so this is a few percent of a trial.
 
+### Compiled library kernels (Cython, optional)
+
+decomp-repair's `native_build.py` builds its typed Cython kernels (`_scan.pyx`: the bracket and loop scans many families
+share, 10x to 70x faster per call, a few seconds to compile) and, with `--all`, every other module unchanged, linked
+into one library. The gain from those is small (the library's test suite compiled: about 1% less CPU time); the large
+speedups came from fixing quadratic scans and regex backtracking in plain Python, 1.92 s to 0.27 s on real functions.
+
+It has to be one library. Importing the library's 1,413 modules on an 18-core arm64 Mac:
+
+| build | import | first import | memory |
+| --- | --- | --- | --- |
+| interpreted | 1.5 s | 1.5 s | 75 MB |
+| a compiled file per module | 19 s | 214 s | 600 MB |
+| one library | 0.5 s | 1.7 s | 150 MB |
+
+The full build takes 156 s with 16 jobs, and the library with its kept object files is about 470 MB per environment.
+
+The app runs both itself (`app/native_library.py`), because `uv sync` compiles nothing and a checkout ran interpreted
+until somebody remembered to build. The kernels are built as the app starts, before anything imports the library (a
+module chooses its kernel once). The plain modules follow in the background at low priority on up to four cores,
+only those without a current build, with a row and Stop in Background work; the app itself uses them from its next
+start, processes started later at once. `cython` and `setuptools` are dependencies for this; a C compiler is the
+system's, and without one (or with `DECOMP_NATIVE_LIBRARY=0`) the library stays interpreted and behaves the same.
+
+Bundles are compiled when built (`packaging/build_library_native.py`: the kernels; `DECOMP_NATIVE_LIBRARY=all` adds the
+plain modules), and a signed or read-only copy is never compiled at run time.
+
 ### Incremental notification source cursors
 
 Each project's notification cursor now uses a covering `(project_id,id)` event
