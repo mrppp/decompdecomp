@@ -99,7 +99,7 @@ def test_compact_project_info_accepts_a_string_compiler(tmp_path):
     class Net:
         def cfg(self, proj): return {'platform': 'n64', 'compiler': 'xbox360-xsdk-placeholder'}
     saved = tools.consoles
-    tools.consoles = type('C', (), {'get': staticmethod(lambda p: type('X', (), {'compilers': ()})())})()
+    tools.consoles = type('C', (), {'get': staticmethod(lambda p: type('X', (), {'compilers': (), 'compilers_for': lambda self, cfg: ()})())})()
     try:
         out = tools.compact_info_head(Net(), {'name': 'dash', 'slug': 'dash-dash'})
         assert 'xbox360-xsdk-placeholder' in out
