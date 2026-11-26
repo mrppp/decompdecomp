@@ -259,6 +259,73 @@ def _report_inversion(mode: str) -> None:
                    "once a writer waits for the tree: %s", mode, " > ".join(f"{name}:{line}" for name, line in site))
 
 
+def _flock(path: Path):
+    """An exclusive lock on `path` for this process (fcntl.flock: released when the file closes, so also when the
+    process dies), or None where file locks can't be had: then the process's own locks are all there is, as before."""
+    try:
+        import fcntl
+    except ImportError:  # (Windows: one process per project there)
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(path, "a+b")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+class _ProcessLock:
+    """A thread lock that, while held, holds a file lock too: the app and its permuter worker (another process, with
+    an engine of its own on the same project) take turns at a unit as two threads of one process do. Before, each
+    process had only its own locks: the worker's repair trials went into a file while the app measured it ("unit
+    diff before a compile" reopened every function the trial broke, until the next measurement put them back) and
+    while helpers edited it ("changed during a trial", their edits merged around the trial's or lost)."""
+
+    def __init__(self, path: Path | None, inner=None):
+        self.path, self.inner = path, inner if inner is not None else threading.RLock()
+        self.depth, self.file = 0, None
+
+    def acquire(self) -> bool:
+        self.inner.acquire()
+        try:
+            if self.depth == 0 and self.path is not None:
+                self.file = _flock(self.path)
+            self.depth += 1
+        except BaseException:
+            self.inner.release()
+            raise
+        return True
+
+    def release(self) -> None:
+        self.depth -= 1
+        if self.depth == 0 and self.file is not None:
+            self.file.close()  # (closing it releases the file lock)
+            self.file = None
+        self.inner.release()
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def _lock_file(root, name: str) -> Path | None:
+    """Where a project's cross-process lock `name` lives (its state folder, which git ignores), or None for a
+    project without a folder."""
+    if not root:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    if len(safe) > 80:
+        safe = safe[:60] + "-" + hashlib.sha1(name.encode()).hexdigest()[:12]
+    return Path(root) / STATE / "locks" / f"{safe}.lock"
+
+
 class _TreeLock:
     """Work on different source files runs side by side; a change any file may depend on (a header) runs alone.
     A thread that holds it exclusively may take it again either way."""
@@ -665,7 +732,7 @@ class ForkEngine:
         self._stale_checked: dict[int, dict[str, tuple[int, int]]] = {}  # project id -> file -> (mtime, size) seen building
         self.recover_trials()
         self._trees: dict[int, _TreeLock] = defaultdict(_TreeLock)  # project id -> its source tree's lock
-        self._unit_locks: dict[tuple[int, str], threading.RLock] = defaultdict(threading.RLock)
+        self._unit_locks: dict[tuple[int, str], _ProcessLock] = {}
         self._build_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)  # one build at a time per tree
         self._unit_builds: dict[int, _UnitBuilds] = defaultdict(_UnitBuilds)  # project id -> its units' builds
         self._git_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)
@@ -733,9 +800,13 @@ class ForkEngine:
         with self._mlock:
             return self._trees[proj["id"]]
 
-    def _unit_lock(self, proj, unit: str) -> threading.RLock:
+    def _unit_lock(self, proj, unit: str) -> _ProcessLock:
         with self._mlock:
-            return self._unit_locks[(proj["id"], unit)]
+            lock = self._unit_locks.get((proj["id"], unit))
+            if lock is None:
+                root = proj["root"] if "root" in proj.keys() else None
+                lock = self._unit_locks[(proj["id"], unit)] = _ProcessLock(_lock_file(root, f"unit-{unit}"))
+            return lock
 
     @contextmanager
     def _units_locked(self, proj, names: list[str]):
@@ -755,7 +826,9 @@ class ForkEngine:
     def _build_units(self, proj, fp: ForkProject, units: list) -> list[tuple[bool, str]]:
         from . import attempt_workers
 
-        with self._build_locks[proj["id"]]:  # (and nothing changes the build's files meanwhile)
+        # (and nothing changes the build's files meanwhile; nor, through the file lock, does the permuter worker's
+        # process, whose ninja shares this tree's log and deps)
+        with self._build_locks[proj["id"]], _ProcessLock(_lock_file(fp.root, "build"), threading.Lock()):
             return attempt_workers.run("project-build", (fp.root, units), lambda: fp.build_units(units),
                                        build=fp._execute)
 
@@ -766,7 +839,7 @@ class ForkEngine:
         return attempt_workers.run("project-diff", (fp.root, unit, symbol), lambda: fp.diff(unit, symbol))
 
     def _build_all(self, proj, fp: ForkProject, failed: list[str] | None = None) -> tuple[bool, str]:
-        with self._build_locks[proj["id"]]:
+        with self._build_locks[proj["id"]], _ProcessLock(_lock_file(fp.root, "build"), threading.Lock()):
             return fp.build_all(failed=failed)
 
     @contextmanager
