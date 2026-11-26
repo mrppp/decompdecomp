@@ -61,6 +61,50 @@ def test_the_target_call_site_reads_argument_registers_and_the_result():
     assert ("target-argument", "h") in kinds(missing) and "$a1" in missing[0]["text"]
 
 
+def test_a_result_read_in_the_next_calls_delay_slot_is_read():
+    """A collision walk's `start = first(0); end = last(0);`: the first result is copied in the second jal's delay
+    slot and the second's in the third's. Both were reported as "overwritten unread" (call it as a statement)."""
+    asm = """glabel w
+/* */ addu $a0, $zero, $zero
+/* */ jal first
+/* */ nop
+/* */ addu $a0, $zero, $zero
+/* */ jal last
+/* */ addu $s0, $v0, $zero
+/* */ addiu $a0, $zero, 0x12D
+/* */ jal find
+/* */ sw $v0, 0x30($sp)
+/* */ jal other
+/* */ nop
+/* */ jal again
+/* */ nop
+/* */ jr $ra
+/* */ nop
+"""
+    assert [(s["callee"], s["result"]) for s in cs.call_sites(asm)] == [
+        ("first", True), ("last", True), ("find", False), ("other", False), ("again", None)]
+    source = "void w(void) {\n    s = first(0);\n    e = last(0);\n    find(0x12D);\n    other();\n}\n"
+    assert not {k for k in kinds(cs.check("w", source, "", {}, {}, asm)) if k[0] == "result-unread"}
+
+
+def test_a_float_result_is_not_judged_by_v0():
+    """A dot product returns f32 in $f0: the target overwriting $v0 after the call does not make the used result
+    "unread" (a ray test got six such findings, each telling the agent to drop a result it needs)."""
+    asm = """glabel w
+/* */ jal dot
+/* */ nop
+/* */ addiu $v0, $zero, 1
+/* */ jal ival
+/* */ nop
+/* */ addiu $v0, $zero, 1
+/* */ jr $ra
+/* */ nop
+"""
+    source = "void w(void) {\n    d = dot(a, b);\n    k = ival();\n}\n"
+    found = cs.check("w", source, "f32 dot(f32 *, f32 *);\ns32 ival(void);\n", {}, {}, asm)
+    assert [(f["kind"], f["callee"]) for f in found] == [("result-unread", "ival")]
+
+
 def test_return_width_from_the_header_against_the_matched_definition():
     found = cs.check("f", "void f(void) {\n    x = get();\n}\n", "s32 get(void);\nu32 put(void);",
                      {"get": "s16 get(void) {\n    return 1;\n}\n"})
@@ -68,6 +112,21 @@ def test_return_width_from_the_header_against_the_matched_definition():
     assert not cs.return_differs("s32", "u32") and not cs.return_differs("f32", "float")
     assert not cs.return_differs("M2C_UNK", "s16") and not cs.return_differs("s32", "void")
     assert cs.return_differs("s32", "u8") and cs.return_differs("int", "f32")
+
+
+def test_a_callee_with_an_array_pointer_or_function_pointer_parameter_still_has_its_arity():
+    """A loader passed a 4th argument to a matched callee declared `(Model *m, s8 (*box)[4], Tri *tri)`: the
+    parenthesised parameter hid the definition, so the stray argument (the whole 120-point difference) went unnamed."""
+    callee = {"draw": "void draw(Model *m, s8 (*box)[4], Tri *tri) {\n    m->x = 1;\n}\n",
+              "each": "void each(void (*cb)(s32, s32), s32 n) {\n    cb(n, n);\n}\n"}
+    source = ("void draw(u8 *, s32, s32, s32);\nvoid each(void *, s32);\n"
+              "void f(u8 *buf, s32 count) {\n    draw(buf, 1, 2, count);\n    each(0, 1);\n}\n")
+    found = cs.check("f", source, "", callee)
+    assert ("extra-argument", "draw") in kinds(found) and ("prototype", "draw") in kinds(found)
+    assert "drop `count`" in next(f for f in found if f["kind"] == "extra-argument")["text"]
+    assert not any(f["callee"] == "each" for f in found)  # two parameters, two arguments
+    assert cs.prototypes(callee["draw"])["draw"]["params"] == 3
+    assert "cb" not in cs.prototypes(callee["each"])  # the call inside the body is not a declaration
 
 
 def test_a_clean_function_says_so():

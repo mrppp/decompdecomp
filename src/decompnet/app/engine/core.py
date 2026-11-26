@@ -11,19 +11,13 @@ import secrets
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from ... import consoles, hostenv
 from ...network import Agent, Network, NetworkError, hash_token
 from ...rom import split
 from ...rom.symbols import Symbol, SymbolTable
 from .common import _ADDRESS
-
-# Settings parsed, by their text: GTA San Andreas's are 193 KB, and one request read them 4 to 12 times (a range
-# check after a match, 462 times). A few versions are kept: each change of a project's settings is a new text.
-SETTINGS_KEPT = 8
-_settings: dict[str, dict] = {}
-_settings_lock = threading.Lock()
-
 
 FORK_SLUG_SECONDS = 10.0  # how long fork_slug keeps its answer (a project's kind never changes)
 
@@ -103,16 +97,8 @@ class Core(Network):
     def cfg(proj) -> dict:
         """A project's settings. Shared by everyone who reads the same version of them: read it, never change it
         (_update_cfg changes settings; code that edits a copy parses its own, json.loads(proj["config"]))."""
-        text = proj["config"]
-        with _settings_lock:
-            parsed = _settings.get(text)
-        if parsed is None:
-            parsed = json.loads(text)
-            with _settings_lock:
-                if len(_settings) >= SETTINGS_KEPT:
-                    _settings.pop(next(iter(_settings)))  # the oldest version
-                _settings[text] = parsed
-        return parsed
+        from ...project import settings
+        return settings(proj["config"])
 
     def find_moved_projects(self) -> list[str]:
         """Projects whose folder isn't where it was, found again in this workspace by their name: a whole Decomp
@@ -223,6 +209,17 @@ class Core(Network):
         if reconsidered:
             done.append(f'{reconsidered} obsolete tooling verdicts reconsidered with supported C')
         n = self.twins.set_aside_asm(self.project_row(slug)) + self.not_c_from_notes(slug)
+        # library code this version recognises: named, then set aside, every function in one go (not the 3 seconds
+        # a turn background naming takes)
+        from ..sdk_assembly import set_aside_c
+        from ..sdk_names import name_functions
+        library = 0
+        if self.is_rom(row):  # (an imported build renames through rebuilds: its background naming does that)
+            before = set_aside_c(self, row)
+            name_functions(self, slug, SimpleNamespace(stop=threading.Event()))
+            library = set_aside_c(self, row) - before
+        if library > 0:
+            done.append(f"{library} library function{'' if library == 1 else 's'} set aside, found by library detection")
         self._update_cfg(slug, lambda cfg: cfg.update(checked=__version__))
         if n:
             done.append(f"{n} more function{'' if n == 1 else 's'} set aside, as no C makes them")
@@ -502,7 +499,11 @@ def _load_images(net, proj) -> list[tuple[int, int, int]]:
             except (OSError, yaml.YAMLError):
                 continue
             if isinstance(data, dict) and isinstance(data.get("segments"), list):
-                images = split.load_images(data)
+                # The raw data after the code is read from the ROM the split describes, only when that is the
+                # project's: a packed game's split is of its unpacked copy, at other offsets.
+                own = (data.get("options") or {}).get("target_path") in (None, net.cfg(proj)["rom"].get("file"))
+                images = split.load_images(data, net._rom(proj)[0] if own else None,
+                                           big_endian=bool(net.cfg(proj).get("big_endian", True)))
                 break
         cache[key] = (rom_entry, images)
     return cache[key][1]

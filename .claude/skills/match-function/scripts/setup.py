@@ -282,6 +282,28 @@ def claim(gateway, function="", strategy="random", max_insns=0, wait=None):
     return found[1]
 
 
+CLAIMS_TRIES = 5
+
+
+def claims(gateway, tries=CLAIMS_TRIES):
+    """This connection's live claims (`get_claims`). The gateway puts the answer to a call it had only acknowledged (a
+    busy app's release_function) at the top of the next reply, so the JSON is looked for inside the text, and a reply
+    without it is asked for again: a `done` once failed on exactly that and worked when run a second time."""
+    text = ""
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(TRANSIENT_PAUSE)
+        text = gateway.call("get_claims", {})
+        for found in re.finditer(r"\{", text):
+            try:
+                value = json.JSONDecoder().raw_decode(text, found.start())[0]
+            except ValueError:
+                continue
+            if isinstance(value, dict) and isinstance(value.get("claims"), list):
+                return value["claims"]
+    raise McpError(f"get_claims gave no list of claims in {tries} tries: {text[:200]}")
+
+
 def older_orders(strategy, max_insns):
     """The claim to ask for, then what an app started before `nearest` and `max_insns` existed understands: closest
     (near-misses relative to size) with the cap, closest alone, random. Refused calls claim nothing, so the one claim
@@ -520,6 +542,16 @@ def try_candidate(holder, path, function=""):
     """Submit CAND.c as the session: `compile_and_diff` over the connection that holds the claim, and print the app's
     verdict text. The window API's /api/try judges as another identity and is refused while this connection holds the
     claim (HTTP 400), so a session never goes through it; nor does anyone need their own gateway client."""
+    try:
+        source = Path(path).read_text()
+    except OSError as error:
+        sys.exit(f"can't read {path}: {error}")
+    print(submit(holder, source, function, again=f"setup.py try {holder} {path}"))
+    return 0
+
+
+def submit(holder, source, function="", again="the same command"):
+    """The app's verdict text for `source`, one submission in flight at a time (haiku.py submits through this too)."""
     root = session_dir(holder)
     if not (root / "connection.json").exists():
         sys.exit(f"no session {holder!r} ({root / 'connection.json'} is missing): start one with setup.py SLUG [FUNC]")
@@ -530,10 +562,6 @@ def try_candidate(holder, path, function=""):
     marker = claimlost.read(root)
     if claimlost.taken(marker) and marker.get("function") == name:
         sys.exit(claimlost.warning(root) + "not submitted: someone else holds this function now.")
-    try:
-        source = Path(path).read_text()
-    except OSError as error:
-        sys.exit(f"can't read {path}: {error}")
     gateway = Gateway(info["gateway_url"], info["token"])
     pending_file = root / "try-pending.json"
     try:
@@ -551,14 +579,13 @@ def try_candidate(holder, path, function=""):
         pending_file.write_text(json.dumps({"function": name, "source": source}))
         text = gateway.call("compile_and_diff", {"function": name, "source": source})
         pending_file.unlink(missing_ok=True)  # answered: nothing is in flight any more
-        print(text)
     except AppSlow as error:
-        sys.exit(f"{error}\nThe submission is still in flight and is kept: `setup.py try {holder} {path}` again collects its "
+        sys.exit(f"{error}\nThe submission is still in flight and is kept: `{again}` again collects its "
                  f"verdict (a different candidate is held back until then).")
     except McpError as error:
         pending_file.unlink(missing_ok=True)  # the app answered (a refusal): nothing in flight
         sys.exit(f"not submitted: {error}")
-    return 0
+    return text
 
 
 def read_pending(path):
@@ -583,7 +610,7 @@ def check_claim(holder):
         status = judge.App(info["home"]).function(info["slug"], function)
         gateway = Gateway(info["gateway_url"], info["token"])
         gateway.start()
-        held = json.loads(gateway.call("get_claims", {})).get("claims", [])
+        held = claims(gateway)
     except (McpError, SystemExit, OSError, ValueError) as error:
         print(f"{holder}: could not ask the app whether {function} is still claimed ({error}); try again in a minute")
         return 1
@@ -799,8 +826,10 @@ def start(args):
         with phase("MCP handshake (gateway initialize)"):
             gateway.start()
         strategy = "random" if asked["random"] else "nearest"
+        picker = getattr(args, "picker", None)  # haiku.py ranks the open functions itself, then claims by name
         with phase("claim_function (gateway to app)"):
-            info["function"] = claim(gateway, asked["function"], strategy, asked["max_size"])
+            info["function"] = (picker(gateway, info) if picker else
+                                claim(gateway, asked["function"], strategy, asked["max_size"]))
         info.pop("claim_pending", None)
         info["started"] = time.time()  # the hand-off clock's start (clock.py HOLDER)
         info["renew_interval"] = args.interval  # reclaim restarts the renewal with it after a match ended it
@@ -824,7 +853,7 @@ def start(args):
     print(f"mcp      {url} (connection {info['connection_name']}, scoped to {args.slug}; token in {root / 'connection.json'}, mode 0600)")
     print(f"python   {info['python']}   (fast_judge.py, passes.py and prove_chain.py: {Path(__file__).parent})")
     print(f"renewal  pid {info['renew_pid']} (every {args.interval // 60} min); end with: setup.py stop {holder}")
-    if not args.no_sync:  # tests build no venv
+    if not args.no_sync and not getattr(args, "no_orient", False):  # tests build no venv
         orient(info, root)
     return 0
 

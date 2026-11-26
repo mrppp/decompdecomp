@@ -651,6 +651,13 @@ def test_boundary_review_preview_shows_original_extent_and_escapes_evidence():
                    capture_output=True,text=True,timeout=GUI_TIMEOUT_SECONDS)
 
 
+def test_agent_proposals_drawer_sorts_escapes_and_acknowledges_approval_at_once():
+    if NODE is None:
+        pytest.skip('needs node')
+    subprocess.run([NODE,str(Path(__file__).with_name('gui_agent_proposals.js'))],check=True,
+                   capture_output=True,text=True,timeout=GUI_TIMEOUT_SECONDS)
+
+
 def test_machine_draft_refresh_has_progress_cancellation_and_error_cleanup():
     if NODE is None:
         pytest.skip('needs node to run the GUI scripts')
@@ -914,3 +921,10 @@ const api=async()=>({state:++polls>=3?'done':'running',log:[],progress:{},result
     # the callback's guard, as source: hidden window or another tab returns before drawing or fetching
     guard = callback[callback.index('if (document.hidden'):]
     assert 'document.hidden' in guard and 'S.tab !== "matching"' in guard
+
+
+def test_compiler_profile_compares_with_a_chosen_profile():
+    if NODE is None:
+        pytest.skip("needs node to run the GUI scripts")
+    subprocess.run([NODE, str(Path(__file__).with_name("gui_profile_compare.js"))],
+                   cwd=Path(__file__).resolve().parents[1], check=True, timeout=GUI_TIMEOUT_SECONDS)

@@ -15,9 +15,10 @@ does it where the permuter and the autopilot already are, with no model:
 2. judge (`run`): each profile through deep_profiles.probe, the same call the permuter's profile sweep uses, so a result
    is cached durably per (function, saved C, build inputs, profile) and never compiled twice, and an EXACT pair is
    rechecked and applied for that function only through `suggest`, with the project's own rule for automatic compiler
-   changes (a project that doesn't apply them leaves the exact pair on the project page). Floating-point, small-data and
-   scheduling variants apply like any other profile here: the permuter's sweep leaves them to review, but they are what
-   this step is for, and only an exact, rechecked pair is ever applied.
+   changes (a project that doesn't apply them leaves the exact pair on the project page). The machine draft, when it is
+   not the saved C, is judged under each profile too: under another profile it is often the closer text. Floating-point,
+   small-data and scheduling variants apply like any other profile here: the permuter's sweep leaves them to review, but
+   they are what this step is for, and only an exact, rechecked pair is ever applied.
 3. say (`diagnose`): the best profile that was not exact is a note on the function ("-mfp32: 20 against 380") for the
    agent that picks it up next. It changes nothing: never a compiler range, never a non-exact profile.
 
@@ -42,8 +43,15 @@ MAX_PROBES = 10  # profiles judged per function and saved C: the plan is cut her
 NEIGHBOUR_MIN = 3  # matched neighbours on one other profile that make it the first profile to judge
 NEIGHBOUR_SHARE = 2 / 3
 NOTE_AT = 0.9  # a non-exact profile is told to the next agent when it scores at most this share of the saved C's own score
+COMMON_MIN = 5  # functions of the project on one per-function profile before it is worth judging under an unrelated one
+COMMON_PROBES = 2  # ... at most this many of them, the most used first
 RESERVE = 3  # compiles left in a search's allowance before one more profile: its own, and the two an exact apply rechecks with
-SIGNATURE = 'profile-probe-v1:'
+# v2: a v1 pass that ran in the Deep Permuter's batch right after the profile sweep kept no scores for the pairs the sweep
+# had just judged (deep_profiles.probe read only their queued outcome), and was still marked finished with no note: a
+# new signature redoes those passes once, from the judge's cache, so they need no compile
+# v3: the project's most used per-function profiles are planned too, so passes finished without them run again (cached
+# verdicts need no compile)
+SIGNATURE = 'profile-probe-v3:'
 FP_FLAGS = ('-mfp32', '-mfp64')
 # libultra's own names: osXxx, __osXxx, __rmon*, __sc*, the routines whose compiler was the library's, not the game's
 LIBRARY_NAME = re.compile(r'^_{0,2}(?:os[A-Z]|rmon|sc[A-Z])')
@@ -61,6 +69,7 @@ class Facts:
     sdk: bool = False  # library detection names it a library function
     votes: Counter = field(default_factory=Counter)  # matched neighbours per (toolchain, flags)
     read: int = 0  # neighbours read
+    common: Counter = field(default_factory=Counter)  # the project's functions per per-function (toolchain, flags)
     ready: Callable[[str], bool] = lambda toolchain: True  # whether a toolchain is installed and runs
     asm: str = ''
     source: str = ''
@@ -113,6 +122,24 @@ def mips_gcc(facts) -> list[dict]:
     return out
 
 
+def float_profile_hint(arch, own, code, big_endian=True) -> str:
+    """One line for an open function's brief when its target was built with the other floating-point register file than
+    its profile names, or ''. An N64 game's functions sat under `-mfp64` for days while agents rewrote source for
+    register rows only `-mfp32` gives, and many matched on that flag alone: the target says so before the first compile.
+    It reads code and flags only and changes no setting."""
+    from . import fp_fingerprints
+    flags = list(own.get('flags') or ())
+    if arch != 'mips' or own.get('cmd') or not code or not own.get('toolchain') or own['toolchain'].startswith('ido-') \
+            or not explicit_fp(flags):
+        return ''
+    why = fp_fingerprints.why(flags, bytes(code), (), big_endian)
+    if why is None:
+        return ''
+    return (f"Compiler check (do this before rewriting source): the target suggests {' '.join(fp_fingerprints.flipped(flags))} "
+            f"rather than this function's flags, because {why}. Judge your C under those flags with compiler_experiments; "
+            "an exact result there is applied for this function only.")
+
+
 def neighbour(facts) -> list[dict]:
     """The profile most of the nearest matched functions were built with, when it is not this function's own: the
     address stretch a library or a module sits in (the matched audio code around an open function)."""
@@ -125,6 +152,17 @@ def neighbour(facts) -> list[dict]:
     return out
 
 
+def project_common(facts) -> list[dict]:
+    """The per-function profiles most functions of the whole project were proven under, wherever they sit. A game whose
+    default is `-O2` had a module's worth of `-O1` functions with no neighbour matched yet and nothing in their code
+    that a rule reads: a dozen near-misses of 5-250 under their own settings were exact under it, several with the
+    machine draft or the repairs alone."""
+    mine = key(facts.own)
+    used = [(other, count) for other, count in facts.common.most_common() if other != mine and count >= COMMON_MIN]
+    return [probe({'toolchain': other[0], 'flags': list(other[1])}, 'project',
+                  f'{count} functions of this project were built with it') for other, count in used[:COMMON_PROBES]]
+
+
 def plan(console, facts) -> list[dict]:
     """The profiles worth one judge compile each, in the order to judge them: [{toolchain, flags, family, why}]. Empty
     when nothing in the target points anywhere. Never the function's own profile, never one that isn't installed."""
@@ -133,7 +171,8 @@ def plan(console, facts) -> list[dict]:
     hints = console.profile_probes(facts)
     # a console's `lead` hint is a tell that settles the compiler's build outright (an `ldc1` and the assembler that
     # writes it): judged before the flag variants of the function's own compiler, which cannot fix a missing build
-    ordered = [*neighbour(facts), *(h for h in hints if h.get('lead')), *mips_gcc(facts), *(h for h in hints if not h.get('lead'))]
+    ordered = [*neighbour(facts), *(h for h in hints if h.get('lead')), *mips_gcc(facts), *(h for h in hints if not h.get('lead')),
+               *project_common(facts)]
     for item in ordered:
         k = key(item)
         if k in seen or not facts.ready(item['toolchain']):
@@ -167,6 +206,7 @@ def gather(net, proj, fn, source, own=None) -> Facts | None:
     arch = proj['arch'] if 'arch' in proj.keys() else 'mips'
     big = bool(proj['big_endian']) if 'big_endian' in proj.keys() else True
     votes, read = profile_detection.neighbours(net, proj, cfg, fn)
+    common = Counter(key(p) for p in (cfg.get('function_compilers') or {}).values() if p.get('toolchain'))
     sdk = bool(LIBRARY_NAME.match(row['name']))
     if not sdk:
         try:
@@ -177,7 +217,7 @@ def gather(net, proj, fn, source, own=None) -> Facts | None:
     context = net._context(proj['id'], row['unit']) if hasattr(net, '_context') else None
     return Facts(own=own, words=words_of(bytes(row.get('target') or b''), big), arch=arch, big_endian=big,
                  rows=profile_detection.saved_rows(net, proj, fn, own) if arch == 'mips' else [],
-                 name=row['name'], vram=row['vram'] or 0, sdk=sdk, votes=votes, read=read, ready=_ready,
+                 name=row['name'], vram=row['vram'] or 0, sdk=sdk, votes=votes, read=read, common=common, ready=_ready,
                  asm=row.get('asm') or '', source=source, header=context['header'] if context else '')
 
 
@@ -221,6 +261,8 @@ def run(search, agent, proj, fn, source) -> bool:
         return False
     if not planned:
         return False
+    seed = fn['seed'] if 'seed' in fn.keys() else None
+    draft = seed if seed and seed.strip() != source.strip() else None
     previous, search.phase = search.phase, 'profile probes'
     search.log(f'Profile probe: {len(planned)} per-function profile(s) the target points to: '
                + '; '.join(f"{p['toolchain']} {' '.join(p['flags'])} ({p['family']})" for p in planned) + '.')
@@ -237,6 +279,16 @@ def run(search, agent, proj, fn, source) -> bool:
                 matched = True
                 return True
             scores.append({**item, 'score': score})
+            if draft and search.limit - search.tested >= RESERVE:
+                # the machine draft under the same profile: a sweep of one KMC game's open functions found 26 of the 64
+                # that score at most half as much under -O1 through their draft, not their saved C
+                search.check()
+                drafted = deep_profiles.probe(search, agent, proj, fn, draft, profile, scored=True, review_variants=False)
+                if drafted == 0:
+                    matched = True
+                    return True
+                if drafted is not None:
+                    scores.append({**item, 'score': drafted, 'draft': True})
             if item['family'] in ('small_data', 'small_data_fp') and score is not None:
                 # the externs the target splits, declared as arrays above the threshold (extern_size_widen)
                 from . import small_data_fingerprints
@@ -267,7 +319,8 @@ def diagnose(search, agent, proj, fn, source, own, scores, complete) -> None:
     scored = [s for s in scores if s['score'] is not None]
     best = min(scored, key=lambda s: s['score'], default=None)
     record = {'own_score': fn['best_score'], 'probes': scores, 'complete': complete,
-              'best': best and {k: best[k] for k in ('toolchain', 'flags', 'family', 'score')}}
+              'best': best and {**{k: best[k] for k in ('toolchain', 'flags', 'family', 'score')},
+                                **({'draft': True} if best.get('draft') else {})}}
     if complete:
         with net.project_store(proj['id']).tx() as db:
             db.execute('INSERT OR REPLACE INTO reuse_trials(function_id,signature,outcome,reason,feedback) VALUES(?,?,?,?,?)',
@@ -275,8 +328,10 @@ def diagnose(search, agent, proj, fn, source, own, scores, complete) -> None:
     if best is None or fn['best_score'] is None or best['score'] > fn['best_score'] * NOTE_AT:
         return
     settings = f"{best['toolchain']} {' '.join(best['flags'])}"
-    line = (f"Profile probe: this saved C scores {best['score']} under {settings} ({best['why']}), "
-            f"{fn['best_score']} under its own settings; not exact. Nothing was changed.")
+    which = 'the machine draft (get_function section=draft)' if best.get('draft') else 'this saved C'
+    line = (f"Profile probe: {which} scores {best['score']} under {settings} ({best['why']}), "
+            f"{'the saved C scores ' if best.get('draft') else ''}{fn['best_score']} under its own settings; not exact. "
+            "Nothing was changed.")
     search.log(f"{fn['name']}: {line}")
     if complete and not any(s['score'] == 0 for s in scores):
         try:

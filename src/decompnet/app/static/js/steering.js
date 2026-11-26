@@ -131,9 +131,12 @@ function renderSteering(ov) {
   if (typeof renderRepositoryAutoPush === "function") renderRepositoryAutoPush(ov.auto_push);
   renderKnowledge();
   // what agents can't change themselves: where a function ends, and suggestions; a compiler's are in Settings → Compiler
-  const sg = (ov.suggestions || []).filter((s) => !s.toolchain), bd = ov.boundaries || [];
-  $("suggestPanel").hidden = !sg.length && !bd.length;
-  setHtml($("suggestList"), bd.map((r) => `<div class="note">${saidHead("where a function ends", [r.agent], r.t, true)}
+  const sg = (ov.suggestions || []).filter((s) => !s.toolchain), bd = ov.boundaries || [], proposed = ov.proposals || 0;
+  $("suggestPanel").hidden = !sg.length && !bd.length && !proposed;
+  // (changes agents proposed: their count opens the drawer that lists them, js/agent-proposals.js)
+  const proposals = proposed ? `<div class="note">${saidHead("agents propose", [], 0, true)}
+    <button class="link-btn" type="button" data-open-proposals>${plural(proposed, "change")} waiting for your approval</button>: functions to set aside and boundaries to fix, each with the agents' evidence. Nothing changes until you approve it.</div>` : "";
+  setHtml($("suggestList"), proposals + bd.map((r) => `<div class="note">${saidHead("where a function ends", [r.agent], r.t, true)}
     <b class="mono">${esc(r.function)}</b> ends at <span class="mono">${hex8(r.end)}</span>: the ${r.cut} bytes after it aren't code. ${esc(r.reason)}
     <p class="small muted mono">after ${hex8(r.end)}: ${esc(r.rest)}</p>
     <div class="row"><button class="primary small-btn" type="button" data-bapply="${r.id}">Cut it there</button><button class="ghost small-btn" type="button" data-bdismiss="${r.id}">Dismiss</button></div></div>`).join("") + sg.map(suggestionHtml).join(""));
@@ -251,6 +254,7 @@ function compilerSuggestionHtml(s) {
 }
 
 $("suggestList").onclick = $("compilerWaiting").onclick = async (e) => {
+  if (e.target.closest("[data-open-proposals]")) { openAgentProposals(); return; }
   const cut = e.target.closest("button[data-bapply], button[data-bdismiss]");
   if (cut) {
     const apply = cut.dataset.bapply != null;
@@ -1445,6 +1449,7 @@ async function renderProjectSettings(keepRemoved = false) {
   if ($("compilerImprovements").dataset.slug !== S.slug) $("compilerImprovements").replaceChildren();
   if ($("compilerProgress").dataset.slug !== S.slug) {
     $("compilerProgress").hidden = true;
+    $("compilerApplyMatches").checked = true;
     $("compilerAutoApply").checked = false;
     $("compilerLogDetails").hidden = true;
   }
@@ -1558,6 +1563,8 @@ $("compilerParts").onclick = async (e) => {
   if (fn) { openFn(fn.dataset.compilerFunction); return; }
   const testDefault = e.target.closest("button[data-profile-test-default]");
   if (testDefault) { await testProfileAsDefault(testDefault, testDefault.dataset.profileAction || "test"); return; }
+  const compareButton = e.target.closest("button[data-profile-compare]");
+  if (compareButton) { await compareProfileWithAnother(compareButton); return; }
   const profileButton = e.target.closest("button[data-profile-default]");
   if (profileButton) { await compareProfileWithDefault(profileButton); return; }
   const undo = e.target.closest("button[data-revert]");
@@ -1952,6 +1959,84 @@ function profileFailureGroups(failures) {
     <div class="profile-failure-cards">${rows.map(f => `<article class="profile-failure-card"><div class="profile-failure-heading">${link(f.function)}<span class="small muted">${f.blockers?.length ? 'Range blocked' : 'Needs review'}</span></div>${f.blockers?.length ? `<p class="small muted">Protect these existing matches</p><div class="profile-related-functions">${f.blockers.map(b=>link(b.function)).join('')}</div><div class="profile-failure-actions"><button class="primary small-btn" type="button" data-safe-profile-range="${esc(f.function)}">Fix range &amp; apply match</button><button class="ghost small-btn" type="button" data-check-profile-blockers="${esc(JSON.stringify(f.blockers.map(b=>b.function)))}">Check affected functions</button></div><div data-blocker-result class="small" role="status"></div>` : `<p class="small muted">${esc(f.reason)}</p>`}</article>`).join('')}</div></div></details>`).join('');
 }
 
+async function compareProfileWithAnother(button) {
+  const group = compilerDisplayedGroups[Number(button.dataset.profileCompare)], part = group?.parts[0];
+  if (!part || group.default) return;
+  const slug = S.slug, key = `${slug}:${group.id}`;
+  const settings = p => ({toolchain:p.toolchain, flags:p.flag_list || p.flags.split(/\s+/).filter(Boolean)});
+  const profile = settings(part);
+  // The default comes first and is sent as "no target", so the server reads today's default.
+  const others = compilerDisplayedGroups.filter(g => g !== group && !g.default && g.parts[0]?.toolchain);
+  const body = dialog('Compare with another profile', `<p class="profile-test-intro">See whether this profile's matches also match byte for byte with another one.</p>
+    <div class="profile-test-selection"><span class="small muted">Matches from</span><strong>${esc(group.compiler)}</strong><code class="compiler-arguments">${esc(profile.flags.join(' '))}</code></div>
+    <label class="field"><span>Compare against</span><select data-compare-target><option value="">Project default — ${esc(`${compilerPartsAnswer?.compiler || ''} ${compilerPartsAnswer?.flags || ''}`)}</option>${others.map((g, i) => `<option value="${i}">${esc(`${g.compiler} ${g.flags}`)}</option>`).join('')}</select></label>
+    <p class="small muted">Comparing changes nothing. You can move the passing matches afterward.</p>
+    <button type="button" class="primary" data-compare-start>Compare matches</button> <button type="button" class="ghost" data-compare-stop hidden>Stop</button>
+    <div data-compare-work></div><p class="err-msg" data-compare-error role="alert" hidden></p><p class="profile-test-verdict" data-compare-verdict role="status"></p>
+    <button type="button" class="primary" data-compare-move hidden></button><div class="profile-failure-list" data-compare-failures></div>`, 'compiler-profile-compare');
+  const get = selector => body.querySelector(selector);
+  const start = get('[data-compare-start]'), stop = get('[data-compare-stop]'), move = get('[data-compare-move]');
+  const picker = get('[data-compare-target]'), work = get('[data-compare-work]'), verdict = get('[data-compare-verdict]');
+  const active = () => S.dialogKind === 'compiler-profile-compare' && !$("dialog").hidden && get('[data-compare-start]') === start;
+  work._errorBox = get('[data-compare-error]');
+  let jobId = null;
+  const chosen = () => picker.value === '' ? null : settings(others[Number(picker.value)].parts[0]);
+  const run = async (action, label, controls) => {
+    if (compilerProfileJobs.get(key)?.running) { showJobError(work, 'This profile is already being compared.'); return null; }
+    const item = {running:true, message:`${label}…`};
+    compilerProfileJobs.set(key, item); renderCompilerParts(compilerPartsAnswer);
+    const done = beginWork(work, label, [...controls, picker], '');
+    work._errorBox.hidden = true;
+    try {
+      const {job} = await api('/api/compiler/compare', {method:'POST', body:{slug, profile, target:chosen(), action}});
+      jobId = job; stop.hidden = false; stop.disabled = false;
+      const out = await followJob(job, null, (lines, state) => {
+        const p = state?.progress;
+        item.message = p?.total != null ? `${label} · ${p.checked} / ${p.total}` : lines[lines.length - 1] || item.message;
+        if (active()) verdict.textContent = item.message;
+      });
+      item.message = '';
+      return out;
+    } catch (error) {
+      item.message = error.message;
+      if (active()) { verdict.textContent = ''; showJobError(work, error.message); }
+      return null;
+    } finally {
+      jobId = null; stop.hidden = true; item.running = false; done();
+      if (S.slug === slug) renderCompilerParts(compilerPartsAnswer);
+    }
+  };
+  const reset = () => { move.hidden = true; verdict.textContent = ''; get('[data-compare-failures]').innerHTML = ''; };
+  picker.onchange = reset;
+  stop.onclick = async () => {
+    if (jobId == null || stop.disabled) return;
+    stop.disabled = true;
+    try { await api('/api/job/cancel', {method:'POST', body:{id:jobId}}); }
+    catch (error) { stop.disabled = false; showJobError(work, error.message); }
+  };
+  body.onclick = event => {
+    const fn = event.target.closest('[data-profile-function]');
+    if (fn) { $("dialog").hidden = true; openFn(fn.dataset.profileFunction); }
+  };
+  start.onclick = async () => {
+    reset();
+    const out = await run('compare', 'Comparing matches', [start]);
+    if (!out || !active()) return;
+    verdict.textContent = !out.total ? 'This profile has no matched functions to compare.'
+      : !out.failed ? `All ${out.total} matches can move to this profile.`
+      : `${out.passed} of ${out.total} matches can move. ${out.failed} cannot; they are listed below.`;
+    get('[data-compare-failures]').innerHTML = profileFailureGroups(out.failures);
+    move.hidden = !out.passed;
+    move.textContent = `Move ${out.passed} ${out.passed === 1 ? 'match' : 'matches'} to this profile`;
+  };
+  move.onclick = async () => {
+    const out = await run('move', 'Rechecking and moving matches', [start, move]);
+    if (!out) return;
+    if (active()) { move.hidden = true; verdict.textContent = `${out.changed.length} moved · ${out.unchanged} kept their settings · ${out.skipped} busy or shared-address skips.`; }
+    if (S.slug === slug) await loadCompilerAnswer();
+  };
+}
+
 async function testProfileAsDefault(button, action="test") {
   const group = compilerDisplayedGroups[Number(button.dataset.profileTestDefault)], part = group?.parts[0];
   if (!part || group.default) return;
@@ -2127,7 +2212,7 @@ function renderCompilerParts(a) {
   setHtml($("compilerParts"), removedHtml + (mode === "range" ? `<ol class="compiler-range-list">${groups.flatMap(g => g.parts).map(p => row(p, true)).join("")}</ol>`
     : groups.map((g, index) => `<details class="compiler-profile" data-compiler-group="${esc(g.id)}"${compilerGroupsOpen.has(g.id) ? " open" : ""}>
       <summary><span><b>${esc(mode === "family" ? g.family.toUpperCase() : g.compiler)}</b>${g.default ? ` <span class="chip-s">${mode === "family" && g.profiles > 1 ? "Includes default" : "Default"}</span>` : ""}${mode === "settings" ? `<code class="compiler-arguments">${g.flags ? compilerFlagsHtml(g.flags, esc) : "No arguments"}</code>` : ""}<span class="compiler-profile-count">${[g.ranges ? plural(g.ranges, "range") : "", g.functions != null ? plural(g.functions, "function") : ""].filter(Boolean).join(" · ")}${mode === "family" ? ` · ${plural(g.profiles, "argument profile")}` : ""}</span></span></summary>
-      ${mode === "settings" && !g.default && S.ov.kind !== "fork" ? `<div class="compiler-profile-action"><div class="compiler-profile-tools"><span class="small muted">Profile actions</span><details class="agent-menu compiler-profile-menu"><summary aria-label="Actions for ${esc(g.compiler)} profile" title="Compiler profile actions">⋮</summary><div class="agent-menu-items"><button type="button" data-profile-default="${index}"${compilerProfileJobs.get(`${S.slug}:${g.id}`)?.running ? " disabled" : ""}>Compare all matches with default</button><button type="button" data-profile-test-default="${index}">Test this profile as default</button><button type="button" data-profile-test-default="${index}" data-profile-action="replace">Replace default with this profile</button><button type="button" data-profile-test-default="${index}" data-profile-action="nonmatches">Test all non-matches</button></div></details></div><p class="small muted">Only exact byte matches move to the project default. Drafts and non-matches keep their settings.</p><p class="small" role="status">${esc(compilerProfileJobs.get(`${S.slug}:${g.id}`)?.message || "")}</p></div>` : ""}
+      ${mode === "settings" && !g.default && S.ov.kind !== "fork" ? `<div class="compiler-profile-action"><div class="compiler-profile-tools"><span class="small muted">Profile actions</span><details class="agent-menu compiler-profile-menu"><summary aria-label="Actions for ${esc(g.compiler)} profile" title="Compiler profile actions">⋮</summary><div class="agent-menu-items"><button type="button" data-profile-default="${index}"${compilerProfileJobs.get(`${S.slug}:${g.id}`)?.running ? " disabled" : ""}>Compare all matches with default</button><button type="button" data-profile-compare="${index}">Compare with another profile…</button><button type="button" data-profile-test-default="${index}">Test this profile as default</button><button type="button" data-profile-test-default="${index}" data-profile-action="replace">Replace default with this profile</button><button type="button" data-profile-test-default="${index}" data-profile-action="nonmatches">Test all non-matches</button></div></details></div><p class="small muted">Only exact byte matches move to the project default. Drafts and non-matches keep their settings.</p><p class="small" role="status">${esc(compilerProfileJobs.get(`${S.slug}:${g.id}`)?.message || "")}</p></div>` : ""}
       <ol class="compiler-range-list">${g.parts.map(p => row(p, mode === "family")).join("")}</ol></details>`).join("")));
   $("compilerParts").querySelectorAll("details[data-range-reason]").forEach(d => d.ontoggle = () => {
     if (!d.isConnected) return;
@@ -2258,7 +2343,7 @@ async function followCompilerComparison(existing = null) {
   const work = $("installedCompilerWork");
   const stop = button, stopError = $("compilerStopError");
   let jobId = existing?.job || null;
-  const controls = [$("compilerUsedProfilesOnly"), $("compilerFlagsOnly"), $("compilerRetest"), $("compilerAutoApply")];
+  const controls = [$("compilerUsedProfilesOnly"), $("compilerFlagsOnly"), $("compilerRetest"), $("compilerApplyMatches"), $("compilerAutoApply")];
   const disabled = controls.map(control => control.disabled);
   run.detach = () => {
     if (compilerComparisonFollowing !== run) return;
@@ -2271,6 +2356,7 @@ async function followCompilerComparison(existing = null) {
     $("compilerFlagsOnly").checked = !!scope.flags_only;
     $("compilerUsedProfilesOnly").checked = !!scope.used_profiles_only;
     $("compilerRetest").checked = scope.untested_only === false;
+    $("compilerApplyMatches").checked = !!scope.apply_matches;
     $("compilerAutoApply").checked = !!scope.auto_apply;
     updateCompilerTestScope();
   };
@@ -2313,7 +2399,7 @@ async function followCompilerComparison(existing = null) {
   if (existing?.progress) renderCompilerProgress(existing.progress);
   showJobError(work, "");
   try {
-    const started = existing || await api("/api/compilermap", { method: "POST", body: { slug, all_installed: true, flags_only: $("compilerFlagsOnly").checked, used_profiles_only: $("compilerUsedProfilesOnly").checked, untested_only: !$("compilerRetest").checked, auto_apply: $("compilerAutoApply").checked } });
+    const started = existing || await api("/api/compilermap", { method: "POST", body: { slug, all_installed: true, flags_only: $("compilerFlagsOnly").checked, used_profiles_only: $("compilerUsedProfilesOnly").checked, untested_only: !$("compilerRetest").checked, apply_matches: $("compilerApplyMatches").checked, auto_apply: $("compilerAutoApply").checked } });
     if (!active()) return;
     const {job} = started;
     restoreOptions(started.scope);
@@ -3216,7 +3302,10 @@ async function acceptWaitingSuggestions(button) {
     renderSuggestionBatchProgress(body,{total:results.length,done:results.length,applied:result.applied,skipped:result.skipped},true);
     const skipped=results.filter(r=>!r.applied);
     body.querySelector('[data-batch-results]').innerHTML=skipped.length ? `<details class="collapsible-box"><summary>${skipped.length} skipped suggestions — view reasons</summary><div class="collapsible-box-body">${skipped.map(r=>`<div><b class="small">Suggestion #${esc(r.id)}</b><p class="small muted">${esc(r.reason)}</p></div>`).join('')}</div></details>` : '';
-    if(S.slug===slug){S.ov=result.overview;renderStats(S.ov);renderProjectSettings();}
+    // The suggestions are applied either way: a failed page refresh is its own message, and the job button frees now.
+    if(S.slug===slug)api(`/api/project?slug=${encodeURIComponent(slug)}`)
+      .then(overview=>{if(S.slug===slug){S.ov=overview;renderStats(S.ov);renderProjectSettings();}})
+      .catch(error=>toast(`Suggestions saved, but the page could not refresh: ${error.message}`));
   }catch(error){
     body.querySelector('[data-batch-status]').textContent='Could not finish applying suggestions';
     body.querySelector('[data-batch-current]').textContent='Completed changes are saved. Review the error before retrying.';

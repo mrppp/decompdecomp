@@ -969,6 +969,7 @@
             <div class="compiler-test-options"><label class="check"><input type="checkbox" id="compilerFlagsOnly"><span><b>Flag variations only</b><small>Faster: keep each function’s compiler and test different flags.</small></span></label>
             <label class="check"><input type="checkbox" id="compilerUsedProfilesOnly"><span><b>Only profiles used in this project</b><small>Faster: test exact compiler and flag combinations already assigned to functions.</small></span></label>
             <label class="check"><input type="checkbox" id="compilerRetest"><span><b>Retest completed functions</b><small>Leave off to continue with new or changed attempts.</small></span></label>
+            <label class="check"><input type="checkbox" id="compilerApplyMatches" checked><span><b>Automatically apply matches</b><small>When a function’s comparison finds an exact match, apply those settings. Each match is rechecked; partial improvements are not applied.</small></span></label>
             <label class="check"><input type="checkbox" id="compilerAutoApply"><span><b>Automatically apply better settings</b><small>Apply each function’s best settings when its comparison finishes. Each change is rechecked; busy or changed functions stay available for review.</small></span></label></div>
             <p class="small muted" id="compilerTestScope">All installed compilers and supported flag variations · new or changed attempts only.</p>
             <div class="row"><button class="primary" type="button" id="testInstalledCompilers">Find better settings</button></div>
@@ -1119,7 +1120,7 @@
             <div id="sdkDetected" class="muted small"></div><div id="sdkChoices"></div>
             <div id="sdkSetAsideC" hidden>
               <label class="check"><input type="checkbox" id="sdkSetAsideCOn"><span>Set aside library code that library detection finds</span></label>
-              <p class="muted small">Library functions found by detection (the built-in libultra signatures, your SDK folders, functions you confirmed) are set aside from C matching (on unless you turn it off): a port replaces that code and the rebuild uses its assembly. Where your SDK archive has a function, its bytes are linked and compared too. Code the port builds from C (libultra's math and synthesizer) is set aside too once you install libultra source (ultralib) in <a href="#/tools">Compilers &amp; tools</a>: the port then compiles ultralib's C for it. Without it, and for names the port doesn't know, it keeps its C work. Turning it off gives them back to the agents. <span id="sdkSetAsideCCount"></span></p>
+              <p class="muted small">Library functions found by detection (the built-in libultra signatures, your SDK folders, functions you confirmed) are set aside from C matching (on unless you turn it off): a port replaces that code and the rebuild uses its assembly. Where your SDK archive has a function, its bytes are linked and compared too. Code the port builds from C (libultra's math and synthesizer) is set aside too once you install libultra source (ultralib) in <a href="#/tools">Compilers &amp; tools</a>: the port then compiles ultralib's C for it. Without it, and for names the port doesn't know, it keeps its C work. A library no public source builds (the N64's n_audio) is set aside on detection: the port runs its original code. Turning it off gives them back to the agents. <span id="sdkSetAsideCCount"></span></p>
             </div>
             <div class="row"><button class="ghost small-btn" id="sdkSelectionSave" type="button">Save selection</button><button class="ghost small-btn" id="sdkSetAsideCStop" type="button" hidden>Stop</button></div>
             <pre class="joblog" id="sdkSelectionLog" hidden></pre>
@@ -1491,6 +1492,7 @@
 <script defer src="/assets/js/repository-setup.js"></script>
 <script defer src="/assets/js/repository-push.js"></script>
 <script defer src="/assets/js/steering.js"></script>
+<script defer src="/assets/js/agent-proposals.js"></script>
 <script defer src="/assets/js/variants.js"></script>
 <script defer src="/assets/js/globals.js"></script>
 <script defer src="/assets/js/background-work.js"></script>

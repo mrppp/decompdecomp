@@ -483,6 +483,11 @@ layout asserts) compile, and a few then meet an LLVM backend error (`Function ad
 placing their symbols. A function whose C compiles but cannot be placed runs as the original's code in a second attempt,
 as one clang rejects does (`build._PlaceFallback`).
 
+A struct written on one line with members declared together (`u16 x, y; u32 hi : 24; u32 mode : 6; u32 lo : 2;`) was once
+left in clang's order, which the size check can't see: a game's menu rows kept their old layer and the port drew no briefing
+text (found with Play beside the console: the text boxes' flag word differed from the console's). Each declarator now goes
+on its own line before the reorder.
+
 #### Functions with no C yet
 
 A function the game's C calls (or reaches through a pointer, or starts a thread at) that has no C yet runs from the
@@ -644,7 +649,18 @@ a port given by `--port-url` needs `PORT_LOCKSTEP=1 PORT_VTIME=1`) the viewer is
 `port_live_gate`, before each retrace) and the emulator (the shared file's gate, frontend.c) park at every retrace, the
 viewer reads both RAMs there (`GET /ram?vi=N` on the port, the file's second RAM block on the console), lists the regions that
 differ and the ones that are new at this retrace, latches the page's pad (a tap stays down four retraces) and lets both go on
-one. The page has Pause, Step and the list; `--rate 50` for a PAL game, `--range START-END` (repeatable) to compare only the
+one. The port still gets ahead in the game itself (it loads in no time and never drops a frame, the console takes
+retraces for both), so the page has **Port speed**: below 100% the port goes on for only that share of the console's
+retraces, and **held** parks it while the console catches up through a load. The two retrace numbers then differ and are
+both shown, and the RAM compared is each side's as it stands. Neither side has save states (the
+port's N64 threads are the host's threads, so its RAM alone isn't where it is), so **Bookmark** keeps the run instead:
+what each side was given at every retrace (the pad, whether the port went on) and the saves the run started from.
+**Go to bookmark** starts both again on copies of those saves and replays it unpaced (about 3,400 retraces, a game's
+briefing screen, in 15 s), pauses there and says whether each side's RAM is as it was (checksums of every 256-byte
+block). On an unchanged build both were; after a rebuild the port's differ and the run can go another way. The saves
+written after going to a bookmark are the copies', not your own. Play keeps bookmarks and the console's saves in
+`side-by-side/` beside the project's ROM; the command line keeps them with `--keep DIR`. The viewer's console now
+saves there instead of in the emulator's folder in your home, so its first run starts without a save. The page has Pause, Step and the list; `--rate 50` for a PAL game, `--range START-END` (repeatable) to compare only the
 game's own data (the port's exception vectors and its stacks always differ),
 `--emulator-offset` if the two count retraces one apart. Measured on an N64 game's menu: both on the same screen, a Start press
 moved both on together, about 52 retraces a second.
@@ -653,7 +669,9 @@ In the app it is the Porting tab's **Play beside the console** button, next to P
 it builds and starts the port as Play does, in lockstep, starts the emulator and opens the page in the game's window. The
 differing addresses carry the project's names (`gScore+0x4`: its symbols and functions, `play.project_symbols`; on the command
 line `--symbols FILE`), and both sides get the same console memory (the emulator the Expansion Pak when the port has its 8 MB, so
-`osMemSize` is no longer a difference). Stop ends both. The page's **Sound** menu plays the port's sound or the console's
+`osMemSize` is no longer a difference). Stop ends both. **Save screenshot** writes both pictures, their frame counts, the retrace and the difference list as one PNG in
+Downloads, for showing a difference (the port not drawing some text, say).
+The page's **Sound** menu plays the port's sound or the console's
 (an audio plugin, `emulator/audio.c`, copies each buffer the game gives the audio interface into a ring in the shared file; the
 viewer serves it in the format the port's own live view uses). The console's frames are drawn one converted picture at a time
 (`Renderer.draw_picture`, planes instead of pixels): about 23 a second where it was 16, the rest being the software renderer
@@ -821,6 +839,12 @@ function is called with:
 ```bash
 python -m decompnet.consoles.n64.emulator baserom.z64 --vis 2600 --input @race.txt --watch 802A45C8 --from 2400
 ```
+
+A headless run starts without a save and keeps none (EEPROM, SRAM, FlashRAM, Controller Pak), so it is the same run every
+time; so are the console's sides of `tools/n64_frame_compare.py` and Check pictures. To run from a save, give its folder:
+`--saves FOLDER` (`emulator.run(saves=...)`). The run reads and writes the files there, so hand it a copy to run the same
+way again. The emulator's own save folder in your home is not used: before this, headless runs read and wrote it, so a
+measurement in these notes that read "the emulator's save" may have had an earlier run's.
 
 That is how a racing game's backwards start was found. Each car's matrix came from an Euler-angle helper; the
 console passed it a yaw of 0x800, and the port passed 0. The yaw was the `$v0` a void function left for its

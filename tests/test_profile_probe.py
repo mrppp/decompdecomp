@@ -442,3 +442,47 @@ def test_the_autopilot_pass_skips_a_function_without_saved_c_and_lets_its_stop_t
         lane.run(net, None, PROJ, {'best_source': 'C'})
     net.autopilots['p']['stop'] = SimpleNamespace(is_set=lambda: False)
     assert lane.run(net, None, PROJ, {'best_source': 'C'}) is False  # (a limit that is not a Stop just ends this function's pass)
+
+
+def test_passes_recorded_before_scores_were_kept_are_redone(monkeypatch):
+    # v1 records from the Deep Permuter's batch have probes without scores (the sweep's queued misses lost them):
+    # a pass is looked up by the current signature only, so each is redone once
+    from decompnet.app import agent_tokens
+    monkeypatch.setattr(agent_tokens, 'target_scope', lambda *a: 'scope')
+    key = profile_probe.marker_key(None, {'id': 1}, 'int f(void) { return 0; }', SN)
+    assert key.startswith(profile_probe.SIGNATURE) and not key.startswith('profile-probe-v1:')
+
+
+def test_the_machine_draft_is_judged_under_each_planned_profile_too(monkeypatch):
+    # one KMC game's sweep: 26 of the 64 open functions that score at most half as much under -O1 did so through their
+    # machine draft, which the probe never judged
+    search, seen = arrange(monkeypatch, {'-a': 300, '-b': None})
+    sources = []
+    from decompnet.app import deep_profiles
+    probe = deep_profiles.probe
+
+    def judged(search_, agent, proj, fn, source, profile, **kw):
+        sources.append(source)
+        return 40 if source == 'DRAFT' else probe(search_, agent, proj, fn, source, profile, **kw)
+    monkeypatch.setattr(deep_profiles, 'probe', judged)
+    assert profile_probe.run(search, None, PROJ, {**FN, 'seed': 'DRAFT'}, 'C') is False
+    assert sources == ['C', 'DRAFT', 'C', 'DRAFT']
+    assert len(search.notes) == 1 and 'machine draft' in search.notes[0][0] and 'scores 40' in search.notes[0][0]
+    assert 'saved C scores 380' in search.notes[0][0]
+    assert json.loads(search.stored[-1][4])['best'] == {'toolchain': 't', 'flags': ['-a'], 'family': 'fp', 'score': 40,
+                                                         'draft': True}
+
+
+def test_a_draft_that_is_the_saved_c_is_not_judged_twice(monkeypatch):
+    search, seen = arrange(monkeypatch, {'-a': 300, '-b': None})
+    assert profile_probe.run(search, None, PROJ, {**FN, 'seed': 'C\n'}, 'C') is False
+    assert [n for n, _ in seen] == ['-a', '-b']
+
+
+def test_the_profiles_most_of_the_project_was_proven_under_are_planned_last():
+    o1 = ('gcc-2.7.2-kmc', ('-G0', '-mips3', '-O1'))
+    rare = ('gcc-2.7.2-kmc', ('-G0', '-mips2', '-O2'))
+    got = profile_probe.project_common(facts(common=Counter({o1: 12, rare: profile_probe.COMMON_MIN - 1})))
+    assert [(p['toolchain'], tuple(p['flags']), p['family']) for p in got] == [(*o1, 'project')]
+    own = {'toolchain': o1[0], 'flags': list(o1[1])}
+    assert profile_probe.project_common(facts(own=own, common=Counter({o1: 12}))) == []

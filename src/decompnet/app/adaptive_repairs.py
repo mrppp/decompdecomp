@@ -13,6 +13,17 @@ from ..project import compiler_for
 from . import trial_bookkeeping
 
 MIN_TRIALS = 32
+# A family with verified matches counts as measured before it has MIN_TRIALS, at most EARLY_MAX_FACTOR until it has them.
+# The narrow repairs that match in a few trials apply to few functions, so spread over profiles and mismatch kinds they
+# rarely reach MIN_TRIALS in any one cell: on a 1,931-function N64 game 68 cells held 100 matches (mmio_address: 11
+# matches in 13 trials) and every one of them was queued as unmeasured, one slot in EXPLORE_EVERY. The smoothing below
+# already shrinks a few trials toward the prior; the lower ceiling keeps one lucky hit from leading the queue.
+EARLY_MATCHES = 1
+EARLY_MAX_FACTOR = 2.0
+# A family this mismatch kind has no measurement of borrows its profile's other kinds' evidence, upward only and at most
+# POOLED_MAX_FACTOR: a repair that matched in one kind of mismatch is worth trying earlier in another, but a different
+# mismatch is weaker proof than this one's own trials, so it never leads the queue and never demotes a family.
+POOLED_MAX_FACTOR = 2.0
 MIN_FACTOR, MAX_FACTOR = 0.25, 4.0
 SCHEMA = '''CREATE TABLE IF NOT EXISTS repair_policy(
  profile TEXT NOT NULL, focus TEXT NOT NULL, family TEXT NOT NULL,
@@ -85,31 +96,97 @@ def policy_rows(net, key, focus):
     return [rows[family] for family in sorted(rows)]
 
 
+def pooled_rows(net, key, focus):
+    """One row per family summed over the profile's OTHER mismatch kinds (not `focus`, and never a `kind@shape` key:
+    each trial is counted under both, so adding them would count it twice), with what this search has counted and not
+    yet written, like `policy_rows`."""
+    stored = trial_bookkeeping.stored(net.store, ('policy-profile', key), lambda: [dict(row) for row in net.store.all(
+        'SELECT * FROM repair_policy WHERE profile=?', key)])
+    rows = [dict(row) for row in stored]
+    for (profile, queued_focus, family), args in trial_bookkeeping.pending_counters(net.store, POLICY_COUNT).items():
+        if profile == key:
+            rows.append({'profile': key, 'focus': queued_focus, 'family': family,
+                         **dict(zip(POLICY_COLUMNS, args[3:]))})
+    pooled = {}
+    for row in rows:
+        if row['focus'] == focus or '@' in row['focus']:
+            continue
+        total = pooled.setdefault(row['family'], {'profile': key, 'focus': '', 'family': row['family'],
+                                                  **dict.fromkeys(POLICY_COLUMNS, 0)})
+        for column in POLICY_COLUMNS:
+            total[column] += row[column]
+    return [pooled[family] for family in sorted(pooled)]
+
+
+def _weight(row, typical, ceiling):
+    """The factor one row of counts earns, at most `ceiling`; None while it has too little evidence to weigh."""
+    early = row['attempted'] < MIN_TRIALS
+    if early and row['matched'] < EARLY_MATCHES:
+        return None
+    # Smooth sparse evidence, favour verified wins, and never remove an applicable mutation.
+    rate = (row['improved'] + 3 * row['matched'] + 1) / (row['attempted'] + MIN_TRIALS)
+    # Prefer wins per unit of observed compiler time within this exact profile/focus.
+    # Unknown durations are neutral; bounded factors and queue interleaving keep exploration.
+    elapsed=row['elapsed_ms']/row['attempted']
+    speed=max(.5,min(2,math.sqrt(typical/elapsed))) if typical and elapsed>0 else 1
+    # Verified exact throughput leads once a cohort has enough trials. Smooth one
+    # win over 32 typical trials so a lucky fast hit cannot monopolize the queue.
+    # These are summed elapsed trial durations, not measured CPU seconds.
+    prior_ms = MIN_TRIALS * typical if typical else 0
+    exact_rate = ((row['matched'] + 1) / (row['elapsed_ms'] + prior_ms)
+                  if row['elapsed_ms'] > 0 and prior_ms else None)
+    reference = 1 / prior_ms if prior_ms else None
+    throughput = math.sqrt(exact_rate / reference) if exact_rate and reference else 1
+    factor = min(2, math.sqrt(rate * MIN_TRIALS)) * speed * max(.5, min(2, throughput))
+    return max(MIN_FACTOR, min(EARLY_MAX_FACTOR if early else ceiling, factor))
+
+
+def _typical(rows):
+    times=[r['elapsed_ms']/r['attempted'] for r in rows if r['attempted']>=MIN_TRIALS and r['elapsed_ms']>0]
+    return statistics.median(times) if times else None
+
+
+def _credited(rows):
+    """Each repair that was tried as part of a combination (`a+b`), with those trials added to its own counts."""
+    own = {row['family']: row for row in rows}
+    totals = {}
+    for row in rows:
+        if '+' not in row['family']:
+            continue
+        for part in set(row['family'].split('+')):
+            total = totals.get(part)
+            if total is None:
+                total = totals[part] = {**dict.fromkeys(POLICY_COLUMNS, 0), **own.get(part, {}), 'family': part}
+            for column in POLICY_COLUMNS:
+                total[column] += row[column]
+    return list(totals.values())
+
+
+def _weights(rows, ceiling):
+    """{family: factor} for the rows with enough evidence. A combination's trials are recorded under its joined name,
+    which no queue ranks, so its wins credited neither repair (a dev database held 700,000 such trials and 32 matches).
+    They count for each part here, upward only: a miss by a pair says too little against either repair to demote it."""
+    typical = _typical(rows)
+    result = {}
+    for row in rows:
+        if (factor := _weight(row, typical, ceiling)) is not None:
+            result[row['family']] = factor
+    for row in _credited(rows):
+        factor = _weight(row, typical, ceiling)
+        if factor is not None and factor > result.get(row['family'], 1):
+            result[row['family']] = factor
+    return result
+
+
 def factors(net, key, focus):
     prepare(net)
-    result = {}
-    rows = policy_rows(net, key, focus)
-    times=[r['elapsed_ms']/r['attempted'] for r in rows if r['attempted']>=MIN_TRIALS and r['elapsed_ms']>0]
-    typical=statistics.median(times) if times else None
-    for row in rows:
-        if row['attempted'] < MIN_TRIALS:
-            continue
-        # Smooth sparse evidence, favour verified wins, and never remove an applicable mutation.
-        rate = (row['improved'] + 3 * row['matched'] + 1) / (row['attempted'] + MIN_TRIALS)
-        # Prefer wins per unit of observed compiler time within this exact profile/focus.
-        # Unknown durations are neutral; bounded factors and queue interleaving keep exploration.
-        elapsed=row['elapsed_ms']/row['attempted']
-        speed=max(.5,min(2,math.sqrt(typical/elapsed))) if typical and elapsed>0 else 1
-        # Verified exact throughput leads once a cohort has enough trials. Smooth one
-        # win over 32 typical trials so a lucky fast hit cannot monopolize the queue.
-        # These are summed elapsed trial durations, not measured CPU seconds.
-        prior_ms = MIN_TRIALS * typical if typical else 0
-        exact_rate = ((row['matched'] + 1) / (row['elapsed_ms'] + prior_ms)
-                      if row['elapsed_ms'] > 0 and prior_ms else None)
-        reference = 1 / prior_ms if prior_ms else None
-        throughput = math.sqrt(exact_rate / reference) if exact_rate and reference else 1
-        result[row['family']] = max(MIN_FACTOR, min(MAX_FACTOR,
-            min(2, math.sqrt(rate * MIN_TRIALS)) * speed * max(.5, min(2, throughput))))
+    result = _weights(policy_rows(net, key, focus), MAX_FACTOR)
+    if '@' not in focus:
+        # A family this mismatch kind hasn't measured borrows what it earned on the profile's other kinds, upward only:
+        # evidence from another kind may bring a family forward, never demote one here (that takes this kind's own trials).
+        for family, factor in _weights(pooled_rows(net, key, focus), POOLED_MAX_FACTOR).items():
+            if family not in result and factor > 1:
+                result[family] = min(factor, POOLED_MAX_FACTOR)
     from . import repair_promotion
     return repair_promotion.cap(net,key,result)
 

@@ -23,6 +23,9 @@ description: Match one function by hand against the running decompdecomp app, th
   machine twice).
 - zsh does not split a flag string held in a variable: pass flags literally.
 
+**Small models (Claude Haiku): do not follow this file.** Read [HAIKU.md](HAIKU.md) instead (`next`, `try`, `done`
+with `scripts/haiku.py`), one function per agent run.
+
 ## First moves, in this order
 
 Most matches in a 1,000-function session came from this order, not from clever spelling.
@@ -557,6 +560,11 @@ says the fix and the library families it names; try those families with `prove_c
   several guards is never moved at all. `-dL`'s `done move-insn matches` lines show the merge that hoists it.
   decomp-repair `guard_symbol_pointer`, `guard_alias_pointer`, `stepped_cursor_index` (290 -> 230 on a bit-stream
   decoder; docs/learnings/function/bit-stream-decoder-guard-pointers-and-loop-made-registers.md).
+- **Two arms building one word from a command's bytes, the bytes and the shared pointer one register round** (SN 2.8.1):
+  anonymous byte reads are block-local and local-alloc colours them before global.c gives the arms' shared values theirs.
+  Hold the reads in locals both arms assign (global pseudos), put each arm's packet pointer back in its own block, and
+  give the arms one statement order (365 -> 0 together). decomp-repair `arm_operand_share`
+  (docs/learnings/function/modify-vertex-arms-shared-byte-locals.md).
 - **A goto loop stops loop.c hoisting constants** (do/while/for loops get the loop pass's treatment).
 - **Copy a short block in place of a `goto` to it** to give a value an extra use (cross-jumping merges the copies back).
 - **`const` pointer parameters** change the prologue's load order.
@@ -760,6 +768,12 @@ says the fix and the library families it names; try those families with `prove_c
 - **`if (G == 1)` with the load and the constant in each other's registers, three local quantities in the block:**
   local-alloc's fixed three-way exchange lets the short-lived constant win; load `G` into a local in a two-deep
   `do { } while (0)` (`compare_load_weight`, 15 -> 0, docs/learnings/finding/three-quantity-block-constant-outranks-load.md).
+- **SN64 GCC 2.8.1: a literal the target loads once, late, in the register reload uses (`li $t6` beside `mflo $t6`), with
+  the block's other values one register round:** the original's constant got no register at all. One local per field
+  (`r = g = b = a = 0xFF;` as four statements at the entry), each a low-priority global pseudo live across the calls, finds
+  the saved registers taken and caller-save unprofitable, so reload rematerialises it (470 -> 82; with the vertices
+  written field by field 0). decomp-repair `constant_channel_locals`
+  (docs/learnings/function/display-list-channel-constant-locals.md). A leaf has no such path.
 - **SN profiles (sn-n64-281, 2.7.2):** `passes.py ... --save DIR` is the one command (see Tool gotchas). By hand it is
   `cppn64.exe -P -undef -nostdinc -D_LANGUAGE_C -D__GNUC__=2` then `cc1n64.exe -quiet <flags> -da FILE.i -o FILE.s`, both under
   wibo; the dumps land beside the `.i` as `FILE.i.lreg` etc. (consoles/n64/sn64.py has the exact commands).
