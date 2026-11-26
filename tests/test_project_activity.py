@@ -120,3 +120,21 @@ def test_only_explicit_permuters_keep_idle_projects_active():
     activity.retire()
     assert stopped == ['automatic']
     assert activity.active('manual')
+
+
+def test_a_removed_project_gets_no_maintenance():
+    """The window (or a helper) can still name a project after it was removed: its maintenance is skipped, not run
+    against a store the catalog no longer has ("This project is not in the catalog" failed startup's console check)."""
+    from decompnet.network import NetworkError
+    activity, _, _, _ = policy()
+
+    def project_row(slug, sync=True):
+        if slug == 'gone':raise NetworkError('This project is not in the catalog.')
+        return {'slug': slug}
+    activity.net = SimpleNamespace(project_row=project_row)
+    queued, calls = [], []
+    startup = SimpleNamespace(add=lambda label, fn, **kw: queued.append(fn), start=lambda:None)
+    activity.maintain(startup, [('Console upgrades', lambda slug, log: calls.append(slug))])
+    activity.touch('gone');activity.touch('game')
+    for run in queued:run(SimpleNamespace(check_cancel=lambda:None))
+    assert calls == ['game']

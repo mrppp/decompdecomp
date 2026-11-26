@@ -48,6 +48,20 @@ class Activity:
                 return True
         return False
 
+    def removed(self, slug):
+        """Whether the project is no longer in the catalog: a removed one the window (or a helper) still names gets
+        no maintenance, as its store can't open ("This project is not in the catalog")."""
+        if self.net is None:return False
+        from ..network import NetworkError
+        try:
+            try:
+                self.net.project_row(slug, sync=False)  # (as stored: a look, not a sync)
+            except TypeError:  # (an engine-less Network: no sync to skip)
+                self.net.project_row(slug)
+        except NetworkError:
+            return True
+        return False
+
     def maintain(self, startup, tasks):
         """Queue each project's upgrades on demand, never preload every project store."""
         queued, done = set(), set()
@@ -62,7 +76,7 @@ class Activity:
                     scheduled = True
                 def run(log, key=key, fn=fn, slug=slug):
                     try:
-                        if not self.active(slug):return
+                        if not self.active(slug) or self.removed(slug):return
                         check = log.check_cancel
                         def check_active():
                             check()
