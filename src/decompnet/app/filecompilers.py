@@ -81,6 +81,9 @@ class FileCompilers:
         says nothing (DS, GameCube/Wii), the project's compilers, nearest to its own first."""
         _, fp, cfg = self.net.forks.get(slug)
         console = consoles.get(cfg.get("platform"))
+        game = console.keeps_game_compiler(fp)
+        if game:  # (one compiler built the whole game: no other can be what built a file of it)
+            return [game]
         said = [c for c, _, _, installed in console.program_compilers(fp) if installed]
         own = [own for *_, own in self._files(slug)]
         if said:
@@ -279,6 +282,10 @@ class FileCompilers:
         tc = next((c.id for c in ours if compiler.strip().lower() in (c.id.lower(), c.name.lower())), None)
         if tc is None:
             raise NetworkError(f"no compiler {compiler!r} for this game; its own: {', '.join(c.id for c in ours)}")
+        game = console.keeps_game_compiler(fp)
+        if game and tc != game:
+            raise NetworkError(f"this game was built with {consoles.compiler_name(game)} alone: "
+                               f"{consoles.compiler_name(tc)} can't be what built any of its files")
         spans = parse_ranges(ranges)
         if not spans and function:  # the file the function is in
             fn = self.net.forks._fn(slug, function)
@@ -375,6 +382,16 @@ class FileCompilers:
         return len(checks)
 
     def _weigh(self, slug: str, c: dict) -> None:
+        _, fp, cfg = self.net.forks.get(slug)
+        game = consoles.get(cfg.get("platform")).keeps_game_compiler(fp)
+        if game and c["toolchain"] != game:  # (a check opened before the game kept one compiler: closed, not weighed)
+            c["status"] = "dismissed"
+            proj = self.net.project_row(slug)
+            for vram in c["tasks"]:  # (its neighbouring files' tasks go back to the queue as they were)
+                source = next((s for s0, _, s, _ in self._files(slug) if s0 == vram), None)
+                for f in self._rows_by_file(proj).get(source, ()):
+                    self.net.set_priority(slug, f["name"], False)
+            return self._save(slug, c, f"this game was built with {consoles.compiler_name(game)} alone", "dismissed")
         files = self._files(slug)
         if not files:
             return

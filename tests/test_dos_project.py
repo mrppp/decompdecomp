@@ -519,3 +519,43 @@ def test_only_helper_thunks_count_across_files():
     from decompnet.forks.project import cross_file_bodies
     assert cross_file_bodies({"memcpy", "id", "h1", "func_0005D679_aux", "vfx_c73b_aux", "func_00012345"}) == {
         "func_0005D679_aux", "vfx_c73b_aux", "func_00012345"}
+
+
+def test_range_checks_on_a_one_compiler_game_never_build_with_another(monkeypatch):
+    """A game built with one known Watcom: the survey tries only it, a suggestion of another is refused, and a check
+    of another opened before is closed rather than weighed again (each weighing compiled whole files with a compiler
+    file_scores then refused: hundreds of failed checks a day)."""
+    from decompnet.app import filecompilers
+    from decompnet.network import NetworkError
+
+    class Console:
+        def keeps_game_compiler(self, fp): return "watcom-10.0a"
+        def file_compiler(self, fp, source): return "watcom-10.0a"
+        def project_compilers(self, fp):
+            return [type("T", (), {"id": i, "name": i})() for i in ("watcom-10.0a", "openwatcom-2.0")]
+    saved, cleared = [], []
+
+    class Net:
+        forks = type("F", (), {"get": staticmethod(lambda slug: (None, None, {"platform": "dos"}))})()
+        def _update_cfg(self, slug, change):
+            cfg = {"file_checks": [{"id": 3, "status": "checking"}], "suggestions": [{"id": 1, "status": "open"}]}
+            change(cfg)
+            saved.append(cfg)
+        def project_row(self, slug): return {"id": 1}
+        def set_priority(self, slug, name, on): cleared.append((name, on))
+    monkeypatch.setattr(filecompilers.consoles, "get", lambda platform: Console())
+    monkeypatch.setattr(filecompilers.consoles, "compiler_name", lambda c: c)
+    files = filecompilers.FileCompilers.__new__(filecompilers.FileCompilers)
+    files.net = Net()
+    monkeypatch.setattr(files, "_files", lambda slug: [(0x10, 0x20, "src/auto/a.c", "watcom-10.0a")])
+    monkeypatch.setattr(files, "_rows_by_file", lambda proj: {"src/auto/a.c": [{"name": "func_10"}]})
+    assert files.candidates("game") == ["watcom-10.0a"]
+    with pytest.raises(NetworkError, match="built with watcom-10.0a alone"):
+        files.suggest(None, "game", "", "openwatcom-2.0", None, "0x10-0x20")
+    monkeypatch.setattr(files, "verdict", lambda *a: pytest.fail("a check of another compiler was weighed"))
+    files._weigh("game", {"id": 3, "suggestion": 1, "toolchain": "openwatcom-2.0", "tasks": [0x10],
+                          "status": "checking", "evidence": {}})
+    check = saved[-1]["file_checks"][0]
+    assert check["status"] == "dismissed" and "alone" in check["said"]
+    assert saved[-1]["suggestions"][0]["status"] == "dismissed"
+    assert cleared == [("func_10", False)]  # (its neighbouring files' tasks go back to the queue)
