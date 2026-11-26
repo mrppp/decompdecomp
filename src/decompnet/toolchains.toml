@@ -1931,6 +1931,7 @@ source = "marijnvdwerf/sn64 release 1,0,0,2"
 description = "Original SN64 GCC 2.8.1, preprocessor and ASN64 2.78. Matching uses wibo and the pinned PsyQ-to-ELF converter."
 requires = ["wibo", "psyq-obj-parser"]
 driver = "consoles/n64/sn64.py"
+pass_dumps = true  # its cc1 takes -da through the driver and writes the pass dumps beside the preprocessed input
 flags = ["-G0", "-mips3", "-O2", "-mgas", "-meb", "-mcpu=VR4300", "-mhard-float", "-mfp64"]
 cmd = ["{python}", "{driver}", "--cc", "{tc}/cc1n64.exe", "--cpp", "{tc}/cppn64.exe", "--assembler", "{tc}/asn64.exe", "--converter", "{tc:psyq-obj-parser}/psyq-obj-parser", "--runner", "{tc:wibo}/wibo", "{src}", "{obj}", "{include}", "{flags}"]
 [["sn-n64-281".parts]]
@@ -1950,6 +1951,18 @@ sha256 = "277f1db571ab963df68a07af8b128995493208776dd68a69979809e45d912595"
 binary = "cppn64.exe"
 platforms = ["linux-x86_64", "macos-x86_64", "macos-arm64"]
 
+["sn-n64-cxx"]
+name = "SN Systems N64 C++ front end (cc1pln64)"
+kind = "tool"
+license = "proprietary"
+source = "marijnvdwerf/sn64 release 1,0,0,2"
+description = "The C++ compiler from the same SN64 release as sn-n64-281 (cc1pln64.exe), which projects such as Paperboy build their C++ files with through wibo."
+[["sn-n64-cxx".parts]]
+url = "https://github.com/marijnvdwerf/sn64/releases/download/1%2C0%2C0%2C2/cc1pln64.exe"
+sha256 = "85e3e9fa05640af67115279a992a616a1a1fec8cf56b2e58191196fbbc51853a"
+binary = "cc1pln64.exe"
+platforms = ["linux-x86_64", "macos-x86_64", "macos-arm64"]
+
 ["sn-n64-272-0001"]
 family = "gcc"
 name = "SN Systems N64 GCC 2.7.2 (0001)"
@@ -1960,6 +1973,7 @@ source = "decompme/compilers n64_sn272_0001"
 description = "Original SN64 GCC 2.7.2 build 0001 and ASN64 2.56. Matching uses wibo and the pinned PsyQ-to-ELF converter."
 requires = ["wibo", "psyq-obj-parser"]
 driver = "consoles/n64/sn64.py"
+pass_dumps = true  # its cc1 takes -da through the driver and writes the pass dumps beside the preprocessed input
 flags = ["-G0", "-mips3", "-O2", "-mgas", "-meb", "-mhard-float"]
 cmd = ["{python}", "{driver}", "--cc", "{tc}/cc1n64.exe", "--cpp", "{tc}/cppn64.exe", "--assembler", "{tc}/asn64.exe", "--converter", "{tc:psyq-obj-parser}/psyq-obj-parser", "--runner", "{tc:wibo}/wibo", "{src}", "{obj}", "{include}", "{flags}"]
 [["sn-n64-272-0001".parts]]
@@ -2122,6 +2136,7 @@ source = "decompals/SN64-gcc 2c037f330a99b514e5b53c66f1c63f90d8a15302"
 description = "Reconstructed SN compiler, with modern-asn64 compatibility assembly. Native source build on macOS."
 requires = ["modern-asn64", "binutils-mips"]
 driver = "consoles/n64/sn64.py"
+pass_dumps = true  # its cc1 takes -da through the driver and writes the pass dumps beside the preprocessed input
 flags = ["-G0", "-mips3", "-O2", "-mgas", "-meb", "-mhard-float", "-fno-exceptions"]
 cmd = ["{python}", "{driver}", "--native", "--cc", "{tc}/cc1", "--cpp", "{tc}/cpp", "--assembler", "{tc:binutils-mips}/mips-ps2-decompals-as", "--wrapper", "{tc:modern-asn64}/modern-asn64.py", "{src}", "{obj}", "{include}", "{flags}"]
 [["sn-n64-272-970404".parts]]
@@ -2149,6 +2164,7 @@ description = "Build 0001's preprocessor and compiler with build 0004's ASN64. B
 own_copy = false  # two builds' files in one folder: no copy of the user's is laid out like it
 requires = ["wibo", "psyq-obj-parser"]
 driver = "consoles/n64/sn64.py"
+pass_dumps = true  # its cc1 takes -da through the driver and writes the pass dumps beside the preprocessed input
 flags = ["-G0", "-mips3", "-O2", "-mgas", "-meb", "-mhard-float"]
 cmd = ["{python}", "{driver}", "--cc", "{tc}/cc1n64.exe", "--cpp", "{tc}/cppn64.exe", "--assembler", "{tc}/asn64-0004.exe", "--converter", "{tc:psyq-obj-parser}/psyq-obj-parser", "--runner", "{tc:wibo}/wibo", "{src}", "{obj}", "{include}", "{flags}"]
 [["sn-n64-272-0001-as0004".parts]]
@@ -2171,6 +2187,7 @@ source = "Mr-Wiseguy/pcsx-redux n64 preserved build 0004; SN64 2.8.1 preprocesso
 description = "Preserved SN64 build 0004 with its paired ASN64 assembler. Distinct from build 0001."
 requires = ["wibo", "psyq-obj-parser"]
 driver = "consoles/n64/sn64.py"
+pass_dumps = true  # its cc1 takes -da through the driver and writes the pass dumps beside the preprocessed input
 flags = ["-G0", "-mips3", "-O2", "-mgas", "-meb", "-mhard-float"]
 cmd = ["{python}", "{driver}", "--cc", "{tc}/cc1n64.exe", "--cpp", "{tc}/cppn64.exe", "--assembler", "{tc}/asn64.exe", "--converter", "{tc:psyq-obj-parser}/psyq-obj-parser", "--runner", "{tc:wibo}/wibo", "{src}", "{obj}", "{include}", "{flags}"]
 [["sn-n64-272-0004".parts]]
@@ -2199,6 +2216,7 @@ source = "decompme/compilers n64_sn272_0006"
 description = "Preserved SN64 build 0006 with its paired ASN64 assembler. Distinct from build 0001."
 requires = ["wibo", "psyq-obj-parser"]
 driver = "consoles/n64/sn64.py"
+pass_dumps = true  # its cc1 takes -da through the driver and writes the pass dumps beside the preprocessed input
 flags = ["-G0", "-mips3", "-O2", "-mgas", "-meb", "-mhard-float"]
 cmd = ["{python}", "{driver}", "--cc", "{tc}/cc1n64.exe", "--cpp", "{tc}/cppn64.exe", "--assembler", "{tc}/asn64.exe", "--converter", "{tc:psyq-obj-parser}/psyq-obj-parser", "--runner", "{tc:wibo}/wibo", "{src}", "{obj}", "{include}", "{flags}"]
 [["sn-n64-272-0006".parts]]

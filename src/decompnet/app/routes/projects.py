@@ -145,6 +145,7 @@ def register(app: App) -> None:
                 running=jobs.active((repairs.safe_job_kind(slug),))
                 return {'job':running['id'] if running else jobs.start(repairs.safe_job_kind(slug),lambda log:repairs.apply_safe(net,slug,log),project=slug,
                                                                          cancel_message='Safe boundary fixes stopped. Fixes already applied are kept and can be undone.')}
+        if action=='automatic':return repairs.set_entry_fixes(net,slug,data.get('enabled'))
         if action=='preview':return repairs.public(repairs.preview(net,slug,data.get('function'),data.get('repair'),data.get('end')))
         if action=='undo':return {'job':jobs.start('Undo boundary decision',lambda log:repairs.undo(net,slug,data.get('key'),log))}
         return {'job':jobs.start('Verify boundary repair',lambda log:repairs.apply(net,slug,data.get('function'),data.get('repair'),data.get('revision'),data.get('image'),data.get('end'),data.get('note',''),log))}
@@ -224,11 +225,8 @@ def register(app: App) -> None:
         return {"job": jobs.start("Test compiler profile as default", lambda log:(compiler_default_test.check_affected(net, slug, data.get('profile'), data.get('functions'), log) if data.get('action') == 'check-affected' else compiler_default_test.apply_matches(net, slug, data.get('profile'), data.get('functions'), log, safe_ranges=data.get('action') == 'apply-safe-range', receipt=data.get('receipt')) if data.get('action') in ('apply-matches', 'apply-safe-range') else compiler_default_test.replace_default(net, slug, data.get('profile'), log) if data.get('action') == 'replace' else compiler_default_test.run(net, slug, data.get('profile'), log, nonmatches=data.get('action') == 'nonmatches')))}
 
     def p_compiler_cleanup(slug, request, data):
-        limit = int(data.get("rare_limit", 3))
-        if not 1 <= limit <= 25:
-            raise NetworkError("Choose a rare-profile limit between 1 and 25 functions.")
         net._rom_only(slug, "compiler profile cleanup")
-        return {"job": jobs.start("compiler-cleanup", lambda log: compiler_cleanup.cleanup(net, slug, limit, log, source_profile=data.get("profile")))}
+        return {"job": jobs.start("compiler-cleanup", lambda log: compiler_cleanup.cleanup(net, slug, log, source_profile=data.get("profile")))}
 
     def p_unverified_profiles(slug, request, data):
         """Function-only compiler settings no match supports (GET: how many, any running recheck; POST: recheck
@@ -254,14 +252,16 @@ def register(app: App) -> None:
         if data.get("function"):
             return net.apply_function_compiler(slug, str(data["function"]), str(data.get("toolchain", "")),
                                                data.get("flags") or [], allow_non_improving=data.get("allow_non_improving") is True)
-        if net.fork_slug(slug) and "auto" not in data:  # its source files each have a compiler (DS)
+        if net.fork_slug(slug) and "auto" not in data and "released" not in data:  # its source files each have a compiler (DS)
             tc = str(data.get("toolchain", ""))
             if not str(data.get("ranges") or "").strip():  # the whole game: every file, one at a time
                 return {"job": jobs.start("compiler", lambda log: net.forks.set_compiler_everywhere(slug, tc, log))}
             said = net.forks.set_compiler_ranges(slug, parse_ranges(str(data["ranges"])), None if data.get("remove") else tc)
             return net.overview(slug) | {"said": said, "reopened": []}
         reopened = []
-        if "auto" in data:  # this project's suggestions apply by themselves once proven, or wait for the user
+        if "released" in data:  # the game's year: compilers newer than it are never used
+            net.set_released(slug, data["released"])
+        elif "auto" in data:  # this project's suggestions apply by themselves once proven, or wait for the user
             net.set_auto_adjust(slug, bool(data["auto"]))
         elif str(data.get("ranges") or "").strip():  # these address ranges only (or back to the project's: remove)
             reopened = net.set_compiler_ranges(slug, parse_ranges(str(data["ranges"])),
@@ -339,14 +339,17 @@ def register(app: App) -> None:
         if data.get("build_mode", "compatibility") != "compatibility":
             require_port_build(data)
         adapter = play.native_adapter(net, slug, runtime) if runtime != "wasm" else None
+        compare = bool(data.get("compare"))  # beside the console: port/wasm/side_by_side.py
         if (view := play.running_result(slug)):
-            if bool(adapter) == view.get("native", False):
+            if bool(adapter) == view.get("native", False) and compare == view.get("compare", False):
                 return view
-            raise NetworkError("Stop the running game before switching runtimes.")
+            raise NetworkError("Stop the running game before switching runtimes or playing beside the console.")
         if (building := jobs.active(("play",), project=slug)):  # a second click, or another window: the same build
             return {"job": building["id"]}
         def launch(log):
-            return play.play(net, slug, log, adapter=adapter) if adapter else play.play(net, slug, log)
+            if adapter:
+                return play.play(net, slug, log, adapter=adapter)
+            return play.play(net, slug, log, compare=True) if compare else play.play(net, slug, log)
 
         return {"job": jobs.start("play", launch, project=slug)}
 
@@ -521,7 +524,14 @@ def register(app: App) -> None:
         follow again after navigating away) or running (its address)."""
         from ...port.readiness import readiness
         from ...port.wasm import play
-        report = readiness(net, slug)
+        from .. import view_cache
+        proj = net.project_row(slug)
+        # The tab asks for its last saved report first so it opens at once, then for a fresh one (#cache).
+        if request.query_params.get("cached"):
+            report = view_cache.load(net, proj, "port-readiness") or {"cache_miss": True}
+        else:
+            report = readiness(net, slug)
+            view_cache.save(net, proj, "port-readiness", report)
         report["play"] = {"job": jobs.active(("play",), project=slug), "url": play.running(slug),
                           "export_job": jobs.active(("play-export",), project=slug),
                           "behaviour_job": jobs.active(("behaviour-check",), project=slug),
@@ -539,7 +549,12 @@ def register(app: App) -> None:
             q = request.query_params
             if q.get('view') == 'status':return rom_explorer.status(net,slug,jobs)
             if q.get('region'):return rom_explorer.detail(net,slug,q['region'],q.get('image_hash',''))
-            return rom_explorer.listing(net,slug)
+            from .. import view_cache
+            proj=net.project_row(slug)
+            if q.get('cached'):return view_cache.load(net,proj,'rom-explorer') or {'cache_miss':True}
+            result=rom_explorer.listing(net,slug)
+            view_cache.save(net,proj,'rom-explorer',result)
+            return result
         # Reserve discovery and start atomically: double clicks and two windows
         # must attach to the same project job rather than launch duplicate scans.
         with jobs._lock:
@@ -854,7 +869,7 @@ def register(app: App) -> None:
 
     def p_set_aside(slug, request, data):
         """You set a function aside: no C makes it (Network.set_aside_by_you)."""
-        net.set_aside_by_you(str(data.get("name", "")), slug, str(data.get("why", "")))
+        net.set_aside_by_you(str(data.get("name", "")), slug, str(data.get("why", "")), library=data.get("library") is True)
         return {"ok": True}
 
     def p_reopen(slug, request, data):
@@ -1060,7 +1075,7 @@ def register(app: App) -> None:
             raise ValueError('Repeat must be true or false.')
         from ..deep_sweep import DEFAULT_VARIANTS
         return sweeps.start(slug, data.get('minutes', 5), data.get('max_variants', DEFAULT_VARIANTS), data.get('repeat', False),
-                            data.get('threads', 0), data.get('compiler_profiles', 1), data.get('loop', False),
+                            data.get('threads', 0), data.get('compiler_profiles', 1), data.get('loop', True),
                             data.get('threads_per_function', 1), data.get('maximum_throughput', False), data.get('compile_slots', 0),
                             data.get('rank_candidates', False), data.get('function_order', 'smart'))
 
@@ -1279,6 +1294,19 @@ def register(app: App) -> None:
     def p_globals(slug, request, data):
         from ..globals_view import globals_list
         return globals_list(net, slug)
+
+    def p_global_types(slug, request, data):
+        from ..global_types import learn_project
+        return learn_project(net, slug)
+
+    def p_global_type(slug, request, data):
+        from ..global_types import change_type
+        name, c_type = str(data.get('name') or ''), str(data.get('type') or '')
+        return {'job': jobs.start('Change global type', lambda log: change_type(net, slug, name, c_type, log), project=slug)}
+
+    def p_global_users(slug, request, data):
+        from ..globals_view import global_users
+        return global_users(net, slug, request.query_params.get('name', ''))
 
     def p_variants(slug, request, data):
         from .. import variants
@@ -1515,6 +1543,9 @@ def register(app: App) -> None:
         "/api/cross-game/run": (p_cross_run, ["POST"]),
         "/api/variants": (p_variants, ["GET", "POST"]),
         "/api/globals": (p_globals, ["GET"]),
+        "/api/global-users": (p_global_users, ["GET"]),
+        "/api/global-types/learn": (p_global_types, ["POST"]),
+        "/api/global-types/change": (p_global_type, ["POST"]),
         "/api/regional": (p_regional, ["GET", "POST"]),
         "/api/regional/names": (p_regional_names, ["POST"]),
         "/api/regional/code": (p_regional_code, ["POST"]),

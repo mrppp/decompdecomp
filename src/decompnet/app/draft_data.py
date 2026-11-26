@@ -10,6 +10,18 @@ MAX_TABLES = 64
 MAX_CASES = 256
 
 
+def case_target(word, instruction_addresses):
+    """The function address a jump-table word names, or None. A game that patches its tables when it loads a
+    segment keeps them in the ROM without the KSEG0 bit (`0x0025A1D8` for `0x8025A1D8`): 79 of a 2,465-function
+    N64 game's open functions had no draft because no word of their table looked like one of their own
+    instructions. The bit is added only when that makes a real instruction of this function, so a stray word is
+    still not a case."""
+    if word in instruction_addresses:
+        return word
+    high = word | 0x80000000
+    return high if not word & 0x80000000 and high in instruction_addresses else None
+
+
 def jump_table_extent(name, reader, instruction_addresses, endian):
     """(address, size) of a jump table the symbol list doesn't have: its address is in its name (`jtbl_800E1DE8`)
     and it runs as long as its words are addresses of this function's own instructions. Nothing is invented: a word
@@ -23,7 +35,7 @@ def jump_table_extent(name, reader, instruction_addresses, endian):
     cases = 0
     while cases < MAX_CASES:
         word = reader(address + 4 * cases, 4)
-        if word is None or len(word) != 4 or struct.unpack(endian + 'I', word)[0] not in instruction_addresses:
+        if word is None or len(word) != 4 or case_target(struct.unpack(endian + 'I', word)[0], instruction_addresses) is None:
             break
         cases += 1
     return (address, 4 * cases) if cases >= 2 else None
@@ -53,6 +65,25 @@ def beside_code_reader(rom, fn, reader):  # (`rom`: the bytes, or a function tha
     return read
 
 
+def delta_readers(net, proj, fn):
+    """Readers of the ROM at each segment's own ROM-to-address offset, for a table in data no segment lists: a game
+    whose boot image holds its data after the code (a jump table at 0x800AD078, 79 functions) has them at the boot
+    segment's offset, not at the function's overlay's. Each reader is wrong for most addresses, which is safe: a table
+    is only accepted when its words are this function's own instruction addresses (`jump_table_extent`)."""
+    try:
+        data, segments = net._rom(proj)
+    except Exception:  # (no ROM to read: nothing to offer)
+        return []
+    deltas = dict.fromkeys(s.rom_start - s.vram for s in segments)
+
+    def reader(delta):
+        def read(address, size):
+            at = address + delta
+            return data[at:at + size] if 0 <= at and at + size <= len(data) else None
+        return read
+    return [reader(delta) for delta in deltas]
+
+
 def read(net, proj, fn):
     """Supply known-size tables/constants and terminated strings; never invent missing bytes or case targets."""
     syms = net.symbols(proj['id'])
@@ -67,6 +98,7 @@ def read(net, proj, fn):
     names.sort(key=lambda name: not name.startswith('jtbl_'))
     count = tables = 0
     beside = []
+    found_readers = {}
 
     def table_reader():  # (only tables, which are checked against the function's own addresses)
         if not beside:
@@ -78,8 +110,11 @@ def read(net, proj, fn):
         if (not symbol or not symbol.size) and name.startswith('jtbl_'):
             if reader is None:
                 reader = net.reader(proj, fn)
-            if extent := jump_table_extent(name, table_reader(), instruction_addresses, endian):
-                symbol = SimpleNamespace(address=extent[0], size=extent[1], kind='jtbl')
+            for candidate in (table_reader(), *delta_readers(net, proj, fn)):
+                if extent := jump_table_extent(name, candidate, instruction_addresses, endian):
+                    symbol = SimpleNamespace(address=extent[0], size=extent[1], kind='jtbl')
+                    found_readers[name] = candidate
+                    break
         if not symbol:
             continue
         table = name.startswith('jtbl_') or symbol.kind == 'jtbl'
@@ -94,7 +129,7 @@ def read(net, proj, fn):
             break
         if reader is None:
             reader = net.reader(proj, fn)
-        data = (table_reader() if table else reader)(symbol.address, size)
+        data = (found_readers.get(name) or (table_reader() if table else reader))(symbol.address, size)
         if data is None or len(data) != size:
             continue
         if table:
@@ -104,7 +139,8 @@ def read(net, proj, fn):
             words = [w for (w,) in struct.iter_unpack(endian+'I', data)]
             while len(words) > 2 and words[-1] == 0:
                 words.pop()  # alignment padding the data file counted into the table; m2c rejects it as a case
-            body = ['.word .L%08X' % w if w in instruction_addresses else '.word 0x%08X' % w for w in words]
+            body = ['.word .L%08X' % case_target(w, instruction_addresses) if case_target(w, instruction_addresses) else '.word 0x%08X' % w
+                    for w in words]
         elif string and b'\0' in data:
             value = data.split(b'\0',1)[0]
             if any(b < 32 or b >= 127 for b in value):

@@ -1890,3 +1890,122 @@ def test_a_file_left_broken_is_put_back_from_its_last_commit(fork):
     assert "src/game.c" in (kept / "list.txt").read_text()
     os.utime(path, (old, old))
     assert net.forks.repair_stale_files(slug) == [], "a file that builds is left alone"
+
+
+def test_splat_project_without_a_split_target_runs_its_bundled_splat_for_the_assets(tmp_path):
+    (tmp_path / "Makefile").write_text("B_FILES := $(wildcard assets/*.bin)\nall:\n\ttrue\n")
+    (tmp_path / "game.yaml").write_text("options:\n  platform: n64\n  target_path: baserom.z64\nsegments: []\n")
+    (tmp_path / "tools" / "splat").mkdir(parents=True)
+    (tmp_path / "tools" / "splat" / "split.py").write_text("")
+    first = ForkProject(tmp_path).setup_commands()[0]
+    assert first[1:] == ["tools/splat/split.py", "game.yaml"]
+    (tmp_path / "assets").mkdir()
+    assert ForkProject(tmp_path).setup_commands()[0][0] == "make"
+
+
+def test_splat_project_links_bin_pieces_from_a_bundled_splat_and_forgives_its_closing_statistics(tmp_path):
+    (tmp_path / "Makefile").write_text("BIN_DIRS = bin\nall:\n\ttrue\n")
+    (tmp_path / "game.yaml").write_text("options:\n  platform: n64\n  target_path: baserom.z64\nsegments: []\n")
+    (tmp_path / "splat").mkdir()
+    (tmp_path / "splat" / "split.py").write_text("")
+    assert ForkProject(tmp_path).setup_commands()[0] == ["python", "splat/split.py", "game.yaml"]
+
+
+def test_a_project_that_names_its_originals_by_md5_in_baseroms_folders(tmp_path):
+    for version, digest in (("ntsc-1.2", "a" * 32), ("gc-us-mq", "b" * 32)):
+        folder = tmp_path / "baseroms" / version
+        folder.mkdir(parents=True)
+        (folder / "checksum-compressed.md5").write_text(f"{digest}  build/{version}/x-compressed.z64\n")
+    (tmp_path / "Makefile").write_text("VERSION ?= gc-us-mq\nall:\n\t@true\nsetup:\n\t@true\n"
+                                       "ROM := baseroms/$(VERSION)/baserom.z64\n")
+    project = ForkProject(tmp_path, create_state=False)
+    found = project.md5_roms()
+    assert found["ntsc-1.2"] == ("baseroms/ntsc-1.2/baserom.z64", {"a" * 32})
+    need = project.needs("ntsc-1.2")
+    assert need["path"] == "baseroms/ntsc-1.2/baserom.z64" and need["sha1"] is None
+    assert {v["version"] for v in need["md5_versions"]} == {"ntsc-1.2", "gc-us-mq"}
+    assert project.setup_commands("ntsc-1.2")[-1][:2] == ["make", "VERSION=ntsc-1.2"]
+
+
+def test_md5_table_in_the_readme_names_versions_and_the_roms_file(tmp_path):
+    (tmp_path / "Makefile").write_text("ROMID ?= ntsc-final\nextract:\n\t@true\nrom:\n\t@true\n")
+    (tmp_path / "README.md").write_text(
+        "| ROM ID | Description | MD5 Checksum |\n|---|---|---|\n"
+        f"| ntsc-final | NTSC | {'c' * 32} |\n| pal-final | PAL | {'d' * 32} |\n\n"
+        "Save your ROM as `pd.ntsc-final.z64`.\n")
+    project = ForkProject(tmp_path, create_state=False)
+    assert project.md5_roms()["pal-final"] == ("pd.pal-final.z64", {"d" * 32})
+    assert project.needs("pal-final")["path"] == "pd.pal-final.z64"
+    assert ["make", "ROMID=pal-final", "extract"] in project.setup_commands("pal-final")
+
+
+def test_one_sha1_file_per_version_with_a_baserom_per_version(tmp_path):
+    (tmp_path / "Makefile").write_text("VERSION ?= us\nall:\n\t@true\n")
+    (tmp_path / "README.md").write_text("Place a ROM called `baserom.<VERSION>.z64` in the project folder.\n")
+    (tmp_path / "game.us.sha1").write_text(f"{'1' * 40}  build/us/game.us.z64\n")
+    (tmp_path / "game.jp.sha1").write_text(f"{'2' * 40}  build/jp/game.jp.z64\n")
+    project = ForkProject(tmp_path, create_state=False)
+    assert project.rom_originals() == {"us": "1" * 40, "jp": "2" * 40}
+    need = project.needs("jp")
+    assert need["path"] == "baserom.jp.z64" and need["sha1"] == "2" * 40
+
+
+def test_decomp_yaml_hash_comes_from_the_versions_own_checksum_file(tmp_path):
+    (tmp_path / "decomp.yaml").write_text(
+        "name: g\nversions:\n- name: us\n  paths:\n    baserom: ver/us/baserom.z64\n"
+        "- name: jp\n  paths:\n    baserom: ver/jp/baserom.z64\n")
+    (tmp_path / "ver" / "us").mkdir(parents=True)
+    (tmp_path / "ver" / "us" / "checksum.sha1").write_text(f"{'3' * 40}  ver/us/build/g.z64\n")
+    roms = ForkProject(tmp_path, create_state=False).decomp_yaml_roms()
+    assert roms["us"] == ("ver/us/baserom.z64", "3" * 40) and roms["jp"][1] is None
+
+
+def test_a_root_configure_script_with_ninja_is_the_build_of_a_makefile_less_project(tmp_path):
+    (tmp_path / "configure").write_text("#!/bin/sh\n")
+    steps = ForkProject(tmp_path, create_state=False).setup_commands()
+    assert steps[0] == [str(tmp_path / "configure")] and Path(steps[1][0]).name == "ninja"
+
+
+def test_make_is_told_the_iconv_decompdecomp_has_when_the_makefile_wants_homebrews(tmp_path, monkeypatch):
+    from decompnet.forks import project as module
+
+    (tmp_path / "Makefile").write_text("ICONV := $(shell brew --prefix)/opt/libiconv/bin/iconv\n")
+    shim = tmp_path / "tools"
+    shim.mkdir()
+    (shim / "iconv").write_text("#!/bin/sh\n")
+    original = module.Path.is_file
+    monkeypatch.setattr(module.Path, "is_file",
+                        lambda self: False if str(self).endswith("opt/libiconv/bin/iconv") else original(self))
+    assert module._iconv_override(tmp_path, [shim], "") == str(shim / "iconv")
+    (tmp_path / "Makefile").write_text("ICONV := iconv\n")
+    assert module._iconv_override(tmp_path, [shim], "") is None
+
+
+def test_a_mac_gets_a_stand_in_for_a_linux_only_header_a_project_tool_includes(tmp_path):
+    """Perfect Dark's tools/mkrom includes <crypt.h> (glibc's) from its gzip code and uses nothing in it."""
+    from decompnet.forks import project as module
+
+    (tmp_path / "tools/mkrom").mkdir(parents=True)
+    (tmp_path / "tools/mkrom/gzip_bits.c").write_text('#include "gzip.h"\n#include "crypt.h"\n')
+    folder = module._mac_host_headers(tmp_path)
+    assert folder and (folder / "crypt.h").is_file()
+    (tmp_path / "tools/mkrom/crypt.h").write_text("")  # (a project that ships its own needs no stand-in)
+    (tmp_path / ".decomp-wtf").rename(tmp_path / "gone")
+    assert module._mac_host_headers(tmp_path) is None
+
+
+def test_a_gmake_failure_line_names_its_target():
+    from decompnet.forks.project import _FAILED
+
+    match = _FAILED.match("gmake: *** [Makefile:582: build/us/levels/bbh/leveldata.elf] Error 1")
+    assert match and match.group(2) == "build/us/levels/bbh/leveldata.elf"
+
+
+def test_a_splat_config_per_version_in_ver_is_found(tmp_path):
+    """Paper Mario keeps ver/<version>/splat.yaml (beside splat-debug.yaml and splat-shift.yaml, which are not it)."""
+    from decompnet.forks.project import ForkProject
+
+    (tmp_path / "ver/us").mkdir(parents=True)
+    (tmp_path / "ver/us/splat.yaml").write_text("options:\n  platform: n64\nsegments: []\n")
+    (tmp_path / "ver/us/splat-debug.yaml").write_text("options:\n  platform: n64\nsegments: []\n")
+    assert ForkProject(tmp_path)._splat_yaml() == tmp_path / "ver/us/splat.yaml"

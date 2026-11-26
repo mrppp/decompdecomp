@@ -35,6 +35,8 @@ class Core(Network):
     def __init__(self, db_path: str | Path, workspace: Path, claim_ttl: int = 30 * 60, *, project_databases=False):
         super().__init__(db_path, claim_ttl=claim_ttl,project_databases=project_databases)
         self.workspace = Path(workspace)
+        from .. import repair_rules
+        repair_rules.configure(self.workspace)   # the library's declarative rules live in the home (DECOMP_REPAIR_RULES)
         self._syms: dict[int, SymbolTable] = {}
         self._sym_override: dict[int, SymbolTable] = {}
         # project id -> held by one rename at a time, from reading the symbols to writing the new name: two at once
@@ -178,11 +180,22 @@ class Core(Network):
         # saved bests scored under older penalties: rescored first, so none blocks a better source (score_version.py)
         rescored = score_version.refresh(self, row, log)
         rescored_said = f"{rescored} saved best score{'' if rescored == 1 else 's'} updated to this version's scoring"
+        restored = 0
+        if self.is_rom(row) and row['arch'] == 'mips':
+            # Boundary decisions saved before they carried the split's data references dropped them (boundary_repairs
+            # restore_relocs reads them back from the originals each decision keeps); cheap and idempotent, so it runs
+            # on every check, like the score refresh above.
+            from ..boundary_repairs import restore_relocs
+            restored = restore_relocs(self, row)
+        restored_said = (f"{restored} function{'' if restored == 1 else 's'} given back the data references a boundary "
+                         "fix had dropped")
         if only_if_updated and self.cfg(row).get("checked") == __version__:
             # Capability fixes can ship without a package-version change. Only this
             # narrow, self-retiring review runs again; console/range work stays gated.
             reconsidered = assembly_reconsideration.run(self, row, log)
             said = [rescored_said] if rescored else []
+            if restored:
+                said.append(restored_said)
             if reconsidered:
                 said.append(f'{reconsidered} obsolete tooling verdicts reconsidered with supported C')
             return "; ".join(said) or None
@@ -192,6 +205,18 @@ class Core(Network):
         self.console(row).on_start(self, slug, log=log)
         # what the console's work did, it said in the feed ("8 pieces of functions ... joined"): in the answer too
         done = [rescored_said] if rescored else []
+        if restored:
+            done.append(restored_said)
+        if self.is_rom(row):
+            # A start or end the bytes prove wrong, in a project imported before the importer fixed them.
+            from ..boundary_repairs import apply_entry_fixes
+            try:
+                fixed = len(apply_entry_fixes(self, slug, log)["fixed"])
+            except NetworkError as e:
+                fixed = 0
+                log(f"function boundaries were not fixed automatically: {e}")
+            if fixed:
+                done.append(f"{fixed} function boundar{'y' if fixed == 1 else 'ies'} fixed (undo in Review function boundaries)")
         done += [r["detail"] for r in self.project_store(row['id']).all("SELECT detail FROM events WHERE project_id=? AND id>? AND "
                                                      "kind='analysis' ORDER BY id", row["id"], last)]
         reconsidered = assembly_reconsideration.run(self, self.project_row(slug), log)

@@ -1466,6 +1466,7 @@ async function renderProjectSettings(keepRemoved = false) {
     for (const option of $("setTc").options) if (option.value === ov.compiler.toolchain) option.textContent += " · Default";
     $("setFlags").value = ov.compiler.flags.join(" ");
     $("autoAdjust").checked = !!ov.auto_compiler;
+    $("releasedYear").value = ov.released || "";
     $("setRanges").value = "";
     renderCompilerWaiting(ov);
     loadCompilerAnswer();
@@ -1530,6 +1531,15 @@ $("unanalysedGo").onclick = async () => {
   } catch (err) { toast(esc(err.message), "err"); } finally { b.disabled = false; }
 };
 $("setTcReset").onclick = () => { $("setFlags").value = ""; };
+$("releasedYear").onchange = async () => {
+  const box = $("releasedYear"), before = S.ov && S.ov.released || "";
+  box.disabled = true;  // (acknowledged at once: no second change while this one saves)
+  try {
+    S.ov = await api("/api/compiler", { method: "POST", body: { slug: S.slug, released: box.value.trim() } });
+    box.value = S.ov.released || "";
+    toast(S.ov.released ? `Compilers released after ${S.ov.released} are not used for this game.` : "Every compiler is allowed for this game.");
+  } catch (err) { box.value = before; toast(esc(err.message), "err"); } finally { box.disabled = false; }
+};
 $("autoAdjust").onchange = async () => {
   const on = $("autoAdjust").checked;
   try {
@@ -1829,12 +1839,10 @@ $("compilerAnswer").addEventListener("click", e => {
 });
 $("compilerCleanupGo").onclick = async () => {
   const slug = S.slug, button = $("compilerCleanupGo"), log = $("compilerCleanupLog"), result = $("compilerCleanupResult");
-  const limit = Number($("compilerRareLimit").value);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 25) return toast("Choose a limit from 1 to 25 functions.", "err");
   result.textContent = "";
-  const finish = beginWork(log, "Checking uncommon compiler settings", [button], "Compiler cleanup finished.");
+  const finish = beginWork(log, "Looking for the fewest compiler profiles", [button], "Compiler cleanup finished.");
   try {
-    const {job} = await api("/api/compiler/cleanup", {method:"POST", body:{slug, rare_limit:limit}});
+    const {job} = await api("/api/compiler/cleanup", {method:"POST", body:{slug}});
     const out = await followJob(job, log);
     if (S.slug !== slug) return;
     result.textContent = `${out.changed.length} functions moved · ${out.profiles_before} → ${out.profiles_after} used profiles · ${out.ranges_before} → ${out.ranges_after} ranges · ${out.tested} trial comparisons · ${out.unchanged} unchanged · ${out.skipped} busy or shared-address functions skipped`;

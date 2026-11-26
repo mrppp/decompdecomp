@@ -966,6 +966,19 @@ class Search(Permuter):
             self.log(f'Call-result lifetime search reached {best:,}.')
         return best
 
+    def store_order_pass(self, agent, proj, fn, best, fork):
+        """A saved C that is already close and holds a block of eight or more independent stores: move one line at a
+        time (store_order_climb.py). The score it reached, or `best` when the function was not a candidate."""
+        from . import store_order_climb
+        source = _candidate_source(fn, best)
+        if not best or not source:
+            return best
+        # (`_context` is a database row, which has no `.get`: every function failed here until this read it by key)
+        context = None if fork else self.net._context(proj['id'], fn['unit'])
+        header = self.net.forks.permuter_header(fork, fn['name']) if fork else (context['header'] if context else '')
+        reached = store_order_climb.run(self, agent, proj, dict(fn, best_score=best), source, header, fork)
+        return best if reached is None else min(best, reached)
+
     def measured_winner(self, fn, source):
         if self.winner_diff is None or self.winner_source is None:
             return False
@@ -2511,8 +2524,15 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
                 raise NetworkError('This function was claimed meanwhile; try again after it is released.')
             try:
                 from . import deep_profile_sweep
-                if deep_profile_sweep.run(search, agent, proj, fn, _candidate_source(fn, fn['best_score'])):
+                saved = _candidate_source(fn, fn['best_score'])
+                if deep_profile_sweep.run(search, agent, proj, fn, saved):
                     search.best = 0
+                else:
+                    # the few per-function profiles its target points to (SN 2.7.2's builds, KMC for library code,
+                    # -mfp32, -G8): judged once per saved C, an exact pair applied for this function only
+                    from . import profile_probe
+                    if profile_probe.run(search, agent, proj, net._function(name, slug), saved):
+                        search.best = 0
             finally:
                 search._let_go(agent, fn)
             proj, fn = net.project_row(slug), net._function(name, slug)
@@ -2560,6 +2580,9 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
                 if (baseline and compiler_profiles == 1 and not relabel
                         and (lane is None or lane.index == 0)):
                     baseline = search.call_result_pass(agent, proj, fn, baseline, fork)
+                    fn = net._function(name, slug)
+                if baseline and not relabel and (lane is None or lane.index == 0):
+                    baseline = search.store_order_pass(agent, proj, fn, baseline, fork)
                     fn = net._function(name, slug)
                 if baseline == 0:
                     reason = 'Matched'

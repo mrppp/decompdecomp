@@ -209,7 +209,7 @@ def enabled(net,proj):
     return bool(net.cfg(proj).get(SETTING, True))
 
 
-def _lead(net,proj,fn,hint):
+def _lead(net,proj,fn,hint,neighbours=()):
     """(name, corpora, the port's source or None) of an open function library detection found (`hint`: one name),
     or None. With a port kit only what it replaces or its glue supplies (`PortKit.sdk_group`), or what it compiles
     as the game's C ("native": the N64 port's libultra math and synthesizer) when the user's ultralib has that C for
@@ -224,7 +224,7 @@ def _lead(net,proj,fn,hint):
     if group in ('replaced','glue'):return names[0],list(hint.get('corpora') or []),None
     if group!='native':return None
     from ..port import ultralib
-    found=ultralib.source(names[0],hint,(meta.get('naming') or {}).get('fingerprint'))
+    found=ultralib.source(names[0],hint,(meta.get('naming') or {}).get('fingerprint'),neighbours)
     if found is None:return None
     path,build=found
     return names[0],list(hint.get('corpora') or []),{'ultralib':path.relative_to(ultralib.root()).as_posix(),'build':build}
@@ -309,6 +309,9 @@ def discover_c(net,proj,stop=None,progress=None):
     cursor=0 if stop is not None or not saved else int(saved['value'])
     hints=detected(net,proj)
     if not hints:return 0
+    # the game's other library functions, for a helper two ultralib files define differently (ultralib.by_neighbours)
+    neighbours={n for h in hints.values() for n in h.get('names') or []}|{r['name'] for r in store.all(
+        "SELECT name FROM functions WHERE project_id=? AND name NOT LIKE 'func\\_%' ESCAPE '\\'",proj['id'])}
     rows=store.all("SELECT * FROM functions WHERE project_id=? AND status='open' AND id>? AND id IN (SELECT value FROM json_each(?)) ORDER BY id",
                    proj['id'],cursor,json.dumps(sorted(hints)))
     count=0;started=time.monotonic();examined=cursor;finished=True
@@ -319,7 +322,7 @@ def discover_c(net,proj,stop=None,progress=None):
             finished=False;break
         if progress:progress({'done':done,'total':len(rows),'set_aside':count,'function':fn['name']})
         examined=fn['id'];hint=hints[fn['id']]
-        lead=_lead(net,proj,fn,hint)
+        lead=_lead(net,proj,fn,hint,neighbours)
         if not lead or store.one('SELECT 1 FROM claims WHERE function_id=?',fn['id']):continue
         proof=(verify(net,proj,fn,{'names':[lead[0]],'corpora':lead[1]},publish=False,from_c=True)
                or signature_proof(proj,fn,lead[0],hint))
@@ -415,11 +418,21 @@ def known_identity(console, cfg, code, *, has_relocs=False):
         return found
 
 
+def _linked_relocs(relocs):
+    """The relocations that tie a body to where this game linked it. A reference to a memory-mapped hardware register
+    (physical 0x03F00000 and up, reached through KSEG1: SP_STATUS at 0xA4040010) is the same address in every game, so
+    the instruction words hold it as the SDK's own build did and the exact-bytes digest still proves the routine.
+    A libultra rmon routine that reads SP_STATUS was left open in many games by its `lui/lw` pair of relocations."""
+    return [r for r in relocs
+            if not (isinstance(r, (list, tuple)) and len(r) > 2 and isinstance(r[2], int)
+                    and r[2] & 0xE0000000 == 0xA0000000 and r[2] & 0x1FFFFFFF >= 0x03F00000)]
+
+
 def known_proof(console, proj, fn):
     """Bind a curated SDK identity to the current function and its analysis image."""
     cfg = json.loads(proj['config'])
     code = bytes(fn['target'] or b'')
-    found = known_identity(console, cfg, code, has_relocs=bool(json.loads(fn['relocs'] or '[]')))
+    found = known_identity(console, cfg, code, has_relocs=bool(_linked_relocs(json.loads(fn['relocs'] or '[]'))))
     if not found or fn['size'] != len(code):
         return None
     if found.get('evidence'):

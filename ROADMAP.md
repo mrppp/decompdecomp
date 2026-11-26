@@ -427,7 +427,9 @@ completes parents truncated to a one/two-instruction prologue. Existing projects
 explicit reimport; ambiguous mappings, indirect flow, kernel stubs and other processors or
 project builds retain review/adapters rather than guessed ownership.
 
-Implemented: possible start-boundary suggestions (`app/start_boundaries.py`): a leading word that looks like alignment padding or a dead word is suggested as "start +4" in the brief and Review function boundaries, never changed. Planned: a reviewer's one-click apply (cut the word off with a retained padding piece and undo record), and the same check for processors other than MIPS.
+Implemented: possible start-boundary suggestions (`app/start_boundaries.py`): a leading word that looks like alignment padding or a dead word is suggested as "start +4" in the brief and Review function boundaries.
+
+Implemented: automatic start and end fixes the bytes prove (`app/entry_fixes.py` decides, `boundary_repairs.apply_entry_fixes` applies): stray words before a function's real entry (another function's leftovers: delay filler, a frame given back and taken again, `break 7`, `j self`, a callback's `lui`/`addiu`) are archived as padding and the real entry becomes the function; a function swallowed after a loop that never returns is split off; a value the stray words compute and lose, an empty function with another's words after it, a function cut where its first part branches into the rest (joined), a retained tail a person's adjustment left for review that other code points at (kept), and functions set aside only by their shape (no verdict) are fixed too. Applied on import (before drafts) and Check again through the same guarded preview/commit as a person's repair, each labelled automatic in Repair history with undo; an undone fix is never applied again; matched functions are never changed and the matches that refer into a changed extent are rebuilt first; a checkbox in Review function boundaries (the project setting `automatic_boundary_fixes`) turns it off, and Apply safe fixes there applies them on request. On an N64 game 41 fixes go in (every known problem but the TLB routine a person must decide); over 41,251 matched functions of 93 N64 games none is flagged. Planned: run it on a PS1, PS2 and PSP game (the shared MIPS path reaches them, but no game or demo build was available to check it), carry the old row's saved C to the new entry (5 of 23 trimmed functions on an N64 game matched with it at once), the same rules for other processors, and project mode (objdiff units have no image-wide layout to cut; `split_source` would carry it).
 
 Implemented: guided mapped MIPS boundary evidence, neighbouring instruction windows, explicit before/after extents and one-shot agent recommendations with cited supporting/counter-evidence and uncertainty. Advice never edits layouts, claims work or compiles, and stale inputs are labelled.
 
@@ -788,6 +790,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Automatic texture banks (CI4/CI8, mixed CI8 palettes, RGBA32, RGBA16 mipmaps, RNC 1/2 and byte-sum RNC banks, named four-block banks, embedded ZIP packs, textures loaded by uncompressed display lists, I64 images in a chunked-RNC filesystem, model textures in a deflated asset table, UVTX files in a UV FORM filesystem, a texture table of back-reference-packed textures with inferred widths, display-list textures and sprites in a table of relocatable VPK0 files, image packs and model bitmaps in a party-game series' main filesystem, FLA2-packed texture banks, zlib RGBA members with stored dimensions, named textures in Iain block archives, RDP textures in paired ROM resource directories; a fork's own splat image segments, JSON asset lists and sno texture sheets) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — image adapter | — image adapter | — | — image adapter | ✓ forks with the game file (N64 checked) |
 | Audio browser, filters, sortable samples and explicit WAV preparation | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
 | Indexed dialogue scripts with scene and speaker browsing, verified voice playback and related cutscene scripts | ✓ ROM | — | — | — | — | — | — | — | — | — | — | — |
+| Port settings menu (Tab or F1 in the game's window; recomp-ui's menu model when built: docs/PORTING.md) | ✓ SDL3 window; RT64 window (adapter ABI 4; drawn over a real game, key presses there not yet tried); browser build (web/settings.js); — Miyoo build | — | — | — | — | — | — | — | — | — | — | — |
 | ELv9 sector extents, PATH keyframes and NCS command inspection | ✓ ROM | — | — | — | — | — | — | — | — | — | — | — |
 | Texture gallery, filters and distinct address / loader reference links | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | ✓ forks with the game file (N64 checked) |
 | Native directory roles: animation, collision, placements, grid, sequences and demos | ✓ validated schema / linked records | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter |
@@ -872,12 +875,14 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Gap recovery between code on one mapping: built pointers, leaves, switches (import) | ✓ | — | — | — | — | — | — | — | — | — | — | — |
 | Function entries seen running in Play, taken by the next import | ✓ | — | — | — | — | — | — | — | — | — | — | — |
 | Automatic proven framed/leaf boundary repair on import/reimport | ✓ | ✓ | ✓ (scalar decoder) | — | — | ✓ | — | — | — | — | — | — |
+| Automatic start/end fixes the bytes prove (`entry_fixes`, import and Check again, undoable) | ✓ | ✓ shared MIPS path, not yet run on a game | ✓ shared MIPS path, not yet run on a game | — | — | ✓ shared MIPS path, not yet run on a game | — | — | — | — | — | — |
 | Guided boundary repair and advisory agent investigation (local mapped ROM) | ✓ | ✓ | ✓ (scalar decoder) | — | — | ✓ | — | — | — | — | — | — |
 | Function-end reports (`report_boundary`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ (2-byte boundaries) | — | ✓ (agents agree, the rebuild checks) | ✓ | — | — |
 | Your own compiler (Setup: another build of one it has) | ✓ | ✓ | ✓ | ✓ your SDK | — | ✓ | ✓ | — | ✓ your Visual C++, for 32-bit games (64-bit ones build with the pack's 2017) | ✓ your XDK | — | the project's own build |
 | Compiler ranges and suggestions | ✓ | ✓ | ✓ | ✓ (ps3dev GCC, your SDK's) | — | ✓ | — | from scratch: per source file (`try_compiler`, Settings); else the project's build | per source file (`try_compiler`, Settings) | per source file (`try_compiler`, Settings): Visual C++ 7.0 / 7.1, your XDK's own | from scratch: per source file (`try_compiler`, Settings); else the project's build | the project's build |
 | Verified cleanup of rare compiler profiles | ✓ ROM mode | ✓ ROM mode | ✓ ROM mode | — | — | ✓ ROM mode | — | — | — | — | — | — |
 | Deep Permuter detects a near-match's compiler (`profile_detection`: its saved C under every installed profile, matched neighbours, the compiler map, code habits; told and tried first) | ✓ demo; copies of three real games | ✓ shared ROM path, unchecked | ✓ shared ROM path, unchecked | ✓ judge and neighbours, unchecked (code habits: MIPS only) | — | ✓ shared ROM path, unchecked | — | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build |
+| Profile probe: the few per-function profiles an open function's target points to (`-mfp32`, `-G8`, SN 2.7.2's builds, the 0001 + 0004-assembler pack for any `ldc1` target, KMC for libultra, the profile most matched neighbours use), judged once per saved C by the Deep Permuter and the autopilot's saved-source pass, an exact pair applied for that function only (`profile_probe`) | ✓ demo; the rules from ~1,000 hand matches of one SN 2.8.1 game | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules, unchecked | — | ✓ flag and neighbour rules, unchecked | — | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build |
 | Flag search (`search_flags`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | — (the project's flags only) | per source file (/Oy- on 32-bit, /O1, /Ob1) | per source file | — (the project's flags only) | the project's build |
 | Compiler map and the judge's survey | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | ✓ per source file, Rich header | the XDK build's compiler (no Rich header: one per game) | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | — |
 | Range checks: a range applies after its neighbours confirm it | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ from scratch: per source file; else the project's build | ✓ over source files | ✓ | ✓ from scratch: per source file; else the project's build | — |
@@ -1216,6 +1221,13 @@ middle argument register the target never writes: the caller's own incoming argu
 widened, docs/learnings/finding/untouched-argument-parameter.md). They reach every MIPS console, ROM and project mode alike
 (N64, PS1, PS2, PSP). Planned: PowerPC (`r3`-`r10` and `r3` for the result, GameCube/Wii) and x86 (the pushes before a
 `call` and `eax`, Windows PC, Xbox) need their processors' call-setup readers, and ARM (DS, GBA) `r0`-`r3`.
+
+### Release years for every console's compilers
+
+A project can name the year its game came out (Settings, "Game release year"), and compilers released after it are
+never offered, tried or accepted (`Compiler.released`, `Console.compilers_for`, `consoles.too_new`). Only the N64's
+compilers have their years so far; every other console's compiler counts as unrestricted ("—") until its entries get
+`released=`. Fill them in per console, and set the year automatically where a public decomp or ROM header says it.
 
 ## Recently done
 
@@ -2329,6 +2341,14 @@ reuse the saved map. See [ROM Explorer](docs/ROM_EXPLORER.md) for support and li
 
 ## Next
 
+### Side-by-side viewer: more games, more consoles
+
+Play beside the console (Porting tab; `port/wasm/side_by_side.py`, docs/PORTING.md "Side by side, live") runs the port and the
+console in lockstep, one pad, the differing RAM named, sound from either. Next: run it on more games to confirm both sides
+number retraces alike (`--emulator-offset` corrects it if not), and give the other consoles with a port and an emulator the
+same page: it needs the console's own gate (the emulator parking before each retrace) and a RAM reader, as the N64's
+`live.h` and `port_live_gate` are. The console's frames come at about 23 a second (the software renderer's own speed).
+
 ### Compiler detection for project mode
 
 The Deep Permuter's compiler detection (`app/profile_detection.py`) scores a near-match's saved C under every
@@ -2338,6 +2358,16 @@ function alone under another compiler. Next: score the unit under the compilers 
 `try_compiler` path, `app/filecompilers.py`), and use the files around it as the neighbours. Offer a file compiler
 change as the same review-only suggestion. Every project-mode console: GameCube, Wii, Windows PC, Xbox, DS. PS4 and
 GBA ROM projects have no compiler choice to detect yet.
+
+### Profile probes for project mode
+
+The profile probe (`app/profile_probe.py`) judges a ROM project's open function under the few per-function profiles its
+target points to and applies an exact one for that function only. Project mode does not get it yet, for the same reason
+as compiler detection: a source file owns its compiler (`Console.file_compiler`, `set_file_compiler`) and a fork's build
+owns its flags. Next: plan the probes from the unit's own objdiff rows, judge them through `try_compiler`'s per-file path
+(`app/filecompilers.py`) and offer an exact one as the file's compiler change. Every project-mode console. The PS1, PS2,
+PS3 and PSP columns run only the flag rules (`-G`) and the neighbours' vote today, unchecked on a real game: their
+consoles have no hints of their own (`Console.profile_probes`) yet, such as an earlier compiler a game mixed in.
 
 ### Deep passes that climb under a closer compiler profile
 
