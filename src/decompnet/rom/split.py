@@ -23,7 +23,7 @@ from . import DisassemblyTimeout, Picked, RomError
 _INSN = re.compile(r"^\s*/\* ([0-9A-F]+) ([0-9A-F]{8}) ([0-9A-F]{8}) \*/\s+(\S+)\s*(.*?)\s*$")
 # A label may carry the name of the overlay or slot it lives in (`_overlay_001`, `_ovl_01`, `_raw_slot_03`,
 # `_packed_program_02`, `_dma_overlay_01`): any lower-case word suffix, so a new kind of slot needs no change here.
-_LOCAL_NAME = r"\.?L([0-9A-F]{8})(?:_[a-z][a-z0-9]*(?:_[a-z0-9]+)*)?"
+_LOCAL_NAME = r"\.?L([0-9A-F]{8})(?:_[a-z][a-z0-9]*(?:_[A-Za-z0-9]+)*)?"  # (`_code_80115DF0_DFF10`: hex words too)
 _LOCAL_REF = re.compile(r"(?<![\w.$])" + _LOCAL_NAME + r"(?![\w.$])")
 _BRANCH = re.compile(r"(?:b(?!\w*al)\w*|j)$")  # branches and jumps, not calls (jal, jalr, bal and the other linking branches)
 _FUNC_REF = re.compile(r"(?<![\w.$])func_([0-9A-Fa-f]{8})(?:_[a-z][a-z0-9_]*)?(?![\w.$])")
@@ -141,11 +141,13 @@ def segments_from_config_data(cfg: dict) -> list[Segment]:
     return out
 
 
-def load_images(cfg: dict) -> list[tuple[int, int, int]]:
+def load_images(cfg: dict, rom: bytes | None = None, *, big_endian: bool = True) -> list[tuple[int, int, int]]:
     """(rom_start, vram, vram_end) of each loaded image a splat config describes: a code segment whose BSS has an
     address loads everything from its start to its BSS at one offset, its data included. The judge reads a
     candidate's own data (jump tables, strings, constants) from these when no code segment holds the address: the
-    code segments alone stop where the code does, and a matched function's wrong jump table went unchecked."""
+    code segments alone stop where the code does, and a matched function's wrong jump table went unchecked.
+
+    With the ROM, the data after code the import found later (`trailing_data`) is added too."""
     out = []
     for seg in cfg.get("segments", []):
         if not isinstance(seg, dict) or seg.get("type") != "code" or "vram" not in seg or "start" not in seg:
@@ -154,7 +156,88 @@ def load_images(cfg: dict) -> list[tuple[int, int, int]]:
                and isinstance(sub.get("vram"), int)]
         if bss and bss[0] > seg["vram"]:
             out.append((int(seg["start"]), int(seg["vram"]), int(bss[0])))
+    if rom is not None:
+        out += [image for image in trailing_data(cfg, rom, big_endian=big_endian)
+                if not any(v < image[2] and image[1] < e for _, v, e in out)]
     return out
+
+
+def trailing_data(cfg: dict, rom: bytes, *, big_endian: bool = True) -> list[tuple[int, int, int]]:
+    """(rom_start, vram, vram_end) of the raw bytes right after a run of code segments that share one ROM-to-RAM
+    offset, mapped at that offset: the run's own .rodata and .data (jump tables, strings, constants).
+
+    The import writes the code it finds the game loads later (insert_segments) as code segments of their own, each
+    followed by a `bin` segment up to the next one, with no vram and no BSS: nothing said those bytes are loaded with
+    the code before them. An N64 racing game's 113 KB of data after 1 MB of code was unreadable: two switches'
+    jump tables "not in a loaded part of the ROM", their drafts without their cases, and the judge skipped checking
+    every table there. A raw run counts only when its end is another segment (not the ROM's tail, where the assets
+    are), it overlaps no segment's and no other run's addresses, and the switches prove it: the run's code has a jump
+    table in it, and every table in it (whoever's code reads it) holds an address in that code's own segment. Raw
+    bytes that are packed, or another overlay's at the same addresses, fail that and stay unread."""
+    raw = [s for s in cfg.get("segments", []) if isinstance(s, (dict, list))]
+
+    def start_of(seg):
+        return seg[0] if isinstance(seg, list) else seg.get("start")
+
+    entries = []
+    for i, seg in enumerate(raw):
+        start = start_of(seg)
+        nxt = next((start_of(s) for s in raw[i + 1:] if start_of(s) is not None), None)
+        if isinstance(seg, dict) and isinstance(start, int) and isinstance(nxt, int) and start < nxt:
+            entries.append((seg, int(start), int(nxt), any(start_of(s) is not None for s in raw[i + 1:]
+                                                            if isinstance(s, dict))))
+    # (every segment's addresses, those past the end of this ROM included: an unpacked program's)
+    codes = [(int(seg["vram"]), int(seg["vram"]) + end - start) for seg, start, end, _ in entries
+             if seg.get("type") == "code" and isinstance(seg.get("vram"), int)]
+    entries = [entry for entry in entries if entry[2] <= len(rom)]
+    found = []  # (rom_start, vram, vram_end, the run's code as (rom_start, rom_end))
+    run = None  # (delta, rom end, code ranges)
+    for seg, start, end, bounded in entries:
+        vram = seg.get("vram")
+        if seg.get("type") == "code" and isinstance(vram, int):
+            if run is not None and run[1] == start and run[0] == vram - start:
+                run = (run[0], end, run[2] + [(start, end)])
+            else:
+                run = (vram - start, end, [(start, end)])
+        elif seg.get("type") == "bin" and vram is None and run is not None and run[1] == start:
+            if bounded:
+                found.append((start, start + run[0], end + run[0], run[2]))
+            run = (run[0], end, run[2])
+        else:
+            run = None
+    tables = [(table, vram, vram + end - start, (start, end)) for seg, start, end, _ in entries
+              if seg.get("type") == "code" and isinstance(vram := seg.get("vram"), int)
+              for table in _jump_tables(rom, start, end, big_endian)]
+    order = "big" if big_endian else "little"
+    out = []
+    for i, (start, lo, hi, code) in enumerate(found):
+        if any(v < hi and lo < e for v, e in codes):
+            continue
+        if any(j != i and other[1] < hi and lo < other[2] for j, other in enumerate(found)):
+            continue
+        inside = [(table, v, e, where in code) for table, v, e, where in tables if lo <= table and table + 4 <= hi]
+        # Every switch whose table lies here, the run's own and any other code's, must jump into its own segment:
+        # the bytes of another overlay at these addresses, or packed data, fail that and the run stays unread.
+        if any(own for *_, own in inside) and all(
+                v <= int.from_bytes(rom[start + table - lo:start + table - lo + 4], order) < e
+                for table, v, e, _ in inside):
+            out.append((start, lo, hi))
+    return out
+
+
+def _jump_tables(rom: bytes, start: int, end: int, big_endian: bool):
+    """The addresses of the jump tables the code in rom[start:end] dispatches through: a `lui` of the table's upper
+    half, a `lw` of the case's entry through it (`%lo`), and a `jr` to what it loaded, a few instructions apart."""
+    order = ">" if big_endian else "<"
+    uppers, loaded = {}, {}
+    for i, w in enumerate(struct.unpack_from(f"{order}{(end - start) // 4}I", rom, start)):
+        op, rs, rt = w >> 26, (w >> 21) & 31, (w >> 16) & 31
+        if op == 15 and rt:
+            uppers[rt] = ((w & 0xffff) << 16, i)
+        elif op == 35 and (upper := uppers.get(rs)) and i - upper[1] <= 12:
+            loaded[rt] = ((upper[0] + (((w & 0xffff) ^ 0x8000) - 0x8000)) & 0xffffffff, i)
+        elif w & 0xfc1fffff == 8 and rs != 31 and (table := loaded.get(rs)) and i - table[1] <= 8:
+            yield table[0]
 
 
 def code_ranges(path: Path) -> list[tuple[int, int, int]]:
@@ -637,8 +720,35 @@ def _complete_delay_slot(fn: RomFunction, rom: bytes, big_endian: bool = True) -
                             if " " in insn.disassemble().strip() else ""))
 
 
+def unlisted_table_targets(name: str, fn: RomFunction, image: bytes, segments: list[Segment],
+                           big_endian: bool) -> set[int]:
+    """Where a jump table points when no splat segment lists the table (a boot image that keeps its data after its
+    code, so `jtbl_800C28A8` is only an undefined symbol). Its bytes are at some segment's own ROM-to-address offset:
+    the one whose words, read from the table's address, are 4-aligned addresses inside the function's own segment is
+    the table. Words stored without the KSEG0 bit (`0x0042_0018` for `0x8042_0018`) count as the address with it. Three
+    such words in a row are taken as the table, and the run ends at the first word that is not one."""
+    own = next((s for s in segments if s.contains(fn.vram)), None)
+    if own is None:
+        return set()
+    address, fmt = int(name[-8:], 16), ">I" if big_endian else "<I"
+    low, high = own.vram, own.vram + (own.rom_end - own.rom_start)
+    for delta in dict.fromkeys(s.rom_start - s.vram for s in segments):
+        found: set[int] = set()
+        at = address + delta
+        while 0 <= at and at + 4 <= len(image):
+            word = struct.unpack_from(fmt, image, at)[0]
+            word |= 0x80000000 if word and not word & 0x80000000 else 0
+            if word % 4 or not low <= word < high:
+                break
+            found.add(word)
+            at += 4
+        if len(found) >= 3 and sum(1 for w in found if w > fn.vram) >= 3:
+            return {w for w in found if w > fn.vram}
+    return set()
+
+
 def merge_switch_cases(functions: list[RomFunction], data: list[DataSymbol], image: bytes,
-                       big_endian: bool) -> list[RomFunction]:
+                       big_endian: bool, segments: list[Segment] | None = None) -> list[RomFunction]:
     """spimdisasm can end a function with a switch at its first return and make each later case a function of its
     own: it does with EE-GCC 3.2, which loads the jump table with `addiu %lo(jtbl)` and then `lw 0(reg)`. A function
     or piece right after one whose jump table points at it is a case of that switch: put it back. Pieces nothing
@@ -662,6 +772,8 @@ def merge_switch_cases(functions: list[RomFunction], data: list[DataSymbol], ima
             if t is not None:
                 raw = image[t.rom:t.rom + t.size]
                 targets |= {w for (w,) in struct.iter_unpack(fmt, raw[:len(raw) // 4 * 4]) if w > fn.vram}
+            elif segments and not any(d.name == name for d in data):
+                targets |= unlisted_table_targets(name, fn, image, segments, big_endian)
     return out
 
 
@@ -790,7 +902,7 @@ def split_rom(workdir: Path, rom_name: str = "rom.z64", console=None, picked: Pi
 
     segments = segments_from_config(config)
     unique = repair(unique, data, rom, console, segments, symbols=symbols or (), log=log, inline_data=inline_data)
-    unique = merge_switch_cases(unique, data, rom, big_endian)
+    unique = merge_switch_cases(unique, data, rom, big_endian, segments)
     if not unique:
         raise RomError("splat found no functions; the code may be compressed or use an unusual boot layout")
     segments = segments_from_config(config)

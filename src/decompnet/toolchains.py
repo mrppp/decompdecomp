@@ -59,6 +59,9 @@ class Toolchain:
     cc: list[str] = field(default_factory=list)
     flags: list[str] = field(default_factory=list)
     requires: list[str] = field(default_factory=list)
+    # Tools it uses only when they are installed, never installed for it: `{tc?:id}` in its command is that tool's
+    # folder, or the whole argument is empty when it isn't installed (or runs through WSL or a Linux VM).
+    optional: list[str] = field(default_factory=list)
     cmd: list[str] = field(default_factory=list)  # full command template, when compiling is more than cc + flags
     parts: list[dict] = field(default_factory=list)
     git: str = ""
@@ -72,6 +75,7 @@ class Toolchain:
     source_extension: str = "c"
     cplusplus: bool = False  # it compiles C++ too (by the file's extension: .cpp)
     driver: str = ""  # packaged, console-owned compiler adapter, staged read-only with the tools
+    pass_dumps: bool = False  # its driver passes -da on to cc1, which writes the pass dumps (compiler_diagnostics)
     build: str = ""  # native source-built tools, after checksum-verified parts are extracted
     family: str = ""  # backend family when the registry id doesn't carry its compiler's name
     wine: bool = False  # Windows programs wibo cannot run: use wine on Linux and macOS
@@ -236,6 +240,53 @@ def data_dir() -> Path:
 def root() -> Path:
     env = os.environ.get("DECOMPNET_TOOLCHAINS")
     return Path(env).expanduser() if env else data_dir() / "toolchains"
+
+
+_DISABLED = {"stamp": None, "ids": frozenset()}
+
+
+def _disabled_file() -> Path:
+    return root() / "disabled.json"
+
+
+def disabled() -> frozenset[str]:
+    """The compilers the user switched off (Compilers & tools -> Disable): compiler checks, drafts and agents skip
+    them, while code already matched with one still verifies. Kept beside the installs, read again when the file changes."""
+    file = _disabled_file()
+    try:
+        stamp = (str(file), file.stat().st_mtime_ns)
+    except OSError:
+        stamp = (str(file), None)
+    if _DISABLED["stamp"] != stamp:
+        ids = frozenset()
+        if stamp[1] is not None:
+            try:
+                ids = frozenset(str(x) for x in json.loads(file.read_text()))
+            except (OSError, ValueError, TypeError):
+                ids = frozenset()
+        _DISABLED.update(stamp=stamp, ids=ids)
+    return _DISABLED["ids"]
+
+
+def is_disabled(tid: str) -> bool:
+    return tid in disabled()
+
+
+def set_disabled(tid: str, off: bool) -> None:
+    """Switch a compiler off or on for the whole app; the choice survives restarts."""
+    if not known(tid):
+        raise ToolchainError(f"no compiler or tool called {tid!r}")
+    ids = set(disabled())
+    if off:
+        ids.add(tid)
+    else:
+        ids.discard(tid)
+    file = _disabled_file()
+    file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sorted(ids)))
+    tmp.replace(file)
+    _DISABLED["stamp"] = None
 
 
 def path(tid: str, linux: bool | None = None, *, vm: bool | None = None) -> Path:
@@ -2016,7 +2067,7 @@ def status() -> list[dict]:
         m = installed(tc.id)
         rows.append({"id": tc.id, "name": tc.name, "kind": tc.kind, "platform": tc.platform, "license": tc.license,
                      "source": tc.source,  # (where it comes from: the install's confirmation says)
-                     "installed": m is not None, "supported": tc.supported, "description": tc.description,
+                     "installed": m is not None, "disabled": tc.id in disabled(), "supported": tc.supported, "description": tc.description,
                      "missing_dependencies": missing(tc, tc.via_wsl or tc.via_vm, True if tc.via_vm else None, {tc.id}) if m else [],
                      "changed": m is None and _manifest(tc.id) is not None,
                      "wsl": tc.via_wsl, "linux_vm": tc.via_vm, "local": tc.local,

@@ -209,22 +209,28 @@ def enabled(net,proj):
     return bool(net.cfg(proj).get(SETTING, True))
 
 
-def _lead(net,proj,fn,hint):
+def _lead(net,proj,fn,hint,neighbours=()):
     """(name, corpora, the port's source or None) of an open function library detection found (`hint`: one name),
     or None. With a port kit only what it replaces or its glue supplies (`PortKit.sdk_group`), or what it compiles
     as the game's C ("native": the N64 port's libultra math and synthesizer) when the user's ultralib has that C for
     the build detection matched (port/ultralib.source): the port then compiles ultralib's C in its place. A name the
-    kit doesn't know (a racing game's `_n_loadBuffer`, `read32`) is the game's own code to it and keeps its C work."""
+    kit doesn't know (`read32`) is the game's own code to it and keeps its C work.
+
+    A library no public source builds (`Console.sdk_without_source`: the N64's n_audio) is set aside whatever the
+    kit calls the name: waiting for ultralib's C left a racing game's `n_alSynNew`, `n_alSeqpNew` and the rest,
+    named from exact signatures, open for agents and the deep permuter for good. The port runs their original code,
+    as it does for any function with no C."""
     meta=json.loads(fn['meta'] or '{}')
     if meta.get('reopened'):return None
     names=hint.get('names') or []
     if len(names)!=1 or not names[0] or ' / ' in names[0]:return None
     kit=net.console(proj).port_kit
     group=kit.sdk_group(names[0]) if kit is not None else 'replaced'
-    if group in ('replaced','glue'):return names[0],list(hint.get('corpora') or []),None
+    if group in ('replaced','glue') or net.console(proj).sdk_without_source(hint.get('corpora') or []):
+        return names[0],list(hint.get('corpora') or []),None
     if group!='native':return None
     from ..port import ultralib
-    found=ultralib.source(names[0],hint,(meta.get('naming') or {}).get('fingerprint'))
+    found=ultralib.source(names[0],hint,(meta.get('naming') or {}).get('fingerprint'),neighbours)
     if found is None:return None
     path,build=found
     return names[0],list(hint.get('corpora') or []),{'ultralib':path.relative_to(ultralib.root()).as_posix(),'build':build}
@@ -251,7 +257,8 @@ def ultralib_needed(net,proj,limit=None):
                                                   "id IN (SELECT value FROM json_each(?)) ORDER BY vram",proj['id'],json.dumps(sorted(hints))):
         if json.loads(row['meta'] or '{}').get('reopened'):continue
         found=hints[row['id']].get('names') or []
-        if len(found)==1 and found[0] and kit.sdk_group(found[0])=='native':
+        if (len(found)==1 and found[0] and kit.sdk_group(found[0])=='native'
+                and not net.console(proj).sdk_without_source(hints[row['id']].get('corpora') or [])):
             names.append(row['name'])
             if limit is not None and len(names)>=limit:break
     return names
@@ -297,20 +304,23 @@ def signature_proof(proj,fn,name,hint):
             'at':time.time()}
 
 
-def discover_c(net,proj,stop=None,progress=None):
+def discover_c(net,proj,stop=None,progress=None,*,function_id=None):
     """Set aside the open functions library detection finds (`detected`), when the project chose that (`SETTING`).
     Where the user's own SDK archive has the function, its object is linked at the function's address and every
     code and data byte compared, as for SDK assembly; otherwise the detection is the evidence (`signature_proof`).
     Background runs take 3 seconds a turn and resume; a user-started run (`stop`, an Event) does them all, reports
-    `progress` and stops when asked."""
-    if not enabled(net,proj) or proj['arch']!='mips' or not net.is_rom(proj) or net.fork_slug(proj['slug']):return 0
+    `progress` and stops when asked. `function_id`: that function alone (the deep permuter, before it searches)."""
+    if proj['slug'] in net.links or not enabled(net,proj) or proj['arch']!='mips' or not net.is_rom(proj) or net.fork_slug(proj['slug']):return 0
     store=net.project_store(proj['id']);cursor_key='sdk-c-cursor:'+str(proj['id'])
     saved=store.one('SELECT value FROM settings WHERE key=?',cursor_key)
-    cursor=0 if stop is not None or not saved else int(saved['value'])
+    cursor=0 if stop is not None or function_id is not None or not saved else int(saved['value'])
     hints=detected(net,proj)
     if not hints:return 0
+    # the game's other library functions, for a helper two ultralib files define differently (ultralib.by_neighbours)
+    neighbours={n for h in hints.values() for n in h.get('names') or []}|{r['name'] for r in store.all(
+        "SELECT name FROM functions WHERE project_id=? AND name NOT LIKE 'func\\_%' ESCAPE '\\'",proj['id'])}
     rows=store.all("SELECT * FROM functions WHERE project_id=? AND status='open' AND id>? AND id IN (SELECT value FROM json_each(?)) ORDER BY id",
-                   proj['id'],cursor,json.dumps(sorted(hints)))
+                   proj['id'],cursor,json.dumps(sorted(hints) if function_id is None else sorted({function_id}&hints.keys())))
     count=0;started=time.monotonic();examined=cursor;finished=True
     for done,fn in enumerate(rows):
         from .maintenance import checkpoint
@@ -319,14 +329,14 @@ def discover_c(net,proj,stop=None,progress=None):
             finished=False;break
         if progress:progress({'done':done,'total':len(rows),'set_aside':count,'function':fn['name']})
         examined=fn['id'];hint=hints[fn['id']]
-        lead=_lead(net,proj,fn,hint)
+        lead=_lead(net,proj,fn,hint,neighbours)
         if not lead or store.one('SELECT 1 FROM claims WHERE function_id=?',fn['id']):continue
         proof=(verify(net,proj,fn,{'names':[lead[0]],'corpora':lead[1]},publish=False,from_c=True)
                or signature_proof(proj,fn,lead[0],hint))
         if proof and lead[2]:
             proof['port_source']=lead[2]  # the port builds ultralib's C for it (port/ultralib.units)
         if proof:count+=int(save(net,proj,fn,proof))
-    if stop is None:
+    if stop is None and function_id is None:
         with store.tx() as db:
             db.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',(cursor_key,str(0 if finished else examined)))
     return count
@@ -415,11 +425,21 @@ def known_identity(console, cfg, code, *, has_relocs=False):
         return found
 
 
+def _linked_relocs(relocs):
+    """The relocations that tie a body to where this game linked it. A reference to a memory-mapped hardware register
+    (physical 0x03F00000 and up, reached through KSEG1: SP_STATUS at 0xA4040010) is the same address in every game, so
+    the instruction words hold it as the SDK's own build did and the exact-bytes digest still proves the routine.
+    A libultra rmon routine that reads SP_STATUS was left open in many games by its `lui/lw` pair of relocations."""
+    return [r for r in relocs
+            if not (isinstance(r, (list, tuple)) and len(r) > 2 and isinstance(r[2], int)
+                    and r[2] & 0xE0000000 == 0xA0000000 and r[2] & 0x1FFFFFFF >= 0x03F00000)]
+
+
 def known_proof(console, proj, fn):
     """Bind a curated SDK identity to the current function and its analysis image."""
     cfg = json.loads(proj['config'])
     code = bytes(fn['target'] or b'')
-    found = known_identity(console, cfg, code, has_relocs=bool(json.loads(fn['relocs'] or '[]')))
+    found = known_identity(console, cfg, code, has_relocs=bool(_linked_relocs(json.loads(fn['relocs'] or '[]'))))
     if not found or fn['size'] != len(code):
         return None
     if found.get('evidence'):

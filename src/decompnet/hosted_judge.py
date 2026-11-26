@@ -25,11 +25,12 @@ Requests:
   tables, as switch_tables.read), "callees" (its callees' matched C, capture_followup_repairs.callee_evidence) and
   "entry_scope" (promoted_entry_repairs.scope), "words" ({symbol: word} of its float constants, float_literal_words.read): the context the app's draft path hands draft_repairs.variants}: everything a local search needs to judge without being told the function's bytes
   (the match-function skill's fast_judge.py).
-- {"op": "passes", "slug", "name", "source", "passes" (optional), "sched_verbose" (optional: the first scheduler's
+- {"op": "passes", "slug", "name", "source", "flags" (optional: flags added to the function's profile for this compile,
+  as the judge request's compiler flags; the skill's --flags), "passes" (optional), "save" (optional: also return every file of the compile, the preprocessed C, the final assembly and each pass dump, as "files"), "sched_verbose" (optional: the first scheduler's
   notes too)} -> {"text"}: the compiler's allocation priority
   table, register preferences and scheduling orders for that C under the function's profile (compiler_passes.report,
   the code behind the compiler_passes tool; the skill's passes.py).
-- {"op": "allocation", "slug", "name", "source", "rows" (optional: the judge's raw rows)} -> {"lreg", "greg"
+- {"op": "allocation", "slug", "name", "source", "flags" (optional, as for passes), "rows" (optional: the judge's raw rows)} -> {"lreg", "greg"
   (the function's part of each dump), "allocation" (gcc_allocation's values: pseudo, hard register, C lines),
   "text" (with rows: register_explain.explain, the skill's explain_regs.py)}.
 - {"op": "neighbours", "slug", "name", "limit" (optional), "rows" (optional: the judge's raw rows for a candidate)}
@@ -39,6 +40,10 @@ Requests:
 - {"op": "signatures", "slug", "name", "source" (optional: the saved best)} -> {"text", "findings"}: every call in
   that C checked against the callee's matched C, the shared header and the target's call sites, and the function's own
   parameters against its matched callers (call_signatures; the skill's signatures.py, printed after a claim).
+- {"op": "candidates", "slug", "max_insns" (optional)} -> {"items"}: open, unclaimed functions worth a small
+  model's try, each with its saved C, stored draft and candidate profiles (match_brief; the skill's haiku.py).
+- {"op": "brief", "slug", "name"} -> that function's assembly, saved C, a fresh draft, candidate profiles, matched
+  neighbours' signatures and header declarations (match_brief.brief).
 - {"op": "preprocess", "slug", "name", "source"} -> {"text", "cc1", "log"}: the candidate preprocessed as the app's
   compile does it (the function's profile, the project's header; compiler.preprocess_candidate), and the cc1 command
   line to run dumps on the result (the skill's preprocess.py). The bundled bare `cpp` aborts, so never run it by hand.
@@ -178,6 +183,18 @@ def function_info(net, request: dict) -> dict:
             "compiler": {"toolchain": profile.get("toolchain"), "flags": list(profile.get("flags") or [])}}
 
 
+def _profile_flags(request: dict):
+    """The request's `flags` (added to the function's profile, as the judge request's compiler flags take them) as a
+    tuple, or an error reply. Two functions of one game were probed under `-mfp32` with fast_judge.py while passes.py and
+    explain_regs.py still dumped the `-mfp64` profile: every float register they named was another compile's."""
+    flags = request.get("flags") or ()
+    if isinstance(flags, str):
+        flags = flags.split()
+    if not isinstance(flags, (list, tuple)) or not all(isinstance(f, str) and f.startswith("-") for f in flags):
+        return {"error": "flags must be a list of compiler options, each starting with '-'"}
+    return tuple(flags)
+
+
 def passes_report(net, request: dict) -> dict:
     """The compiler's own allocation, preference and scheduling output for a candidate (compiler_passes' code)."""
     from .app import compiler_passes
@@ -190,8 +207,14 @@ def passes_report(net, request: dict) -> dict:
     if not isinstance(source, str) or not source.strip():
         return {"error": "no source"}
     passes = tuple(request.get("passes") or compiler_passes.SKILL_PASSES)
+    files = {} if request.get("save") else None
+    flags = _profile_flags(request)
+    if isinstance(flags, dict):
+        return flags
     try:
-        return {"text": compiler_passes.report(net, proj, fn, source, passes, sched_verbose=bool(request.get("sched_verbose")))}
+        text = compiler_passes.report(net, proj, fn, source, passes, sched_verbose=bool(request.get("sched_verbose")), files=files,
+                                      **({"profile_flags": flags} if flags else {}))
+        return {"text": text, **({"files": files} if files is not None else {})}
     except NetworkError as error:
         return {"error": str(error)}
 
@@ -211,12 +234,19 @@ def allocation_report(net, request: dict) -> dict:
     source = request.get("source")
     if not isinstance(source, str) or not source.strip():
         return {"error": "no source"}
+    flags = _profile_flags(request)
+    if isinstance(flags, dict):
+        return flags
     try:
-        result, _ = compiler_passes.diagnose(net, proj, fn, source, ("lreg", "greg"), compiler_passes.SKILL_EXCERPT_CHARS)
+        more = {"profile_flags": flags} if flags else {}
+        result, _ = compiler_passes.diagnose(net, proj, fn, source, ("lreg", "greg"), compiler_passes.SKILL_EXCERPT_CHARS, **more)
         # The C lines come from a second compile with -g (its line notes). -g changes KMC GCC's code (a 20 became
         # 180), but not the pseudo numbers expansion hands out, so its lines are used only when it allocated the same
         # pseudos; otherwise the report has no lines.
-        lines = _pseudo_lines(*compiler_passes.diagnose(net, proj, fn, source, (), 0, extra_flags=("-g",)))
+        try:
+            lines = _pseudo_lines(*compiler_passes.diagnose(net, proj, fn, source, (), 0, extra_flags=("-g",), **more))
+        except NetworkError:
+            lines = {}  # a compiler that refuses -g (SN's) still gives the tables, only without the C lines
     except NetworkError as error:
         return {"error": str(error)}
     phases = result.get("phases") or {}
@@ -300,6 +330,19 @@ def signatures_for(net, proj, fn, source, call_signatures=None):
     return {"text": "\n".join(call_signatures.render(findings)), "findings": findings}
 
 
+def match_candidates(net, request: dict) -> dict:
+    """The open functions a small model's matching loop picks from (match_brief; the skill's haiku.py)."""
+    from .app import match_brief
+    return {"items": match_brief.candidates(net, str(request.get("slug") or ""),
+                                            int(request.get("max_insns") or 0))}
+
+
+def match_brief_report(net, request: dict) -> dict:
+    """One function's screen for that loop: assembly, saved C, draft, candidate profiles, neighbours."""
+    from .app import match_brief
+    return match_brief.brief(net, str(request.get("slug") or ""), str(request.get("name") or ""))
+
+
 def preprocess_report(net, request: dict) -> dict:
     """A candidate preprocessed exactly as the app's compile does it, and the cc1 command to dump its passes."""
     from . import compiler, toolchains
@@ -317,6 +360,14 @@ def preprocess_report(net, request: dict) -> dict:
         return {"error": "this function's compiler isn't a pinned, installed one; nothing is downloaded"}
     cfg = compiler_config(Path(proj["root"]), {"compiler": {"toolchain": tid, "flags": profile.get("flags", [])}})
     header = net._context(proj["id"], fn["unit"])["header"]
+    if toolchains.get(tid).pass_dumps:
+        # A driver-run compiler (SN's, under wibo) has no `-E`: its own preprocessor step leaves the .i the compile
+        # reads, which the diagnostic compile keeps with the pass dumps.
+        from .app import compiler_diagnostics
+        result = compiler_diagnostics.diagnose(profile, header, source, fn["name"], root=proj["root"], keep_files=True)
+        if "files" not in result or "i" not in result["files"]:
+            return {"error": result.get("skipped") or "the compile left no preprocessed file", "log": result.get("error", "")}
+        return {"text": result["files"]["i"], "cc1": compiler_diagnostics.driver_cc1_words(cfg), "log": ""}
     return compiler.preprocess_candidate(cfg, header, source)
 
 
@@ -377,6 +428,10 @@ def serve(net, lines=sys.stdin, out=sys.stdout) -> None:
                 reply = neighbours_report(net, request)
             elif request.get("op") == "signatures" and not packs:
                 reply = signatures_report(net, request)
+            elif request.get("op") == "candidates" and not packs:
+                reply = match_candidates(net, request)
+            elif request.get("op") == "brief" and not packs:
+                reply = match_brief_report(net, request)
             elif request.get("op") == "preprocess" and not packs:
                 reply = preprocess_report(net, request)
             else:

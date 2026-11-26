@@ -181,6 +181,21 @@ def test_exact_runtime_backfill_requires_the_linked_image_and_library_setting(mo
     assert discover_known(net, net.project_row(slug)) == 1
 
 
+def test_a_reference_to_a_hardware_register_does_not_stop_an_exact_sdk_routine(monkeypatch):
+    """The SP_STATUS poll of libultra's rmon is relocated against 0xA4040010 in every game; its digest covers the
+    words, so only a reference to the game's own memory keeps a body from being identified."""
+    from decompnet.app.sdk_assembly import known_proof
+
+    words = (0x00001021, 0x3C08A404, 0x8D080010, 0x31080003, 0x15000002, 0, 0x34420001, 0x03E00008, 0)
+    body = b''.join(w.to_bytes(4, 'big') for w in words)
+    monkeypatch.setattr(pack, 'KNOWN', {hashlib.sha256(body).hexdigest(): ('toyRunning', 36, 'fixture', 'rmon/toy.s')})
+    monkeypatch.setattr(pack, 'SIZES', (36,))
+    proj = {'config': json.dumps({'kind': 'rom', 'compiler': {'toolchain': 'gcc-2.7.2-kmc'}})}
+    fn = {'vram': 0x80001000, 'size': 36, 'target': body, 'relocs': '[[4,5,2751725584],[8,6,2751725584]]'}
+    assert known_proof(N64, proj, fn)['name'] == 'toyRunning'
+    assert known_proof(N64, proj, dict(fn, relocs='[[4,5,2148000000],[8,6,2148000000]]')) is None
+
+
 def test_sdk_matrix_rebuild_variant_checks_full_reference_free_body(monkeypatch):
     from decompnet.app.sdk_assembly import known_proof
 
@@ -400,3 +415,13 @@ def test_the_2_0h_archives_and_branch_ending_routines_are_in_the_tables():
     assert sum(1 for name, size, *_ in pack.KNOWN.values() if name == 'bcopy' and size in (772, 856)) == 2
     assert any('2.0H' in variant for _, _, variant, _ in pack.KNOWN.values())
     assert any('2.0H' in variant for _, _, variant in pack.KNOWN_C.values())
+
+
+def test_a_libgcc_division_body_is_told_by_its_image():
+    from decompnet.consoles.n64 import sdk_linked
+
+    image = 'ed0fe7c9a2e8015bdf8262d35065f53c6fcea60f'
+    digest = '4bee29095ef2f2997a0e010696463aaba82d3bb7c2f4ecd64cebede00dc2a16a'
+    assert sdk_linked._KNOWN[image][digest] == ('__udivmoddi4', 1596)
+    assert 1596 in sdk_linked.SIZES
+    assert sdk_linked.identify(b'\0' * 1596, image) is None

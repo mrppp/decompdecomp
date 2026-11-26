@@ -139,7 +139,8 @@ def test_the_window_code_agrees_with_sdl3s_own_headers(tmp_path):
     pairs["SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK"] = re.search(r"#define SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK (\w+)u", source)[1]
     offsets = {"EV_KEY_SCANCODE": "offsetof(SDL_KeyboardEvent, scancode)",
                "EV_KEY_REPEAT": "offsetof(SDL_KeyboardEvent, repeat)",
-               "EV_PAD_WHICH": "offsetof(SDL_GamepadDeviceEvent, which)"}
+               "EV_PAD_WHICH": "offsetof(SDL_GamepadDeviceEvent, which)",
+               "EV_PAD_BUTTON": "offsetof(SDL_GamepadButtonEvent, button)"}
     scancodes = dict(re.findall(r"\bS_([A-Z0-9]+) = (\d+)", source))
     checks = [f"_Static_assert({offsets.get(name, name)} == {value}, \"{name}\");" for name, value in pairs.items()]
     checks += [f"_Static_assert(SDL_SCANCODE_{name} == {value}, \"S_{name}\");" for name, value in scancodes.items()]
@@ -1828,3 +1829,12 @@ def test_a_game_that_reads_the_cartridge_through_the_pi_registers_is_counted():
     start = text.index("case 0xA460000Cu:")
     body = text[start:start + 2500]
     assert "dmas++;" in body and "NOT DONE" in body
+
+
+def test_both_sides_can_log_the_polls_that_first_show_each_pad_change():
+    """EMU_PAD_LOG (the emulator's input plugin) and PORT_PAD_LOG (the host) write "PAD <task> <buttons>" at the first controller
+    read that shows each change, so the task an edge reaches the game at can be compared per edge (docs/PORTING.md)."""
+    plugin = (HOST.parent.parent / "emulator" / "input.c").read_text()
+    assert "EMU_PAD_LOG" in plugin and '"PAD %u %04X' in plugin
+    host = HOST.read_text()
+    assert "PORT_PAD_LOG" in _function(host, "w2c_env_osContGetReadData")

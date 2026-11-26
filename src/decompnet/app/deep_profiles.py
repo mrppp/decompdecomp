@@ -68,7 +68,7 @@ def tail_dispatch(net, proj, fn):
         return None
     cfg = net.cfg(proj)
     compiler = 'gcc-4.4.0-n64'
-    if not any(option.id == compiler for option in consoles.of(cfg).compilers):
+    if not any(option.id == compiler for option in consoles.of(cfg).compilers_for(cfg)):
         return None
     profile = {'toolchain': compiler, 'flags': consoles.default_flags(cfg, compiler)}
     own = compiler_for(cfg, fn['vram'], fn)
@@ -77,10 +77,11 @@ def tail_dispatch(net, proj, fn):
     return None
 
 
-def probe(search, agent, proj, fn, source, profile, *, scored=False):
+def probe(search, agent, proj, fn, source, profile, *, scored=False, review_variants=True):
     """Cache misses separately by profile; only a reverified exact bundle can change settings. 0 for an exact pair,
     else None, or with `scored` a miss's score (a cached one's too, when its record kept it): what compiler
-    detection compares (profile_detection)."""
+    detection compares (profile_detection). `review_variants=False` (the profile probe, profile_probe.py) applies an exact
+    floating-point, small-data or scheduling variant like any other profile, by the project's own automatic-change rule."""
     from . import agent_tokens, ido_compat
     search.check()
     search.visited += 1
@@ -90,8 +91,11 @@ def probe(search, agent, proj, fn, source, profile, *, scored=False):
     scope = agent_tokens.target_scope(search.net, {**dict(fn), 'best_source':source}, '')
     key = 'deep-profile-v1:'+hashlib.sha256(repr((scope, source, profile)).encode()).hexdigest()
     store = search.net.project_store(proj['id'])
+    # a miss queued earlier in this batch (the profile sweep's, judged just before the profile probe asks for the same
+    # pair) keeps its score beside its outcome: it was the outcome alone, and 816 of 837 neighbour probes of one game
+    # were recorded without a score, so the probe's note never said which profile scored better
     queued = trial_bookkeeping.lookup(store, ('profile-probe', fn['id'], key))
-    cached = {'outcome': queued} if queued is not None else store.one(
+    cached = {'outcome': queued[0], 'feedback': json.dumps({'score': queued[1]})} if queued is not None else store.one(
         'SELECT outcome,feedback FROM reuse_trials WHERE function_id=? AND signature=?', fn['id'], key)
     # (a compile failure is as settled as a miss: retrying one recompiled 88 broken rewrites 9,844 times)
     if cached and cached['outcome'] in ('miss', 'compile_failed'):
@@ -114,7 +118,7 @@ def probe(search, agent, proj, fn, source, profile, *, scored=False):
     trial_bookkeeping.submit(store, [('INSERT OR REPLACE INTO reuse_trials(function_id,signature,outcome,reason,feedback) VALUES(?,?,?,?,?)',
                    (fn['id'], key, outcome, 'deep compiler profile probe',
                     json.dumps({'score':score, 'profile':profile, **({'source':source} if exact else {})})))],
-                   immediate=bool(exact), memo=(('profile-probe', fn['id'], key), outcome))
+                   immediate=bool(exact), memo=(('profile-probe', fn['id'], key), (outcome, score)))
     search.log('Profile '+profile['toolchain']+' '+' '.join(profile['flags'])+': '+
                ('exact; rechecking source/profile bundle' if exact else 'score '+str(score) if score is not None else 'does not compile'))
     if exact:
@@ -177,7 +181,7 @@ def probe(search, agent, proj, fn, source, profile, *, scored=False):
             bases.append(consoles.default_flags(cfg, profile['toolchain']))
         except Exception:  # noqa: BLE001 - a toolchain this install doesn't know has no default to compare with
             pass
-        review = ({'review_only': True} if any(is_fp_variant(flags, profile['flags']) or is_scheduler_variant(flags, profile['flags'])
+        review = ({'review_only': True} if review_variants and any(is_fp_variant(flags, profile['flags']) or is_scheduler_variant(flags, profile['flags'])
                                                or is_small_data_variant(flags, profile['flags'])
                                                for flags in bases) else {})
         said = search.net.suggest(agent, proj['slug'], 'Deep permuter found an exact source/compiler profile pair.',

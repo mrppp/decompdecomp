@@ -20,8 +20,11 @@ from __future__ import annotations
 import re
 
 KEYWORDS = {'if', 'while', 'for', 'switch', 'return', 'sizeof', 'do', 'else', 'case', 'goto', 'defined'}
+# A parameter list may hold one level of parentheses: a pointer to an array (`s8 (*box)[4]`) or a function pointer
+# (`void (*cb)(s32)`). Without them a matched callee written that way had no prototype here, so a stray m2c argument
+# to it went unreported (a 182-instruction loader stayed at 120 for hours on one extra `count`, 120 -> 0 dropped).
 DECL = re.compile(r'(?:^|(?<=[;}\n]))[ \t]*((?:(?:extern|static|inline|const|volatile|unsigned|signed|struct|union|enum)'
-                  r'\s+)*[A-Za-z_]\w*(?:[\s*]+))([A-Za-z_]\w*)\s*\(([^()]*)\)\s*(\{|;)', re.M)
+                  r'\s+)*[A-Za-z_]\w*(?:[\s*]+))([A-Za-z_]\w*)\s*\(((?:[^()]|\([^()]*\))*)\)\s*(\{|;)', re.M)
 CALL = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
 ARG_REGS = ('$a0', '$a1', '$a2', '$a3')
 NO_WRITE = re.compile(r'^(?:s[bhwd][lr]?|swc1|sdc1|sc|scd|b\w*|j|jr|jalr?|mt\w*|dmtc1|ctc1|cache|sync|syscall|break|t\w+)$')
@@ -189,11 +192,19 @@ def call_sites(asm, aliases=None):
                 break
         arg_regs = max((ARG_REGS.index(r) + 1 for r in written if r in ARG_REGS), default=0)
         result = None
-        for m, o, _label in insns[i + 2:i + 2 + MAX_FORWARD]:
+        window = insns[i + 2:i + 2 + MAX_FORWARD]
+        for k, (m, o, _label) in enumerate(window):
             if '$v0' in _reads(m, o):
                 result = True
                 break
-            if m in ('jal', 'jalr') or '$v0' in _writes(m, o):
+            if m in ('jal', 'jalr'):
+                # The next call's delay slot runs before that call returns: a collision walk's
+                # `jal start; ...; jal end; move $s0, $v0` keeps the first result there, and calling it
+                # "overwritten unread" sent agents to turn a used result into a bare statement.
+                slot = window[k + 1] if k + 1 < len(window) else None
+                result = bool(slot and '$v0' in _reads(*slot[:2]))
+                break
+            if '$v0' in _writes(m, o):
                 result = False
                 break
             if m == 'jr':
@@ -295,10 +306,17 @@ def check(name, source, header='', callee_sources=None, caller_sources=None, asm
             theirs = [s for s in sites if s['callee'] == callee]
             if len(mine) != len(theirs):
                 continue  # inlined, duplicated or reordered calls: no pairing
+            # A float result comes back in $f0, so whether the target reads $v0 after the call says nothing about
+            # it: a ray test's six `func_X(n, ...)` dot products (f32) were each reported "overwritten unread".
+            ret = (matched.get(callee) or header_protos.get(callee) or source_protos.get(callee) or {}).get('ret')
+            float_result = CANON.get(' '.join(w for w in (ret or '').split() if w not in ('const', 'volatile'))) in (
+                'f32', 'f64')
             for call, site in zip(mine, theirs):
                 n = len(call['args'])
                 where = f"line {call['line']}: {callee}({_arg_list(call['args'])})"
                 definition = matched.get(callee)
+                if float_result:
+                    site = dict(site, result=None)
                 if site['arg_regs'] > n and not definition and n < 4:
                     add('target-argument', callee, call['line'],
                         f"{where} passes {n}; the target sets {ARG_REGS[site['arg_regs'] - 1]} just before the call: "

@@ -11,19 +11,13 @@ import secrets
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from ... import consoles, hostenv
 from ...network import Agent, Network, NetworkError, hash_token
 from ...rom import split
 from ...rom.symbols import Symbol, SymbolTable
 from .common import _ADDRESS
-
-# Settings parsed, by their text: GTA San Andreas's are 193 KB, and one request read them 4 to 12 times (a range
-# check after a match, 462 times). A few versions are kept: each change of a project's settings is a new text.
-SETTINGS_KEPT = 8
-_settings: dict[str, dict] = {}
-_settings_lock = threading.Lock()
-
 
 FORK_SLUG_SECONDS = 10.0  # how long fork_slug keeps its answer (a project's kind never changes)
 
@@ -35,6 +29,8 @@ class Core(Network):
     def __init__(self, db_path: str | Path, workspace: Path, claim_ttl: int = 30 * 60, *, project_databases=False):
         super().__init__(db_path, claim_ttl=claim_ttl,project_databases=project_databases)
         self.workspace = Path(workspace)
+        from .. import repair_rules
+        repair_rules.configure(self.workspace)   # the library's declarative rules live in the home (DECOMP_REPAIR_RULES)
         self._syms: dict[int, SymbolTable] = {}
         self._sym_override: dict[int, SymbolTable] = {}
         # project id -> held by one rename at a time, from reading the symbols to writing the new name: two at once
@@ -101,16 +97,8 @@ class Core(Network):
     def cfg(proj) -> dict:
         """A project's settings. Shared by everyone who reads the same version of them: read it, never change it
         (_update_cfg changes settings; code that edits a copy parses its own, json.loads(proj["config"]))."""
-        text = proj["config"]
-        with _settings_lock:
-            parsed = _settings.get(text)
-        if parsed is None:
-            parsed = json.loads(text)
-            with _settings_lock:
-                if len(_settings) >= SETTINGS_KEPT:
-                    _settings.pop(next(iter(_settings)))  # the oldest version
-                _settings[text] = parsed
-        return parsed
+        from ...project import settings
+        return settings(proj["config"])
 
     def find_moved_projects(self) -> list[str]:
         """Projects whose folder isn't where it was, found again in this workspace by their name: a whole Decomp
@@ -178,11 +166,22 @@ class Core(Network):
         # saved bests scored under older penalties: rescored first, so none blocks a better source (score_version.py)
         rescored = score_version.refresh(self, row, log)
         rescored_said = f"{rescored} saved best score{'' if rescored == 1 else 's'} updated to this version's scoring"
+        restored = 0
+        if self.is_rom(row) and row['arch'] == 'mips':
+            # Boundary decisions saved before they carried the split's data references dropped them (boundary_repairs
+            # restore_relocs reads them back from the originals each decision keeps); cheap and idempotent, so it runs
+            # on every check, like the score refresh above.
+            from ..boundary_repairs import restore_relocs
+            restored = restore_relocs(self, row)
+        restored_said = (f"{restored} function{'' if restored == 1 else 's'} given back the data references a boundary "
+                         "fix had dropped")
         if only_if_updated and self.cfg(row).get("checked") == __version__:
             # Capability fixes can ship without a package-version change. Only this
             # narrow, self-retiring review runs again; console/range work stays gated.
             reconsidered = assembly_reconsideration.run(self, row, log)
             said = [rescored_said] if rescored else []
+            if restored:
+                said.append(restored_said)
             if reconsidered:
                 said.append(f'{reconsidered} obsolete tooling verdicts reconsidered with supported C')
             return "; ".join(said) or None
@@ -192,12 +191,35 @@ class Core(Network):
         self.console(row).on_start(self, slug, log=log)
         # what the console's work did, it said in the feed ("8 pieces of functions ... joined"): in the answer too
         done = [rescored_said] if rescored else []
+        if restored:
+            done.append(restored_said)
+        if self.is_rom(row):
+            # A start or end the bytes prove wrong, in a project imported before the importer fixed them.
+            from ..boundary_repairs import apply_entry_fixes
+            try:
+                fixed = len(apply_entry_fixes(self, slug, log)["fixed"])
+            except NetworkError as e:
+                fixed = 0
+                log(f"function boundaries were not fixed automatically: {e}")
+            if fixed:
+                done.append(f"{fixed} function boundar{'y' if fixed == 1 else 'ies'} fixed (undo in Review function boundaries)")
         done += [r["detail"] for r in self.project_store(row['id']).all("SELECT detail FROM events WHERE project_id=? AND id>? AND "
                                                      "kind='analysis' ORDER BY id", row["id"], last)]
         reconsidered = assembly_reconsideration.run(self, self.project_row(slug), log)
         if reconsidered:
             done.append(f'{reconsidered} obsolete tooling verdicts reconsidered with supported C')
         n = self.twins.set_aside_asm(self.project_row(slug)) + self.not_c_from_notes(slug)
+        # library code this version recognises: named, then set aside, every function in one go (not the 3 seconds
+        # a turn background naming takes)
+        from ..sdk_assembly import set_aside_c
+        from ..sdk_names import name_functions
+        library = 0
+        if self.is_rom(row):  # (an imported build renames through rebuilds: its background naming does that)
+            before = set_aside_c(self, row)
+            name_functions(self, slug, SimpleNamespace(stop=threading.Event()))
+            library = set_aside_c(self, row) - before
+        if library > 0:
+            done.append(f"{library} library function{'' if library == 1 else 's'} set aside, found by library detection")
         self._update_cfg(slug, lambda cfg: cfg.update(checked=__version__))
         if n:
             done.append(f"{n} more function{'' if n == 1 else 's'} set aside, as no C makes them")
@@ -477,7 +499,11 @@ def _load_images(net, proj) -> list[tuple[int, int, int]]:
             except (OSError, yaml.YAMLError):
                 continue
             if isinstance(data, dict) and isinstance(data.get("segments"), list):
-                images = split.load_images(data)
+                # The raw data after the code is read from the ROM the split describes, only when that is the
+                # project's: a packed game's split is of its unpacked copy, at other offsets.
+                own = (data.get("options") or {}).get("target_path") in (None, net.cfg(proj)["rom"].get("file"))
+                images = split.load_images(data, net._rom(proj)[0] if own else None,
+                                           big_endian=bool(net.cfg(proj).get("big_endian", True)))
                 break
         cache[key] = (rom_entry, images)
     return cache[key][1]

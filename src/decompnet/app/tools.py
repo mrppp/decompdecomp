@@ -21,6 +21,7 @@ from ..network import CLAIM_ORDERS, Agent, Network, NetworkError
 from ..release_receipts import operation as release_operation
 from ..repair_feedback import AGENT_CATEGORIES, submission, track_matches
 from . import (
+    agent_proposals,
     agent_tokens,
     asset_agents,
     automatic_assignment,
@@ -34,6 +35,7 @@ from . import (
     local_experiments,
     polish_automation,
     prove_chain,
+    repair_rules,
     repair_search,
     reviewed_search_seeds,
     score_permutations,
@@ -77,6 +79,7 @@ GUIDES = {
     "agent-experiments": "repair families, candidate revisions, compiler trials and recovery",
     "workflow": "the matching loop, reading diffs, priorities",
     "near-match": "finishing a near-match: combining neutral edits, compiler passes, register priorities",
+    "repair-rules": "teaching the library a rewrite: the JSON rule format add_repair_rule saves, with a worked example",
     "mips": "MIPS registers, calling convention, delay slots, types from instructions",
     "m2c": "reading the machine-generated draft",
     "data": "globals, strings, tables, floats, data you define",
@@ -137,7 +140,8 @@ one claim; one function back is normal.)
    "Next step: ..." for the next agent. Omit notes if there is nothing useful to pass on. Before
    that, compile the next step instead of releasing. A direct callee blocks work?
    release_function(needs=that one) allows one pivot per unchanged input, respecting pauses. Sure that
-   no C makes its code at all (hand-written assembly): not_c=true, saying why.
+   no C makes its code at all (hand-written assembly): not_c=true, saying why. Can you show it is driver or
+   SDK code, or that its extent is wrong? propose_change(...) once with the evidence; the user approves it.
    A boundary-review warning comes first: use get_boundary_evidence to inspect the original bytes, overlap,
    and possible data references. Leave boundary decisions to review and move to an eligible function.
    A target ending without a return is not an assembly verdict; report or correct its extent first.
@@ -153,7 +157,8 @@ WORK_BOUNDARY = """\
 The function runs on past its end into padding, linker leftovers or data? report_boundary(...) where it really
 ends, then work on as it is. The brief says "possible start boundary problem"? Its first word is probably
 padding or dead code, so no C can match this extent: release the function with that in your notes instead of tuning
-it. A person reviews the suggested start; do not cut it yourself."""
+it. A person reviews the suggested start; do not cut it yourself. Stray words between a return and the next
+prologue? propose_change(action="split_gap", end=after the return, entry=the prologue) for the user to approve."""
 
 # A helper started on "make matched code readable" (options task=readable), in any project (app/readable.py);
 # {names}: step 3, as the project's mode has it (READABLE_ROM, READABLE_FORK)
@@ -173,7 +178,9 @@ functions, then stop:
    tests a suggested pattern. Shared names still use rename_symbol. For complex scopes or restructuring use
    make_readable(function, source): the same function with meaningful parameter and local names, the header's
    types and names, and one comment saying what it does. Preserve the original behavior and the code shape that
-   matching requires. Each rewrite is judged again and must still match byte for byte, or it's refused and the matching C stays. Refused? Undo
+   matching requires: keep the m2c prelude (#ifndef M2C_DEFINES ... #endif) and the declarations above the
+   function, and the constructs the claim lists as there for the match (do {{ }} while (0), goto loops, register,
+   volatile, __repair_* locals). Each rewrite is judged again and must still match byte for byte, or it's refused and the matching C stays. Refused? Undo
    your last change and try a smaller one.
 
 Once every function in a source file is readable, claim_readable may give you the file to tidy instead (TIDY A
@@ -387,7 +394,7 @@ def compact_info_head(net, proj):
     platform=consoles.get(cfg.get('platform'))
     compiler=profile.get('toolchain') if isinstance(profile,dict) else str(profile)
     compiler=compiler or 'set by the project build'
-    known=', '.join(c.id for c in platform.compilers)
+    known=', '.join(c.id for c in platform.compilers_for(cfg))
     return (f"{proj['name']} ({proj['slug']})\ncompiler: {compiler} {' '.join(profile.get('flags',[]) if isinstance(profile,dict) else [])}\n"
             + (f"this platform's compilers (for try_compiler): {known}\n" if known else ''))
 
@@ -708,6 +715,8 @@ HANDLERS: dict[str, Callable[..., str]] = {
     "defer_asset_region": asset_agents.defer,
     "get_boundary_evidence": boundary_investigations.evidence,
     "suggest_boundary": boundary_investigations.report,
+    "propose_change": lambda net, agent, slug, function, action, evidence, end="", entry="":
+        agent_proposals.propose(net, agent, slug, function, action, evidence, end, entry),
     "get_claims": claim_state.get_claims,
     "resolve_addresses": _resolve_addresses,
     "report_data_region": _report_data_region,
@@ -800,6 +809,7 @@ HANDLERS: dict[str, Callable[..., str]] = {
     "find_similar": lambda net, agent, slug, function, limit=5: net.find_similar(slug, function, limit),
     "get_callers": lambda net, agent, slug, function, limit=8: net.get_callers(slug, function, limit),
     "search_learnings": lambda net, agent, slug, symptom, top=5: learnings_search.run(net, agent, slug, symptom, top),
+    "add_repair_rule": lambda net, agent, slug, function, rule: repair_rules.run(net, agent, slug, function, rule),
     "guide": lambda net, agent, slug, topic="": guide_text(topic, net.overview(slug).get("platform")),
     "read_file": lambda net, agent, slug, path, start=1, count=200:
         net.forks.read_file(_fork(net, slug, "read_file"), path, start, count),
@@ -1215,9 +1225,9 @@ QUICK_TOOLS = frozenset({
     'last_diff', 'search_notes', 'search_learnings', 'read_file', 'search_code', 'file_status', 'get_class', 'get_callers', 'compiler_map',
     'get_candidate', 'get_compiler_trial', 'get_search_brief', 'family_targets', 'get_boundary_evidence',
     'resolve_addresses', 'read_data', 'standins_for', 'claim_function', 'claim_readable', 'release_function', automatic_assignment.RELEASE,
-    'search_repair_examples', 'get_repair_examples', 'upvote_repair_example',
+    'search_repair_examples', 'get_repair_examples', 'upvote_repair_example', 'add_repair_rule',
     'add_note', 'report_repair', 'share_knowledge', 'suggest', 'tidy_done', 'claim_asset_region', 'defer_asset_region',
-    'inspect_asset_region', 'report_data_region', 'report_boundary', 'suggest_boundary', 'port_readiness', 'get_data_unit', 'claim_data', 'release_data',
+    'inspect_asset_region', 'report_data_region', 'report_boundary', 'suggest_boundary', 'propose_change', 'port_readiness', 'get_data_unit', 'claim_data', 'release_data',
     'claim_port_fix', 'release_port_fix',
 })
 QUICK_LANE = 16
@@ -1369,7 +1379,7 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
     @tool
     async def get_function(ctx: Context, function: str, section: str = 'summary', start: int = 0, limit: int = 6000) -> str:
         """Show any function (by name or address): assembly, status, best attempt, notes. Read matched
-        functions to learn how this codebase is written. section: summary (default), work (one objective, complete current C, mismatch and recent measurements), brief, all, history, candidate, experiment, quality, notes, declarations, compiler, layouts. start/limit page supporting sections by character offset; candidate/brief always return complete C. Prefer the specific section you need."""
+        functions to learn how this codebase is written. section: summary (default), work (one objective, complete current C, mismatch and recent measurements), brief, all, history, candidate, experiment, quality, notes, declarations, compiler, layouts. start/limit page supporting sections by character offset, and section=matched (a matched function's C) when it is long; candidate/brief always return complete C. Prefer the specific section you need."""
         return await run(ctx, "get_function", function=function, section=section, start=start, limit=limit)
 
     @tool
@@ -1604,12 +1614,29 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
 
     @tool
     async def suggest_boundary(ctx: Context, function: str, action: str, supporting: str, counter: str,
-                               uncertainty: str, citations: str, end: str = "", confidence: str = "tentative") -> str:
+                               uncertainty: str, citations: str, end: str = "", confidence: str = "tentative",
+                               entry: str = "") -> str:
         """Save an advisory boundary recommendation with cited hex instructions; never apply a layout change.
-        action: delay_slot, join_previous, adjust, padding, data, keep, unclear. end: exclusive hex address for adjust.
+        action: delay_slot, join_previous, adjust, padding, data, keep, trim_start, split_end, split_gap, unclear.
+        end: exclusive hex end for adjust and split_gap, the real entry for trim_start and split_end. entry: for
+        split_gap, where the next function starts after the stray words.
         confidence: strong, tentative, unclear. citations: comma-separated hex instruction addresses from evidence."""
         return await run(ctx, "suggest_boundary", function=function, action=action, supporting=supporting,
-                         counter=counter, uncertainty=uncertainty, citations=citations, end=end, confidence=confidence)
+                         counter=counter, uncertainty=uncertainty, citations=citations, end=end, confidence=confidence,
+                         entry=entry)
+
+    @tool
+    async def propose_change(ctx: Context, function: str, action: str, evidence: str, end: str = "",
+                             entry: str = "") -> str:
+        """Propose a change only the user may make; nothing changes until they approve it with one click.
+        action: set_aside (hand-written assembly no C makes), set_aside_sdk (SDK, driver or library code, not the
+        game's own), or a boundary change (mapped MIPS ROM projects): delay_slot, join_previous, adjust (end = new
+        exclusive end), padding, data, keep, trim_start (end = the real entry; the words before it are padding),
+        split_end (end = where the next function starts), split_gap (end = where this function's last instruction
+        ends, entry = where the next function starts; the stray words between stay out of any function).
+        evidence: the instructions and addresses that show it, and what you could not rule out."""
+        return await run(ctx, "propose_change", function=function, action=action, evidence=evidence, end=end,
+                         entry=entry)
 
     @tool
     async def report_boundary(ctx: Context, function: str, end: str, reason: str) -> str:
@@ -1904,6 +1931,14 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
         what the callers say about the function's result type (a caller that reads $v0 or $f0 after the call proves
         it returns a value). Use it when the function's own code leaves its return type or its arguments unclear."""
         return await run(ctx, "get_callers", function=function, limit=limit)
+
+    @tool
+    async def add_repair_rule(ctx: Context, function: str, rule: str) -> str:
+        """Save a repair the library runs from now on: a JSON rule that finds one C shape and writes another (guide
+        "repair-rules" has the format and an example). It is tried on `function`'s current C first and saved only when it
+        makes at least one child there; the draft pass, the beam and the Deep Permuter then run it on every function of
+        the game. Use it when you fixed a near-match by a rewrite that other functions will need too."""
+        return await run(ctx, "add_repair_rule", function=function, rule=rule)
 
     @tool
     async def search_learnings(ctx: Context, symptom: str, top: int = 5) -> str:

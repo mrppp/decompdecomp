@@ -36,11 +36,11 @@ def test_compiler_flags_are_part_of_the_policy_profile(monkeypatch):
     assert policy.profile(net, proj, fn) != first
 
 
-def test_adaptive_family_order_interleaves_original_exploration(monkeypatch):
+def test_adaptive_family_order_feeds_unmeasured_families_in_and_leaves_poor_ones_last(monkeypatch):
     net = FakeNet()
     proj, fn = net.project_row('game'), net.function()
     monkeypatch.setattr(policy, 'factors', lambda *a: {'useful':4,'bad':0.25})
-    assert policy.order(net, proj, fn, [], ['bad','unknown','useful']) == ['useful','bad','unknown']
+    assert policy.order(net, proj, fn, [], ['bad','unknown','useful']) == ['useful','unknown','bad']
 
 
 def test_metrics_audit_records_origin_and_collection_window_without_merging_legacy_rates():
@@ -68,3 +68,92 @@ def test_explicit_nonexact_zero_does_not_train_a_verified_win():
     policy.record(net,'same','register','family',20,0,100,exact=False)
     row = net.store.one('SELECT * FROM repair_policy')
     assert row['improved'] == 1 and row['matched'] == 0
+
+
+def test_a_family_with_a_few_matches_counts_as_measured_before_it_has_enough_trials():
+    net = FakeNet()
+    for _ in range(13):
+        policy.record(net, 'profile', 'call', 'narrow_repair', 20, 0, 10)
+    for _ in range(13):
+        policy.record(net, 'profile', 'call', 'misses', 20, None, 10)
+    factors = policy.factors(net, 'profile', 'call')
+    assert 1 < factors['narrow_repair'] <= policy.EARLY_MAX_FACTOR
+    assert 'misses' not in factors  # no match, too few trials: still unmeasured
+
+
+def test_early_evidence_never_outranks_a_family_with_enough_trials_of_the_same_yield():
+    net = FakeNet()
+    for _ in range(40):
+        policy.record(net, 'profile', 'call', 'proven', 20, 0, 10)
+    policy.record(net, 'profile', 'call', 'lucky', 20, 0, 10)
+    factors = policy.factors(net, 'profile', 'call')
+    assert factors['lucky'] <= policy.EARLY_MAX_FACTOR < factors['proven'] <= policy.MAX_FACTOR
+
+
+def test_an_early_match_family_is_ranked_ahead_of_unmeasured_ones(monkeypatch):
+    net = FakeNet()
+    proj, fn = net.project_row('game'), net.function()
+    for _ in range(5):
+        policy.record(net, policy.profile(net, proj, fn), '', 'narrow_repair', 20, 0, 10)
+    assert policy.order(net, proj, fn, [], ['other', 'narrow_repair'])[0] == 'narrow_repair'
+
+
+def test_a_family_unmeasured_for_this_mismatch_kind_borrows_the_profiles_other_kinds_upward():
+    net = FakeNet()
+    for _ in range(40):
+        policy.record(net, 'profile', 'control', 'useful', 20, 0, 10)
+    assert 'useful' not in policy.policy_rows(net, 'profile', 'call')
+    factors = policy.factors(net, 'profile', 'call')
+    assert 1 < factors['useful'] <= policy.POOLED_MAX_FACTOR
+    assert policy.factors(net, 'other profile', 'call') == {}  # another compiler's evidence is never borrowed
+
+
+def test_borrowed_evidence_never_demotes_and_never_overrides_the_kinds_own_measurement():
+    net = FakeNet()
+    for _ in range(200):
+        policy.record(net, 'profile', 'register', 'bad', 20, None)
+    for _ in range(40):
+        policy.record(net, 'profile', 'control', 'useful', 20, 0, 10)
+        policy.record(net, 'profile', 'call', 'useful', 20, None, 10)
+    factors = policy.factors(net, 'profile', 'call')
+    assert 'bad' not in factors              # poor elsewhere says nothing against it here
+    assert factors['useful'] < 1             # this kind's own 40 failures outweigh its wins in another kind
+
+
+def test_pooling_counts_a_trial_once_even_though_it_is_recorded_under_its_shape_too():
+    net = FakeNet()
+    for _ in range(5):
+        policy.record(net, 'profile', 'call', 'narrow', 20, 0, 10)
+        policy.record(net, 'profile', 'call@field', 'narrow', 20, 0, 10, coverage=False)
+    [row] = policy.pooled_rows(net, 'profile', 'register')
+    assert row['attempted'] == row['matched'] == 5
+    assert policy.pooled_rows(net, 'profile', 'call') == []
+    assert policy.factors(net, 'profile', 'call@field')['narrow'] > 1   # a shape key keeps its own evidence and no pool
+
+
+def test_a_combinations_matches_credit_each_of_its_repairs():
+    net = FakeNet()
+    for _ in range(40):
+        policy.record(net, 'profile', 'call', 'hoist+sink', 20, 0, 10)
+    factors = policy.factors(net, 'profile', 'call')
+    assert factors['hoist'] > 1 and factors['sink'] > 1
+    assert policy.factors(net, 'profile', 'register')['hoist'] > 1  # and the profile's other mismatch kinds borrow it
+    assert 'hoist' not in policy.factors(net, 'other profile', 'call')
+
+
+def test_a_combinations_misses_never_demote_its_repairs():
+    net = FakeNet()
+    for _ in range(40):
+        policy.record(net, 'profile', 'call', 'hoist', 20, 0, 10)
+    alone = policy.factors(net, 'profile', 'call')['hoist']
+    for _ in range(500):
+        policy.record(net, 'profile', 'call', 'hoist+sink', 20, None, 10)
+    factors = policy.factors(net, 'profile', 'call')
+    assert factors['hoist'] >= alone
+    assert 'sink' not in factors  # only ever seen missing in a pair: still unmeasured, not poor
+
+
+def test_a_repair_applied_twice_counts_that_trial_once():
+    [row] = policy._credited([{'family': 'hoist+hoist', 'attempted': 3, 'improved': 1, 'matched': 1,
+                               'failed': 0, 'elapsed_ms': 30}])
+    assert (row['family'], row['attempted'], row['matched']) == ('hoist', 3, 1)

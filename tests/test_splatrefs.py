@@ -538,3 +538,147 @@ def test_import_maps_generated_names_to_linked_c_names(tmp_path, platform):
     base = tmp_path / unit['base_path']
     assert splatrefs.source_symbol_mappings(target, base, {'readable_function': 0x80000404}, 0x80000400) == {}
     assert splatrefs.source_symbol_mappings(target, tmp_path / 'missing.o', {}, 0x80000400) == {}
+
+
+def test_plan_accepts_rdata_and_constructor_tables(tmp_path):
+    """splat's `.rdata` is rodata under another name, and `.ctors`/`.dtors` hold no functions to count."""
+    cfg = config(tmp_path)
+    cfg['segments'][0]['subsegments'] = [[0, 'c', 'demo'], [0x10, '.rdata', 'demo'], [0x20, '.ctors', 'demo'],
+                                         [0x30, 'dtors', 'demo']]
+    (unit,) = splatrefs.plan(tmp_path, cfg)
+    assert unit['name'] == 'demo' and unit['sections'] == {'.rodata': 0x80000410}
+
+
+
+def test_plan_accepts_auto_offsets_and_dict_data_subsegments(tmp_path):
+    cfg = config(tmp_path)
+    (tmp_path / 'src/real.c').write_text('int real_func(void) { return 1; }')
+    (tmp_path / 'build/src/real.o').write_bytes(b'candidate')
+    cfg['segments'][0]['subsegments'] = [
+        [0, 'c', 'demo'], ['auto', 'hasm', 'libm_vals'], [8, 'c', 'real'], [0x20, 'data', 'real'],
+        {'start': 0x30, 'type': '.data', 'vram': 0x80000430, 'name': 'real'},
+        {'start': 0x40, 'type': '.rodata', 'vram': 0x80000440, 'name': 'only_data'},
+        {'start': 0x50, 'type': '.bss', 'vram': 0x80000450, 'name': 'real'}]
+    units = splatrefs.plan(tmp_path, cfg)
+    assert [unit['name'] for unit in units] == ['demo', 'real']
+    assert units[1]['sections']['.data'] == 0x80000430 and units[1]['sections']['.bss'] == 0x80000450
+
+
+def test_versions_follow_a_makefile_that_names_its_config_through_variables(tmp_path):
+    (tmp_path / 'versions/us').mkdir(parents=True)
+    (tmp_path / 'versions/eu').mkdir()
+    for version in ('us', 'eu'):
+        (tmp_path / f'versions/{version}/game.yaml').write_text('options: {}\nsegments: []\n')
+    (tmp_path / 'Makefile').write_text('VERSION ?= us\nTARGET := game\nVERSION_DIR := versions/$(VERSION)\n'
+                                       'SPLAT_YAML := $(VERSION_DIR)/$(TARGET).yaml\n'
+                                       'SPLAT := splat split $(SPLAT_YAML)\n')
+    found = ForkProject(tmp_path)._splat_version_configs()
+    assert sorted(found) == ['eu', 'us']
+
+def test_an_elf_counts_when_only_the_header_crc_and_the_tail_padding_differ_and_the_built_cartridge_is_the_original(
+        tmp_path, monkeypatch):
+    original = bytearray(b"A" * 0x1100)
+    original[0x10:0x18] = b"CRCCRC12"
+    original += b"\xff" * 64
+    image = tmp_path / "baserom.z64"
+    image.write_bytes(bytes(original))
+    (tmp_path / "game.z64").write_bytes(bytes(original))  # (the project's own finished cartridge)
+    build = tmp_path / "build"
+    build.mkdir()
+    elf = build / "game.elf"
+    elf.write_bytes(b"elf")
+    flat = bytearray(original[:0x1100])
+    flat[0x10:0x18] = b"\0" * 8
+    binary = tmp_path / "out.bin"
+    monkeypatch.setattr(splatrefs, "binary_span", lambda path: 0x1100)
+    monkeypatch.setattr(splatrefs, "run", lambda cmd, root, log: binary.write_bytes(bytes(flat)))
+    sha1 = splatrefs.digest(image)
+    found = lambda: splatrefs._through_header_crc(tmp_path, build, {elf}, image, sha1, tmp_path / "objcopy", binary)
+    assert found() == [elf]
+    flat[0x500] = 0x42  # (any other byte differing is no match)
+    assert found() == []
+    flat[0x500] = ord("A")
+    (tmp_path / "game.z64").unlink()  # (no finished cartridge that is the original)
+    assert found() == []
+
+
+def test_a_library_source_named_with_a_parent_path_is_a_unit_named_by_its_place_in_the_checkout(tmp_path):
+    cfg = config(tmp_path)
+    (tmp_path / 'lib/nusys').mkdir(parents=True)
+    (tmp_path / 'build/lib/nusys').mkdir(parents=True)
+    (tmp_path / 'lib/nusys/boot.c').write_text('void boot(void) {}')
+    (tmp_path / 'build/lib/nusys/boot.o').write_bytes(b'candidate')
+    cfg['segments'][0]['subsegments'][0][2] = '../lib/nusys/boot'
+    cfg['segments'][0]['subsegments'].insert(1, {'type': 'custom_data', 'start': 8, 'name': 'data/anim'})
+    unit = splatrefs.plan(tmp_path, cfg)[0]
+    assert unit['name'] == 'lib/nusys/boot' and unit['raw'] == '../lib/nusys/boot'
+    assert unit['source'] == tmp_path / 'lib/nusys/boot.c' and unit['base'] == tmp_path / 'build/lib/nusys/boot.o'
+    cfg['segments'][0]['subsegments'][0][2] = '../../../outside'  # (still never outside the checkout)
+    with pytest.raises(ForkError):
+        splatrefs.plan(tmp_path, cfg)
+
+
+
+def test_plan_takes_cpp_units_and_the_build_folder_the_checksum_file_names(tmp_path):
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'src/demo.cpp').write_text('int demo_func(void) { return 8; }')
+    for variant in ('ntsc', 'pal'):
+        (tmp_path / f'build/{variant}/src').mkdir(parents=True)
+        (tmp_path / f'build/{variant}/src/demo.o').write_bytes(b'candidate')
+    cfg = {'options': {'src_path': 'src', 'build_path': '.', 'platform': 'n64'},
+           'segments': [{'type': 'code', 'start': 0, 'vram': 0x80000400, 'subsegments': [[0, 'cpp', 'demo']]}]}
+    with pytest.raises(ForkError, match='ambiguous'):
+        splatrefs.plan(tmp_path, cfg)
+    (tmp_path / 'checksum.sha1').write_text('A' * 40 + '  build/ntsc/game.z64\n')
+    prefer = splatrefs.verified_build_folders(tmp_path, 'a' * 40)
+    assert prefer == ('build/ntsc',)
+    units = splatrefs.plan(tmp_path, cfg, prefer=prefer)
+    assert units[0]['base'] == tmp_path / 'build/ntsc/src/demo.o' and units[0]['source'].name == 'demo.cpp'
+
+
+def test_combine_parts_drops_repeated_includes():
+    from decompnet.forks.splatrefs import combine_parts
+    one = '.include "macro.inc"\nglabel a\nnop\n'
+    two = '.include "macro.inc"\n.section .data\n.word 1\n'
+    out = combine_parts([one, two])
+    assert out.count('.include "macro.inc"') == 1 and '.word 1' in out and 'glabel a' in out
+
+
+def test_non_ascii_strings_detected(tmp_path):
+    from decompnet.forks.splatrefs import non_ascii_strings
+    (tmp_path / 'a.s').write_text('.asciz "abc"\n', encoding='utf-8')
+    assert not non_ascii_strings(tmp_path)
+    (tmp_path / 'b.s').write_text('.asciz "渾"\n', encoding='utf-8')
+    assert non_ascii_strings(tmp_path)
+
+
+def test_built_child_sha1_needs_rebuild_and_matching_cartridge(tmp_path):
+    from decompnet.forks.splatnested import built_child_sha1
+    child = tmp_path / 'game'
+    (child / 'build').mkdir(parents=True)
+    (tmp_path / 'build').mkdir()
+    image = child / 'game.decompressed.bin'
+    image.write_bytes(b'original')
+    outer = tmp_path / 'build' / 'rom.z64'
+    outer.write_bytes(b'cartridge')
+    outer_sha = hashlib.sha1(b'cartridge').hexdigest()
+    assert built_child_sha1(tmp_path, child, image, outer_sha) is None  # nothing rebuilt yet
+    (child / 'build' / 'game.bin').write_bytes(b'different')
+    assert built_child_sha1(tmp_path, child, image, outer_sha) is None
+    (child / 'build' / 'game.bin').write_bytes(b'original')
+    assert built_child_sha1(tmp_path, child, image, outer_sha) == hashlib.sha1(b'original').hexdigest()
+    assert built_child_sha1(tmp_path, child, image, '0' * 40) is None  # the rebuilt cartridge must match
+
+
+def test_plan_skips_top_level_custom_data_segments(tmp_path):
+    from decompnet.forks.splatrefs import plan
+    config = {'options': {}, 'segments': [[0, 'bin', 'a'], [0x10, 'rzip', 'logo'], [0x20, 'databin', 'd'],
+                                          [0x30]]}
+    with pytest.raises(Exception, match='distinct code units'):
+        plan(tmp_path, config)  # (no code at all, but the custom data segments were not refused)
+
+
+def test_assemble_skips_zero_size_unit(tmp_path):
+    from decompnet.forks.splatrefs import assemble
+    unit = {'name': 'buffers/empty', 'vram': 0x80000000}
+    assert assemble(tmp_path, tmp_path, unit, {}, b'', 'as', 'ld', (), lambda *a: None) is None

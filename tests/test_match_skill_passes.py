@@ -6,6 +6,7 @@ import stat
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -149,3 +150,169 @@ def test_the_verbose_scheduler_notes_need_no_compiler_flag_and_print_only_the_no
     assert "First scheduler notes (3 lines):" in text
     assert ";; launching insn 58 (priority 2)" in text and ";; set-count rule: insn 4 first" in text
     assert compiler_passes.verbose_schedule({"phases": {}}) == []
+
+
+LOOP = """;; Function f
+Loop from 17 to 57: 13 real insns.
+Insn 33: regno 90 (life 4), savings 2  moved to 73
+(insn 33 31 35 (set (reg:SI 90)
+        (const_int 7)) 1 {movsi} (nil)
+    (nil))
+Biv 83 initialized at insn 16: initial value 0
+giv at 43 reduced to (reg:SI 101)
+"""
+
+
+def test_the_loop_optimizers_notes_are_read_out_of_the_loop_dump_without_the_rtl():
+    assert compiler_passes.loop_decisions({"phases": {"loop": {"excerpt": LOOP}}}) == [
+        "Loop from 17 to 57: 13 real insns.", "Insn 33: regno 90 (life 4), savings 2  moved to 73",
+        "Biv 83 initialized at insn 16: initial value 0", "giv at 43 reduced to (reg:SI 101)"]
+    assert compiler_passes.loop_decisions({}) == []
+    many = {"phases": {"loop": {"excerpt": "\n".join(f"Insn {i}: moved to {i}" for i in range(100))}}}
+    assert compiler_passes.loop_decisions(many)[-1] == "... 20 more in the loop dump"
+
+
+def test_the_report_has_the_loop_section_and_hands_back_the_compile_files(tmp_path, monkeypatch):
+    net = project(tmp_path)
+    kept = {"i": "int f1(void){return 0;}", "s": "f1:\n\tjr\t$31\n", "lreg": ";; Function f1\n"}
+    monkeypatch.setattr(compiler_passes, "diagnose", lambda *a, **k: (
+        result() | {"toolchain": "sn-n64-281", "files": kept, "phases": {"loop": {"excerpt": LOOP}}}, {}))
+    reply = hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}", "save": True})
+    assert "Loop optimizer decisions" in reply["text"] and "  Insn 33: regno 90" in reply["text"]
+    assert reply["files"] == kept
+    assert "files" not in hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}"})
+
+
+def test_passes_py_save_writes_every_file_beside_the_report(tmp_path):
+    sys.path.insert(0, str(SCRIPTS))
+    spec = importlib.util.spec_from_file_location("skill_passes_save", SCRIPTS / "passes.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    line = module.save_files(tmp_path / "out", "f", "the report", {"i": "C", "s": "asm", "lreg": "alloc"})
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["f.i", "f.lreg", "f.report.txt", "f.s"]
+    assert (tmp_path / "out" / "f.report.txt").read_text() == "the report" and "f.s" in line
+
+
+def test_sn_profiles_are_diagnosable_through_their_driver():
+    from decompnet.app import compiler_diagnostics
+    for tid in ("sn-n64-281", "sn-n64-272-0001", "sn-n64-272-0001-as0004", "sn-n64-272-0004", "sn-n64-272-0006", "sn-n64-272-970404"):
+        assert toolchains.get(tid).pass_dumps, tid
+    assert not toolchains.get("gcc-2.7.2-kmc").pass_dumps  # a native driver needs no flag
+    cfg = SimpleNamespace(cmd=["py", "sn64.py", "--cc", "/t/cc1n64.exe", "--cpp", "/t/cppn64.exe", "--runner", "/t/wibo",
+                               "{src}", "{obj}", "{include}", "-G0", "-O2", "-DX=1", "-I/inc"])
+    assert compiler_diagnostics.driver_cc1_words(cfg) == ["/t/wibo", "/t/cc1n64.exe", "-quiet", "-G0", "-O2", "IN.i", "-o", "OUT.s"]
+    assert compiler_diagnostics.driver_cc1_words(SimpleNamespace(cmd=["gcc", "-c"])) is None
+
+
+def test_kept_files_name_each_by_its_last_extension_and_skip_objects(tmp_path):
+    from decompnet.app import compiler_diagnostics
+    for name, text in {"func.c": "src", "func.sn.i": "pre", "func.sn.s": "a\r\nb\r\n", "func.sn.i.lreg": "L", "func.sn.i.addressof": "x"}.items():
+        (tmp_path / name).write_bytes(text.encode())
+    (tmp_path / "func.o").write_bytes(b"\x7fELF")
+    (tmp_path / "func.sn.obj").write_bytes(b"obj")
+    assert compiler_diagnostics.kept_files(tmp_path) == {"c": "src", "i": "pre", "lreg": "L", "s": "a\nb\n"}
+
+
+SN = "sn-n64-281"
+
+
+@pytest.mark.skipif(not toolchains.installed(SN) or not toolchains.installed("wibo") or not toolchains.installed("psyq-obj-parser"),
+                    reason="the SN64 compiler, wibo or the converter isn't installed")
+def test_a_real_sn_compile_gives_the_passes_loop_notes_and_files(tmp_path):
+    net = project(tmp_path)
+    config = {"kind": "rom", "platform": "n64", "compiler": {"toolchain": SN, "flags": toolchains.get(SN).flags}}
+    with net.store.tx() as db:
+        db.execute("UPDATE projects SET config=?", (json.dumps(config),))
+    source = "extern int g; int f1(int *p, int a, int n) { int i, s = 0; for (i = 0; i < n; i++) { s += p[i] * (a * 7 + g); } return s; }"
+    reply = hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": source, "save": True})
+    assert "Register allocation" in reply["text"] and "Loop optimizer decisions" in reply["text"] and "moved to" in reply["text"]
+    assert "Scheduling order, sched2" in reply["text"]
+    assert {"i", "s", "lreg", "greg", "loop", "sched", "sched2"} <= set(reply["files"])
+    assert "f1:" in reply["files"]["s"] and "f1" in reply["files"]["i"]
+    pre = hosted_judge.preprocess_report(net, {"slug": "game", "name": "f1", "source": source})
+    assert "f1" in pre["text"] and pre["cc1"][-3:] == ["IN.i", "-o", "OUT.s"] and "-quiet" in pre["cc1"]
+
+
+@pytest.mark.skipif(not toolchains.installed(SN) or not toolchains.installed("wibo") or not toolchains.installed("psyq-obj-parser"),
+                    reason="the SN64 compiler, wibo or the converter isn't installed")
+def test_a_real_sn_compile_answers_the_allocation_request_handoff_and_explain_regs_use(tmp_path):
+    net = project(tmp_path)
+    config = {"kind": "rom", "platform": "n64", "compiler": {"toolchain": SN, "flags": toolchains.get(SN).flags}}
+    with net.store.tx() as db:
+        db.execute("UPDATE projects SET config=?", (json.dumps(config),))
+    source = "int f1(int a, int b) { int i, s = 0; for (i = 0; i < a; i++) { s += b * i; } return s; }"
+    reply = hosted_judge.allocation_report(net, {"slug": "game", "name": "f1", "source": source, "rows": []})
+    assert "error" not in reply and "Register " in reply["lreg"] and reply["allocation"]  # -g (refused or not) costs nothing
+
+
+def test_the_requests_flags_reach_the_diagnostic_compile_as_profile_flags(tmp_path, monkeypatch):
+    """#match-function: two functions probed under -mfp32 with fast_judge.py --flags were dumped under their -mfp64
+    profile by passes.py and explain_regs.py: every float register the dumps named was another compile's."""
+    net = project(tmp_path)
+    seen = []
+    monkeypatch.setattr(compiler_passes, "diagnose",
+                        lambda *a, **k: (seen.append(k.get("profile_flags")) or result() | {"toolchain": "gcc-2.7.2-kmc"}, {}))
+    hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}", "flags": ["-mfp32"]})
+    hosted_judge.allocation_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}", "flags": "-mfp32"})
+    hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}"})
+    assert seen[0] == ("-mfp32",) and seen[1] == ("-mfp32",) and not seen[-1]
+    bad = hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}", "flags": ["x; rm"]})
+    assert "flags must be" in bad["error"]
+
+
+FLAG_STUB = textwrap.dedent("""\
+    #!{python}
+    import json, sys
+    for line in sys.stdin:
+        r = json.loads(line)
+        out = ({{"name": "f", "vram": 1, "target": "00", "header": "", "compiler": {{"toolchain": "t", "flags": ["-mfp64"]}}}}
+               if r["op"] == "function" else {{"text": "flags " + " ".join(r.get("flags") or [])}})
+        print(json.dumps(out), flush=True)
+""")
+
+
+def test_passes_py_sends_the_flags_it_scores_with(tmp_path, monkeypatch, capsys):
+    stub = tmp_path / "decomp"
+    stub.write_text(FLAG_STUB.format(python=sys.executable))
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("DECOMP_BIN", str(stub))
+    monkeypatch.delenv("DD_EXTRA_FLAGS", raising=False)
+    sys.path.insert(0, str(SCRIPTS))
+    spec = importlib.util.spec_from_file_location("skill_passes_flags", SCRIPTS / "passes.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    (tmp_path / "c.c").write_text("int f(void){return 0;}")
+    module.main([str(tmp_path / "c.c"), "--slug", "g", "--function", "f", "--flags=-mfp32"])
+    assert capsys.readouterr().out.strip() == "flags -mfp32"
+    monkeypatch.setenv("DD_EXTRA_FLAGS", "-mfp32")
+    module.main([str(tmp_path / "c.c"), "--slug", "g", "--function", "f"])
+    assert capsys.readouterr().out.strip() == "flags -mfp32"
+
+
+@pytest.mark.skipif(not toolchains.installed(SN) or not toolchains.installed("wibo") or not toolchains.installed("psyq-obj-parser"),
+                    reason="the SN64 compiler, wibo or the converter isn't installed")
+def test_a_real_sn_compile_dumps_the_profile_with_the_requests_flags(tmp_path):
+    net = project(tmp_path)
+    flags = [f for f in toolchains.get(SN).flags if f not in ("-mfp32", "-mfp64")] + ["-mfp64"]
+    config = {"kind": "rom", "platform": "n64", "compiler": {"toolchain": SN, "flags": flags}}
+    with net.store.tx() as db:
+        db.execute("UPDATE projects SET config=?", (json.dumps(config),))
+    source = "float f1(float a, float b) { return a * b + a; }"
+    reply = hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": source, "save": True, "flags": ["-mfp32"]})
+    assert "-mfp64 -mfp32 -da" in reply["text"] and "Warning: the dump flags changed" not in reply["text"]
+
+
+def test_a_long_sched_dump_whose_notes_come_first_still_gives_its_order(tmp_path, monkeypatch):
+    """An SN64 GCC 2.8.1 sched dump writes ~60 KB of `;;` launch notes before its RTL: cut at 60,000 characters, a
+    395-instruction function's first-scheduler order came back empty ("not written by this compiler build")."""
+    net = project(tmp_path)
+    notes = ";; insn[   8]: priority =    1, ref_count =    2\n" * 2000
+    sched = notes + SCHED
+    assert len(sched) > 60000 and compiler_passes.SKILL_EXCERPT_CHARS > 1_000_000
+    monkeypatch.setattr(compiler_passes, "diagnose", lambda *a, **k: (
+        result() | {"toolchain": "gcc-2.7.2-kmc", "phases": {"sched": {"excerpt": sched[:a[5]], "excerpt_cut": len(sched) > a[5]}}}, {}))
+    text = hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}", "passes": ["sched"]})["text"]
+    assert "Scheduling order, sched (first scheduler), 2 insns:" in text and "4 movsi_internal2" in text
+    monkeypatch.setattr(compiler_passes, "SKILL_EXCERPT_CHARS", 1000)
+    text = hosted_judge.passes_report(net, {"slug": "game", "name": "f1", "source": "int f1(void){return 0;}", "passes": ["sched"]})["text"]
+    assert "the dump was cut: the order is incomplete" in text

@@ -726,6 +726,17 @@ def test_nothing_is_handed_out_while_the_compiler_cannot_run(game, monkeypatch):
     assert net.readability.claim(agent, 'game').startswith('MAKE READABLE')
 
 
+def test_blocked_reason_tells_a_helper_to_wait_for_the_compiler(game, monkeypatch):
+    # A helper whose session could only hear "the compiler can't run" was counted as failing and paused after five.
+    from decompnet import toolchains
+
+    net, _, _ = game
+    monkeypatch.setattr(toolchains, 'runtime_error', lambda tid: 'The Linux compiler runner is not ready.')
+    assert net.readability.blocked_reason('game') == 'The Linux compiler runner is not ready.'
+    monkeypatch.setattr(toolchains, 'runtime_error', lambda tid: None)
+    assert net.readability.blocked_reason('game') == ''
+
+
 def test_a_function_is_handed_out_only_when_its_own_compiler_can_run(game, monkeypatch):
     # An N64 game's smallest function is built with the compiler its Linux runner runs; the check looked only at
     # the game's own compiler, which ran, and the function was handed out 10 times while the runner was down.
@@ -740,11 +751,13 @@ def test_a_function_is_handed_out_only_when_its_own_compiler_can_run(game, monke
         db.execute("UPDATE functions SET n_insns=60 WHERE name='g'")  # g first, as the bigger one
     down = {'gcc-4.4.0-n64': 'The Linux compiler runner is not ready.'}
     monkeypatch.setattr(toolchains, 'runtime_error', lambda tid: down.get(tid))
+    assert net.readability.blocked_reason('game') == ''  # f can still be polished: the helper isn't parked
     assert net.readability.claim(agent, 'game').startswith('MAKE READABLE: f')  # g skipped, not handed out
     with net.store.tx() as db:
         db.execute("UPDATE functions SET readable=1 WHERE name='f'")
         db.execute('DELETE FROM claims')
     said = net.readability.claim(agent, 'game')
+    assert net.readability.blocked_reason('game') == 'The Linux compiler runner is not ready.'
     assert said.startswith("The compiler for what's left can't run right now")
     assert [r['detail'] for r in net.store.all("SELECT detail FROM events WHERE kind='polish'")] == ['f']
     down.clear()

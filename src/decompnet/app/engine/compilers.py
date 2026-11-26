@@ -4,12 +4,14 @@ suggestions and try_compiler, and the compiler map with the judge's survey (comp
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
 import re
 import threading
 import time
+from bisect import bisect_right
 from contextlib import closing, nullcontext
 
 from ... import arch, compiler, compilermap, consoles, toolchains
@@ -44,6 +46,55 @@ FLAG_EXTRAS = {"gcc": ("-fno-strength-reduce", "-fno-schedule-insns", "-fno-sche
 SMALL_DATA_SIZES = (0, 8)
 MAX_FLAG_VARIANTS = 13
 FLAGS_SHOWN = 6
+
+
+def merge_compiler_settings(base: dict, ours: dict, theirs: dict) -> dict:
+    """`ours` (a change made from `base`) on top of `theirs`, which others changed meanwhile: what we changed wins,
+    what we didn't is theirs."""
+    out = dict(theirs)
+    if ours.get('compiler') != base.get('compiler'):
+        out['compiler'] = ours['compiler']
+    old, new = base.get('compiler_ranges') or [], ours.get('compiler_ranges') or []
+    if old != new:
+        added = [r for r in new if r not in old]
+        kept = []
+        for r in theirs.get('compiler_ranges') or []:
+            if r in old and r not in new:
+                continue
+            pieces = [(r['start'], r['end'])]
+            for other in added:
+                pieces = [(x, y) for lo, hi in pieces
+                          for x, y in ((lo, min(hi, other['start'])), (max(lo, other['end']), hi)) if x < y]
+            kept.extend(dict(r, start=lo, end=hi) for lo, hi in pieces)
+        out['compiler_ranges'] = sorted(kept + added, key=lambda r: r['start'])
+    old, new = base.get('function_compilers') or {}, ours.get('function_compilers') or {}
+    if old != new:
+        merged = dict(theirs.get('function_compilers') or {})
+        for key in old.keys() | new.keys():
+            if old.get(key) != new.get(key):
+                if key in new:
+                    merged[key] = new[key]
+                else:
+                    merged.pop(key, None)
+        out['function_compilers'] = merged
+    return out
+
+
+def keep_compilers(proposed: dict, current: dict, functions: list, starts: list[int]) -> dict:
+    """The proposed settings with `functions` keeping what they're built with now."""
+    from ..prepared_evidence import scoped_config
+    out = copy.deepcopy(proposed)
+    ordered = sorted(set(starts))
+    for fn in functions:
+        own = compiler_for(current, fn['vram'], fn)
+        settings = {'toolchain': own['toolchain'], 'flags': list(own.get('flags', []))}
+        # Stop before the next start, even when a legacy extent overlaps another overlay.
+        after = bisect_right(ordered, fn['vram'])
+        end = min(fn['vram'] + max(1, fn['size'] or 0), ordered[after] if after < len(ordered) else 1 << 64)
+        out = scoped_config({'config': json.dumps(out)},
+                            {'vram': fn['vram'], 'size': end - fn['vram'], 'rom_offset': fn['rom_offset'], 'name': fn['name']},
+                            settings)
+    return out
 
 
 class CompilerMixin:
@@ -199,7 +250,7 @@ class CompilerMixin:
         if all_installed:
             # Only this console's installed, usable compilers: never download tools or call an AI provider.
             candidates = sorted({(c.id, tuple(consoles.default_flags(cfg, c.id)))
-                                 for c in consoles.of(cfg).compilers
+                                 for c in consoles.of(cfg).compilers_for(cfg)
                                  if c.automatic and ready(c.id)} | set(candidates))
             candidates = [(tc, flags) for tc, flags in candidates if ready(tc)]
         # Debug line labels can change old GCC assemblers' delay-slot scheduling even at the same -O level.
@@ -296,7 +347,8 @@ class CompilerMixin:
             result["default"] = result["toolchain"] == default["toolchain"] and result["flags"] == default["flags"]
         return {"completed_at": row["completed_at"], "stale": digest != row["input_digest"], "comparison": comparison}
 
-    def run_compiler_comparison(self, slug, log=print, function="", untested_only=True, flags_only=False, auto_apply=False, used_profiles_only=False):
+    def run_compiler_comparison(self, slug, log=print, function="", untested_only=True, flags_only=False, auto_apply=False, used_profiles_only=False,
+                                apply_matches=False):
         lock = self._compiler_comparison_locks.setdefault(slug, threading.Lock())
         if not lock.acquire(blocking=False):
             raise NetworkError("A compiler comparison is already running for this project. Wait for it to finish.")
@@ -306,36 +358,40 @@ class CompilerMixin:
                 if check:
                     check()
                 return self.survey_compilers(slug, log=log, all_installed=True, function=function,
-                                             untested_only=untested_only and not function, flags_only=flags_only, auto_apply=auto_apply, used_profiles_only=used_profiles_only)
+                                             untested_only=untested_only and not function, flags_only=flags_only, auto_apply=auto_apply, used_profiles_only=used_profiles_only,
+                                             apply_matches=apply_matches)
         finally:
             lock.release()
 
     @batched
     def survey_compilers(self, slug: str, log=lambda line: None, limit: int | None = None, state: dict | None = None,
                          all_installed: bool = False, function: str = "", untested_only: bool = False, flags_only: bool = False,
-                         auto_apply: bool = False, used_profiles_only: bool = False) -> dict:
+                         auto_apply: bool = False, used_profiles_only: bool = False, apply_matches: bool = False) -> dict:
         # Saved-file watching owns synchronization. A comparison uses current DB inputs and
         # rejudges before applying; loading a project here must not restore/reverify its files.
         with self.progress.view() if hasattr(self,'progress') else nullcontext():
-            if auto_apply and all_installed and not function:
+            if (auto_apply or apply_matches) and all_installed and not function:
                 from ..compiler_apply_queue import Queue
                 queue = Queue(self, log)
                 try:
                     return self._survey_compilers(slug,queue,limit,state,all_installed,function,untested_only,
-                                                  flags_only,auto_apply,used_profiles_only,apply_queue=queue)
+                                                  flags_only,auto_apply,used_profiles_only,apply_queue=queue,
+                                                  apply_matches=apply_matches)
                 finally:queue.close()
             return self._survey_compilers(slug,log,limit,state,all_installed,function,untested_only,
-                                          flags_only,auto_apply,used_profiles_only)
+                                          flags_only,auto_apply,used_profiles_only,apply_matches=apply_matches)
 
     def _survey_compilers(self, slug: str, log=lambda line: None, limit: int | None = None, state: dict | None = None,
                          all_installed: bool = False, function: str = "", untested_only: bool = False, flags_only: bool = False,
-                         auto_apply: bool = False, used_profiles_only: bool = False, apply_queue=None) -> dict:
+                         auto_apply: bool = False, used_profiles_only: bool = False, apply_queue=None, apply_matches: bool = False) -> dict:
         """The judge's part of the compiler map. Agents' C for functions that don't match yet, built with each other
         compiler the project uses: C that matches the game with another compiler (and not with today's) confirms that
         compiler for its function. Contradicted functions first, then the closest attempts; C already tried is
         skipped. Then each run of the map with confirmations becomes a suggestion, checked like an agent's."""
         if type(auto_apply) is not bool or auto_apply and not all_installed:
             raise NetworkError("Auto-apply requires an installed-compiler comparison and a boolean option.")
+        if type(apply_matches) is not bool or apply_matches and not all_installed:
+            raise NetworkError("Applying matches requires an installed-compiler comparison and a boolean option.")
         if not isinstance(function, str):
             raise NetworkError("Choose a function by name.")
         started=time.monotonic()
@@ -492,7 +548,8 @@ class CompilerMixin:
                             "before": baseline, "best": best, "profile": best_profile, "exact_matches_current": 0,
                             "total": total, "remaining": total - (n - 1) if total is not None else None, "deferred": deferred,
                             "completed": n - 1, "improved": len(improvements), "exact": found,
-                            "skipped": skipped, "results": list(results), "auto_apply": auto_apply, "applied_count": applied_count}
+                            "skipped": skipped, "results": list(results), "auto_apply": auto_apply, "apply_matches": apply_matches,
+                            "applied_count": applied_count}
                 report(progress)
                 if n==1:log(f'Compiler preparation · first compile ready: {time.monotonic()-started:.3f}s')
                 from ..compiler_profiles import check_profiles
@@ -553,9 +610,13 @@ class CompilerMixin:
                     with self.project_store(proj['id']).tx() as db:
                         db.execute("INSERT OR REPLACE INTO compiler_tests VALUES(?,?,?,?)",
                                    (fn["id"], input_digest, time.time(), json.dumps(completed)))
-                if auto_apply and best_profile and (improved or matches) and not draft_gain:
+                # "Apply matches" takes exact C only; "apply better settings" takes partial gains too. An exact
+                # profile wins over one that merely scores 100% without matching.
+                target = matches[0] if matches and best_profile not in matches else best_profile
+                wanted = auto_apply and (improved or matches) or apply_matches and matches
+                if wanted and target and not draft_gain:
                     def apply(fn=fn, source=source, candidates=candidates, input_digest=input_digest,
-                              best_profile=best_profile, completed=completed, result_row=result_row):
+                              target=target, completed=completed, result_row=result_row):
                         nonlocal applied_count
                         applied, apply_error = False, ""
                         check_cancel()
@@ -567,7 +628,7 @@ class CompilerMixin:
                                     self._comparison_digest(current_proj, current, source, candidates) != input_digest):
                                 raise NetworkError("Code or build inputs changed during comparison; review a fresh result before applying.")
                             check_cancel()
-                            self.apply_function_compiler(slug, fn["name"], best_profile[0], best_profile[1])
+                            self.apply_function_compiler(slug, fn["name"], target[0], target[1])
                             applied = True
                             applied_count += 1
                             log(f"{fn['name']}: best settings applied and rechecked.")
@@ -598,7 +659,8 @@ class CompilerMixin:
                         "before": baseline, "best": best, "profile": best_profile,
                         "total": total, "remaining": total - n if total is not None else None, "deferred": deferred,
                         "completed": n, "improved": len(improvements), "exact": found, "skipped": skipped,
-                        "results": list(results), "auto_apply": auto_apply, "applied": applied, "applied_count": applied_count})
+                        "results": list(results), "auto_apply": auto_apply, "apply_matches": apply_matches,
+                        "applied": applied, "applied_count": applied_count})
                 state.update(tried=n, confirmed=found)
                 if n % 25 == 0:
                     log(f"{n} functions tried, {found} with exact matches")
@@ -618,7 +680,7 @@ class CompilerMixin:
                 log(f"{n} functions tried, {found} confirmed")
         if apply_queue:apply_queue.finish()
         if all_installed:
-            # Auto-apply is explicit for this run; the compiler-map agreement preference is separate.
+            # Auto-apply and applying matches are explicit for this run; the compiler-map agreement preference is separate.
             log(f"Finished: {n} functions tested; {len(improvements)} have better tested settings; "
                 f"{found} have exact matches. {applied_count} function profiles applied and rechecked.")
             if not n:
@@ -627,7 +689,7 @@ class CompilerMixin:
             return {"tried": n, "skipped": skipped, "total": total, "remaining": max(0, total - n),
                     "deferred": deferred, "confirmed": found, "matches": confirmed, "comparison": comparison,
                     "improvements": sorted(improvements, key=lambda r: -r["best"]), "results": results,
-                    "auto_apply": auto_apply, "applied_count": applied_count}
+                    "auto_apply": auto_apply, "apply_matches": apply_matches, "applied_count": applied_count}
         self._update_cfg(slug, lambda c: c.__setitem__("compiler_survey", {"tried": tried, "confirmed": confirmed,
                                                                            "t": time.time()}))
         suggested = self._suggest_from_map(proj, confirmed)
@@ -898,11 +960,27 @@ class CompilerMixin:
         counts = self.test_compilers(slug, console.installable_compilers(), log=log) if retest and self.is_rom(proj) else {}
         return {"installed": installed, "left_out": left_out, "test": counts}
 
+    def set_released(self, slug: str, year) -> None:
+        """The year this game came out (0: not known): compilers newer than it are never offered or used (consoles.too_new).
+        A compiler the project already uses stays; it's the user's to change."""
+        try:
+            year = int(year or 0)
+        except (TypeError, ValueError):
+            raise NetworkError("the release year is a number, like 1998") from None
+        if year and not 1970 <= year <= 2100:
+            raise NetworkError("the release year is a number, like 1998")
+        self._update_cfg(slug, lambda cfg: cfg.__setitem__("released", year) if year else cfg.pop("released", None))
+
     def set_auto_adjust(self, slug: str, on: bool) -> None:
         self._update_cfg(slug, lambda cfg: cfg.__setitem__("auto_compiler", bool(on)))
 
     def _toolchain_named(self, cfg: dict, compiler: str) -> str:
-        names = [c.id for c in consoles.of(cfg).compilers]
+        if tc := next((t.id for t in consoles.of(cfg).compilers if compiler.strip().lower() in (t.id, t.name.lower())), None):
+            if why := consoles.too_new(cfg, tc):
+                raise NetworkError(why)
+            if toolchains.is_disabled(tc):
+                raise NetworkError(f"{consoles.compiler_name(tc)} is disabled (Compilers & tools); enable it there to use it")
+        names = [c.id for c in consoles.of(cfg).compilers_for(cfg)]
         tc = next((t for t in names if compiler.strip().lower() in (t, consoles.compiler_name(t).lower())), None)
         if tc is None:
             raise NetworkError(f"no compiler {compiler!r} for this game; its platform's: {', '.join(names)}")
@@ -1029,15 +1107,24 @@ class CompilerMixin:
 
     def resolve_suggestion(self, slug: str, sid: int, apply: bool, guard: bool = False, log=lambda line: None) -> None:
         """The user's answer to a suggestion: apply it (a compiler: the project switches to it) or dismiss it."""
-        hit = next((s for s in self.cfg(self._project(slug)).get("suggestions", []) if s["id"] == sid), None)
+        # Saved-file watching owns imports and exports: a forced folder check around every step here made one
+        # single-function suggestion take over a minute on a 2,000-function project.
+        with self.progress.view() if hasattr(self, 'progress') else nullcontext():
+            hit = next((s for s in self.cfg(self._project(slug)).get("suggestions", []) if s["id"] == sid), None)
         if hit is None:
             raise NetworkError(f"no suggestion {sid}")
         from .. import function_profile_suggestions
-        bundle = function_profile_suggestions.saved(self, self._project(slug), hit) if apply and hit['toolchain'] and not self.fork_slug(slug) else None
+        with self.progress.view() if hasattr(self, 'progress') else nullcontext():
+            bundle = function_profile_suggestions.saved(self, self._project(slug), hit) if apply and hit['toolchain'] and not self.fork_slug(slug) else None
         if bundle:
+            from ..restore_effects import batched as defer_effects
             agent, _ = self.local_agent('you')
             log('Rechecking exact source/header/profile for '+bundle['function']+' only…')
-            function_profile_suggestions.apply(self, agent, self._project(slug), bundle, hit['toolchain'], hit['flags'])
+            judging = (self.progress.judging(slug, synchronize=False, publish=False)
+                       if hasattr(self, 'progress') else nullcontext())
+            with self.progress.view() if hasattr(self, 'progress') else nullcontext(), judging:
+                defer_effects(function_profile_suggestions.apply)(
+                    self, agent, self._project(slug), bundle, hit['toolchain'], hit['flags'])
             log('Exact source/header/profile saved for '+bundle['function']+' only.')
         elif apply and hit["toolchain"] and hit.get("ranges") and self.fork_slug(slug):  # (its files: each if it holds)
             self.forks.set_compiler_ranges(slug, hit["ranges"], hit["toolchain"], log=log)
@@ -1046,7 +1133,7 @@ class CompilerMixin:
         elif apply and hit["toolchain"]:
             self.set_compiler(slug, hit["toolchain"], hit["flags"], guard=guard, log=log)
         self._update_cfg(slug, lambda cfg: next(s for s in cfg["suggestions"] if s["id"] == sid).__setitem__(
-            "status", "applied" if apply else "dismissed"))
+            "status", "applied" if apply else "dismissed"), synchronize=False)
 
     @batched
     def apply_function_compiler(self, slug: str, function: str, toolchain: str, flags: list[str],
@@ -1180,126 +1267,196 @@ class CompilerMixin:
             opened.append(name)
         return opened
 
-    def _apply_compiler_config(self, proj, cfg: dict, reopen: bool = False, log=lambda line: None) -> list[str]:
+    def _apply_compiler_config(self, proj, cfg: dict, reopen: bool = False, log=lambda line: None,
+                               preserve_matches: bool = False) -> list[str]:
         """Check proposed settings privately, then publish settings and scores together. A green population must
         describe today's compiler, including functions outside the old forty-function sample. Failed checks must
         not expose trial flags to working helpers, erase drafts or announce a change that never happened.
-        Returns the matched functions `reopen` opened again (#259: the page says which the change no longer matches)."""
+
+        Helpers keep working while this runs. What they change meanwhile is checked in another round, reusing every
+        verdict whose inputs are the same, instead of aborting a long check at its end. A function matched during the
+        check keeps the settings it matched with if the new ones don't match it; with `preserve_matches`, so does every
+        affected match. Returns the matched functions `reopen` opened again (#259: the page says which the change no
+        longer matches)."""
         before = self.cfg(proj)
+        proposed = cfg
+        pinned = set()  # matches given their previous settings: once, so an overlay a range can't isolate still stops
         keys = ("compiler", "compiler_ranges",'function_compilers')
         # Profile selection needs identity only. Narrow range edits must not load every source/target blob.
         identities = "id,name,vram,rom_offset"
-        # An original-image override cannot change unrelated entry selectors. Keep
-        # the broad path for ranges/defaults, including their overlapping overlays.
-        old_profiles = before.get('function_compilers') or {}
-        new_profiles = cfg.get('function_compilers') or {}
-        changed = {k for k in old_profiles.keys() | new_profiles.keys() if old_profiles.get(k) != new_profiles.get(k)}
-        scoped = (before.get('compiler') == cfg.get('compiler') and
-                  before.get('compiler_ranges') == cfg.get('compiler_ranges') and len(changed) == 1)
-        selector = next(iter(changed)) if scoped else None
-        where, parameters = "project_id=?", (proj['id'],)
-        if selector and ':' in selector:
-            try:
-                offset, address = map(int, selector.split(':'))
-            except ValueError:
-                pass
-            else:
-                profiles = [p for p in (old_profiles.get(selector), new_profiles.get(selector)) if p]
-                if selector == f'{offset}:{address}' and all(p.get('vram') == address for p in profiles):
-                    # Null-offset legacy entries can resolve an override by name.
-                    names = [p.get('function') for p in profiles]
-                    where += " AND ((rom_offset=? AND vram=?) OR (rom_offset IS NULL AND vram=? AND name IN (SELECT value FROM json_each(?))))"
-                    parameters += (offset, address, address, json.dumps(names))
-        rows = self.project_store(proj['id']).all(f"SELECT {identities} FROM functions WHERE {where} ORDER BY id", *parameters)
-        ids = [f['id'] for f in rows if compiler_for(before, f["vram"], f) != compiler_for(cfg, f["vram"], f)]
-        affected = self.project_store(proj['id']).all("SELECT * FROM functions WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id", json.dumps(ids))
-        trial = dict(proj) | {"config": json.dumps(cfg)}
-        contexts = [tuple(r) for r in self.project_store(proj['id']).all("SELECT unit,version FROM context_versions WHERE project_id=? ORDER BY version", proj["id"])]
-        matched = [f for f in affected if f["status"] == "matched"]
-        log(f"Checking {len(matched)} matched functions before changing compiler settings.")
+        verdicts, scores = {}, {}  # by everything the judge saw, so a later round only does what's new
+        matched_at_start = None
+        check_cancel = getattr(log, 'check_cancel', lambda: None)
         report = getattr(log, 'progress', lambda value: None)
-        def matched_progress(value):
-            report({**value, 'phase':'Checking affected matches', 'affected':len(affected)})
-            if value['done'] == value['total'] or value['done'] % 25 == 0:
-                log(f"Checked {value['done']} of {value['total']} affected matches.")
-        matched_progress({'phase':'Checking affected matches', 'done':0, 'total':len(matched)})
-        broken = self.regression_test(trial, None, only=matched,
-                                     header_for=lambda f: self._context(proj["id"], f["unit"])["header"],
-                                     progress=matched_progress) if matched else []
-        if broken and not reopen:
-            error = NetworkError(f"{len(broken)} matched function(s) wouldn't match with it any more "
-                               f"({', '.join(n for n, _ in broken[:5])}): narrow the ranges or keep their compiler settings; when removing a range, reopen those functions explicitly")
-            error.compiler_blockers = [{"function": name, "reason": reason} for name, reason in broken]
-            raise error
-        broken_names = {n for n, _ in broken}
-        scores = {}
-        rescored = [f for f in affected if f["status"] == "open" or f["name"] in broken_names]
-        log(f"Updating saved scores for {len(rescored)} affected attempts.")
-        def rescore(fn):
-            source = fn["matched_source"] if fn["name"] in broken_names else self._source_of(fn)
-            own = compiler_for(cfg, fn["vram"], fn)
-            _, diff, _ = self._judge_with(trial, fn, own["toolchain"], list(own["flags"]), source) if source else (False, None, "")
-            return fn['id'], diff.score if diff is not None else None, fn['name']
-        report({'phase':'Updating saved scores', 'done':0, 'total':len(rescored), 'affected':len(affected)})
-        # Use a purpose-owned judge group; agents keep seeing the old settings until every result is validated.
-        # A single-entry apply stays in its private compile session, reusing exact
-        # compiler output from validation while still judging the current target.
-        from contextlib import nullcontext
-        with nullcontext(None) if len(rescored) == 1 else self._pool.group('Saved attempt rescoring', proj['slug']) as pool:
-            rescoring = map(rescore, rescored) if len(rescored) == 1 else pool.map(rescore, rescored)
-            for done, (fid, score, name) in enumerate(rescoring, 1):
-                scores[fid] = score
-                report({'phase':'Updating saved scores', 'done':done, 'total':len(rescored),
-                        'affected':len(affected), 'function':name})
-                if done == len(rescored) or done % 25 == 0:
-                    log(f"Updating score {done} of {len(rescored)}: {name}")
-        # An agent can finish while checks run. Never overwrite its work with a verdict from an older snapshot.
-        def population(items):
-            return [tuple(r[k] for k in ("id", "name", "vram", "rom_offset", "unit", "size", "target", "relocs", "meta",
-                                         "status", "matched_source")) for r in items]
-        with self.project_store(proj['id']).tx() as db:
-            current = json.loads(db.execute("SELECT config FROM projects WHERE id=?", (proj["id"],)).fetchone()["config"])
-            latest = db.execute(f"SELECT {identities} FROM functions WHERE {where} ORDER BY id", parameters).fetchall()
-            headers = [tuple(r) for r in db.execute("SELECT unit,version FROM context_versions WHERE project_id=? ORDER BY version", (proj["id"],))]
-            latest_ids = [f['id'] for f in latest if compiler_for(before, f["vram"], f) != compiler_for(cfg, f["vram"], f)]
-            latest_affected = db.execute("SELECT id,name,vram,rom_offset,unit,size,target,relocs,meta,status,matched_source,best_source,best_score "
-                                         "FROM functions WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id", (json.dumps(latest_ids),)).fetchall()
-            # Helpers saving a better attempt while the check runs is normal: it only makes that function's saved
-            # score stale, which is redone below. Matches, targets and the header are what a verdict depends on.
-            if any(current.get(k) != before.get(k) for k in keys) or population(latest_affected) != population(affected) or headers != contexts:
-                raise NetworkError("The project's code or settings changed during the compiler check. Try again after pausing its helpers.")
-            for key in keys:
-                if key in cfg:
-                    current[key] = cfg[key]
+        store = self.project_store(proj['id'])
+
+        def population(f):
+            return tuple(f[k] for k in ("id", "name", "vram", "rom_offset", "unit", "size", "target", "relocs", "meta",
+                                        "status", "matched_source"))
+
+        def header(f):
+            context = self._context(proj["id"], f["unit"])
+            return context["header"] if context else ""
+
+        def checked_and_saved():
+            """One round: the names reopened once saved, or None when something moved and it has to be checked."""
+            nonlocal proposed, matched_at_start
+            check_cancel()
+            current_cfg = json.loads(store.one("SELECT config FROM projects WHERE id=?", proj["id"])["config"])
+            # Another change saved while we checked (a helper's one-function profile): keep it under ours.
+            cfg = merge_compiler_settings(before, proposed, current_cfg)
+            # An original-image override cannot change unrelated entry selectors. Keep
+            # the broad path for ranges/defaults, including their overlapping overlays.
+            old_profiles = current_cfg.get('function_compilers') or {}
+            new_profiles = cfg.get('function_compilers') or {}
+            changed = {k for k in old_profiles.keys() | new_profiles.keys() if old_profiles.get(k) != new_profiles.get(k)}
+            scoped = (current_cfg.get('compiler') == cfg.get('compiler') and
+                      current_cfg.get('compiler_ranges') == cfg.get('compiler_ranges') and len(changed) == 1)
+            selector = next(iter(changed)) if scoped else None
+            where, parameters = "project_id=?", (proj['id'],)
+            if selector and ':' in selector:
+                try:
+                    offset, address = map(int, selector.split(':'))
+                except ValueError:
+                    pass
                 else:
-                    current.pop(key, None)
-            db.execute("UPDATE projects SET config=? WHERE id=?", (json.dumps(current), proj["id"]))
-            newest = {r["id"]: r["best_source"] for r in db.execute(
-                "SELECT id,best_source FROM functions WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(latest_ids),))}
+                    profiles = [p for p in (old_profiles.get(selector), new_profiles.get(selector)) if p]
+                    if selector == f'{offset}:{address}' and all(p.get('vram') == address for p in profiles):
+                        # Null-offset legacy entries can resolve an override by name.
+                        names = [p.get('function') for p in profiles]
+                        where += " AND ((rom_offset=? AND vram=?) OR (rom_offset IS NULL AND vram=? AND name IN (SELECT value FROM json_each(?))))"
+                        parameters += (offset, address, address, json.dumps(names))
+
+            def affected_ids(rows):
+                return [f['id'] for f in rows if compiler_for(current_cfg, f["vram"], f) != compiler_for(cfg, f["vram"], f)]
+
+            rows = store.all(f"SELECT {identities} FROM functions WHERE {where} ORDER BY id", *parameters)
+            affected = store.all("SELECT * FROM functions WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id",
+                                 json.dumps(affected_ids(rows)))
+            trial = dict(proj) | {"config": json.dumps(cfg)}
+            contexts = [tuple(r) for r in store.all("SELECT unit,version FROM context_versions WHERE project_id=? ORDER BY version", proj["id"])]
+            matched = [f for f in affected if f["status"] == "matched"]
+            if matched_at_start is None:
+                matched_at_start = {f['id'] for f in matched}
+                log(f"Checking {len(matched)} matched functions before changing compiler settings.")
+
+            def judged(f):
+                own = compiler_for(cfg, f["vram"], f)
+                return (population(f), header(f), own["toolchain"], tuple(own.get("flags", [])))
+
+            judged_matched = {f['id']: judged(f) for f in matched}
+            unchecked = [f for f in matched if judged_matched[f['id']] not in verdicts]
+
+            def matched_progress(value):
+                report({**value, 'phase':'Checking affected matches', 'affected':len(affected)})
+                if value['done'] == value['total'] or value['done'] % 25 == 0:
+                    log(f"Checked {value['done']} of {value['total']} affected matches.")
+            matched_progress({'phase':'Checking affected matches', 'done':0, 'total':len(unchecked)})
+            if unchecked:
+                failed = dict(self.regression_test(trial, None, only=unchecked, header_for=header,
+                                                   progress=matched_progress))
+                verdicts.update((judged_matched[f['id']], failed.get(f['name'])) for f in unchecked)
+            broken = [(f, verdicts[judged_matched[f['id']]]) for f in matched if verdicts[judged_matched[f['id']]]]
+            keep = [f for f, _ in broken if f['id'] not in pinned
+                    and (preserve_matches or (not reopen and f['id'] not in matched_at_start))]
+            if keep:
+                starts = [r['vram'] for r in store.all(
+                    "SELECT vram FROM functions WHERE project_id=? AND vram IS NOT NULL", proj['id'])]
+                proposed = keep_compilers(proposed, current_cfg, keep, starts)
+                pinned.update(f['id'] for f in keep)
+                log(f"{len(keep)} matched function(s) keep their previous compiler settings.")
+                return None
+            if broken and not reopen:
+                error = NetworkError(f"{len(broken)} matched function(s) wouldn't match with it any more "
+                                   f"({', '.join(f['name'] for f, _ in broken[:5])}): narrow the ranges or keep their compiler settings; when removing a range, reopen those functions explicitly")
+                error.compiler_blockers = [{"function": f['name'], "reason": reason} for f, reason in broken]
+                raise error
+            broken_names = {f['name'] for f, _ in broken}
+            rescored = [f for f in affected if f["status"] == "open" or f["name"] in broken_names]
+            sources = {f['id']: f["matched_source"] if f["name"] in broken_names else self._source_of(f) for f in rescored}
+
+            def scored(f):
+                return (*judged(f), sources[f['id']])
+
+            score_keys = {f['id']: scored(f) for f in rescored}
+            unscored = [f for f in rescored if score_keys[f['id']] not in scores]
+            log(f"Updating saved scores for {len(unscored)} affected attempts.")
+
+            def rescore(fn):
+                source = sources[fn['id']]
+                own = compiler_for(cfg, fn["vram"], fn)
+                _, diff, _ = self._judge_with(trial, fn, own["toolchain"], list(own["flags"]), source) if source else (False, None, "")
+                return fn['id'], diff.score if diff is not None else None, fn['name']
+
+            report({'phase':'Updating saved scores', 'done':0, 'total':len(unscored), 'affected':len(affected)})
+            # Use a purpose-owned judge group; agents keep seeing the old settings until every result is validated.
+            # A single-entry apply stays in its private compile session, reusing exact
+            # compiler output from validation while still judging the current target.
+            from contextlib import nullcontext
+            with nullcontext(None) if len(unscored) <= 1 else self._pool.group('Saved attempt rescoring', proj['slug']) as pool:
+                rescoring = map(rescore, unscored) if len(unscored) <= 1 else pool.map(rescore, unscored)
+                for done, (fid, score, name) in enumerate(rescoring, 1):
+                    check_cancel()
+                    scores[score_keys[fid]] = score
+                    report({'phase':'Updating saved scores', 'done':done, 'total':len(unscored),
+                            'affected':len(affected), 'function':name})
+                    if done == len(unscored) or done % 25 == 0:
+                        log(f"Updating score {done} of {len(unscored)}: {name}")
+
+            # An agent can finish while checks run. Never overwrite its work with a verdict from an older snapshot.
             stale = []
-            for fn in affected:
-                if fn["status"] == "open":
-                    if newest.get(fn["id"]) != fn["best_source"]:
-                        # A helper saved a newer attempt meanwhile; our score describes the old one.
-                        db.execute("UPDATE functions SET seed=NULL WHERE id=?", (fn["id"],))
-                        stale.append(fn["id"])
-                        continue
-                    db.execute("UPDATE functions SET seed=NULL, best_score=? WHERE id=?", (scores[fn["id"]], fn["id"]))
-                elif fn["name"] in broken_names:
-                    db.execute("UPDATE functions SET status='open', best_source=matched_source, best_agent_id=matched_agent_id, "
-                               "best_score=?, matched_source=NULL, matched_agent_id=NULL, matched_at=NULL WHERE id=?",
-                               (scores[fn["id"]], fn["id"]))
-                    self._event(db, proj["id"], None, "reopen", f"{fn['name']}: open again (its range was removed)")
+            with store.tx() as db:
+                current = json.loads(db.execute("SELECT config FROM projects WHERE id=?", (proj["id"],)).fetchone()["config"])
+                latest = db.execute(f"SELECT {identities} FROM functions WHERE {where} ORDER BY id", parameters).fetchall()
+                headers = [tuple(r) for r in db.execute("SELECT unit,version FROM context_versions WHERE project_id=? ORDER BY version", (proj["id"],))]
+                latest_ids = affected_ids(latest)
+                latest_affected = db.execute("SELECT id,name,vram,rom_offset,unit,size,target,relocs,meta,status,matched_source,best_source,best_score "
+                                             "FROM functions WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id", (json.dumps(latest_ids),)).fetchall()
+                # Helpers saving a better attempt while the check runs is normal: it only makes that function's saved
+                # score stale, which is redone below. Matches, targets and the header are what a verdict depends on.
+                moved = (any(current.get(k) != current_cfg.get(k) for k in keys)
+                         or [population(f) for f in latest_affected] != [population(f) for f in affected]
+                         or headers != contexts)
+                if not moved:
+                    for key in keys:
+                        if key in cfg:
+                            current[key] = cfg[key]
+                        else:
+                            current.pop(key, None)
+                    db.execute("UPDATE projects SET config=? WHERE id=?", (json.dumps(current), proj["id"]))
+                    newest = {r["id"]: r["best_source"] for r in latest_affected}
+                    for fn in affected:
+                        if fn["status"] == "open":
+                            if newest.get(fn["id"]) != fn["best_source"]:
+                                # A helper saved a newer attempt meanwhile; our score describes the old one.
+                                db.execute("UPDATE functions SET seed=NULL WHERE id=?", (fn["id"],))
+                                stale.append(fn["id"])
+                                continue
+                            db.execute("UPDATE functions SET seed=NULL, best_score=? WHERE id=?",
+                                       (scores[score_keys[fn["id"]]], fn["id"]))
+                        elif fn["name"] in broken_names:
+                            db.execute("UPDATE functions SET status='open', best_source=matched_source, best_agent_id=matched_agent_id, "
+                                       "best_score=?, matched_source=NULL, matched_agent_id=NULL, matched_at=NULL WHERE id=?",
+                                       (scores[score_keys[fn["id"]]], fn["id"]))
+                            self._event(db, proj["id"], None, "reopen", f"{fn['name']}: open again (its range was removed)")
+            if moved:
+                log("Helpers changed some of these while they were checked: checking just those again.")
+                return None
+            return cfg, affected, stale, broken_names
+
+        while (saved := checked_and_saved()) is None:
+            pass
+        cfg, affected, stale, broken_names = saved
         if stale:
             fresh = dict(proj) | {"config": json.dumps(cfg)}
             for fid in stale:
-                fn = self.project_store(proj['id']).one("SELECT * FROM functions WHERE id=?", fid)
+                fn = store.one("SELECT * FROM functions WHERE id=?", fid)
                 source = self._source_of(fn) if fn is not None and fn["status"] == "open" else None
                 if not source:
                     continue
                 own = compiler_for(cfg, fn["vram"], fn)
                 _, diff, _ = self._judge_with(fresh, fn, own["toolchain"], list(own["flags"]), source)
-                with self.project_store(proj['id']).tx() as db:
+                with store.tx() as db:
                     db.execute("UPDATE functions SET best_score=? WHERE id=?", (diff.score if diff is not None else None, fid))
         report({'phase':'Compiler settings saved', 'done':1, 'total':1, 'affected':len(affected)})
         log("Compiler checks passed; settings and scores saved.")

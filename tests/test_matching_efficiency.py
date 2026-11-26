@@ -64,7 +64,9 @@ def test_repair_ranking_uses_time_without_disabling_exploration():
     weights=adaptive_repairs.factors(net,'compiler','register')
     assert weights['fast']>weights['slow']>=adaptive_repairs.MIN_FACTOR
     assert adaptive_repairs.factors(net,'other compiler','register')=={}
-    assert adaptive_repairs.factors(net,'compiler','call')=={}
+    # another mismatch kind borrows only what lifts a family, capped: the slow one's weight stays unmeasured there
+    borrowed=adaptive_repairs.factors(net,'compiler','call')
+    assert set(borrowed)=={'fast'} and 1<borrowed['fast']<=adaptive_repairs.POOLED_MAX_FACTOR
 
 
 def test_efficiency_preserves_token_categories_and_includes_failed_work():
@@ -99,7 +101,7 @@ def test_compact_project_info_accepts_a_string_compiler(tmp_path):
     class Net:
         def cfg(self, proj): return {'platform': 'n64', 'compiler': 'xbox360-xsdk-placeholder'}
     saved = tools.consoles
-    tools.consoles = type('C', (), {'get': staticmethod(lambda p: type('X', (), {'compilers': ()})())})()
+    tools.consoles = type('C', (), {'get': staticmethod(lambda p: type('X', (), {'compilers': (), 'compilers_for': lambda self, cfg: ()})())})()
     try:
         out = tools.compact_info_head(Net(), {'name': 'dash', 'slug': 'dash-dash'})
         assert 'xbox360-xsdk-placeholder' in out
@@ -128,3 +130,15 @@ def test_explicit_larger_work_budget_extends_low_gain_minimum(tmp_path):
         net._record(net._function('f','game'),a,1000-i%2,'int f(){return 1;}',1)
         assert not progress_rate.track(net,a,'game',net._function('f','game'))
     assert net.store.one('SELECT 1 FROM claims WHERE agent_id=?',a.id)
+
+
+def test_a_family_measured_as_poor_goes_after_the_rest_and_new_ones_are_still_explored():
+    from decompnet.app import adaptive_repairs
+    ranked = ['a', 'b', 'c', 'd', 'e', 'new1', 'new2', 'ladder']
+    measured = {'a': 2.0, 'b': 1.5, 'c': 1.2, 'd': 1.1, 'e': 1.0, 'ladder': 0.25}
+    order = adaptive_repairs.explore(ranked, set(), measured)
+    assert order[-1] == 'ladder'                       # known poor: after everything else, not back near its old place
+    assert order.index('new1') == 3                    # one unmeasured family among every three proven ones
+    assert set(order) == set(ranked) and len(order) == len(ranked)
+    # a poor family this function has learned a start from stays among the proven ones
+    assert adaptive_repairs.explore(ranked, {'ladder'}, measured).index('ladder') < len(ranked) - 1
