@@ -531,7 +531,7 @@ def test_range_checks_on_a_one_compiler_game_never_build_with_another(monkeypatc
     class Console:
         def keeps_game_compiler(self, fp): return "watcom-10.0a"
         def file_compiler(self, fp, source): return "watcom-10.0a"
-        def project_compilers(self, fp):
+        def project_compilers(self, fp, *rest):
             return [type("T", (), {"id": i, "name": i})() for i in ("watcom-10.0a", "openwatcom-2.0")]
     saved, cleared = [], []
 
