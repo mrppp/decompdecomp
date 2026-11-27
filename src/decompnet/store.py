@@ -524,6 +524,8 @@ class _ThreadReader:
 
 
 class Store:
+    project_slug = None  # set on a project's own database, for diagnostics (db_diagnostics)
+
     def __init__(self, path: str | Path, *, repair_archive=None, project_namespace=None, stable_ids=False, require_existing=False):
         self.path = str(path)
         self.require_existing = require_existing
@@ -747,7 +749,9 @@ class Store:
         from .project_views import install as install_views
         install_views(self.conn)
         # what the last run left in the log goes into the database now, and the log starts empty
-        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # This pragma returns a row. Leaving its cursor active can make the
+        # savepoint below fail until Python happens to collect the cursor.
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").close()
         self.conn.execute("CREATE TABLE IF NOT EXISTS read_revisions(kind TEXT PRIMARY KEY, revision INTEGER NOT NULL)")
         self.read_cache = ReadCache(lambda: getattr(getattr(self, '_local', None), 'in_tx', False))
         for table, columns in (
@@ -1046,7 +1050,8 @@ class Store:
                     if queued:
                         last = self._last_writer
                         db_diagnostics.write_waited(began-queued[0], where,
-                                                    last[0] if last and last[1] >= queued[0] else None)
+                                                    last[0] if last and last[1] >= queued[0] else None,
+                                                    self.project_slug)
                     self._local.in_tx = True
                     self._local.after_commit = []
                     _transactions.depth = getattr(_transactions, 'depth', 0) + 1

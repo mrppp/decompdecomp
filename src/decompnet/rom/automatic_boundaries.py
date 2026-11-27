@@ -21,6 +21,7 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
     from .split import _LOCAL_REF, _SYMBOL_LINE, AsmLine, DataSymbol
     explicit={int(m[2],16) for text in symbols for m in _SYMBOL_LINE.finditer(text)}
     starts={f.vram for f in functions}
+    original_entries={(f.rom, f.vram):f for f in functions}
     order='big' if console.big_endian else 'little'
     fmt='>I' if console.big_endian else '<I'
     # Generated C units can change at a false cut inside one mapped code segment.
@@ -377,11 +378,42 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
                     and not any(d.rom is not None and d.rom < after and before < d.rom+d.size for d in data))
         return False
 
+    # A disassembler can start code in the tail of a double constant. Keep the
+    # proof tied to actual typed loads and to the single mapped segment.
+    loaded_words = loaded_constant_words(functions)
     recovered_data=[]
     predecessors={(fn.rom+fn.size,fn.vram+fn.size):fn for fn in result if fn.size>=8}
-    kept=[];dropped=markers=recovered_shared=recovered_continuations=0;ordered=sorted(result,key=lambda f:(owner(f),f.rom))
+    kept=[];dropped=markers=recovered_shared=recovered_fallthrough=recovered_continuations=shared_delay_entries=return_wrappers=backward_loops=cache_prefixes=0;ordered=sorted(result,key=lambda f:(owner(f),f.rom))
     for i,fn in enumerate(ordered):
         previous=kept[-1] if kept else None;following=ordered[i+1] if i+1<len(ordered) else None
+        successor = following if fn.size == 4 else original_entries.get((fn.rom+4, fn.vram+4))
+        merged = fn.size > 4
+        if (previous is not None and successor is not None and owner(fn)[0] >= 0
+                and owner(previous) == owner(fn) == owner(successor)
+                and previous.rom+previous.size == fn.rom and previous.vram+previous.size == fn.vram
+                and previous.lines[-1].word == JR_RA and not fn.lines[0].word
+                and (not merged or successor.size == fn.size-4
+                     and [line.word for line in successor.lines] == [line.word for line in fn.lines[1:]])
+                and image[fn.rom:fn.rom+4] == bytes(4) and fn.vram in direct_calls
+                and any(segments[owner(fn)[0]].rom_start <= source < segments[owner(fn)[0]].rom_end
+                        and int.from_bytes(image[source:source+4], order) >> 26 == 3
+                        for source, _ in references.get(fn.vram, ()))
+                and successor.rom == fn.rom+4 and successor.vram == fn.vram+4
+                and is_frame(successor.lines[0].word)
+                and not any(d.rom is not None and d.rom < fn.rom+4 and fn.rom < d.rom+d.size for d in data)
+                and called_extent(image, successor.rom, successor.rom+successor.size, successor.vram,
+                                  big_endian=console.big_endian, cpu=console.cpu_variant,
+                                  asm_check=console.asm_reason, table_ranges=tables) == successor.size):
+            # A call may enter on the previous return's NOP delay slot and then
+            # fall into the next closed function. Keep both addresses: the
+            # word completes the return, while the entry remains a symbol.
+            kept[-1] = replace(previous, lines=previous.lines+[fn.lines[0]])
+            data.append(DataSymbol(fn.name, fn.vram, fn.rom, 0, 'func'))
+            if merged:
+                kept.append(replace(successor, lines=fn.lines[1:],
+                                    labels=successor.labels | {a for a in fn.labels if a >= successor.vram}))
+            shared_delay_entries += 1
+            continue
         if (previous is not None and owner(fn)[0] >= 0 and owner(previous) == owner(fn)
                 and previous.rom+previous.size == fn.rom and previous.vram+previous.size == fn.vram
                 and previous.lines[0].word & 0xffff0000 == 0x27bd0000
@@ -409,19 +441,75 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
             data.append(DataSymbol(fn.name, fn.vram, fn.rom, 4, 'data'))
             markers += 1
             continue
-        if (previous is not None and owner(previous)==owner(fn)
+        # A hand-written wrapper temporarily replaces $ra to reuse a separately
+        # callable leaf, then returns through the saved register. Preserve both
+        # entries and its local continuation when the whole shape is proven.
+        wrapper = kept[-2] if len(kept) >= 2 else None
+        if (wrapper is not None and owner(wrapper)[0] >= 0 and owner(wrapper) == owner(previous) == owner(fn)
+                and wrapper.vram in direct_calls and previous.vram in direct_calls
+                and fn.size == 8 and fn.lines[0].word == 0x03200008):
+            external = explicit | pointers | {address for address, sources in references.items()
+                if any(not wrapper.rom <= src < fn.rom+fn.size for src, _ in sources)}
+            if shared_return_wrapper(wrapper, previous, fn, image, console, order, segments, external, data):
+                kept[-2] = replace(wrapper, lines=wrapper.lines+previous.lines+fn.lines,
+                    labels=wrapper.labels | previous.labels | fn.labels,
+                    entry_aliases={**wrapper.entry_aliases, previous.vram:previous.name, fn.vram:fn.name})
+                kept.pop()
+                data.extend((DataSymbol(previous.name,previous.vram,previous.rom,0,'func'),
+                             DataSymbol(fn.name,fn.vram,fn.rom,0,'func')))
+                return_wrappers += 1
+                continue
+        if (previous is not None and owner(previous)[0] >= 0 and owner(previous) == owner(fn)
+                and previous.size == 8 and previous.vram not in direct_calls and fn.vram in direct_calls
+                and previous.lines[0].word >> 26 in (20,21,22,23)):
+            external = explicit | pointers | {address for address, sources in references.items()
+                if any(not previous.rom <= src < fn.rom+fn.size for src, _ in sources)}
+            if backward_loop_entry(previous,fn,image,console,order,segments,external,data):
+                kept[-1] = replace(previous,lines=previous.lines+fn.lines,labels=previous.labels|fn.labels,
+                                   entry_aliases={**previous.entry_aliases,fn.vram:fn.name})
+                data.append(DataSymbol(fn.name,fn.vram,fn.rom,0,'func'))
+                backward_loops += 1
+                continue
+        if (previous is not None and owner(previous)[0] >= 0 and owner(previous) == owner(fn)
+                and previous.vram not in direct_calls and fn.vram in direct_calls
+                and 8 <= previous.size <= 64 and fn.size >= 16 and fn.lines[0].word >> 26 == 47):
+            external = explicit | pointers | {address for address, sources in references.items()
+                if any(not previous.rom <= src < fn.rom+fn.size for src, _ in sources)}
+            if cache_fallthrough(previous,fn,image,console,order,segments,external,data):
+                kept[-1] = replace(previous,lines=previous.lines+fn.lines,labels=previous.labels|fn.labels,
+                                   entry_aliases={**previous.entry_aliases,fn.vram:fn.name})
+                data.append(DataSymbol(fn.name,fn.vram,fn.rom,0,'func'))
+                cache_prefixes += 1
+                continue
+        same_owner = previous is not None and owner(previous) == owner(fn)
+        possible_fallthrough = (same_owner and 8 <= previous.size <= 128 and fn.lines
+                                and previous.rom+previous.size == fn.rom
+                                and previous.vram+previous.size == fn.vram and is_frame(fn.lines[0].word))
+        both_called = same_owner and previous.vram in direct_calls and fn.vram in direct_calls
+        # A single argument adjustment can also be an independently callable
+        # prefix to a leaf, even when only the shared entry is called here.
+        arg_adjust = (same_owner and previous.size == 4 and previous.lines
+                      and previous.lines[0].word >> 26 == 9
+                      and 4 <= (previous.lines[0].word >> 21) & 31 <= 7
+                      and (previous.lines[0].word >> 21) & 31 == (previous.lines[0].word >> 16) & 31)
+        possible_shuffle = same_owner and fn.vram in direct_calls and (previous.size in (8, 12) or arg_adjust)
+        external_entries = (explicit | pointers | {address for address, sources in references.items()
+            if any(not previous.rom <= src < fn.rom+fn.size for src, _ in sources)}
+            if possible_fallthrough or both_called or possible_shuffle else set())
+        fallthrough = (possible_fallthrough
+                       and shared_fallthrough_frame(previous,fn,image,console,order,segments,external_entries,data))
+        if (same_owner
                 and (fn.vram in (explicit | pointers)
                      and shared_entry_leaf(previous,fn,image,console,order,segments,entered)
-                     or previous.vram in direct_calls and fn.vram in direct_calls
-                     and shared_called_leaf(previous,fn,image,console,order,segments,
-                                            explicit | pointers | {address for address, sources in references.items()
-                                                if any(not previous.rom <= src < fn.rom+fn.size for src, _ in sources)},
-                                            data))):
+                     or (both_called or possible_shuffle)
+                     and shared_called_leaf(previous,fn,image,console,order,segments,external_entries,data)
+                     or fallthrough)):
             kept[-1] = replace(previous,lines=previous.lines+fn.lines,
                                labels=previous.labels|fn.labels,
                                entry_aliases={**previous.entry_aliases,fn.vram:fn.name})
             data.append(DataSymbol(fn.name,fn.vram,fn.rom,0,'func'))
-            recovered_shared += 1
+            if fallthrough:recovered_fallthrough += 1
+            else:recovered_shared += 1
             continue
         predecessor=predecessors.get((fn.rom,fn.vram))
         if (fn.size >= 16 and fn.size % 4 == 0 and owner(fn)[0] >= 0
@@ -431,6 +519,20 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
                 and not any(d.rom is not None and d.rom < fn.rom+fn.size and fn.rom < d.rom+d.size for d in data)):
             # An array whose every word names a discovered entry is data even
             # when a caller passes its address and splat creates a function.
+            recovered_data.append(DataSymbol(fn.name, fn.vram, fn.rom, fn.size, 'data'))
+            continue
+        if (owner(fn)[0] >= 0 and not any(fn.vram <= address < fn.vram+fn.size
+                                          for address in explicit | transfer_targets)
+                and not any(d.rom is not None and d.rom < fn.rom+fn.size and fn.rom < d.rom+d.size for d in data)
+                and terminated_mapped_addresses(fn, image, order, segments, segments[owner(fn)[0]])):
+            recovered_data.append(DataSymbol(fn.name, fn.vram, fn.rom, fn.size, 'data'))
+            continue
+        if (terminal_loaded_record(fn, previous, image, order, segments, functions, references,
+                                   lines_by_rom, explicit | pointers | transfer_targets, data)):
+            recovered_data.append(DataSymbol(fn.name, fn.vram, fn.rom, fn.size, 'data'))
+            continue
+        if (leading_loaded_constants(fn, following, image, order, segments, loaded_words,
+                                     explicit | pointers | transfer_targets, data)):
             recovered_data.append(DataSymbol(fn.name, fn.vram, fn.rom, fn.size, 'data'))
             continue
         if (leading_constant_padding(fn, following, image, order, segments, direct_calls, entered-{fn.vram})
@@ -469,11 +571,45 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
             # and the independently called next entry is unreachable padding.
             dropped += 1
             continue
+        if (fn.size == 12 and previous is not None and following is not None
+                and owner(fn)[0] >= 0 and owner(previous) == owner(fn) == owner(following)
+                and previous.size == 8 and previous.rom+8 == fn.rom and previous.vram+8 == fn.vram
+                and previous.lines[0].word == 0x08000000 | ((previous.vram >> 2) & 0x03ffffff)
+                and previous.lines[1].word == 0 and previous.vram in direct_calls
+                and following.rom == fn.rom+8 and following.vram == fn.vram+8
+                and following.vram in direct_calls and is_frame(following.lines[0].word)
+                and fn.lines[-1].word == following.lines[0].word
+                and not ({fn.vram, fn.vram+4} & entered_addresses)
+                and not any(m.start() % 4 == 0 for m in re.finditer(
+                    re.escape((fn.vram+4).to_bytes(4, order)), image))
+                and not any(d.rom is not None and d.rom < fn.rom+8 and fn.rom < d.rom+d.size for d in data)
+                and image[fn.rom:fn.rom+12] == b''.join(line.word.to_bytes(4, order) for line in fn.lines)):
+            import rabbitizer
+            if all(rabbitizer.Instruction(line.word).hasDelaySlot() for line in fn.lines[:2]):
+                # Two unentered transfer words after a called self-loop cannot be its fallthrough; the
+                # second transfer would also be in the first one's delay slot. The called frame overlaps
+                # only because the disassembler borrowed its first word as that second transfer's slot.
+                dropped += 1
+                continue
         if zero_alignment(fn, previous):
             if fn.vram in data_only:
                 recovered_data.append(DataSymbol(fn.name,fn.vram,fn.rom,4,'data'))
             else:
                 dropped+=1
+            continue
+        if (fn.size == 4 and not fn.lines[0].word and owner(fn)[0] >= 0
+                and segments[owner(fn)[0]].rom_start == fn.rom
+                and following is not None and owner(fn) == owner(following)
+                and following.rom == fn.rom+4 and following.vram == fn.vram+4
+                and following.vram % 16 == 0 and following.vram in direct_calls
+                and not referenced(fn)
+                and image[fn.rom:fn.rom+4] == bytes(4)
+                and leaf_extent(image, following.rom, following.rom+following.size, following.vram,
+                                big_endian=console.big_endian, cpu=console.cpu_variant,
+                                asm_check=console.asm_reason) == following.size):
+            # An unreferenced NOP before a called, aligned leaf can be a
+            # mapping's leading alignment, rather than a function of its own.
+            dropped += 1
             continue
         if (filler_extent(fn.size,fn.lines[0].word) and following is not None
                 and owner(fn)==owner(following) and following.rom==fn.rom+4 and following.vram==fn.vram+4):
@@ -504,17 +640,157 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
         log(f'Recovered {len(recovered_data)} referenced words as data between functions.')
     if recovered_shared:
         log(f'Recovered {recovered_shared} closed leaves with independently entered assembly tails.')
+    if recovered_fallthrough:
+        log(f'Recovered {recovered_fallthrough} straight initializers with preserved framed entries.')
+    if cache_prefixes:
+        log(f'Joined {cache_prefixes} proven cache-writing fallthroughs, preserving their called entries.')
+    if backward_loops:
+        log(f'Joined {backward_loops} backward-entered assembly loops, preserving their callable entries.')
+    if return_wrappers:
+        log(f'Recovered {return_wrappers} shared assembly return wrappers with their entry symbols.')
     if recovered_continuations:
         log(f'Joined {recovered_continuations} unentered framed continuations.')
-    return kept if dropped or markers or recovered_data or recovered_shared or recovered_continuations else result if changed else functions
+    if shared_delay_entries:
+        log(f'Preserved {shared_delay_entries} called NOP entries shared with a return delay slot.')
+    return kept if dropped or markers or recovered_data or recovered_shared or recovered_fallthrough or recovered_continuations or shared_delay_entries or return_wrappers or backward_loops or cache_prefixes else result if changed else functions
 
+
+
+def identified_sdk_tail(console, image, tail):
+    """Keep separately identifiable SDK routines intact for SDK classification."""
+    import hashlib
+
+    code = image[tail.rom:tail.rom+tail.size]
+    if (tail.size in console.sdk_assembly_sizes and console.sdk_assembly_identity(code,big_endian=console.big_endian)):
+        return True
+    lo, hi = console.sdk_shape_sizes
+    if lo <= tail.size <= hi and console.sdk_shape_identity(code,big_endian=console.big_endian):
+        return True
+    return bool(tail.size in console.sdk_linked_sizes
+                and console.sdk_linked_identity(code,hashlib.sha1(image).hexdigest()))
+
+
+def cache_fallthrough(head, tail, image, console, order, segments, entered, data):
+    """A global pointer update falls into a separately called cache-writing leaf."""
+    import rabbitizer
+
+    from ..arch.mips import _mips_uses, rabbitizer_category
+    from ..arch.mips_assets import read
+
+    if (head.piece or tail.piece or not 8 <= head.size <= 64 or tail.size < 16
+            or head.rom+head.size != tail.rom or head.vram+head.size != tail.vram
+            or head.entry_aliases or tail.entry_aliases
+            or sum(segment.contains(head.vram,head.size+tail.size) for segment in segments) != 1
+            or any(head.vram <= address < tail.vram+tail.size and address != tail.vram for address in entered)):
+        return False
+    end = tail.rom+tail.size
+    if (end > len(image) or any(d.rom is not None and d.rom < end and head.rom < d.rom+d.size for d in data)
+            or image[head.rom:end] != b''.join(line.word.to_bytes(4,order) for fn in (head,tail) for line in fn.lines)
+            or len(tail.lines) < 2 or any(line.word >> 26 != 47 for line in tail.lines[:2])):
+        return False
+    if identified_sdk_tail(console,image,tail):
+        return False
+    for line in head.lines:
+        instruction = rabbitizer.Instruction(line.word,line.vram,rabbitizer_category(console.cpu_variant))
+        uses = _mips_uses(line.word,console.cpu_variant)
+        if (not instruction.isValid() or instruction.hasDelaySlot() or uses is None
+                or {29,31} & (uses[0] | uses[1])
+                or instruction.getOpcodeName() in ('eret','break','syscall','teq','tne','tge','tgeu','tlt','tltu')):
+            return False
+    facts = read(head.vram,image[head.rom:tail.rom],big_endian=console.big_endian,cpu=console.cpu_variant)
+    addresses = {kind:{event['place']['value'] for event in facts['events']
+                       if event.get('kind') == kind and event.get('place',{}).get('kind') == 'constant'
+                       and 0x80000000 <= event['place']['value'] < 0x80800000}
+                 for kind in ('load','store')}
+    if not addresses['load'] & addresses['store']:
+        return False
+    return (assembly_extent(image,tail.rom,end,tail.vram,console,order,allow_cache=True) == tail.size
+            and assembly_extent(image,head.rom,end,head.vram,console,order,allow_cache=True) == head.size+tail.size)
+
+
+def backward_loop_entry(head, body, image, console, order, segments, entered, data):
+    """Keep a callable leaf whose loop branches back to the preceding two words."""
+    if (head.piece or body.piece or head.size != 8 or body.size < 16 or head.entry_aliases or body.entry_aliases
+            or head.rom+head.size != body.rom or head.vram+head.size != body.vram
+            or sum(segment.contains(head.vram,head.size+body.size) for segment in segments) != 1
+            or any(head.vram <= address < body.vram+body.size and address != body.vram for address in entered)):
+        return False
+    end = body.rom+body.size
+    if (end > len(image) or any(d.rom is not None and d.rom < end and head.rom < d.rom+d.size for d in data)
+            or image[head.rom:end] != b''.join(line.word.to_bytes(4,order) for fn in (head,body) for line in fn.lines)):
+        return False
+    if identified_sdk_tail(console,image,body):
+        return False
+    branch = head.lines[0].word
+    if branch >> 26 not in (20,21,22,23):
+        return False
+    delta = branch & 0xffff
+    target = head.vram+4+(delta-0x10000 if delta & 0x8000 else delta)*4
+    if not body.vram <= target < body.vram+body.size:
+        return False
+    for line in body.lines:
+        op = line.word >> 26
+        if op in (1,4,5,6,7,20,21,22,23):
+            offset = line.word & 0xffff
+            destination = line.vram+4+(offset-0x10000 if offset & 0x8000 else offset)*4
+            if destination == head.vram:
+                break
+    else:
+        return False
+    return assembly_extent(image,head.rom,end,head.vram,console,order) == head.size+body.size
+
+
+def shared_return_wrapper(head, body, continuation, image, console, order, segments, entered, data):
+    """Prove a saved-$ra wrapper, shared leaf and local return continuation."""
+    import rabbitizer
+
+    from ..arch.mips import _mips_uses, rabbitizer_category
+
+    if (head.piece or body.piece or continuation.piece or head.size != 12 or body.size < 8
+            or continuation.size != 8 or head.rom+head.size != body.rom
+            or body.rom+body.size != continuation.rom or head.vram+head.size != body.vram
+            or body.vram+body.size != continuation.vram
+            or head.entry_aliases or body.entry_aliases or continuation.entry_aliases
+            or sum(segment.contains(head.vram,head.size+body.size+continuation.size) for segment in segments) != 1):
+        return False
+    end = continuation.rom+continuation.size
+    if (end > len(image) or any(d.rom is not None and d.rom < end and head.rom < d.rom+d.size for d in data)
+            or any(head.vram < address < continuation.vram+continuation.size and address != body.vram
+                   for address in entered)
+            or image[head.rom:end] != b''.join(line.word.to_bytes(4,order)
+                                                for fn in (head,body,continuation) for line in fn.lines)):
+        return False
+    if identified_sdk_tail(console,image,body):
+        return False
+    first, high, low = (line.word for line in head.lines)
+    if first != 0x03e0c825 or high >> 16 != 0x3c1f or low >> 16 != 0x27ff:
+        return False
+    lo = low & 0xffff
+    target = (((high & 0xffff) << 16)+(lo-0x10000 if lo & 0x8000 else lo)) & 0xffffffff
+    if target != continuation.vram or body.lines[-2].word != JR_RA or continuation.lines[0].word != 0x03200008:
+        return False
+    for line in body.lines[:-2] + [body.lines[-1], continuation.lines[-1]]:
+        instruction = rabbitizer.Instruction(line.word,line.vram,rabbitizer_category(console.cpu_variant))
+        uses = _mips_uses(line.word,console.cpu_variant)
+        if (not instruction.isValid() or instruction.hasDelaySlot() or uses is None
+                or {25,31} & (uses[0] | uses[1])
+                or instruction.getOpcodeName() in ('eret','break','syscall','teq','tne','tge','tgeu','tlt','tltu')):
+            return False
+    return bool(console.asm_reason(image[head.rom:end]))
 
 
 def shared_called_leaf(head, tail, image, console, order, segments, entered, data):
     """Keep both called entries when a short prefix falls through into a closed leaf."""
-    if (head.size != 4 or tail.size < 8 or head.rom+head.size != tail.rom
+    if (head.size not in (4, 8, 12) or tail.size < 8 or head.rom+head.size != tail.rom
             or head.vram+head.size != tail.vram or head.entry_aliases or tail.entry_aliases
-            or any(tail.vram < address < tail.vram+tail.size for address in entered)):
+            or any(head.vram < address < head.vram+head.size or tail.vram < address < tail.vram+tail.size
+                   for address in entered)):
+        return False
+    # Longer wrappers must only rearrange the argument registers before
+    # falling into the separately callable implementation.
+    if head.size > 4 and any(line.word >> 26 != 0 or line.word & 0x7ff != 0x25
+                             or not 4 <= (line.word >> 11) & 31 <= 7
+                             or (line.word >> 16) & 31 != 0 for line in head.lines):
         return False
     if sum(s.contains(head.vram,head.size+tail.size) for s in segments) != 1:
         return False
@@ -523,9 +799,56 @@ def shared_called_leaf(head, tail, image, console, order, segments, entered, dat
         return False
     if image[head.rom:end] != b''.join(line.word.to_bytes(4,order) for fn in (head,tail) for line in fn.lines):
         return False
+    if identified_sdk_tail(console,image,tail):
+        return False
     options = dict(big_endian=console.big_endian, cpu=console.cpu_variant, asm_check=console.asm_reason)
-    return (leaf_extent(image,head.rom,end,head.vram,**options) == head.size+tail.size
-            and leaf_extent(image,tail.rom,end,tail.vram,**options) == tail.size)
+    if leaf_extent(image,head.rom,end,head.vram,**options) != head.size+tail.size:
+        return False
+    # A valid independently entered assembly leaf can start with an FPU
+    # instruction that is not itself a compiler-like function prologue.
+    from ..arch.mips_gaps import extent
+    flow = extent(image,tail.rom,end,tail.vram,order,cpu=console.cpu_variant)
+    return (flow['direct_flow_closed'] and not flow['step_limit'] and flow['extent_bytes'] == tail.size
+            and flow['decoded_instructions']*4 == tail.size)
+
+
+def shared_fallthrough_frame(head, tail, image, console, order, segments, entered, data):
+    """A straight global initializer falls through to a closed framed entry."""
+    import rabbitizer
+
+    from ..arch.mips import _mips_uses, rabbitizer_category
+    from ..arch.mips_assets import read
+    from ..arch.mips_gaps import extent
+
+    if (head.piece or tail.piece or not 8 <= head.size <= 128 or head.rom+head.size != tail.rom
+            or head.vram+head.size != tail.vram or head.entry_aliases or tail.entry_aliases
+            or any(head.vram < address < head.vram+head.size or tail.vram < address < tail.vram+tail.size
+                   for address in entered)
+            or sum(segment.contains(head.vram, head.size+tail.size) for segment in segments) != 1):
+        return False
+    end = tail.rom+tail.size
+    if (end > len(image) or not is_frame(tail.lines[0].word)
+            or any(d.rom is not None and d.rom < end and head.rom < d.rom+d.size for d in data)
+            or image[head.rom:end] != b''.join(line.word.to_bytes(4, order) for fn in (head, tail) for line in fn.lines)
+            or not console.boundary_reason(image[head.rom:tail.rom])):
+        return False
+    for line in head.lines:
+        ins = rabbitizer.Instruction(line.word, line.vram, rabbitizer_category(console.cpu_variant))
+        registers = _mips_uses(line.word, console.cpu_variant)
+        if (not ins.isValid() or ins.hasDelaySlot() or registers is None
+                or {29, 31} & (registers[0] | registers[1])
+                or ins.getOpcodeName() in ('eret', 'break', 'syscall', 'teq', 'tne', 'tge', 'tgeu', 'tlt', 'tltu')):
+            return False
+    facts = read(head.vram, image[head.rom:tail.rom], big_endian=console.big_endian, cpu=console.cpu_variant)
+    stores = {event['place']['value'] for event in facts['events']
+              if event.get('kind') == 'store' and (event.get('place') or {}).get('kind') == 'constant'
+              and 0x80000000 <= event['place']['value'] < 0x80800000}
+    if len(stores) < 2:return False
+    if called_extent(image, tail.rom, end, tail.vram, big_endian=console.big_endian,
+                     cpu=console.cpu_variant, asm_check=console.asm_reason) != tail.size:
+        return False
+    flow = extent(image, head.rom, end, head.vram, order, cpu=console.cpu_variant)
+    return flow['direct_flow_closed'] and flow['extent_bytes'] == head.size+tail.size
 
 
 def shared_entry_leaf(head, tail, image, console, order, segments, entered):
@@ -880,6 +1203,33 @@ def closes_with_back_edge(fn, end, mapping):
     return fn.vram <= target < branch.vram
 
 
+def terminated_mapped_addresses(fn, image, order, segments, owner):
+    """Recognize a padded, ordered table of addresses into one other code bank."""
+    import rabbitizer
+
+    if not 16 <= fn.size <= 128 or fn.size % 4 or fn.rom+fn.size+8 > len(image):
+        return False
+    words = [line.word for line in fn.lines]
+    if (len(words)*4 != fn.size or words != sorted(words) or len(set(words)) < 3
+            or any(word % 4 or not 0x80000400 <= word < 0x80800000 for word in words)
+            or image[fn.rom:fn.rom+fn.size] != b''.join(word.to_bytes(4, order) for word in words)
+            or any(image[fn.rom+fn.size:fn.rom+fn.size+8])):
+        return False
+    returned = any(image[at:at+4] == JR_RA.to_bytes(4, order)
+                   and (slot := rabbitizer.Instruction(int.from_bytes(image[at+4:at+8], order))).isValid()
+                   and not slot.hasDelaySlot() and not any(image[at+8:fn.rom])
+                   for at in range(max(owner.rom_start, fn.rom-64), fn.rom-7, 4))
+    if not returned:
+        return False
+    targets = [[segment for segment in segments if segment is not owner and segment.contains(word, 4)]
+               for word in words]
+    if any(len(matches) != 1 for matches in targets) or len({id(matches[0]) for matches in targets}) != 1:
+        return False
+    segment = targets[0][0]
+    return sum(bool(any(image[segment.rom_start+word-segment.vram:segment.rom_start+word-segment.vram+4]))
+               for word in set(words)) >= 3
+
+
 def raw_return_before(fn, segment, segments, image, order):
     import rabbitizer
 
@@ -1062,6 +1412,92 @@ def string_address_references(fn, references, lines, bodies):
             return False
         uses.difference_update((start,start+4))
     return True
+
+def terminal_loaded_record(fn, previous, image, order, segments, functions, references, lines, entered, data):
+    """A loaded pointer and an adjacent address passed in a stack record, after a closed overlay."""
+    if (fn.size != 8 or previous is None or previous.size < 8
+            or previous.lines[-2].word != JR_RA or previous.rom + previous.size + 4 != fn.rom
+            or previous.vram + previous.size + 4 != fn.vram
+            or image[fn.rom - 4:fn.rom] != bytes(4)
+            or image[fn.rom:fn.rom + 8] != b''.join(line.word.to_bytes(4, order) for line in fn.lines)
+            or not 0x80000000 <= fn.lines[0].word < 0x80800000 or fn.lines[0].word % 4
+            or not 0 < fn.lines[1].word <= 0x10000
+            or any(fn.vram <= addr < fn.vram + 8 for addr in entered)
+            or any(d.rom is not None and d.rom < fn.rom + 8 and fn.rom < d.rom + d.size for d in data)
+            or not address_word_references(fn, references, lines)
+            or not any(lines[offset].word >> 26 == 35 for offset, _ in references.get(fn.vram, ())
+                       if offset in lines)):
+        return False
+    owners = [s for s in segments if s.rom_start <= previous.rom and s.rom_end == fn.rom + 8
+              and s.vram - s.rom_start == fn.vram - fn.rom and s.contains(fn.vram, 8)]
+    if len(owners) != 1:
+        return False
+    if any(not match.start() % 4 for address in (fn.vram, fn.vram + 4)
+           for match in re.finditer(re.escape(address.to_bytes(4, order)), image)):
+        return False
+    address = fn.vram + 4
+    for body in functions:
+        for first, second, third in zip(body.lines, body.lines[1:], body.lines[2:]):
+            a, b, c = first.word, second.word, third.word
+            reg = (a >> 16) & 31
+            if (reg and a >> 26 == 15 and a & 0xffff == ((address + 0x8000) >> 16) & 0xffff
+                    and b == (0x24000000 | reg << 21 | reg << 16 | address & 0xffff)
+                    and c >> 26 == 43 and (c >> 16) & 31 == reg and (c >> 21) & 31 in (29, 30)):
+                return True
+    return False
+
+
+def loaded_constant_words(functions):
+    """Find words read by direct floating-point loads from a tracked LUI base."""
+    words, doubles = set(), set()
+    for fn in functions:
+        high = {}
+        for line in fn.lines:
+            word = line.word
+            op, rs, rt = word >> 26, (word >> 21) & 31, (word >> 16) & 31
+            if op in (49, 53) and rs in high:
+                offset = (word & 0xffff) - (0x10000 if word & 0x8000 else 0)
+                address = (high[rs] + offset) & 0xffffffff
+                if not address % 4:
+                    words.add(address)
+                    if op == 53 and not address % 8:
+                        doubles.add(address)
+                        words.add(address + 4)
+            if op == 15 and rt:
+                high[rt] = (word & 0xffff) << 16
+            elif op == 0:
+                high.pop((word >> 11) & 31, None)
+            elif op in (2, 3):
+                high.clear()
+            elif op in (16, 17) and rs < 8:
+                high.pop(rt, None)
+            elif op in (8, 9, 10, 11, 12, 13, 14, 32, 33, 34, 35, 36, 37, 38):
+                high.pop(rt, None)
+            elif op not in (1, 4, 5, 6, 7, 16, 17, 20, 21, 22, 23, 40, 41, 42, 43, 46, 49, 53, 57, 61):
+                high.clear()
+    return words, doubles
+
+
+def leading_loaded_constants(fn, following, image, order, segments, loaded, entered, data):
+    """A segment begins inside a double and float, both read as floating data."""
+    if (fn.size != 8 or fn.rom < 4 or following is None or following.rom != fn.rom + 12
+            or following.vram != fn.vram + 12 or not is_frame(following.lines[0].word)
+            or image[fn.rom + 8:fn.rom + 12] != bytes(4)
+            or image[fn.rom:fn.rom + 8] != b''.join(line.word.to_bytes(4, order) for line in fn.lines)
+            or fn.vram - 4 not in loaded[1] or fn.vram + 4 not in loaded[0]
+            or any(fn.vram <= addr < fn.vram + 8 for addr in entered)
+            or any(d.rom is not None and d.rom < fn.rom + 8 and fn.rom < d.rom + d.size for d in data)):
+        return False
+    if not any(s.rom_start == fn.rom and s.vram == fn.vram and following.rom + following.size <= s.rom_end
+               for s in segments):
+        return False
+    if any(sum(s.contains(addr, 4) for s in segments) != 1 for addr in (fn.vram, fn.vram + 4)):
+        return False
+    if any(not match.start() % 4 for address in (fn.vram, fn.vram + 4)
+           for match in re.finditer(re.escape(address.to_bytes(4, order)), image)):
+        return False
+    return True
+
 
 def leading_constant_padding(fn, following, image, order, segments, calls, entered):
     """A harmless instruction-shaped word and zero alignment after a floating constant."""

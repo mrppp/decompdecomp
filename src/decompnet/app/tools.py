@@ -729,8 +729,8 @@ HANDLERS: dict[str, Callable[..., str]] = {
         compiler_passes.run(net, agent, slug, function, revision, passes),
     "score_permutations": lambda net, agent, slug, function, revision, statements=None, patches=None, max=64, marked='':
         score_permutations.run(net, agent, slug, function, revision, statements, patches, max, marked),
-    "prove_chain": lambda net, agent, slug, function, revision, families=None, steps=4, children=40:
-        prove_chain.run(net, agent, slug, function, revision, families, steps, children),
+    "prove_chain": lambda net, agent, slug, function, revision, families=None, steps=4, children=40, max_judged=400:
+        prove_chain.run(net, agent, slug, function, revision, families, steps, children, max_judged),
     "compiler_source": lambda net, agent, slug, compiler, function_name: compiler_source.run(net, agent, slug, compiler,
                                                                                              function_name),
     "get_compiler_trial": compiler_experiments.retrieve,
@@ -748,7 +748,7 @@ HANDLERS: dict[str, Callable[..., str]] = {
     "search_repair_examples": repair_search.search,
     "get_repair_examples": repair_search.details,
     "upvote_repair_example": repair_search.upvote,
-    "report_repair": lambda net, agent, slug, function, change='', category='other', automation='', case_id=0, suggested_category='':
+    "report_repair": lambda net, agent, slug, function, change='', category='other', automation='', case_id=None, suggested_category='':
         net.repair_feedback.report(agent, slug, function, change, category, automation, case_id, suggested_category),
     "last_diff": agent_tokens.diff_page,
     "report_candidate_issue": lambda net, agent, slug, function, revision, issue, reason, alternative_revision="":
@@ -1442,12 +1442,14 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
 
     @tool
     async def prove_chain(ctx: Context, function: str, revision: str, families: list[str] | None = None,
-                          steps: int = 4, children: int = 40) -> str:
+                          steps: int = 4, children: int = 40, max_judged: int = 400) -> str:
         """Would the repair library reach the match from here? Applies the best child of the named families (default
-        all) step by step, judged with the exact judge (at most 8 steps, 80 children a step, 2 minutes). Only a final
-        source beating the saved best is recorded; otherwise nothing, and no move-on count. ROM projects."""
+        all) step by step, judged with the exact judge (at most 8 steps and 2 minutes). max_judged caps the variants
+        judged in the whole call (default 400, at most 2000); the output says when it stopped there and how many
+        children were left. children is only a step's batch size (at most 80). Only a final source beating the saved
+        best is recorded; otherwise nothing, and no move-on count. ROM projects."""
         return await run(ctx, 'prove_chain', function=function, revision=revision, families=families, steps=steps,
-                         children=children)
+                         children=children, max_judged=max_judged)
 
     @tool
     async def compiler_source(ctx: Context, compiler: str, function_name: str) -> str:
@@ -1517,7 +1519,7 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
 
     @tool
     async def report_repair(ctx: Context, function: str, change: str = '', category: str = 'other',
-                            automation: str = '', case_id: int = 0, suggested_category: str = '') -> str:
+                            automation: str = '', case_id: int | None = None, suggested_category: str = '') -> str:
         """Classify your verified repair. Pass case_id from the match result and a category. For other, optionally
         suggest a short new category. Change and automation notes are optional."""
         return await run(ctx, 'report_repair', function=function, change=change, category=category,
@@ -1902,8 +1904,9 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]],
 
     @tool
     async def try_compiler(ctx: Context, function: str, compiler: str, flags: str = "", source: str = "") -> str:
-        """Compile a function's C with another compiler and flags and see the diff, recording nothing: to find out
-        which compiler built a part of the game before you suggest it. Cheap: try several.
+        """Compile a function's C with another compiler and flags and see the diff: to find out which compiler built a
+        part of the game before you suggest it. No attempt or match is recorded (the closest C under another profile is
+        kept and shown to whoever works on the function next). Cheap: try several.
 
         Args:
             function: the function to judge it against

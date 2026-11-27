@@ -26,6 +26,57 @@ def fixture(words=BODY,cuts=(0,12,32),order='big'):
     return image,functions,[Segment('code',0,len(image),BASE)]
 
 
+@pytest.mark.parametrize('case', ['padding', 'pointer', 'interior_pointer', 'called_padding', 'not_called_next',
+                                  'not_loop', 'data', 'different_delay'])
+def test_unentered_transfers_after_a_called_self_loop_are_alignment(case):
+    loop = 0x08000000 | ((BASE >> 2) & 0x3ffffff)
+    call_loop = 0x0c000000 | ((BASE >> 2) & 0x3ffffff)
+    call_next = 0x0c000000 | (((BASE+16) >> 2) & 0x3ffffff)
+    words = [loop, 0, 0x56578b7e, 0x0633f6e9, *BODY, call_loop, 0, call_next, 0, 0x03e00008, 0]
+    if case == 'called_padding': words[-4] = 0x0c000000 | (((BASE+8) >> 2) & 0x3ffffff)
+    if case == 'not_called_next': words[-4] = 0
+    if case == 'not_loop': words[0] += 1
+    image, functions, segments = fixture(words, cuts=(0, 8, 16, 48, 72))
+    functions[1].lines.append(functions[2].lines[0])  # the second transfer borrowed the next prologue
+    if case in ('pointer', 'interior_pointer'):
+        image += (BASE+(8 if case == 'pointer' else 12)).to_bytes(4, 'big')
+    if case == 'different_delay':
+        functions[1].lines[-1] = replace(functions[1].lines[-1], word=0)
+    data = [DataSymbol('inside', BASE+8, 8, 4, 'data')] if case == 'data' else []
+    result = repair(functions, data, image, consoles.get('n64'), segments)
+    assert any(fn.rom == 8 for fn in result) == (case != 'padding')
+    assert any(fn.rom == 16 and fn.lines[0].word == BODY[0] for fn in result)
+
+
+@pytest.mark.parametrize('protected', [False, True])
+def test_padded_ordered_addresses_into_another_code_bank_are_data(protected):
+    targets = [BASE+0x1000, BASE+0x1004, BASE+0x1004, BASE+0x1008, BASE+0x100c]
+    words = [0x03e00008, 0, 0, 0, *targets, 0, 0, 0, *BODY]
+    image, functions, _ = fixture(words, cuts=(0, 8, 16, 36, 48, 80))
+    image += bytes(0x100-len(image)) + bytes.fromhex('24020001')*16
+    segments = [Segment('code', 0, 80, BASE), Segment('other', 0x100, 0x140, BASE+0x1000)]
+    data = []
+    symbols = ['entry = 0x80001010; // type:func'] if protected else []
+    result = repair(functions, data, image, consoles.get('n64'), segments, symbols=symbols)
+    assert any(fn.rom == 16 for fn in result) == protected
+    assert any(item.rom == 16 and item.size == 20 for item in data) != protected
+
+
+@pytest.mark.parametrize('referenced', [False, True])
+def test_unreferenced_nop_before_called_aligned_bank_entry_is_padding(referenced):
+    base = BASE + 12
+    target = base + 4
+    words = [0, 0x3c01803d, 0x03e00008, 0xac24a9c0,
+             0x0c000000 | ((target >> 2) & 0x3ffffff), 0, 0x03e00008, 0]
+    image, functions, _ = fixture(words, cuts=(0, 4, 16, 32))
+    functions = [replace(fn, vram=fn.vram+12,
+                         lines=[replace(line, vram=line.vram+12) for line in fn.lines]) for fn in functions]
+    if referenced:
+        image += base.to_bytes(4, 'big')
+    result = repair(functions, [], image, consoles.get('n64'), [Segment('code', 0, 32, base)])
+    assert [fn.rom for fn in result] == ([0, 4, 16] if referenced else [4, 16])
+
+
 @pytest.mark.parametrize('case',['scheduled','different argument','different callee','incoming pointer'])
 def test_exception_cleanup_delay_slot_can_precede_two_alignment_words(case):
     entry = BASE+32
@@ -910,6 +961,30 @@ def test_duplicate_return_delay_word_before_called_entry_is_padding(protect):
     assert image[16:20] == words[4].to_bytes(4, 'big')
 
 
+@pytest.mark.parametrize('case', ['called', 'merged', 'not_called', 'non_nop', 'incomplete', 'foreign'])
+def test_called_return_delay_nop_keeps_its_entry_symbol(case):
+    first = [0x27bdffe8, 0xafbf0014, 0x8fbf0014, 0x27bd0018, 0x03e00008]
+    next_body = [0x27bdffe8, 0xafbf0014, 0x24020001, 0x8fbf0014, 0x03e00008,
+                 0 if case == 'incomplete' else 0x27bd0018]
+    destination = BASE+20 if case != 'not_called' else BASE
+    call = 0x0c000000 | ((destination >> 2) & 0x3ffffff)
+    call_next = 0x0c000000 | (((BASE if case == 'merged' else BASE+24) >> 2) & 0x3ffffff)
+    words = first + [0x24020001 if case == 'non_nop' else 0] + next_body + [call, 0, call_next, 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 20, 24, 48, 72))
+    if case == 'foreign':
+        segments = [Segment('code', 0, 48, BASE), Segment('caller', 48, 72, BASE+48)]
+    data = []
+    result = repair(functions, data, image, consoles.get('n64'), segments)
+    if case in ('called', 'merged'):
+        head = next(fn for fn in result if fn.rom == 0)
+        assert head.size == 24 and head.lines[-1].word == 0
+        assert not any(fn.rom == 20 for fn in result)
+        assert any(fn.rom == 24 for fn in result)
+        assert any(s.rom == 20 and s.vram == BASE+20 and s.kind == 'func' for s in data)
+    else:
+        assert not any(s.rom == 20 and s.kind == 'func' for s in data)
+
+
 @pytest.mark.parametrize('protect', [None, 'symbol', 'frame_mismatch', 'transfer'])
 def test_unentered_framed_continuation_can_join(protect):
     words = [0x27bdffe0, 0xafbf001c, 0x08000410 if protect == 'transfer' else 0x24840001,
@@ -979,3 +1054,211 @@ def test_leading_string_references_are_kept_as_data_unless_called_indirectly(ind
     result = repair(functions, data, image, consoles.get('n64'), [Segment('code',16,len(image),BASE+16)])
     assert (16 in {fn.rom for fn in result}) == indirect
     assert [(d.rom,d.size) for d in data] == ([] if indirect else [(16,4)])
+
+
+@pytest.mark.parametrize('case', ['valid', 'interior', 'stack', 'one_store', 'unknown_store', 'unclosed', 'data'])
+def test_global_initializer_falls_through_to_a_closed_frame(case):
+    # The original bytes execute two global stores before entering a framed tail.
+    prefix = [0x3c088000, 0x24090001, 0xad090000, 0xad090004]
+    if case == 'stack':prefix[3] = 0xafa90004
+    if case == 'one_store':prefix[3] = 0
+    if case == 'unknown_store':prefix[3] = 0xad490004  # the temporary base has no known address
+    tail = list(BODY)
+    if case == 'unclosed':tail[-1] = 0
+    image, functions, segments = fixture(prefix+tail, cuts=(0, 16, 48))
+    symbols = [f'interior = 0x{BASE+4:08X};'] if case == 'interior' else ()
+    data = [DataSymbol('overlap', BASE+8, 8, 4, 'data')] if case == 'data' else []
+    result = repair(functions, data, image, consoles.get('n64'), segments, symbols=symbols)
+    if case == 'valid':
+        assert [(fn.rom, fn.size) for fn in result] == [(0, 48)]
+        assert result[0].entry_aliases == {BASE+16: f'func_{BASE+16:08X}'}
+    else:
+        assert any(fn.rom == 16 for fn in result)
+
+
+@pytest.mark.parametrize('case', ['moves', 'not_moves', 'interior', 'head_interior', 'data'])
+def test_called_argument_shuffle_preserves_shared_leaf_entry(case):
+    from decompnet.rom.automatic_boundaries import shared_called_leaf
+
+    words = [0x00a03025, 0x00802825, 0x00a61021, 0x03e00008, 0]
+    if case == 'not_moves':
+        words[0] = 0xaca60000
+    image, functions, segments = fixture(words, cuts=(0, 8, 20))
+    data = [DataSymbol('table', BASE+12, 12, 4, 'data')] if case == 'data' else []
+    entered = {BASE+12} if case == 'interior' else {BASE+4} if case == 'head_interior' else set()
+    assert shared_called_leaf(*functions[:2], image, consoles.get('n64'), 'big', segments, entered, data) == (case == 'moves')
+
+
+def test_shared_called_fpu_entry_does_not_need_a_compiler_prologue():
+    from decompnet.rom.automatic_boundaries import shared_called_leaf
+
+    words = [0x00a03025, 0x00802825, 0x44865000, 0x3c083f80, 0x44888000,
+             0xc4a40000, 0x460a8283, 0xe4840000, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 8, 40))
+    assert shared_called_leaf(*functions, image, consoles.get('n64'), 'big', segments, set(), [])
+
+
+def test_uncalled_argument_shuffle_keeps_called_tail_entry():
+    words = [0x00a03025, 0x00802825, 0x00a61021, 0x03e00008, 0,
+             0x0c000000 | ((BASE+8) >> 2 & 0x3ffffff), 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 8, 20, 36))
+    result = repair(functions, [], image, consoles.get('n64'), segments)
+    assert result[0].size == 20
+    assert result[0].entry_aliases == {BASE+8: functions[1].name}
+
+
+@pytest.mark.parametrize('prefix, joined', [(0x24844000, True), (0x24854000, False), (0xac840000, False)])
+def test_one_word_argument_adjustment_preserves_called_leaf(prefix, joined):
+    words = [prefix, 0x00041040, 0x03e00008, 0,
+             0x0c000000 | ((BASE+4) >> 2 & 0x3ffffff), 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 4, 16, 32))
+    result = repair(functions, [], image, consoles.get('n64'), segments)
+    assert (result[0].size == 16) == joined
+    if joined:
+        assert result[0].entry_aliases == {BASE+4: functions[1].name}
+
+
+@pytest.mark.parametrize('case', ['valid', 'wrong_return', 'changed_ra', 'external_interior', 'data'])
+def test_shared_assembly_return_wrapper_preserves_entries(case):
+    from decompnet.rom.automatic_boundaries import shared_return_wrapper
+
+    words = [0x03e0c825, 0x3c1f8000, 0x27ff101c, 0xc4840000,
+             0x46042002, 0x03e00008, 0, 0x03200008, 0x46000004]
+    if case == 'wrong_return':
+        words[2] += 4
+    if case == 'changed_ra':
+        words[3] = 0x27ff0004
+    image, functions, segments = fixture(words, cuts=(0, 12, 28, 36))
+    entered = {BASE+16} if case == 'external_interior' else set()
+    data = [DataSymbol('data', BASE+16, 16, 4, 'data')] if case == 'data' else []
+    assert shared_return_wrapper(*functions, image, consoles.get('n64'), 'big', segments, entered, data) == (case == 'valid')
+
+
+def test_shared_assembly_return_wrapper_joins_all_three_parts():
+    words = [0x03e0c825, 0x3c1f8000, 0x27ff101c, 0xc4840000,
+             0x46042002, 0x03e00008, 0, 0x03200008, 0x46000004,
+             0x0c000000 | (BASE >> 2 & 0x3ffffff), 0,
+             0x0c000000 | ((BASE+12) >> 2 & 0x3ffffff), 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 12, 28, 36, 60))
+    data = []
+    result = repair(functions, data, image, consoles.get('n64'), segments)
+    assert result[0].size == 36
+    assert result[0].entry_aliases == {BASE+12: functions[1].name, BASE+28: functions[2].name}
+    assert {d.vram for d in data} >= {BASE+12, BASE+28}
+
+
+@pytest.mark.parametrize('case', ['valid', 'no_back_edge', 'bad_target', 'external', 'data'])
+def test_backward_loop_preserves_the_callable_entry(case):
+    from decompnet.rom.automatic_boundaries import backward_loop_entry
+
+    words = [0x51000004, 0x00001025, 0x90880000, 0x5100fffc, 0, 0x03e00008, 0]
+    if case == 'no_back_edge':
+        words[3] = 0x51000001
+    if case == 'bad_target':
+        words[0] = 0x5100ffff
+    image, functions, segments = fixture(words, cuts=(0, 8, 28))
+    entered = {BASE+12} if case == 'external' else set()
+    data = [DataSymbol('table', BASE+12, 12, 4, 'data')] if case == 'data' else []
+    assert backward_loop_entry(*functions, image, consoles.get('n64'), 'big', segments, entered, data) == (case == 'valid')
+
+
+def test_backward_loop_repair_keeps_the_real_entry():
+    words = [0x51000004, 0x00001025, 0x90880000, 0x5100fffc, 0, 0x03e00008, 0,
+             0x0c000000 | ((BASE+8) >> 2 & 0x3ffffff), 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 8, 28, 44))
+    data = []
+    result = repair(functions, data, image, consoles.get('n64'), segments)
+    assert result[0].size == 28
+    assert result[0].entry_aliases == {BASE+8: functions[1].name}
+    assert any(d.vram == BASE+8 and d.kind == 'func' for d in data)
+
+
+@pytest.mark.parametrize('case', ['valid', 'unmatched_store', 'bad_tail', 'external', 'data'])
+def test_cache_fallthrough_preserves_the_called_tail(case):
+    from decompnet.rom.automatic_boundaries import cache_fallthrough
+
+    words = [0x3c088000, 0x8d050100, 0x24a5ffc0, 0xad050100, 0x00402825,
+             0xbcad0000, 0xbcad0010, 0x24840004, 0x03e00008, 0]
+    if case == 'unmatched_store':
+        words[3] = 0xad050104
+    if case == 'bad_tail':
+        words[6] = 0
+    image, functions, segments = fixture(words, cuts=(0, 20, 40))
+    entered = {BASE+4} if case == 'external' else set()
+    data = [DataSymbol('data', BASE+24, 24, 4, 'data')] if case == 'data' else []
+    assert cache_fallthrough(*functions, image, consoles.get('n64'), 'big', segments, entered, data) == (case == 'valid')
+
+
+def test_cache_fallthrough_repair_keeps_the_tail_symbol():
+    words = [0x3c088000, 0x8d050100, 0x24a5ffc0, 0xad050100, 0x00402825,
+             0xbcad0000, 0xbcad0010, 0x24840004, 0x03e00008, 0,
+             0x0c000000 | ((BASE+20) >> 2 & 0x3ffffff), 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 20, 40, 56))
+    data = []
+    result = repair(functions, data, image, consoles.get('n64'), segments)
+    assert result[0].size == 40
+    assert result[0].entry_aliases == {BASE+20: functions[1].name}
+    assert any(d.vram == BASE+20 and d.kind == 'func' for d in data)
+
+
+@pytest.mark.parametrize('kind', ['assembly', 'shape', 'linked'])
+def test_cache_fallthrough_does_not_absorb_identified_sdk_tail(monkeypatch, kind):
+    from decompnet.rom.automatic_boundaries import cache_fallthrough
+
+    words = [0x3c088000, 0x8d050100, 0x24a5ffc0, 0xad050100, 0x00402825,
+             0xbcad0000, 0xbcad0010, 0x24840004, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 20, 40))
+    console = consoles.get('n64')
+    monkeypatch.setattr(console, f'sdk_{kind}_identity', lambda *args, **kwargs: {'name': 'sdk'})
+    monkeypatch.setattr(console, f'sdk_{kind}_sizes', (0, 100) if kind == 'shape' else (20,))
+    assert not cache_fallthrough(*functions, image, console, 'big', segments, set(), [])
+
+
+@pytest.mark.parametrize('case', ['loaded', 'missing_double', 'missing_float', 'entry', 'pointer', 'clobbered'])
+def test_segment_start_inside_loaded_floating_constants_is_data(case):
+    # The double starts in the preceding data segment; its second word and a
+    # separately loaded float were mistaken for a function at the code start.
+    address = BASE + 4
+    hi = 0x3c010000 | ((BASE + 0x8000) >> 16)
+    double = 0xd4200000 | (BASE & 0xffff)
+    single = 0xc4200000 | ((BASE + 8) & 0xffff)
+    words = [0x3f1a36e2, 0xeb1c432d, 0x38d1b717, 0, *BODY,
+             hi, double, hi, single, 0x03e00008, 0]
+    if case == 'missing_double': words[13] = 0
+    if case == 'missing_float': words[15] = 0
+    if case == 'clobbered': words[13] = 0x24010000
+    image, functions, _ = fixture(words, cuts=(0, 4, 12, 16, 48, 72))
+    functions = [functions[1], *functions[3:]]
+    segments = [Segment('code', 4, len(image), address)]
+    if case == 'pointer': image += address.to_bytes(4, 'big')
+    symbols = [f'entry = 0x{address:08X}; // type:func'] if case == 'entry' else []
+    data = [DataSymbol('constant', BASE, 0, 4, 'data')]
+    result = repair(functions, data, image, consoles.get('n64'), segments, symbols=symbols)
+    assert any(fn.rom == 4 for fn in result) == (case != 'loaded')
+    assert any(item.rom == 4 and item.size == 8 for item in data) == (case == 'loaded')
+
+
+@pytest.mark.parametrize('case', ['record', 'no_load', 'no_stack_address', 'call', 'pointer', 'open_predecessor'])
+def test_closed_overlay_terminal_loaded_pointer_record_is_data(case):
+    address = BASE + 12
+    upper = ((address + 0x8000) >> 16) & 0xffff
+    inside = address + 4
+    words = [0x03e00008, 0, 0, 0x800a1000, 4,
+             0x3c010000 | upper, 0x8c220000 | (address & 0xffff),
+             0x3c030000 | ((inside + 0x8000) >> 16), 0x24630000 | (inside & 0xffff),
+             0xafa30004, 0x03e00008, 0]
+    if case == 'no_load': words[6] = 0
+    if case == 'no_stack_address': words[9] = 0
+    if case == 'call': words[10] = 0x0c000000 | ((address >> 2) & 0x3ffffff)
+    if case == 'open_predecessor': words[0] = 0
+    image, functions, _ = fixture(words, cuts=(0, 8, 12, 20, 48))
+    functions = [functions[0], functions[2], functions[3]]
+    # The assembly reader annotates both halves of a typed symbolic access.
+    functions[2].lines[0] = replace(functions[2].lines[0], operands=f'$at, %hi({functions[1].name})')
+    functions[2].lines[1] = replace(functions[2].lines[1], operands=f'$v0, %lo({functions[1].name})($at)')
+    segments = [Segment('overlay', 0, 20, BASE), Segment('caller', 20, 48, BASE + 20)]
+    if case == 'pointer': image += address.to_bytes(4, 'big')
+    data = []
+    result = repair(functions, data, image, consoles.get('n64'), segments)
+    assert any(fn.rom == 12 for fn in result) == (case != 'record')
+    assert any(item.rom == 12 and item.size == 8 for item in data) == (case == 'record')

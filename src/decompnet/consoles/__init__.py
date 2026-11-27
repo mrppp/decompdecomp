@@ -458,6 +458,7 @@ class Console:
         """ROM mode's export: a file of spimdisasm's assembly as GNU as reads it. What it can't read as spimdisasm
         writes it (coprocessor 2's instructions), or would place elsewhere (8-byte data), becomes the raw words it is."""
         from ..arch.mips import raw_cop2, raw_doubles  # (splat's consoles are MIPS)
+        from ..arch.mips_export import backward_delay_highs
 
         # Inferred code can include link instructions whose source is also their destination.
         # GNU as rejects them; the rebuild still needs the original bytes.
@@ -472,7 +473,7 @@ class Console:
 
         text = re.sub(r"^(\s*/\*\s*[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+([0-9A-Fa-f]{8})\s*\*/[ \t]*)[^\n]+",
                       link_word, text, flags=re.M)
-        return raw_doubles(raw_cop2(text, self.big_endian), self.big_endian)
+        return raw_doubles(raw_cop2(backward_delay_highs(text, self.big_endian), self.big_endian), self.big_endian)
 
     def find_gp(self, image: bytes, program: bytes, segments: list) -> int:
         """$gp as the game sets it, when splat didn't say (0: the game keeps no data $gp-relative)."""
@@ -527,6 +528,12 @@ class Console:
         """Whether a detected library routine (`corpora`: the signature collections that name it) is from a library
         no public source builds, so neither a port nor anybody else can have its C from there: it's set aside as SDK
         code on the detection alone (app/sdk_assembly._lead), not left to agents."""
+        return False
+
+    def sdk_sample_code(self, name: str) -> bool:
+        """Whether a detected routine is SDK sample code that a game builds as its own, so the port kit runs the
+        game's copy (`PortKit.sdk_group` None). It is still the SDK's code: set aside like the rest of the library
+        (app/sdk_assembly._lead), not left to agents."""
         return False
 
     def scan_sdk(self, net, proj, job=None) -> None:

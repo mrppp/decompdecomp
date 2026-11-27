@@ -278,6 +278,17 @@ def rom_renames(syms, source: str, a: Print, b: Print, a_name: str, b_name: str,
     for in_a, in_b in zip(a.addrs, b.addrs):
         if in_a == in_b and syms_b is None:
             continue
+        # A name the C writes for exactly this address that the symbol table doesn't hold (`extern u8 D_801C7469;`)
+        # is its base: walking down to the nearest named symbol found the function itself, and a global both
+        # look-alikes share then had to be both functions' names, so no mapping was made at all.
+        auto = next((f"{prefix}{in_a:08X}" for prefix in ("D_", "func_") if f"{prefix}{in_a:08X}" in words), None)
+        if auto is not None and (syms.by_addr.get(in_a) is None or syms.by_addr[in_a].name not in words):
+            to = in_b
+            other = (syms_b or syms).by_addr.get(to)
+            name = other.name if other is not None else f"{auto.split('_')[0]}_{to:08X}"
+            if out.setdefault(auto, name) != name:
+                return None
+            continue
         below = bisect.bisect_right(syms.starts, in_a) - 1
         base = None
         for k in range(below, max(-1, below - LABELS_BACK), -1):  # back to the symbol the C writes
@@ -289,6 +300,8 @@ def rom_renames(syms, source: str, a: Print, b: Print, a_name: str, b_name: str,
                 break
         if base is None:
             continue  # the C doesn't name it (a literal, a string it defines): the judge compares the values
+        if base.name == a_name and 0 < in_a - base.address < a.size:
+            continue  # a jump to the function's own body, not a name for the C to write
         to = in_b - (in_a - base.address)
         other = (syms_b or syms).by_addr.get(to)
         name = other.name if other is not None else f"D_{to:08X}"
@@ -337,10 +350,44 @@ def _declared(header_a: str, header_b: str, names: dict[str, str], a_name: str) 
     return "\n".join(decls) + ("\n" if decls else "")
 
 
+# One file-scope declaration of a name as a C object: `extern Unk D_x[];`, `extern u16 D_y;`, `extern u8 *D_z;`
+_OBJECT_DECL = r"^[ \t]*extern[ \t]+(?P<type>[A-Za-z_][\w \t]*?[ \t*]+?){name}(?P<array>(?:\[[^\]\n]*\])?)[ \t]*;[ \t]*\n?"
+
+
+def _merged(source: str, names: dict[str, str]) -> tuple[str, dict[str, str]]:
+    """`source` and `names` for renames that make two of a donor's objects one of this function's.
+
+    A donor that reads one record through `D_A` and its field through another symbol `D_B` can be a look-alike of a
+    function that names one symbol for both: renaming `D_A` to `D_B` then declared `D_B` twice with two types and the
+    transfer didn't build. The renamed-away name keeps its own type as a cast of the surviving symbol, which compiles
+    to the same address."""
+    declared = {}
+    for old, new in names.items():
+        found = re.search(_OBJECT_DECL.format(name=re.escape(old)), source, re.M)
+        if found and old != new:
+            declared.setdefault(new, []).append((old, found))
+    casts = {}
+    for new, olds in declared.items():
+        kept = re.search(_OBJECT_DECL.format(name=re.escape(new)), source, re.M) if new not in names else None
+        if kept is None:
+            kept, olds = olds[0][1], olds[1:]
+        for old, found in olds:
+            kind = " ".join(found["type"].split())
+            if (kind, found["array"]) == (" ".join(kept["type"].split()), kept["array"]):
+                continue  # declared alike: C takes the repeated declaration
+            if found["array"].count("[") > 1:
+                continue
+            casts[old] = f"(({kind} *) {new})" if found["array"] else f"(*({kind} *) &{new})"
+    for old in casts:
+        source = re.sub(_OBJECT_DECL.format(name=re.escape(old)), "", source, flags=re.M)
+    return source, {**names, **casts}
+
+
 def apply(source: str, names: dict[str, str]) -> str:
     """Rename identifiers in C source, all at once (so a -> b, b -> c doesn't make a into c)."""
     if not names:
         return source
+    source, names = _merged(source, names)
     pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + r")\b")
     return pattern.sub(lambda m: names[m.group(1)], source)
 
@@ -945,7 +992,25 @@ class Twins:
             source = self.source_for(proj, a, b)
         except (NetworkError, OSError, ValueError):
             return False
-        return bool(source) and self._missed(b_id, source, project_id=proj['id'])
+        return bool(source) and self._missed(b_id, self._keyed(proj, a, b, source), project_id=proj['id'])
+
+    def donor_profile(self, proj, a, b) -> dict | None:
+        """a's compiler profile, when its own game builds it otherwise than b (a per-function `-O1` beside the
+        default, an SN build): its twin's C is tried with it too, and an exact match makes it b's
+        (lookalike_profiles.py)."""
+        if not self.net.is_rom(proj) or self.net.fork_slug(proj['slug']) or b['rom_offset'] is None:
+            return None
+        cfg = self.net.cfg(proj)
+        theirs, mine = compiler_for(cfg, a['vram'], a), compiler_for(cfg, b['vram'], b)
+        if theirs.get('cmd') or mine.get('cmd') or all(theirs.get(k) == mine.get(k) for k in ('toolchain', 'flags')):
+            return None
+        return {'toolchain': theirs['toolchain'], 'flags': list(theirs.get('flags', []))}
+
+    def _keyed(self, proj, a, b, source: str) -> str:
+        """What a miss is remembered by: a's code, and a's profile when it is tried too (a miss cached before
+        that was tried with b's profile only, so it is no reason to skip the pair)."""
+        profile = self.donor_profile(proj, a, b)
+        return source if profile is None else source + '\n/* also with ' + json.dumps(profile, sort_keys=True) + ' */'
 
     def _refresh_overlay_metadata(self, proj, job):
         cfg = self.net.cfg(proj)
@@ -1243,8 +1308,12 @@ class Twins:
         verified=sorted([dict(r) for r in [*matches,*archived_matches]],key=lambda r:r['created_at'],reverse=True)
         if not all_matches: verified = verified[:30]
         from .shared_reuse import summary
-        return {'counts':totals,'recent':recent,'matches':verified,'discovery':summary(self,proj),
-                'compiler_leads': attempts('compiler') if totals.get('compiler') else []}
+        out = {'counts':totals,'recent':recent,'matches':verified,'discovery':summary(self,proj),
+               'compiler_leads': attempts('compiler') if totals.get('compiler') else []}
+        if all_matches:  # the results drawer, not the overview's polling: what each similar-code step has done
+            from .similar_matches import step_report
+            out['similar_steps'] = step_report(self.net, proj)
+        return out
 
     def suggestions(self, slug: str, function: str, limit: int = 5) -> list[dict]:
         """Read-only cross-game and local SDK name hints. Similar code is a lead, never a verified match."""
@@ -1637,7 +1706,7 @@ class Twins:
                     and self.net.forks.mark_asm(b, a["name"])):
                 return "asm"
             return "skip"
-        if self._missed(b["id"], source, project_id=proj["id"]):
+        if self._missed(b["id"], source if partial else self._keyed(proj, a, b, source), project_id=proj["id"]):
             return "known"
         if partial:
             feedback = {}
@@ -1647,10 +1716,19 @@ class Twins:
                 outcome = 'improved'
         else:
             outcome, why = self._attempt_twin(agent, proj, a, b, source)
+            if outcome == 'miss' and (profile := self.donor_profile(proj, a, b)):
+                from . import lookalike_profiles
+                note = f"/* identical to {a['name']} (matched), with its names changed by decompdecomp */\n"
+                tried, said, _ = lookalike_profiles.trial(self.net, agent, proj, b, note + source, profile, budget=8)
+                if tried == 'match':
+                    outcome = 'match'
+                elif tried == 'miss':
+                    why = said
         if outcome in ('miss', 'improved'):
+            key = source if partial else self._keyed(proj, a, b, source)
             with self.net.project_store(proj['id']).tx() as db:
                 db.execute("INSERT OR REPLACE INTO twin_misses(function_id, source_hash, project_id, at, why) "
-                           "VALUES(?,?,?,?,?)", (b["id"], self._miss_key(source), proj["id"], time.time(), why))
+                           "VALUES(?,?,?,?,?)", (b["id"], self._miss_key(key), proj["id"], time.time(), why))
         return outcome
 
     def miss_why(self, b_id: int, *, project_id=None) -> str | None:
@@ -1663,8 +1741,13 @@ class Twins:
     def _why(res: dict) -> str:
         """The gist of a try that didn't match: the compiler's first error, or how close it came."""
         if res.get("score") is None:
-            lines = [ln.strip(" #") for ln in (res.get("text") or "").splitlines()
-                     if re.search(r"undefined|undeclared|expected|illegal|redefin|not a |declaration|conversion", ln)]
+            said = [ln.strip(" #") for ln in (res.get("text") or "").splitlines()]
+            # GCC's errors carry no word in common ("conflicting types for", "request for member"): any message at
+            # a file's line that isn't a warning or a pointer back, else the words other compilers use
+            lines = [ln for ln in said if re.search(r"[\w)]:\d+: ", ln)
+                     and not re.search(r"warning|previous |In function|At top level|each undeclared|for each function", ln)]
+            lines = lines or [ln for ln in said
+                              if re.search(r"undefined|undeclared|expected|illegal|redefin|not a |declaration|conversion", ln)]
             return (lines[0] if lines else "it didn't build")[:WHY_CHARS]
         return (res.get("text") or "").splitlines()[0][:WHY_CHARS] if res.get("text") else f"score {res.get('score')}"
 
@@ -1838,6 +1921,9 @@ class Twins:
                                 self.run(proj["slug"], only=batch)
                                 # Leave the full pass's ordering in place while it is still running.
                                 self.update_boosts(proj, pending=self._full_running(proj["slug"]))
+                            # and their look-alikes: the donor's C with their names, constants and its profile
+                            from . import similar_matches
+                            similar_matches.after_match(self, proj, batch)
                     except Exception as e:
                         log.info("twins after a match: %s", e)
             finally:

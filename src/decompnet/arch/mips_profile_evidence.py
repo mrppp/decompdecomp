@@ -8,6 +8,7 @@ import struct
 
 JR_RA = 0x03E00008
 NOP = 0
+MOVE_FP_SP = (0x03A0F021, 0x03A0F025, 0x03A0F02D)  # `$fp = $sp` written as addu, or, daddu
 
 
 def words_of(code: bytes, big_endian: bool = True) -> list[int]:
@@ -40,3 +41,55 @@ def ends_jr_ra_nop(words) -> bool:
     op, funct = before >> 26, before & 63
     transfer = op in (1, 2, 3, 4, 5, 6, 7, 0x14, 0x15, 0x16, 0x17) or (op == 0 and funct in (8, 9, 0xC, 0xD))
     return before != NOP and not transfer
+
+
+def keeps_frame_pointer(words) -> bool:
+    """The prologue copies `$sp` into `$fp`: GCC's unoptimised (`-O0`) code does it in every function, optimised code
+    omits the frame pointer unless it needs one (`alloca`)."""
+    return any(word in MOVE_FP_SP for word in words[:16])
+
+
+def saves_before_parameter_moves(words) -> bool:
+    """The prologue stores every saved register first and only then copies the parameters into them (`sw $s1; sw $s0;
+    move $s3, $a3`), as code GCC never ran its second scheduler over does (-O1, -O0 or -fno-schedule-insns2). The
+    scheduler pairs each store with its copy (`sw $s3; move $s3, $a3; sw $s2; ...`). Needs three stores and two copies
+    in the first basic block: fewer say nothing. Of one KMC game's matched functions with that many, all 87 built -O2
+    interleaved them and all 13 built -O1 did not."""
+    saves, moves = [], []
+    for index, word in enumerate(words):
+        op, rs, rt, rd, func = word >> 26, (word >> 21) & 31, (word >> 16) & 31, (word >> 11) & 31, word & 63
+        if op == 0x2B and rs == 29 and (16 <= rt <= 23 or rt in (30, 31)):  # sw $s*/$fp/$ra, n($sp)
+            saves.append(index)
+        elif op == 0 and func in (0x21, 0x25) and rt == 0 and 4 <= rs <= 7 and (16 <= rd <= 23 or rd == 30):
+            moves.append(index)
+        elif op in (1, 2, 3, 4, 5, 6, 7, 0x14, 0x15, 0x16, 0x17) or (op == 0 and func in (8, 9)):
+            break
+    return len(saves) >= 3 and len(moves) >= 2 and min(moves) > max(saves)
+
+
+def reads_through_held_address(words) -> bool:
+    """A symbol's address built into a register (`lui r; addiu r, r`) and two or more other offsets read or written
+    through it before the next jump: GCC folds `sym + 4` into the instruction itself for a pointer that holds a
+    constant address, and keeps `4(r)` under `-fforce-addr`."""
+    for index, word in enumerate(words):
+        if word >> 26 != 0x0F:  # lui
+            continue
+        register = (word >> 16) & 31
+        built = next((at for at in range(index + 1, min(index + 3, len(words)))
+                      if words[at] >> 26 == 9 and (words[at] >> 21) & 31 == register == (words[at] >> 16) & 31), None)
+        if register in (1, 29) or built is None:
+            continue
+        offsets = set()
+        for after in words[built + 1:]:
+            op, base, rt = after >> 26, (after >> 21) & 31, (after >> 16) & 31
+            if op in (1, 2, 3, 4, 5, 6, 7, 0x14, 0x15, 0x16, 0x17) or (op == 0 and after & 63 in (8, 9)):
+                break
+            load, store = op in (0x20, 0x21, 0x23, 0x24, 0x25), op in (0x28, 0x29, 0x2B)
+            if base == register and (load or store or op in (0x31, 0x35, 0x39, 0x3D)) and after & 0xFFFF:
+                offsets.add(after & 0xFFFF)
+            written = (after >> 11) & 31 if op == 0 and after else rt if load or 8 <= op <= 15 else None
+            if written == register:
+                break
+        if len(offsets) >= 2:
+            return True
+    return False
