@@ -20,11 +20,16 @@
 mod hosted;
 mod native;
 mod rom_judge;
+mod desktop_judge;
 mod mips_link;
 mod mips_elf;
 mod mips_ecoff;
 mod mips_dispatch;
+mod mips_diff;
+#[path = "../../native/matching_blocks.rs"]
+mod matching_blocks;
 mod mips_rom;
+mod mips_uso;
 mod rom_project;
 mod verifier;
 mod window;
@@ -1070,9 +1075,20 @@ async fn until_parent_leaves(native: Arc<native::Native>) {
     }
 }
 
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["desktop-judge"] {
+        std::process::exit(desktop_judge::serve());
+    }
+    gateway_main(args);
+}
+
 #[tokio::main]
-async fn main() {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+async fn gateway_main(mut args: Vec<String>) {
+    if args.as_slice() == ["--licenses"] {
+        print!("{}", include_str!("../THIRD_PARTY_LICENSES.txt"));
+        return;
+    }
     if args.first().map(String::as_str) == Some("hosted") {
         // Standalone: shared projects served without the desktop app (hosted.rs).
         args.remove(0);
