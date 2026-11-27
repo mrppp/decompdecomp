@@ -3,15 +3,18 @@
 
     haiku.py next SLUG [FUNC] [--repo CHECKOUT] [--home DIR] [--holder NAME] [--max-size N]
                          start a session (setup.py: private worktree, venv, MCP connection, claim renewal), claim FUNC or
-                         the most promising open function of at most N=150 instructions (recently tried ones and
-                         library names last or never), and print one screen: assembly, saved C, a fresh machine draft,
+                         the most promising open function of at most N=150 instructions (recently tried ones last,
+                         the most given up last of all; library names never), and print one screen: assembly, saved C, a fresh machine draft,
                          an earlier worker's near-miss under another profile, every candidate profile's score, the
                          matched twin's C, neighbours' signatures
     haiku.py try HOLDER CAND.c
                          judge CAND.c under every candidate profile; submit it when it beats the saved score; when it is
-                         exact, make it the match (under another profile: `suggest`, for this function only)
+                         exact, make it the match (under another profile: `suggest`, for this function only).
+                         Scaffolding the starting C already has may stay, also in a match (which is reported as keeping
+                         it); adding more is refused
     haiku.py done HOLDER [--note TEXT]     (also: giveup)
-                         submit the best candidate seen, keep a better one under another profile as a compiler trial
+                         submit the best candidate seen, run the repair library on a close one under another profile (exact:
+                         saved as the match), keep a better one under another profile as a compiler trial
                          (compiler_experiments: nothing is applied; the next `next` shows it), write the note, release
                          the claim, remove the session (with no try and no --note: only the claim and session go)
 
@@ -23,7 +26,9 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -43,6 +48,8 @@ LINE_WIDTH = 240
 PICK_ATTEMPTS = 5
 RELEASE_WAIT_SECONDS = 600
 VERIFY_SECONDS = 90
+CHAIN_NEAR = 300  # `done` walks a near-miss of another profile this close through the repair library
+CHAIN_STEPS, CHAIN_CHILDREN, CHAIN_SECONDS = 4, 600, 600
 
 
 # --- the sources a matcher may not send -------------------------------------------------------------------------------
@@ -65,16 +72,17 @@ def _without_records(code):
         code = code[:found.start()] + " record " + code[end:]
 
 
-def faults(source):
-    """Why `source` may not be sent: scaffolding that scores without being a program anybody wrote."""
+def scaffolding(source):
+    """{item: how often} of the scaffolding in `source`: constructs that score without being a program anybody wrote."""
     code = _code(source)
-    found = []
-    if re.search(r"\bwhile\s*\(\s*0[uUlL]*\s*\)", code):
-        found.append("a `do { } while (0)` fence (or `while (0)`): delete it and write the statements plainly")
-    if "__repair_" in code:
-        found.append("a `__repair_` local or helper from a search: rewrite it as ordinary C")
-    if re.search(r"\bvolatile\b", code):
-        found.append("`volatile`: remove it")
+    found = {}
+    fences = len(re.findall(r"\bwhile\s*\(\s*0[uUlL]*\s*\)", code))
+    if fences:
+        found["fence"] = fences
+    found.update({f"repair:{name}": 1 for name in re.findall(r"\w*__repair_\w*", code)})
+    volatiles = len(re.findall(r"\bvolatile\b", code))
+    if volatiles:
+        found["volatile"] = volatiles
     body, depth = [], 0
     for char in _without_records(code):
         depth += {"{": 1, "}": -1}.get(char, 0)
@@ -87,7 +95,37 @@ def faults(source):
             continue
         name = array[1]
         if re.match(r"_*(pad|dummy|unused|filler)", name, re.I) or len(re.findall(rf"\b{name}\b", inside)) == 1:
-            found.append(f"the padding array `{name}[]` (declared but not used for anything): delete it")
+            found[f"padding:{name}"] = 1
+    return found
+
+
+def inherited(sources):
+    """The scaffolding the C a session starts from already has: the most of each item in any one of `sources`."""
+    found = {}
+    for source in sources:
+        for item, count in scaffolding(source or "").items():
+            found[item] = max(count, found.get(item, 0))
+    return found
+
+
+def kinds(found):
+    """The kinds of scaffolding in `scaffolding`'s items, for one line: "fence, volatile"."""
+    return ", ".join(sorted({item.split(":")[0] for item in found}))
+
+
+def faults(source, allowed=None):
+    """Why `source` may not be sent: its scaffolding beyond `allowed` ({item: how often}, from `inherited`)."""
+    allowed = allowed or {}
+    over = [item for item, count in scaffolding(source).items() if count > allowed.get(item, 0)]
+    found = []
+    if "fence" in over:
+        found.append("a `do { } while (0)` fence (or `while (0)`): delete it and write the statements plainly")
+    if any(item.startswith("repair:") for item in over):
+        found.append("a `__repair_` local or helper from a search: rewrite it as ordinary C")
+    if "volatile" in over:
+        found.append("`volatile`: remove it")
+    found.extend(f"the padding array `{item.split(':', 1)[1]}[]` (declared but not used for anything): delete it"
+                 for item in over if item.startswith("padding:"))
     return found
 
 
@@ -133,8 +171,9 @@ def shown(score):
 
 
 def rank(worker, items):
-    """The shortlist, most promising first: the lowest score any profile gives the saved C or the draft, per
-    instruction, discounted for matched neighbours to learn from."""
+    """The shortlist, most promising first: functions nobody worked on lately by the lowest score any profile gives
+    the saved C or the draft, per instruction, discounted for matched neighbours to learn from; then the others, those
+    given up least first and, among equals, the longest untouched."""
     ranked = []
     for item in items:
         found = [s["score"] for source in dict.fromkeys((item["best"], item["draft"], item.get("near"))) if source
@@ -143,7 +182,9 @@ def rank(worker, items):
         if found:
             value = min(found) / max(1, item["n_insns"] or 1) / (1 + 0.25 * min(4, item["matched_near"]))
             value *= 1 + item.get("abandons", 0)
-            ranked.append((item.get("worked", 0), value, item["n_insns"], item["name"]))
+            worked = item.get("worked", 0)
+            ranked.append((bool(worked), item.get("abandons", 0) if worked else 0, worked, value, item["n_insns"],
+                           item["name"]))
     return [name for *_, name in sorted(ranked)]
 
 
@@ -203,11 +244,16 @@ def same_profile(one, other):
 
 
 def screen(root, info, brief, worker, write=print):
-    """Print the one screen; returns (the scores per profile, the kept near-miss's score under its profile now)."""
+    """Print the one screen; returns (the scores per profile, the kept near-miss's score under its profile now, the
+    scaffolding the starting C already has)."""
     folder = root / "start"
     folder.mkdir(exist_ok=True)
-    near = next((t for t in brief.get("trials") or [] if not faults(t["source"])), None)
     twin = brief.get("twin")
+    came_with = [brief["best"], brief["draft"], (twin or {}).get("source")]
+    allowed = inherited(came_with)
+    near = next((t for t in brief.get("trials") or [] if not faults(t["source"], allowed)), None)
+    if near:
+        allowed = inherited([*came_with, near["source"]])
     sources = {"best": brief["best"], "draft": brief["draft"], **({"near": near["source"]} if near else {})}
     files = {key: folder / f"{key}.c" for key in sources}
     files["asm"] = folder / "asm.s"
@@ -249,9 +295,10 @@ def screen(root, info, brief, worker, write=print):
         if rows:
             (folder / "rows.txt").write_text(rows)
             write(f"Its differing rows (target | yours):\n{differing(rows, folder / 'rows.txt')}")
-        problems = faults(sources[key] or "")
-        if problems:
-            write("It contains scaffolding you must remove before `try`: " + "; ".join(problems))
+    if allowed:
+        write("\nThe C above came with scaffolding (" + kinds(allowed)
+              + "). `try` accepts what is already there, also in a match, so start from it and keep your progress; "
+              "adding more is refused.")
     if brief.get("declarations"):
         write("\n--- shared header declarations (already included; do not redeclare differently)")
         write("\n".join(brief["declarations"]))
@@ -260,7 +307,7 @@ def screen(root, info, brief, worker, write=print):
                     for n in brief.get("neighbours") or []) or "(none matched yet)")
     kept = next((pair[keys.index("near")] for profile, pair in zip(profiles, results)
                  if near and same_profile(near, profile)), None)
-    return results, kept
+    return results, kept, allowed
 
 
 def next_function(args):
@@ -286,11 +333,12 @@ def next_function(args):
     try:
         brief = worker.ask({"op": "brief", "name": info["function"]})
         first = not (root / "haiku.json").exists()
-        results, kept = screen(root, info, brief, worker)
+        results, kept, allowed = screen(root, info, brief, worker)
         if first:
             write_state(root, {"function": {k: brief[k] for k in ("name", "vram", "target")},
                                "profiles": brief["profiles"], "tries": 0, "best": {}, "submitted": [],
-                               "start": results, "app_score": brief["best_score"], "kept": kept})
+                               "start": results, "app_score": brief["best_score"], "kept": kept,
+                               "inherited": allowed})
     finally:
         worker.close()
     return 0
@@ -344,9 +392,10 @@ def try_source(holder, path):
         source = Path(path).read_text()
     except OSError as error:
         sys.exit(f"can't read {path}: {error}")
-    problems = faults(source)
+    problems = faults(source, state.get("inherited"))
     if problems:
-        sys.exit("NOT judged. Remove this scaffolding first:\n- " + "\n- ".join(problems))
+        sys.exit("NOT judged. You added scaffolding the C you started from doesn't have; remove it:\n- "
+                 + "\n- ".join(problems))
     claimlost.warn(root)
     if claimlost.taken(claimlost.read(root)):
         sys.exit(f"{name} is no longer yours (matched, or someone else holds it): run `haiku.py done {holder}`")
@@ -378,6 +427,9 @@ def try_source(holder, path):
         exact = own if found[own] == 0 else next((i for i, s in enumerate(found) if s == 0), None)
         saved = current.get("best")
         if exact is not None:
+            # only inherited scaffolding gets here (added scaffolding was refused above): saved, but said
+            state["scaffolded"] = kinds(scaffolding(source))
+            write_state(root, state)
             if exact == own:
                 print(submit(holder, root, state, source))
             else:
@@ -391,6 +443,8 @@ def try_source(holder, path):
                 print(f"\nMATCHED: the app records {name} as matched"
                       f"{'' if exact == own else f' with {label(profiles[exact])}'}. Stop editing and run: "
                       f"haiku.py done {holder}")
+                if state["scaffolded"]:
+                    print(f"It keeps scaffolding it started with ({state['scaffolded']}): say so in your report.")
                 return 0
             print(f"\nExact here, but the app does not record {name} as matched yet (read its answer above). "
                   f"Run: haiku.py done {holder}   and report both.")
@@ -456,6 +510,66 @@ def candidate(gateway, name):
     raise setup.McpError(f"get_candidate gave no candidate to experiment on: {text[:200]}")
 
 
+def library_chain(root, info, name, profile, path):
+    """prove_chain from the C at `path` under `profile` (with the session's venv, which can import the app): the final
+    source, or None when it could not run or ran out of time."""
+    venv, out = Path(info.get("venv") or ""), root / "chain.c"
+    out.unlink(missing_ok=True)
+    command = [str(venv / "bin" / "python"), str(Path(__file__).with_name("prove_chain.py")), str(path),
+               "--slug", info["slug"], "--function", name, "--toolchain", profile["toolchain"],
+               f"--flags={' '.join(profile['flags'])}", "--steps", str(CHAIN_STEPS),
+               "--children", str(CHAIN_CHILDREN), "--out", str(out)]
+    if info.get("home"):
+        command += ["--home", info["home"]]
+    try:
+        subprocess.run(command, env=dict(os.environ, UV_PROJECT_ENVIRONMENT=str(venv)), capture_output=True,
+                       timeout=CHAIN_SECONDS, check=True)
+        return out.read_text()
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"the repair library could not be run on the near-miss: {str(error)[:200]}")
+        return None
+
+
+def chain_near(root, info, state):
+    """The repair library on the closest candidate of another profile, before it is only kept as a trial: nothing
+    else ever searches it (the Deep Permuter works from the saved C under the function's own profile). A 25 under -O1
+    of an -O2 function was one `join_tail_arm_split` step from exact and waited as a trial. An exact result is saved
+    as the match and a closer one replaces the near-miss; one that adds scaffolding is dropped, as in `try`."""
+    profiles = state["profiles"]
+    others = [(kept["score"], int(i)) for i, kept in state["best"].items() if not profiles[int(i)]["own"]]
+    if not others:
+        return
+    score, index = min(others)
+    mine = next((kept["score"] for i, kept in state["best"].items() if profiles[int(i)]["own"]), None)
+    if score > CHAIN_NEAR or (mine is not None and score >= mine):
+        return
+    function, profile = state["function"], profiles[index]
+    name, path = function["name"], Path(state["best"][str(index)]["path"])
+    print(f"running the repair library on the {score} near-miss under {label(profile)} (a few minutes at most)")
+    source = library_chain(root, info, name, profile, path)
+    if source is None or source == path.read_text() or faults(source, state.get("inherited")):
+        return
+    worker = Worker(info)
+    try:
+        found = worker.score(function, profile, source)["score"]
+    finally:
+        worker.close()
+    if found is None or found >= score:
+        return
+    print(f"the repair library took the near-miss {score} -> {found}")
+    copy = root / f"best-profile{index}.c"
+    copy.write_text(source)
+    state["best"][str(index)] = {"score": found, "path": str(copy)}
+    if found == 0:
+        state["scaffolded"] = kinds(scaffolding(source))
+        try:
+            print(apply_profile(info, name, profile, source))
+            wait_matched(info, name)
+        except setup.McpError as error:
+            print(f"the app refused the profile change: {error}")
+    write_state(root, state)
+
+
 def keep_near(holder, root, info, state):
     """Keep the closest candidate of another profile where it survives the session: a `compiler_experiments` trial
     records the C, the profile and the score with the function and applies nothing; the next `next` shows it. Returns
@@ -507,11 +621,15 @@ def done(holder, note=""):
     near = ""
     if current.get("status") != "matched" and not lost:
         keep_work(holder, root, info, state)
-        near = keep_near(holder, root, info, state)
+        chain_near(root, info, state)
         current = app_function(info, name)
+        if current.get("status") != "matched":
+            near = keep_near(holder, root, info, state)
+            current = app_function(info, name)
     if current.get("status") == "matched":
         setup.stop_session(holder)
-        print(f"RESULT {name}: MATCHED")
+        kept = state.get("scaffolded")
+        print(f"RESULT {name}: MATCHED" + (f" (keeps inherited scaffolding: {kept})" if kept else ""))
         return 0
     text = summary(state, note, near)
     try:

@@ -51,7 +51,8 @@ def lead(search, agent, proj, fn, source, own_score, *, check=None):
         rows = repair_ranking.instruction_rows(repair_ranking.evidence(search.net, fn['id'], getattr(agent, 'id', None)))
         from . import fp_fingerprints
         big_endian = bool(proj['big_endian']) if 'big_endian' in proj.keys() else True
-        for flags in (profile_hypotheses.kmc_cse_address_probe(own, rows), profile_hypotheses.kmc_cse_skip_probe(own, rows),
+        for flags in (profile_hypotheses.kmc_cse_address_probe(own, rows), profile_hypotheses.kmc_cse_hoist_probe(own, rows),
+                      profile_hypotheses.kmc_cse_skip_probe(own, rows),
                       profile_hypotheses.kmc_expensive_probe(own, rows),
                       fp_fingerprints.probe(own, bytes(fn['target']) if 'target' in fn.keys() and fn['target'] else b'',
                                             rows, big_endian)):
@@ -75,6 +76,22 @@ def lead(search, agent, proj, fn, source, own_score, *, check=None):
             best = (profile, score)
         if floor is not None and agree is not None and agree > floor and (closer is None or score < closer[1]):
             closer = (profile, score)
+    # The jump threader off, under the closest profile so far: one KMC state routine was exact under -O1 only with it,
+    # its single differing row a branch the threader sent past a later test of the same value.
+    lead_profile = best[0] if best else own
+    if (proj['arch'] == 'mips' and lead_profile['toolchain'] == 'gcc-2.7.2-kmc'
+            and not any(flag in lead_profile['flags'] for flag in ('-fno-thread-jumps', '-fthread-jumps'))
+            and search.tested < search.limit):
+        check()
+        flags = lead_profile['flags']  # (a project's settings may spell them as one string)
+        flags = flags.split() if isinstance(flags, str) else list(flags)
+        profile = dict(lead_profile, flags=[*flags, '-fno-thread-jumps'])
+        score = _judge(search, proj, fn, profile, source)
+        if score == 0:
+            return profile, score
+        if score is not None and score < (best[1] if best else own_score):
+            search.log(f"Profile {profile['toolchain']} {' '.join(profile['flags'])} on the current C: score {score}")
+            best = (profile, score)
     if search.tested < search.limit:
         check()
         profile = neighbour_profile(search.net, proj, cfg, fn, [own, *(p for _, p in ranked)])
@@ -163,6 +180,18 @@ def fp_variant(search, proj, fn, profile) -> bool:
         return False
 
 
+def level_variant(search, proj, fn, profile) -> bool:
+    """True when `profile` is the function's own settings at another -O level."""
+    try:
+        from ..project import compiler_for
+        from . import opt_levels
+        own = compiler_for(search.net.cfg(proj), fn['vram'], fn)
+        return own['toolchain'] == profile['toolchain'] and list(profile['flags']) in opt_levels.variants(
+            own['toolchain'], own['flags'])
+    except Exception:  # noqa: BLE001 - not knowing the function's settings is not being a level variant
+        return False
+
+
 def _fp_first(options):
     """[(family, child)] with the FP-constant and operand families first (stable otherwise): a step judges at most
     CHAIN_CHILDREN of them, and the literal inlining that matches under the flipped profile is one child among hundreds."""
@@ -247,8 +276,9 @@ def climb(search, agent, proj, fn, source, profile, score, seed=0, *, require_cl
     seen = {hashlib.sha256(source.encode()).hexdigest()}
     best_source, best = source, score
     spent = 0
-    if fp_variant(search, proj, fn, profile):
-        # (the flipped floating-point profile: the source may need a repair under it too: a best-child chain first)
+    if fp_variant(search, proj, fn, profile) or level_variant(search, proj, fn, profile):
+        # (the flipped floating-point profile, or another -O level: the source may need a repair under it too: a
+        # best-child chain first)
         best_source, best, spent = repair_chain(search, agent, proj, fn, source, score, profile,
                                                 max(1, budget // CHAIN_SHARE), check, header, key)
         seen.add(hashlib.sha256(best_source.encode()).hexdigest())
@@ -309,6 +339,27 @@ def climb(search, agent, proj, fn, source, profile, score, seed=0, *, require_cl
 
 class _ProfileTimeElapsed(Exception):
     """The alternate-profile window ended while time remains for the main search."""
+
+
+def explore_level(search, agent, proj, fn, leads) -> bool:
+    """Repair under the -O level the profile probe found clearly closer: `leads` is [(profile, C, its score there)],
+    one level, closest text first. Within the same share of the pass's time as `explore`; True when one was exact."""
+    now = time.monotonic()
+    deadline = now + max(0, search.deadline - now) / CLIMB_SHARE
+
+    def check():
+        search.check()
+        if time.monotonic() >= deadline:
+            raise _ProfileTimeElapsed
+
+    try:
+        for profile, source, score in leads:
+            check()
+            if climb(search, agent, proj, fn, source, profile, score, check=check) == 0:
+                return True
+    except _ProfileTimeElapsed:
+        search.log('Optimisation level time share reached; continuing with the current settings.')
+    return False
 
 
 def explore(search, agent, proj, fn, baseline, clean_profile=None):

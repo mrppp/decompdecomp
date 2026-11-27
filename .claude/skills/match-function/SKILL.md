@@ -45,8 +45,9 @@ Most matches in a 1,000-function session came from this order, not from clever s
 
 Rules for the trials:
 - The exact flag set matters: `-G8 -mips2 -O2 -mfp32` scored 110 where `-G0 -mips3 ... -mfp32` was exact.
-- The app's trial is the truth. `fast_judge.py --flags` may append to the function's flags instead of replacing them: read
-  the flags it prints.
+- The app's trial is the truth. In `fast_judge.py`, `--flags` ADDS to the function's own profile; to judge another
+  compiler or level pass `--toolchain ID` and `--replace-flags='-O2 ...'` (also after a match changed the function's
+  profile). Its `judged with` line (stderr) says what the score is of.
 - **An exact trial is applied with `suggest(function=FUNC, trial_id=ID)` WITHOUT `review_only`.** The user has allowed
   compiler-setting changes without asking. (Haiku agents once left seven exact trials queued.) Then check
   `get_function(section="summary")` shows the profile and `matched` 0, and report the profile change.
@@ -208,7 +209,8 @@ and exits 1 when it does not. Run it **every 20 minutes** and **before any long 
 matches the function, and isolated scoring never notices. The renewal retries a failed renewal within seconds and, when
 the app says someone else holds the function (or it is matched), writes a `LOST` file in the session folder; from then on
 every `setup.py` command, `fast_judge.py`, `prove_chain.py` and `grid.py` print a boxed **CLAIM LOST** warning, and
-`setup.py try` refuses to submit. **On a lost claim stop working on that function**: if `check` says it is free,
+`setup.py try` refuses to submit. A function this session matched itself is not a lost claim: it is said once,
+quietly. **On a lost claim stop working on that function**: if `check` says it is free,
 `setup.py reclaim <holder> FUNC` (reread the saved best first: someone may have changed it); if someone else holds it or
 it is matched, `release` your notes through `add_note`, then `setup.py release <holder>` and `setup.py reclaim <holder>`
 for another function. Never keep working "in the isolated judge" on a function you no longer hold.
@@ -273,7 +275,8 @@ The gateway deduplicates pending calls by connection, tool and arguments.
 - **An enormous function** (well over ~1000 instructions, or a best in the thousands with no near-miss rows) may be
   released once and another claimed: `release_function` it (with its claim token, `move_on=true`), then
   `setup.py release <holder>` (the renewal must stop renewing it, or it claims the function back every 5 minutes), then
-  `setup.py reclaim <holder>` for the next one (the nearest; or `reclaim <holder> FUNC`, `--random`, `--max-size N`).
+  `setup.py reclaim <holder>` for the next one (the nearest; or `reclaim <holder> FUNC`, `--random`, `--max-size N`;
+  it removes the previous function's `start/` files).
   If you keep it, work it with the large-function method (step 2).
 - **A function given**: call `claim_function(function=FUNC, fallback=false)` when the tool exposes
   `fallback`. If someone else holds it, report the conflict and continue in the isolated judge.
@@ -780,6 +783,9 @@ says the fix and the library families it names; try those families with `prove_c
 
 ## 3a. The fast tools (use them before writing variants by hand)
 
+- **Read the `levels` line first.** `plain_best.py` judges the saved best at each other -O level. When one is far closer
+  (`closer under ... -O1`), the function was built at that level: write plain C from the target (typed records, a real
+  `switch`, no fences) and judge it there; do not tune the old best.
 - **A claim starts with several sources.** `setup.py` prints the saved best, its plain form (`plain_best.py`:
   decomprepair `scaffold_strip.plain`, fences opened and scaffolding stripped) and the levels of decomprepair
   `clean_rewrite` (`clean_rewrite_structure.c`: m2c's gotos as loops, `if`s, `break`s and returns;
