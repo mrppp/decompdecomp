@@ -37,6 +37,8 @@ struct Options {
     token: String,
     name: String,
     slots: usize,
+    trials_only: bool,
+    parent_pipe: bool,
     judge: Vec<String>,
     poll: Duration,
     idle_exit: Option<Duration>,
@@ -50,6 +52,8 @@ impl Options {
             token: std::env::var("DECOMP_VERIFIER_TOKEN").unwrap_or_default(),
             name: String::new(),
             slots: 2,
+            trials_only: false,
+            parent_pipe: false,
             judge: Vec::new(),
             poll: Duration::from_secs(3),
             idle_exit: None,
@@ -58,6 +62,14 @@ impl Options {
         let mut judge_args = Vec::new();
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
+            if flag == "--trials-only" {
+                options.trials_only = true;
+                continue;
+            }
+            if flag == "--parent-pipe" {
+                options.parent_pipe = true;
+                continue;
+            }
             let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--server" => options.server = value.trim_end_matches('/').to_string(),
@@ -82,6 +94,9 @@ impl Options {
             options.judge.push("--packs".into());
             options.judge.push(packs.to_string_lossy().into_owned());
         }
+        if options.trials_only && options.packs.is_none() {
+            return Err("--trials-only requires --packs".into());
+        }
         if options.server.is_empty() || options.token.is_empty() || options.name.is_empty() {
             return Err("--server, --token (or DECOMP_VERIFIER_TOKEN) and --name are required".into());
         }
@@ -94,12 +109,14 @@ struct Judge {
     _child: Child,
     input: ChildStdin,
     output: Lines<BufReader<ChildStdout>>,
+    rom_project: Option<(String, Arc<crate::rom_project::Project>)>,
 }
 
 impl Judge {
     fn start(command: &[String]) -> Result<Judge, String> {
         let mut child = Command::new(&command[0])
             .args(&command[1..])
+            .env_remove("DECOMP_VERIFIER_TOKEN")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -107,20 +124,106 @@ impl Judge {
             .map_err(|e| format!("can't start the judge {:?}: {e}", command[0]))?;
         let input = child.stdin.take().ok_or("no judge stdin")?;
         let output = BufReader::new(child.stdout.take().ok_or("no judge stdout")?).lines();
-        Ok(Judge { _child: child, input, output })
+        Ok(Judge { _child: child, input, output, rom_project: None })
     }
 
     async fn ask(&mut self, request: &Value, limit: Duration) -> Result<Value, String> {
         let exchange = async {
             self.input.write_all(format!("{request}\n").as_bytes()).await.map_err(|e| e.to_string())?;
             self.input.flush().await.map_err(|e| e.to_string())?;
-            match self.output.next_line().await {
-                Ok(Some(line)) => serde_json::from_str::<Value>(&line).map_err(|e| format!("the judge said {line:?}: {e}")),
-                Ok(None) => Err("the judge ended".into()),
-                Err(e) => Err(e.to_string()),
+            loop {
+                let line = self.output.next_line().await.map_err(|error| error.to_string())?
+                    .ok_or("the judge ended")?;
+                let reply: Value = serde_json::from_str(&line).map_err(|error| format!("the judge said {line:?}: {error}"))?;
+                let result = if let Some(plan) = reply.get("rom_mips") {
+                    if request["rom_mips"].as_u64() != Some(crate::mips_rom::VERSION) {
+                        return Err("unexpected MIPS ROM link request from the judge".into());
+                    }
+                    self.link_rom(plan, request).await
+                } else if let Some(plan) = reply.get("parse_mips") {
+                    if request["parse_mips"].as_u64() != Some(crate::mips_elf::VERSION) {
+                        return Err("unexpected MIPS ELF request from the judge".into());
+                    }
+                    crate::mips_elf::prepare(plan)
+                } else if let Some(plan) = reply.get("link_mips") {
+                    if request["link_mips"].as_u64() != Some(crate::mips_link::VERSION) {
+                        return Err("unexpected MIPS link request from the judge".into());
+                    }
+                    crate::mips_link::link(plan)
+                } else {
+                    return Ok(reply);
+                };
+                // Answer errors too, so no callback response stays in flight.
+                let result = result.unwrap_or_else(|error| json!({"error": error}));
+                self.input.write_all(format!("{result}\n").as_bytes()).await.map_err(|error| error.to_string())?;
+                self.input.flush().await.map_err(|error| error.to_string())?;
             }
         };
         tokio::time::timeout(limit, exchange).await.map_err(|_| format!("the judge took over {} s", limit.as_secs()))?
+    }
+}
+
+impl Judge {
+    async fn link_rom(&mut self, plan: &Value, request: &Value) -> Result<Value, String> {
+        let project = if let Some(offset) = plan.get("rom_offset") {
+            if request["project_mips"].as_u64() != Some(crate::rom_project::VERSION) {
+                return Err("unexpected MIPS project snapshot".into());
+            }
+            let key = request["pack_sha256"].as_str().ok_or("missing verification pack revision")?;
+            if self.rom_project.as_ref().is_none_or(|(cached, _)| cached != key) {
+                let metadata = self.lookup(json!({"project_inputs": true}), None).await?;
+                let project = tokio::task::spawn_blocking(move || crate::rom_project::Project::load(metadata))
+                    .await.map_err(|error| error.to_string())??;
+                let project = Arc::new(project);
+                self.rom_project = Some((key.to_owned(), project));
+            }
+            self.rom_project.as_ref().map(|(_, project)| (Arc::clone(project), offset.as_i64()))
+        } else {
+            None
+        };
+        let view = project.as_ref().map(|(project, offset)| project.view(*offset)).transpose()?;
+        crate::mips_rom::link(plan, &mut ProjectReader { judge: self, view }).await
+    }
+
+    async fn lookup(&mut self, request: Value, view: Option<&crate::rom_project::View<'_>>) -> Result<Value, String> {
+        self.input.write_all(format!("{}\n", json!({"rom_lookup": request})).as_bytes()).await
+            .map_err(|error| error.to_string())?;
+        self.input.flush().await.map_err(|error| error.to_string())?;
+        loop {
+            let line = self.output.next_line().await.map_err(|error| error.to_string())?
+                .ok_or("the judge ended during a ROM lookup")?;
+            let reply: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
+            if let Some(error) = reply["error"].as_str() {
+                return Err(error.to_owned());
+            }
+            if let (Some(view), Some(read)) = (view, reply.get("rom_read")) {
+                // The Python dispatch analyser also reads from the Rust overlay view.
+                let result = view.lookup(&json!({"read": read}))
+                    .map(|value| json!({"rom_read_value": value}))
+                    .unwrap_or_else(|error| json!({"error": error}));
+                self.input.write_all(format!("{result}\n").as_bytes()).await
+                    .map_err(|error| error.to_string())?;
+                self.input.flush().await.map_err(|error| error.to_string())?;
+                continue;
+            }
+            return reply.get("rom_value").cloned().ok_or_else(|| "missing ROM lookup response".into());
+        }
+    }
+}
+
+struct ProjectReader<'a> {
+    judge: &'a mut Judge,
+    view: Option<crate::rom_project::View<'a>>,
+}
+
+impl crate::mips_rom::Reader for ProjectReader<'_> {
+    async fn ask(&mut self, request: Value) -> Result<Value, String> {
+        if let Some(view) = &self.view {
+            if let Some(value) = view.lookup(&request)? {
+                return Ok(value);
+            }
+        }
+        self.judge.lookup(request, self.view.as_ref()).await
     }
 }
 
@@ -227,8 +330,18 @@ impl Verifier {
         let id = item.get("id").and_then(Value::as_i64).unwrap_or(0);
         let slug = item.get("slug").and_then(Value::as_str).unwrap_or("").to_string();
         let verifier = self.id.load(Ordering::Relaxed);
-        let request = json!({"op": "judge", "slug": slug, "function": item.get("function"),
-                             "compiler": item.get("compiler"), "source": item.get("source")});
+        let mut request = json!({"op": "judge", "slug": slug, "function": item.get("function"),
+                                 "compiler": item.get("compiler"), "source": item.get("source")});
+        if let Some(trial) = item["trial"].as_object() {
+            request["score_evidence"] = json!(crate::rom_judge::SCORE_VERSION);
+            request["link_mips"] = json!(crate::mips_link::VERSION);
+            request["parse_mips"] = json!(crate::mips_elf::VERSION);
+            request["rom_mips"] = json!(crate::mips_rom::VERSION);
+            request["project_mips"] = json!(crate::rom_project::VERSION);
+            for (key, value) in trial {
+                request[key] = value.clone();
+            }
+        }
         let outcome = match self.judge() {
             Ok(mut judge) => match judge.ask(&request, JUDGE_LIMIT).await {
                 Ok(reply) => {
@@ -239,8 +352,15 @@ impl Verifier {
             },
             Err(e) => Err(e),
         };
+        let outcome = outcome.and_then(|mut reply| {
+            if let Some(evidence) = reply.get("score_evidence") {
+                reply["score"] = json!(crate::rom_judge::score(evidence)?);
+            }
+            Ok(reply)
+        });
         let result = match outcome {
-            Ok(reply) if reply.get("error").is_none() => {
+            Ok(reply) if reply.get("error").is_none()
+                && (request["pack_sha256"].is_null() || request["pack_sha256"] == reply["pack_sha256"]) => {
                 let body = json!({"id": id, "verifier": verifier, "score": reply.get("score"),
                                   "detail": reply.get("detail").and_then(Value::as_str).unwrap_or("")});
                 self.post(&format!("/v1/p/{slug}/verdicts"), &body).await.map(|v| {
@@ -270,6 +390,22 @@ pub async fn main(args: Vec<String>) -> i32 {
             return 2;
         }
     };
+    if options.parent_pipe {
+        let (closed, parent) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            let _ = closed.send(());
+        });
+        tokio::select! {
+            result = run(options) => result,
+            _ = parent => 0,
+        }
+    } else {
+        run(options).await
+    }
+}
+
+async fn run(options: Options) -> i32 {
     let slots = options.slots;
     let verifier = Arc::new(Verifier {
         http: reqwest::Client::builder().timeout(Duration::from_secs(60)).build().expect("HTTP client"),
@@ -280,8 +416,12 @@ pub async fn main(args: Vec<String>) -> i32 {
         released: AtomicU64::new(0),
     });
     let mut pause = Duration::from_secs(1);
+    let starting = Instant::now();
     while let Err(e) = verifier.register().await {
         log(format!("can't register yet: {e}"));
+        if verifier.options.idle_exit.is_some_and(|limit| starting.elapsed() >= limit) {
+            return 1;
+        }
         tokio::time::sleep(pause).await;
         pause = (pause * 2).min(Duration::from_secs(60));
     }
@@ -298,7 +438,9 @@ pub async fn main(args: Vec<String>) -> i32 {
         let free = running.available_permits();
         let mut leased = 0;
         if free > 0 {
-            let body = json!({"verifier": verifier.id.load(Ordering::Relaxed), "max": free});
+            let body = json!({"verifier": verifier.id.load(Ordering::Relaxed), "max": free,
+                              "judge_trials": verifier.options.packs.is_some(),
+                              "judge_trials_only": verifier.options.trials_only});
             match verifier.post("/v1/work/lease", &body).await {
                 Ok(reply) => {
                     for item in reply.get("work").and_then(Value::as_array).cloned().unwrap_or_default() {

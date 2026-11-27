@@ -8,6 +8,30 @@ MAX_BYTES = 4096
 MAX_TOTAL = 16384
 MAX_TABLES = 64
 MAX_CASES = 256
+# `lw $v0, %lo(D_80183198)($at)` followed by `jr $v0`: a dispatch through a table the symbol list calls data.
+_DISPATCH = re.compile(r'\blw\s+(\$\w+),\s*%lo\((D_[0-9A-Fa-f]{8})\)\(\$\w+\)[^\n]*\n(?:[^\n]*\n){0,2}?[^\n]*\bjr\s+\1(?!\w)')
+# A table the disassembler spelled from a symbol it lies inside (`%lo(func_80001500 + 0x20)`): the splitter filed
+# the data holding it as part of that symbol.
+_OFFSET_REF = re.compile(r'%(?:hi|lo)\(\s*([A-Za-z_]\w*)\s*\+\s*(0x[0-9A-Fa-f]+|\d+)\s*\)')
+_TABLE_JUMP = re.compile(r'\bjr\s+\$(?!ra\b|31\b)\w+')
+_RANGE_CHECK = re.compile(r'\bsltiu\s+\$\w+,\s*\$\w+,\s*(0x[0-9A-Fa-f]+|\d+)')
+DISPATCH_WINDOW = 10  # lines before a `jr` that load its table's address and check its index
+
+
+def offset_dispatches(asm):
+    """[(symbol, offset, range-check bound or None)] of each table spelled `symbol + offset` before a `jr`. A lead
+    only: `read` takes it for a table when the words there are this function's own instruction addresses."""
+    lines, found = asm.splitlines(), {}
+    for number, line in enumerate(lines):
+        if not _TABLE_JUMP.search(line):
+            continue
+        window = '\n'.join(lines[max(0, number - DISPATCH_WINDOW):number])
+        refs = _OFFSET_REF.findall(window)
+        if not refs:
+            continue
+        checks = _RANGE_CHECK.findall(window)
+        found[(refs[-1][0], int(refs[-1][1], 0))] = int(checks[-1], 0) if checks else None
+    return [(symbol, offset, bound) for (symbol, offset), bound in found.items()]
 
 
 def case_target(word, instruction_addresses):
@@ -22,7 +46,7 @@ def case_target(word, instruction_addresses):
     return high if not word & 0x80000000 and high in instruction_addresses else None
 
 
-def jump_table_extent(name, reader, instruction_addresses, endian):
+def jump_table_extent(name, reader, instruction_addresses, endian, max_cases=MAX_CASES):
     """(address, size) of a jump table the symbol list doesn't have: its address is in its name (`jtbl_800E1DE8`)
     and it runs as long as its words are addresses of this function's own instructions. Nothing is invented: a word
     that is not a case target ends the table, and fewer than two cases is not a table. m2c can't resolve a `jr`
@@ -33,12 +57,52 @@ def jump_table_extent(name, reader, instruction_addresses, endian):
         return None
     address = int(match[1], 16)
     cases = 0
-    while cases < MAX_CASES:
+    while cases < min(max_cases, MAX_CASES):
         word = reader(address + 4 * cases, 4)
         if word is None or len(word) != 4 or case_target(struct.unpack(endian + 'I', word)[0], instruction_addresses) is None:
             break
         cases += 1
     return (address, 4 * cases) if cases >= 2 else None
+
+
+def guarded_table_sizes(asm):
+    """Exact bounds for a direct MIPS dispatch guarded by an unsigned range check.
+
+    Tables may be adjacent and point into the same function, so scanning until a non-case can swallow the next
+    table. Only use a bound when the guard, scaled index, relocation and indirect jump form one straight sequence.
+    """
+    insns = []
+    for line in asm.splitlines():
+        line = re.sub(r"^\s*(?:/\*.*?\*/\s*)?", "", line).strip()
+        if not line or line.endswith(':') or line.startswith(('glabel ', 'nonmatching ', 'endlabel ')):
+            insns.append('')  # do not match across labels or other block boundaries
+        else:
+            insns.append(re.sub(r"\s*,\s*", ", ", re.sub(r"\s+", " ", line)))
+    bounds = {}
+    for i in range(len(insns) - 6):
+        match = re.fullmatch(r"sltiu \$(\w+), \$(\w+), (0x[0-9A-Fa-f]+|\d+)", insns[i])
+        if not match:
+            continue
+        result, index, size = match.groups()
+        if result in (index, "at"):
+            continue  # the comparison or address load would overwrite the index
+        branch, shift, high, add, load, jump = insns[i + 1:i + 7]
+        if not re.fullmatch(rf"beqz \${result}, \S+", branch):
+            continue
+        if not re.fullmatch(rf"sll \${result}, \${index}, (?:2|0x2)", shift):
+            continue
+        table = re.fullmatch(r"lui \$at, %hi\(((?:jtbl_|D_)[0-9A-Fa-f]{8})\)", high)
+        if not table or not re.fullmatch(rf"addu \$at, \$at, \${result}", add):
+            continue
+        name = table[1]
+        target = re.fullmatch(rf"lw \$(\w+), %lo\({name}\)\(\$at\)", load)
+        if not target or not re.fullmatch(rf"jr \${target[1]}", jump):
+            continue
+        name = 'jtbl_' + name[2:] if name.startswith('D_') else name
+        bound = int(size, 16 if size.lower().startswith("0x") else 10)
+        if 2 <= bound <= MAX_CASES:
+            bounds.setdefault(name, set()).add(bound)
+    return {name: sizes.pop() for name, sizes in bounds.items() if len(sizes) == 1}
 
 
 def beside_code_reader(rom, fn, reader):  # (`rom`: the bytes, or a function that returns them, read only when needed)
@@ -84,6 +148,32 @@ def delta_readers(net, proj, fn):
     return [reader(delta) for delta in deltas]
 
 
+def offset_tables(net, proj, fn, syms, asm, instruction_addresses, endian):
+    """The tables `offset_dispatches` names, each as `jtbl_<address>` data with a comment saying which spelling in
+    the assembly it stands for (seeds renames those references, and m2c then drafts the whole switch). Without this
+    m2c cut the switch: a sound library's three functions whose tables sat inside the symbol before them."""
+    out, reader, beside = [], None, None
+    for symbol, offset, bound in offset_dispatches(asm)[:MAX_TABLES]:
+        known = syms.by_name.get(symbol)
+        spelled = re.fullmatch(r'(?:func|D|jtbl)_([0-9A-Fa-f]{8})', symbol)
+        base = known.address if known else int(spelled[1], 16) if spelled else None
+        if base is None:
+            continue
+        name = 'jtbl_%08X' % (base + offset)
+        if reader is None:
+            reader = net.reader(proj, fn)
+            beside = beside_code_reader(lambda: net._rom(proj)[0], fn, reader)
+        limit = bound if bound and 2 <= bound <= MAX_CASES else MAX_CASES
+        for candidate in (beside, *delta_readers(net, proj, fn)):
+            if extent := jump_table_extent(name, candidate, instruction_addresses, endian, limit):
+                data = candidate(*extent)
+                words = [w for (w,) in struct.iter_unpack(endian + 'I', data)]
+                out.extend(['/* table-alias %s+0x%X %s */' % (symbol, offset, name), 'dlabel ' + name,
+                            *('.word .L%08X' % case_target(w, instruction_addresses) for w in words)])
+                break
+    return out
+
+
 def read(net, proj, fn):
     """Supply known-size tables/constants and terminated strings; never invent missing bytes or case targets."""
     syms = net.symbols(proj['id'])
@@ -95,7 +185,12 @@ def read(net, proj, fn):
     # Tables first, outside the constants' limits: m2c can't decompile a function with any `jr` whose table is
     # missing, while a missing constant only costs a named global. A large state machine (a 4,399-instruction N64
     # function with 18 tables) got 4 of them after its constants and no draft at all.
+    # A table the splitter did not name `jtbl_` (it sits in data no segment lists, so it is only `D_80183198`) is
+    # still supplied under that name: seeds renames the draft's references to it. Without it m2c cut the switch.
+    dispatched = {'jtbl_' + found[2][2:]: found[2] for found in _DISPATCH.finditer(asm)}
+    names = [name for name in names if name not in dispatched.values()] + sorted(dispatched)
     names.sort(key=lambda name: not name.startswith('jtbl_'))
+    bounds = guarded_table_sizes(asm)
     count = tables = 0
     beside = []
     found_readers = {}
@@ -111,7 +206,7 @@ def read(net, proj, fn):
             if reader is None:
                 reader = net.reader(proj, fn)
             for candidate in (table_reader(), *delta_readers(net, proj, fn)):
-                if extent := jump_table_extent(name, candidate, instruction_addresses, endian):
+                if extent := jump_table_extent(name, candidate, instruction_addresses, endian, bounds.get(name, MAX_CASES)):
                     symbol = SimpleNamespace(address=extent[0], size=extent[1], kind='jtbl')
                     found_readers[name] = candidate
                     break
@@ -157,4 +252,5 @@ def read(net, proj, fn):
             tables += 1
         else:
             count += 1; used += len(data)
+    out.extend(offset_tables(net, proj, fn, syms, asm, instruction_addresses, endian))
     return out

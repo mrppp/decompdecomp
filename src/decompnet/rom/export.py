@@ -36,15 +36,28 @@ DISCARD = ["*(.reginfo)", "*(.MIPS.abiflags)", "*(.MIPS.options)", "*(.pdr)", "*
            "*(.gnu.attributes)", "*(.note*)", "*(.gptab.*)"]
 
 
+def _entry_reads_available(reads, image, segments, mappings):
+    """Only extract entries whose judge reads the standalone image can reproduce."""
+    ranges = [dict(rom_start=s['start'], rom_end=s['end'] or len(image), vram=s['vram'])
+              for s in segments if s.get('type') == 'code'] + list(mappings)
+    for addr, size, expected in reads:
+        offsets = {s['rom_start'] + addr - s['vram'] for s in ranges
+                   if 0 <= s['rom_start'] < s['rom_end'] <= len(image)
+                   and s['vram'] <= addr and addr + size <= s['vram'] + s['rom_end'] - s['rom_start']}
+        if len(offsets) != 1 or image[next(iter(offsets)):next(iter(offsets)) + size] != expected:
+            return False
+    return True
+
+
 def _auto_addresses(texts, defined) -> dict[str, int]:
     """The automatic names (func_8C000000, D_800A1234) these sources use that nothing defines, each at the address
     its name carries, so the standalone link can resolve them."""
     found = {}
     for text in texts:
-        for word in set(re.findall(r"\b[A-Za-z]\w*_[0-9A-Fa-f]{1,8}(?:_code_[0-9A-Fa-f]{8})?\b", text)):
+        for word in set(re.findall(r"\b[A-Za-z]\w*_[0-9A-Fa-f]{1,8}(?:_code_[0-9A-Fa-f]{8}|_)?\b", text)):
             # Inferred overlay scopes append their segment name after the
             # address; the suffix names a scope, not a second address.
-            base = re.sub(r'_code_[0-9A-Fa-f]{8}$', '', word)
+            base = re.sub(r'_code_[0-9A-Fa-f]{8}$', '', word).removesuffix('_')
             if (m := AUTO_NAME.fullmatch(base)) and word not in defined:
                 found.setdefault(word, int(m.group(1), 16))
     return found
@@ -68,13 +81,58 @@ def exported_source(prelude: str, include: str, source: str) -> str:
 _SPLAT_LABEL = re.compile(
     r'^[ \t]*(nonmatching|glabel|dlabel|jlabel|alabel|ehlabel|enddlabel)[ \t]+'
     r'([A-Za-z_.$][\w.$]*)(?=[, \t\r\n]|$)[^\n]*(?:\n|$)', re.M)
+_SPLAT_CODE_LABEL = re.compile(
+    r'^[ \t]*(nonmatching|glabel|dlabel|jlabel|alabel|ehlabel|enddlabel|endlabel)[ \t]+'
+    r'([A-Za-z_.$][\w.$]*)(?=[, \t\r\n]|$)[^\n]*(?:\n|$)', re.M)
+
+
+def remove_foreign_bank_labels(root: Path, functions, segments=()) -> None:
+    """Keep named entries and scoped local labels only in their original ROM bank."""
+    locations = {row['name']: row['rom_offset'] for row in functions if row['rom_offset'] is not None}
+    scopes = {}
+    for segment in segments:
+        if (segment.get('type') == 'code' and isinstance(segment.get('name'), str)
+                and isinstance(segment.get('start'), int) and isinstance(segment.get('end'), int)
+                and isinstance(segment.get('vram'), int)):
+            scopes.setdefault(segment['name'], []).append(segment)
+    for path in (root / 'asm' / 'nonmatchings').rglob('*.s'):
+        text = path.read_text(encoding='utf-8')
+        removed_entries = set()
+        def keep(match, source=text, directory=path.parent.name, removed_entries=removed_entries):
+            name = match[2]
+            if match[1] == 'endlabel':
+                if name in removed_entries:
+                    removed_entries.remove(name)
+                    return ''
+                return match[0]
+            expected = locations.get(name)
+            if expected is None and (local := re.fullmatch(r'\.L([0-9A-Fa-f]{8})_(.+)', name)):
+                address = int(local[1], 16)
+                owners = [s for s in scopes.get(local[2], [])
+                          if s['vram'] <= address < s['vram'] + s['end'] - s['start']]
+                if len(owners) == 1:
+                    expected = owners[0]['start'] + address - owners[0]['vram']
+                elif not scopes and re.fullmatch(r'code_[0-9A-Fa-f]+', local[2]):
+                    if not (directory == local[2] or directory.startswith(local[2] + '_')):
+                        return ''
+            if expected is None:
+                return match[0]
+            next_word = _ADDR_COMMENT.search(source, match.end())
+            if next_word and int(next_word[1], 16) != expected:
+                if match[1] == 'glabel':
+                    removed_entries.add(name)
+                return ''
+            return match[0]
+        updated = _SPLAT_CODE_LABEL.sub(keep, text)
+        if updated != text:
+            path.write_text(updated, encoding='utf-8')
 
 
 def remove_shadowed_bss(root: Path, functions) -> None:
-    """Splat may reuse loaded code addresses as BSS labels. Keep the space and the actual text definition."""
+    """Splat may reuse loaded code addresses as data labels. Keep the bytes and the actual text definition."""
     bss = {}
     labels = set()
-    for path in (root / 'asm' / 'data').rglob('*.bss.s'):
+    for path in (root / 'asm' / 'data').rglob('*.s'):
         text = path.read_text(encoding='utf-8')
         bss[path] = text
         labels.update(name for directive, name in _SPLAT_LABEL.findall(text) if directive not in ('nonmatching', 'enddlabel'))
@@ -121,7 +179,9 @@ def _symbol_lines(net, proj, rows=None, excluded=(), segments=(), unsized=()) ->
         owner = next((s for s in segments if s.get("type") == "code" and s["start"] <= rom < s["end"]
                       and s["vram"] + rom - s["start"] == vram), None) if rom is not None else None
         if counts[vram] > 1 and (owner is None or not owner.get("exclusive_ram_id")):
-            raise ExportError("An overlapping function has no matching scoped ROM bank.")
+            where = f" at ROM offset 0x{rom:X}" if isinstance(rom, int) else ""
+            raise ExportError(f"Overlapping function {row['name']}{where} has no matching scoped ROM bank. "
+                              "Review its ROM-to-memory mapping.")
         if owner is not None and owner.get("exclusive_ram_id"):
             suffix = f" rom:0x{rom:X} segment:{owner['name']}"
         size = "" if row["name"] in unsized else f" size:0x{row['size']:X}"
@@ -129,8 +189,11 @@ def _symbol_lines(net, proj, rows=None, excluded=(), segments=(), unsized=()) ->
     # One name per address: splat refuses two ("Duplicate symbol detected", an N64 game whose agents gave one address
     # two names). The table's own name for the address labels it; the other names still link, from build.json.
     named = set(funcs)
+    function_names = {row['name'] for row in rows}
     for s in sorted(syms.by_name.values(), key=lambda s: (s.address, s.name != syms.name_at(s.address)[0], s.name)):
-        if s.name in excluded or s.address in named or AUTO_NAME.match(s.name):
+        # A moved function can leave a symbol with the same name at its former address. Splat
+        # cannot define one name twice; the function row is the current placement for that name.
+        if s.name in excluded or s.name in function_names or s.address in named or AUTO_NAME.match(s.name):
             continue
         named.add(s.address)
         lines.append(f"{s.name} = 0x{s.address:08X};")
@@ -170,6 +233,14 @@ def _segments(config: dict) -> list[dict]:
     return out
 
 
+def _analysis_only_names(cfg, rows):
+    """Appended relocatable banks are rebuilt separately from the cartridge's splat split."""
+    banks = cfg.get('donor_overlays') or {}
+    native_end = min(banks.values(), default=None)
+    return ({row['name'] for row in rows if row['rom_offset'] is not None and row['rom_offset'] >= native_end}
+            if native_end is not None else set())
+
+
 def _export_segments(config: dict, functions) -> dict:
     """Keep known function tails out of data when regenerating the export's split.
 
@@ -179,6 +250,8 @@ def _export_segments(config: dict, functions) -> dict:
     """
     from .reviewed import extend_config
     config = extend_config(config, functions)
+    # The export writes its own complete symbol table; project-specific paths are not copied there.
+    config.setdefault('options', {})['symbol_addrs_path'] = ['symbol_addrs.txt']
     # Splat uses the function sizes we supply to keep switch tails in text. Its BSS scan
     # also uses those sizes to insert padding, which can assert when a sized symbol
     # overlaps the end of a BSS subsection. Let the configured BSS boundaries size it.
@@ -354,10 +427,7 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     cfg = net.cfg(proj)
     store = net.project_store(proj['id'])
     population = store.all('SELECT name,vram,size,rom_offset,meta,target FROM functions WHERE project_id=?', proj['id'])
-    banks = cfg.get('donor_overlays') or {}
-    native_end = min(banks.values(), default=None)
-    analysis_only = ({r['name'] for r in population if r['rom_offset'] is not None and r['rom_offset'] >= native_end}
-                     if native_end is not None else set())
+    analysis_only = _analysis_only_names(cfg, population)
     excluded = analysis_only | {r['name'] for r in population if r['meta'] and console.overlay_cartridge_placement(r, cfg)}
     # Raw overlay entries still occupy space in the cartridge split; build their C
     # through the loader path while the assembly supplies the original placeholders.
@@ -386,7 +456,8 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     log("writing the assembly with the project's names (splat)")
     split_config = yaml.safe_load(configs[0].read_text(encoding='utf-8'))
     known = population
-    (out / 'splat.yaml').write_text(yaml.safe_dump(_export_segments(split_config, known), sort_keys=False), encoding='utf-8')
+    exported_config = _export_segments(split_config, known)
+    (out / 'splat.yaml').write_text(yaml.safe_dump(exported_config, sort_keys=False), encoding='utf-8')
     shutil.copyfile(work / image_name, out / image_name)
     for extra in ("reloc_addrs.txt",):
         if (work / extra).exists():
@@ -399,6 +470,7 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
     res = run([console_python(), "-m", "splat", "split", "splat.yaml"], out, log)
     if res.returncode != 0:
         raise ExportError("splat failed:\n" + (res.stdout + res.stderr)[-1500:])
+    remove_foreign_bank_labels(out, population, _segments(exported_config))
     for generated in (out / "src").glob("*.c"):
         generated.unlink()  # splat's INCLUDE_ASM files: this tree builds one object per function instead
     for ld in out.glob("*.ld"):
@@ -444,6 +516,8 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
         except toolchains.ToolchainError as error:
             return row, unit, hdr, None, error
 
+    entry_segments = _segments(_export_segments(split_config, known))
+    entry_mappings = cfg.get("audit_data_mappings") or []
     objects, private, as_fallback = [], [], []
     check = getattr(log, 'check_cancel', lambda: None)
     candidates = (matched_rows[(f["vram"], f["rom"])] for f in functions if (f["vram"], f["rom"]) in matched_rows)
@@ -465,28 +539,27 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
                 as_fallback.append((f["name"], "doesn't compile any more"))
                 f["kind"] = "asm"
                 continue
-            from ..app.compiler_context import verified
             from ..app.donor_unit import is_unit
             donor_unit = is_unit(hdr, proj)
             single = _single_definition(compiled.obj, row["name"])
-            predecessor = None if single or donor_unit else verified(net, proj, row, compiled.obj)
-            if not single and not predecessor and not donor_unit:
-                as_fallback.append((f["name"], "its C also defines other functions; split their bodies into separate source files"))
-                f["kind"] = "asm"
-                continue
-            linked = match.link(compiled.obj, row["name"], net._rom_target(row), net.symbols(proj["id"]), net.reader(proj, row))
+            reader = net.reader(proj, row)
+            linked = match.link(compiled.obj, row["name"], net._rom_target(row), net.symbols(proj["id"]), reader)
             if not linked.exact:
                 as_fallback.append((f["name"], "no longer matches"))
                 f["kind"] = "asm"
                 continue
             bases, problem = _section_bases(linked.placements)
-            if problem or predecessor or donor_unit:
+            if problem or not single or donor_unit:
                 # Recompile and judge this entry every build; the builder can retain
-                # scattered original pools without pretending they share one base.
+                # scattered original pools and other function bodies without placing them in this entry's slot.
+                if not _entry_reads_available(linked.required_data_reads, image, entry_segments, entry_mappings):
+                    as_fallback.append((f['name'], 'its constant data cannot be verified in the exported image'))
+                    f['kind'] = 'asm'
+                    continue
                 from .export_entry import object_for
                 try:object_for(compiled.obj,row['name'],linked.linked_code)
-                except (ValueError,TypeError):
-                    as_fallback.append((f['name'],problem));f['kind']='asm';continue
+                except (ValueError,TypeError) as error:
+                    as_fallback.append((f['name'],problem or str(error)));f['kind']='asm';continue
                 f['entry_only']=True
                 bases={}
             src = out / "src" / f["seg"] / f"{f['name']}.{'cpp' if compiled.language == 'c++' else 'c'}"  # as it compiled
@@ -646,6 +719,7 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
         "big_endian": console.big_endian, "asm_preamble": console.asm_preamble,
         "as_flags": [*console.as_flags, "-G0", "-no-pad-sections", "-I", "include"],
         "ld_flags": ["-EB" if console.big_endian else "-EL", "--no-check-sections"],
+        "data_mappings": entry_mappings,
         "assembly": objects, "segments": layout, "functions": fn_json, "overlay_functions": overlays, "overlay_total": len(excluded),
         "data": [{k: d[k] for k in ("name", "src", "obj", "vram", "size")} for d in data_c],
         # every named datum's address, for the judge steps (export_entry, `build.py check`): names the assembly
@@ -662,29 +736,47 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
 
         original = (work / original_name).read_bytes()
         blocks, cursor = [], len(original)
-        for offset, payload in unpack_code(original):
+        compressed = unpack_code(original)
+        verified_blocks = any(original[offset:offset + 4] != b"RNC\x01" for offset, _ in compressed)
+        for offset, payload in compressed:
             cursor += -cursor % 0x10 + 0x2000
-            if original[offset:offset + 4] != b"RNC\x01" or image[cursor:cursor + len(payload)] != payload:
+            if image[cursor:cursor + len(payload)] != payload:
                 raise ExportError("compressed analysis export needs a verified reconstruction for every block")
             blocks.append({"rom": offset, "analysis": cursor, "size": len(payload)})
             cursor += len(payload)
+        if verified_blocks:
+            from ..consoles.n64.code import verify_unpacked_analysis
+            if not verify_unpacked_analysis(original, image):
+                raise ExportError("compressed analysis differs from its original cartridge and decoded blocks")
         gzip_boot_ranges = []
         archive_analysis = False
+        runtime_programs = []
         if not blocks:
             gzip_boot_ranges = [entry for entry in split.code_ranges(configs[0]) if entry[1] <= len(original)]
             if not boot_gzip.verify_analysis(original, image, gzip_boot_ranges):
                 from ..consoles.n64 import indexed_runtime_code
                 archive_analysis = indexed_runtime_code.verify_analysis(original, image)
                 if not archive_analysis:
-                    raise ExportError("expanded analysis image has no verified compressed-block reconstruction")
+                    from ..consoles.n64 import runtime_zlib
+                    manifest = work / runtime_zlib.MANIFEST
+                    try:
+                        runtime_programs = json.loads(manifest.read_text(encoding='utf-8'))
+                    except (OSError, ValueError):
+                        runtime_programs = []
+                    if not runtime_zlib.verify_analysis(original, image, runtime_programs):
+                        raise ExportError("expanded analysis image has no verified compressed-block reconstruction")
                 gzip_boot_ranges = []
         cartridge = f"baserom.cartridge{ext}"
         (out / cartridge).write_bytes(original)
         build["cartridge"] = {"image": cartridge, "sha1": hashlib.sha1(original).hexdigest(), "blocks": blocks}
+        if verified_blocks:
+            build["cartridge"]["verified_blocks"] = True
         if gzip_boot_ranges:
             build["cartridge"]["gzip_boot_ranges"] = gzip_boot_ranges
         if archive_analysis:
             build["cartridge"]["indexed_archive"] = True
+        if runtime_programs:
+            build["cartridge"]["runtime_zlib"] = runtime_programs
     (out / "build.json").write_text(json.dumps(build, indent=1), encoding="utf-8")
     shutil.copyfile(Path(__file__).with_name("export_build.py"), out / "build.py")
     shutil.copyfile(Path(__file__).with_name("export_entry.py"), out / "export_entry.py")
@@ -712,9 +804,13 @@ def export_rom(net, slug: str, out: Path, console, log=print, *, sources=None) -
                             f"1. Keep both generated private inputs: `{base}` (expanded analysis image) and "
                             f"`{cartridge['image']}` (original normalized cartridge). Reimport and export your ROM "
                             "to regenerate them; the original cartridge alone is not the expanded analysis input.")
-        text += ("\nThe build first compares the expanded linked image, then reconstructs RNC method-1 blocks "
-                 "from that linked output using the original compression template. It checks the final cartridge "
-                 "against its fixed original checksum. Incompatible edits require a general compressor.\n")
+        if cartridge.get('runtime_zlib') or cartridge.get('indexed_archive') or cartridge.get('gzip_boot_ranges'):
+            text += ("\nThe build checks the linked analysis image against the original compressed programs and "
+                     "verifies the original cartridge. Byte-changing edits require recompression.\n")
+        else:
+            text += ("\nThe build first compares the expanded linked image, then reconstructs RNC method-1 blocks "
+                     "from that linked output using the original compression template. It checks the final cartridge "
+                     "against its fixed original checksum. Incompatible edits require a general compressor.\n")
         readme.write_text(text, encoding="utf-8")
 
     # everything made from the game itself stays local: build.py regenerates it from your copy

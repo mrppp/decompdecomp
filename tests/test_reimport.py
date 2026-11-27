@@ -1,6 +1,9 @@
 """Reimporting a ROM project replaces its analysis while preserving valid work."""
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +12,84 @@ from decompnet.app.repository_git import git
 from decompnet.consoles import Console
 from decompnet.network import NetworkError
 from decompnet.rom import Picked, split
+
+
+def test_simultaneous_reimports_recheck_only_their_own_saved_sources(monkeypatch):
+    from decompnet.app.engine.importing import ImportMixin
+
+    barrier = threading.Barrier(2)
+    seen = {}
+    class Fake(ImportMixin):
+        def _project(self, slug):
+            return {'id': slug, 'config': '{"kind":"rom"}'}
+        def import_split(self, console, picked, *, reimport_slug, rejudge_out=None, **kwargs):
+            item = (reimport_slug, f'{reimport_slug} source', None)
+            if rejudge_out is None:  # The old shared queue made the race reproducible.
+                self._reimport_rejudge = [item]
+            else:
+                rejudge_out.append(item)
+            barrier.wait(timeout=5)
+        def _judge_kept_matches(self, slug, kept, log):
+            seen[slug] = kept[:]
+        def project_store(self, pid):
+            return SimpleNamespace(one=lambda *args: {'functions': 1, 'matched': 0})
+    net = Fake()
+    monkeypatch.setattr('decompnet.app.engine.importing.consoles.identify',
+                        lambda _: SimpleNamespace(read_game=lambda data, name: data))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(net.reimport_rom, slug, b'game', confirmed=True, log=lambda _: None)
+                   for slug in ('one', 'two')]
+        for future in futures:
+            future.result(timeout=10)
+    assert seen == {'one': [('one', 'one source', None)], 'two': [('two', 'two source', None)]}
+
+
+def test_reimport_rejudge_releases_only_its_own_claims(tmp_path):
+    net = RomNetwork(tmp_path/'app.db', tmp_path)
+    with net.store.tx() as db:
+        pid = db.execute('INSERT INTO projects(slug,name,root,arch,config) VALUES(?,?,?,?,?)',
+                         ('game', 'Game', str(tmp_path), 'mips', '{}')).lastrowid
+        for index, name in enumerate(('first', 'second', 'user_claim')):
+            db.execute('INSERT INTO functions(project_id,name,size,n_insns,target,relocs,status,vram) '
+                       'VALUES(?,?,?,?,?,?,?,?)', (pid, name, 4, 1, b'\0'*4, '[]', 'open', 0x80000000+4*index))
+    agent = net.attribution_agent('saved-author')
+    store = net.project_store(pid)
+    seen = []
+    def attempt(who, name, source, slug):
+        fn = net._function(name, slug)
+        assert store.one('SELECT agent_id FROM claims WHERE function_id=?', fn['id'])['agent_id'] == who.id
+        seen.append(name)
+        return {'matched': False}
+    net.attempt = attempt
+    net._judge_kept_matches('game', [('first', 'int x;', agent.id), ('second', 'int y;', agent.id)], lambda _: None)
+    assert seen == ['first', 'second']
+    assert store.one('SELECT COUNT(*) AS n FROM claims')['n'] == 0
+    net.local_agent = lambda name: pytest.fail('rechecking saved C must not issue new runner credentials')
+    net._judge_kept_matches('game', [('first', 'int x;', None)], lambda _: None)
+
+    existing = net._function('user_claim', 'game')
+    with store.tx() as db:
+        db.execute('INSERT INTO claims VALUES(?,?,?,?)', (existing['id'], agent.id, 1.0, 9999999999.0))
+    net._judge_kept_matches('game', [('first', 'int x;', agent.id)], lambda _: None)
+    assert seen[-1] == 'first'
+    assert store.one('SELECT COUNT(*) AS n FROM claims')['n'] == 1
+    before = list(seen)
+    net._judge_kept_matches('game', [('user_claim', 'int z;', agent.id)], lambda _: None)
+    assert seen == before
+    assert store.one('SELECT claimed_at FROM claims WHERE function_id=?', existing['id'])['claimed_at'] == 1.0
+
+    with store.tx() as db:
+        db.execute('DELETE FROM claims WHERE function_id=?', (existing['id'],))
+    def interrupted(*args):
+        raise RuntimeError('interrupted')
+    net.attempt = interrupted
+    with pytest.raises(RuntimeError, match='interrupted'):
+        net._judge_kept_matches('game', [('first', 'int x;', agent.id)], lambda _: None)
+    assert store.one('SELECT COUNT(*) AS n FROM claims')['n'] == 0
+
+    net._judge_kept_matches('game', [('removed', 'int preserved;', None)], lambda _: None)
+    note = store.one("SELECT text FROM notes WHERE project_id=? AND function_id IS NULL", pid)
+    assert 'removed' in note['text'] and 'int preserved;' in note['text']
 
 
 @pytest.mark.parametrize("legacy_reset",[False,True])
@@ -171,6 +252,8 @@ def test_reimport_replaces_analysis_and_keeps_only_unchanged_matches(tmp_path, m
                             "FROM functions WHERE id=?", changed_id)
     assert changed["status"] == "open" and changed["matched_source"] is None
     assert changed["target"] == bytes.fromhex("24020002")
+    assert 'void func_80000004(void) {}' in net.store.one(
+        "SELECT text FROM notes WHERE function_id=? AND text LIKE '%before reimport: saved C%'", changed_id)["text"]
     assert changed["last_checked"] is None and changed["last_improved"] is None
     assert net.store.one("SELECT text FROM notes WHERE function_id=?", changed_id)["text"] == "keep this note"
     assert net.store.one("SELECT 1 FROM functions WHERE project_id=? AND name=?",
@@ -340,3 +423,131 @@ def test_reimport_keeps_agents_names_and_judges_c_whose_references_were_read_ane
     row = net.store.one("SELECT status, best_source FROM functions WHERE id=?", fid)
     assert row["status"] == "open" and row["best_source"] == "void race_update(void) { gRecords = 0; }"
     assert any("0 of 1 still match" in m for m in messages)
+
+
+@pytest.mark.parametrize('status,collision,interrupt,extended', [
+    ('matched', False, False, False), ('open', False, False, False),
+    ('matched', True, False, False), ('open', True, False, False),
+    ('matched', False, True, False), ('open', False, True, False),
+    ('matched', False, False, True), ('open', False, False, True),
+])
+def test_reimport_rejudges_same_rom_function_when_its_link_address_changes(tmp_path, monkeypatch, status, collision, interrupt, extended):
+    """A corrected overlay base must not discard C or give it to a different function at the old address."""
+    import hashlib
+
+    root = tmp_path / 'game'
+    root.mkdir()
+    image = bytes(16)
+    (root / 'rom.z64').write_bytes(image)
+    net = RomNetwork(tmp_path / 'app.db', tmp_path)
+    cfg = {'kind': 'rom', 'platform': 'n64', 'big_endian': True,
+           'rom': {'file': 'rom.z64', 'sha1': 'game', 'analysis_sha1': hashlib.sha1(image).hexdigest()},
+           'segments': [], 'compiler': {'toolchain': 'ido-7.1', 'flags': ['-O2']}}
+    source = 'int preserved(void) { return 1; }'
+    with net.store.tx() as db:
+        pid = db.execute('INSERT INTO projects(slug,name,root,arch,config) VALUES(?,?,?,?,?)',
+                         ('game', 'Game', str(root), 'mips', json.dumps(cfg))).lastrowid
+        fid = db.execute('INSERT INTO functions(project_id,name,size,n_insns,target,relocs,status,matched_source,best_source,vram,rom_offset) '
+                         'VALUES(?,?,?,?,?,?,?,?,?,?,?)', (pid, 'old_entry', 4, 1, bytes.fromhex('24020001'),
+                          '[]', status, source if status == 'matched' else None,
+                          source if status == 'open' else None, 0x80401000, 4)).lastrowid
+
+    class TestConsole(Console):
+        id = 'n64'
+        name = 'Nintendo 64'
+        arch = 'mips'
+
+        def read_game(self, file, name):
+            return Picked('n64', image, 'rom.z64', {'title': 'Game', 'size': len(image), 'game_code': 'DEMO',
+                          'region': 'Test', 'compiler_guess': 'IDO', 'sha1': 'game'}, True)
+
+        def debug_info(self, program, known):
+            return None
+
+        def default_compiler(self, info, guess):
+            return 'ido-7.1'
+
+        def default_flags(self, toolchain, gp):
+            return []
+
+        def after_import(self, net, slug, chosen, log):
+            pass
+
+    console = TestConsole()
+    monkeypatch.setattr('decompnet.app.engine.importing.consoles.identify', lambda _: console)
+    net.console = lambda _: console
+    line = split.AsmLine(4, 0x80402000, 0x24020001, 'addiu', 'v0, zero, 1')
+    extra = split.AsmLine(8, 0x80402004, 0x24030003, 'addiu', 'v1, zero, 3')
+    fn = split.RomFunction('new_entry', 0x80402000, 4, 'overlay', [line, extra] if extended else [line], root / 'f.s')
+    other_line = split.AsmLine(12, 0x80401000, 0x24020002, 'addiu', 'v0, zero, 2')
+    other = split.RomFunction('old_entry' if collision else 'other_entry', 0x80401000, 12, 'other',
+                              [other_line], root / 'other.s')
+    monkeypatch.setattr(split, 'split_rom', lambda work, *a, **kw: split.SplitResult(
+        [other, fn], [], [split.Segment('overlay', 4, 12, 0x80402000),
+                          split.Segment('other', 12, 16, 0x80401000)], {}, None, '', '', image='rom.z64'))
+    judged = []
+    def attempt(agent, name, code, slug):
+        judged.append((name, code))
+        if interrupt:
+            raise RuntimeError('judge interrupted')
+        return {'matched': False}
+
+    net.attempt = attempt
+    if interrupt:
+        with pytest.raises(RuntimeError, match='judge interrupted'):
+            net.reimport_rom('game', root / 'rom.z64', confirmed=True, log=lambda _: None)
+    else:
+        net.reimport_rom('game', root / 'rom.z64', confirmed=True, log=lambda _: None)
+    row = net.store.one('SELECT name, vram, best_source, status FROM functions WHERE id=?', fid)
+    if collision:
+        assert row is None or (row['vram'] == 0x80401000 and row['best_source'] is None)
+        assert judged == []
+        assert source in net.store.one('SELECT text FROM notes WHERE project_id=? AND text LIKE ?', pid,
+                                       '%before reimport:%')['text']
+        assert net.store.one('SELECT vram FROM functions WHERE name=?', 'old_entry')['vram'] == 0x80401000
+    else:
+        assert (row['name'], row['vram'], row['best_source'], row['status']) == ('old_entry', 0x80402000, source, 'open')
+        assert judged == [('old_entry', source)]
+        assert net.store.one('SELECT address FROM symbols WHERE project_id=? AND name=?', pid, 'old_entry')['address'] == 0x80402000
+        assert net.store.one('SELECT vram FROM functions WHERE name=?', 'other_entry')['vram'] == 0x80401000
+
+
+def test_reimport_aborts_if_entries_change_after_preservation_stage(tmp_path, monkeypatch):
+    import hashlib
+
+    from decompnet import consoles
+
+    root = tmp_path/'game'
+    root.mkdir()
+    (root/'old.z64').write_bytes(b'original')
+    net = RomNetwork(tmp_path/'app.db', tmp_path)
+    image = bytes(16)
+    cfg = {'kind':'rom', 'platform':'n64', 'big_endian':True,
+           'rom':{'file':'old.z64', 'sha1':'same', 'analysis_sha1':hashlib.sha1(image).hexdigest()},
+           'segments':[], 'compiler':{'toolchain':'gcc-2.7.2-kmc','flags':['-O2']}}
+    with net.store.tx() as db:
+        pid = db.execute('INSERT INTO projects(slug,name,root,arch,config) VALUES(?,?,?,?,?)',
+                         ('game','Game',str(root),'mips',json.dumps(cfg))).lastrowid
+        db.execute('INSERT INTO functions(project_id,name,vram,rom_offset,size,n_insns,target,relocs,status) '
+                   'VALUES(?,?,?,?,?,?,?,?,?)',(pid,'old',0x80001000,0,4,1,bytes(4),'[]','open'))
+
+    def replacement(work, *args, **kwargs):
+        line = split.AsmLine(0,0x80001000,0,'nop','')
+        fn = split.RomFunction('new',0x80001000,0,'code',[line],work/'new.s')
+        return split.SplitResult([fn],[],[split.Segment('code',0,16,0x80001000)],{},work/'splat.yaml','KMC','',image='rom.z64')
+
+    def changed_during_stage(network, project, result, data, rows, log):
+        with network.project_store(pid).tx() as db:
+            db.execute("UPDATE functions SET name='changed' WHERE project_id=?",(pid,))
+        return 1
+
+    monkeypatch.setattr(split, 'split_rom', replacement)
+    console = consoles.get('n64')
+    monkeypatch.setattr(console, 'preserve_reimport_entries', changed_during_stage)
+    picked = Picked('n64',image,'rom.z64',{'title':'Game','size':16,'sha1':'same',
+                    'game_code':'DEMO','region':'Test','compiler_guess':'KMC'},True)
+    with pytest.raises(NetworkError, match='entries changed during reimport'):
+        net.import_split(console,picked,reimport_slug='game',log=lambda *_:None)
+    assert (root/'old.z64').read_bytes() == b'original'
+    assert not (root/'rom.z64').exists()
+    assert net.project_store(pid).one('SELECT name FROM functions WHERE project_id=?',pid)['name'] == 'changed'

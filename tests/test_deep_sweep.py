@@ -205,6 +205,25 @@ def test_single_function_search_also_records_a_completed_pass(monkeypatch):
     assert obj.history('game',net.function())['completed']
 
 
+def test_sweep_records_one_stalled_pass_through_the_real_search(monkeypatch):
+    from threading import Lock
+
+    from decompnet.app.permute import Permuter
+    from tests.test_deep_permuter import setup
+
+    net = setup(monkeypatch)
+    obj = Sweeps(net, Jobs())
+    net.deep_sweeps = obj
+    monkeypatch.setattr(Permuter, '_score', lambda *args: 40)
+    proj, fn = net.project_row('game'), net.function()
+    scope = deep_sweep.signature(net, proj, fn, 1, 1)
+    log = Log()
+    stats = dict(activity=deep_sweep.Activity(log), visited=0, tested=0, matched=0)
+    assert obj.search_one('game', proj, fn, scope, 1, 1, log, stats, Lock(), 1, 0) == 'completed'
+    assert obj.stalled('game', fn) == 1
+    assert obj.history('game', fn)['completed']
+
+
 def test_improvement_totals_scores_and_percentages_survive_restart_and_repeat(sweep):
     obj, net, _, path = sweep
     with net.store.tx() as db:
@@ -762,6 +781,51 @@ def test_free_workers_refill_before_slow_turn_finishes(sweep, monkeypatch):
     assert refilled.is_set()
 
 
+def test_saturated_queue_does_not_reload_waiting_rows_on_worker_timeouts(sweep, monkeypatch):
+    from threading import Event
+
+    obj, net, _, _ = sweep
+    started, release = Event(), Event()
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET best_source=NULL,best_score=NULL WHERE name='f1'")
+    monkeypatch.setattr(deep_sweep.deep_source_recovery, 'prepare', lambda net, proj, fn, log: fn)
+    log = Log()
+
+    def search(*args):
+        started.set()
+        assert release.wait(3)
+        log.cancelled = True
+        return {'tested': 1, 'matched': False, 'best_score': 50}
+
+    monkeypatch.setattr(deep_permuter, 'run', search)
+    batches = []
+    original_all = net.store.all
+
+    def read(sql, *args):
+        if 'LEFT JOIN deep_permutation_passes' in sql:
+            batches.append(args)
+        return original_all(sql, *args)
+
+    monkeypatch.setattr(net.store, 'all', read)
+    original_wait = deep_sweep.wait
+    polls = 0
+
+    def wait(futures, **kwargs):
+        nonlocal polls
+        assert started.wait(3)
+        polls += 1
+        if polls <= 3:
+            return set(), set(futures)
+        release.set()
+        return original_wait(futures, **kwargs)
+
+    monkeypatch.setattr(deep_sweep, 'wait', wait)
+    with pytest.raises(RuntimeError, match='cancelled'):
+        obj.run('game', 1, 10, log)
+    assert polls == 4
+    assert len(batches) == 1
+
+
 def test_loop_flag_validation(sweep):
     obj, *_ = sweep
     with pytest.raises(NetworkError, match='true or false'):
@@ -1164,6 +1228,22 @@ def test_sweep_recovers_exact_candidates_before_search(sweep, monkeypatch):
     assert calls == ['f1']
 
 
+def test_a_finished_function_still_gets_a_probe_it_has_not_had(sweep, monkeypatch):
+    # a pass that doesn't repeat finished searches skipped them before the profile probe learnt the -O levels
+    from decompnet.app import profile_probe_autopilot
+    obj, net, calls, _ = sweep
+    probed = []
+    monkeypatch.setattr(obj, 'probe_pending', lambda proj, fid: False)
+    obj.run('game', 1, 10, Log(), loop=False)
+    assert calls == ['f0', 'f1']
+    monkeypatch.setattr(obj, 'probe_pending', lambda proj, fid: True)  # (still pending: asked once a run all the same)
+    monkeypatch.setattr(profile_probe_autopilot, 'catch_up',
+                        lambda engine, slug, fid, minutes, variants, log: probed.append(fid) or True)
+    result = obj.run('game', 1, 10, Log(), loop=False)
+    assert len(probed) == 2 == len(set(probed)) and result['matched'] == 2
+    assert calls == ['f0', 'f1']  # no function was searched again
+
+
 def _record_pass(obj, net, name, state, result, completed_at):
     cfg, proj = obj.config('game'), net.project_row('game')
     fn = net._function(name, 'game')
@@ -1388,3 +1468,22 @@ def test_status_sends_the_first_rewrite_rows_and_the_export_all_of_them(sweep, m
     assert obj.status('game')['recipes_total'] == 5  # cached for a few seconds: the window does not need the last trial
     obj.reset_metrics('game')
     assert obj.status('game')['recipes_total'] == 0  # a reset shows at once
+
+
+def test_a_missing_package_stops_the_pass_and_keeps_the_queue_instead_of_marking_errors(sweep, monkeypatch):
+    obj,net,calls,_=sweep
+    def broken(*args):
+        raise RuntimeError("No module named 'decomprepair'")
+    monkeypatch.setattr(deep_permuter,'run',broken)
+    with pytest.raises(Exception, match='could not load part of itself'):
+        obj.run('game',1,10,Log())
+    assert obj.status('game')['errors']==0
+    assert obj.history('game',net._function('f0','game'))['state']=='pending'
+
+
+def test_import_errors_from_earlier_passes_are_requeued(sweep):
+    obj,net,*_=sweep
+    fn=net.store.one("SELECT * FROM functions WHERE name='f0'")
+    obj.record(fn,'old-scope','error',1,10,error="RuntimeError: No module named 'decomprepair'")
+    obj.recover_room_transport('game')
+    assert net.store.one('SELECT state,error FROM deep_permutation_passes WHERE function_id=?',fn['id'])['state']=='pending'

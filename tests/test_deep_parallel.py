@@ -21,11 +21,12 @@ def library_calls_in_this_process(monkeypatch):
 def test_paths_overlap_share_budget_deadline_and_aggregate(monkeypatch, imported):
     net = setup(monkeypatch, imported)
     barrier = threading.Barrier(3)
-    seen = []
+    seen, caches = [], []
     def path(net, slug, name, minutes, allowance, log, profiles, *, lane):
         lane.prepared()
         barrier.wait(timeout=5)
         seen.append((lane.index, allowance, lane.deadline))
+        caches.append(log.miss_cache)
         log.progress({'tested': allowance, 'best_score': 40-lane.index, 'best_percent': 50+lane.index})
         return {'tested': allowance, 'best_score': 40-lane.index, 'skipped': lane.index}
     monkeypatch.setattr(deep_permuter, '_run', path)
@@ -33,6 +34,7 @@ def test_paths_overlap_share_budget_deadline_and_aggregate(monkeypatch, imported
     result = deep_permuter.run(net, 'game', 'f', 1, 11, log, threads_per_function=3)
     assert sorted((i, n) for i,n,_ in seen) == [(0,4), (1,4), (2,3)]
     assert len({d for _,_,d in seen}) == 1
+    assert caches[0] is not None and all(cache is caches[0] for cache in caches)
     assert result['tested'] == 11 and result['skipped'] == 3
     assert result['threads_per_function'] == 3
     assert result['reason'] == 'Variant limit reached'
@@ -441,6 +443,12 @@ def test_scoped_byte_read_trial_recognizes_a_saved_address_named_draft(monkeypat
                           '    }\n}\n')}
     search = deep_permuter.Search(net, 1, 6, Log())
     monkeypatch.setattr(deep_permuter.permuter_focus, 'classify', lambda *args: 'operand')
+    # The pass tries only its first few children, and this family's eight for the same call come first (its own test:
+    # test_argument_weight_scope_wiring).
+    from decompnet.app import generation_calls
+    from decomprepair import argument_weight_scope
+    monkeypatch.setattr(generation_calls, 'IN_SERVER', True)
+    monkeypatch.setattr(argument_weight_scope, 'variants', lambda *args, **kwargs: [])
     tried = []
     # Worse than the best (75) for every child, so the pass goes through all its proposals: a library family that
     # wraps the call in `do {...} while (0)` now comes before the byte-read one, and an improvement would stop there.

@@ -38,3 +38,52 @@ def refresh(net,proj,console):
         if updated:
             net._event(db,proj['id'],None,'analysis',f'Boundary review updated {updated} targets; {reopened} retired automatic assembly decisions reopened. Unresolved boundaries require review before automatic agent work.')
     return updated
+
+
+def refresh_shared_entries(net, proj, console, segments, originals=None):
+    """Reprove shared entries after import-time edits invalidate their old evidence."""
+    if console.arch != 'mips':
+        return refresh(net,proj,console)
+    from ..rom.shared_entries import intentional
+    from ..rom.split import function_from_text
+
+    store = net.project_store(proj['id'])
+    rows = store.all("SELECT id,name,unit,asm,status,meta FROM functions WHERE project_id=? AND gone_mark IS NULL",
+                     proj['id'])
+    original_pieces = None
+    if originals is not None:
+        original_pieces = {}
+        for fn in originals:
+            key = (fn.name,fn.rom,fn.vram,fn.size)
+            # A repeated identity is ambiguous even if one record says it is a function.
+            original_pieces[key] = key in original_pieces or getattr(fn,'piece',True)
+    functions = []
+    for row in rows:
+        if not row['asm']:
+            continue
+        try:
+            fn = function_from_text(row['name'],row['asm'],row['unit'])
+            if original_pieces is not None:
+                # A repaired or unknown fragment cannot inherit a claim that it
+                # was an independently discovered function.
+                fn.piece = original_pieces.get((fn.name,fn.rom,fn.vram,fn.size),True)
+            functions.append(fn)
+        except (IndexError, ValueError):
+            continue
+    evidence = intentional(functions,console,segments)
+    changes = []
+    for row in rows:
+        if row['status'] != 'open' or row['name'] not in evidence:
+            continue
+        meta = json.loads(row['meta'] or '{}')
+        if meta.get('boundary_decision') or meta.get('reopened'):
+            continue
+        meta['shared_entry'] = evidence[row['name']]
+        meta['boundary_override'] = True
+        meta['boundary_override_source'] = 'shared_entry'
+        meta.pop('boundary_review',None)
+        changes.append((json.dumps(meta),row['id'],row['meta']))
+    if changes:
+        with store.tx() as db:
+            db.executemany("UPDATE functions SET meta=? WHERE id=? AND status='open' AND meta IS ?",changes)
+    return refresh(net,proj,console)

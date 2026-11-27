@@ -965,6 +965,12 @@ function renderAutopilot(ov) {
     $("apTitle").textContent = "Autopilot: waiting for its turn";
     $("apSub").textContent = `Other games' autopilots are running; this one starts when one of them ends. Agents can work meanwhile.${perm}`;
     $("apBtn").textContent = "Stop";
+  } else if (running && ap.phase === "preparing") {
+    $("apBar").className = "workbar";
+    $("apBar").firstElementChild.style.width = "";
+    $("apTitle").textContent = "Autopilot: preparing C candidates";
+    $("apSub").textContent = `${(ap.candidate_units || 0).toLocaleString()} units prepared${ap.candidate_current ? ` · ${ap.candidate_current}` : ""}`;
+    $("apBtn").textContent = "Stop";
   } else if (reuseRunning) {
     $("apTitle").textContent = "Autopilot: trying verified C from this game and other projects";
     const progress = tw?.progress || {phase: 'Preparing reusable-code search'};
@@ -1023,7 +1029,7 @@ let crossGameDrawerResults = null;
 async function openCrossGameResults(ov, filter='matches') {
   const slug=ov.slug;
   crossGameDrawerResults=null;
-  dialog('Matches from other games', `<p class="small muted">Saved results across searches. Only verified byte matches count toward progress.</p><label class="field"><span>Show</span><select id="crossGameFilter"><option value="matches">Verified matches</option><option value="improved">Recent improvements</option><option value="compiler">Compiler leads</option><option value="all">Recent checks</option></select></label><p id="crossGameDrawerStatus" class="small muted" role="status"></p><ol class="transfer-list" id="crossGameRecent"></ol>`, 'cross-game-results');
+  dialog('Matches from other games', `<p class="small muted">Saved results across searches. Only verified byte matches count toward progress.</p><label class="field"><span>Show</span><select id="crossGameFilter"><option value="matches">Verified matches</option><option value="improved">Recent improvements</option><option value="compiler">Compiler leads</option><option value="steps">What each similar-code step found</option><option value="all">Recent checks</option></select></label><p id="crossGameDrawerStatus" class="small muted" role="status"></p><div id="crossGameSteps" hidden></div><ol class="transfer-list" id="crossGameRecent"></ol>`, 'cross-game-results');
   $('dialogBody').dataset.crossSlug=slug;
   $('crossGameFilter').value=filter;
   renderCrossGameResults(ov);
@@ -1047,6 +1053,10 @@ function renderCrossGameResults(ov) {
   }
   const run = $("crossGameRun"), tried = Object.values(cross.counts).reduce((a,b)=>a+b,0);
   const filter = $("crossGameFilter").value;
+  $("crossGameSteps").hidden = filter !== 'steps';
+  $("crossGameRecent").hidden = filter === 'steps';
+  $("crossGameFilter").onchange = () => {$("crossGameFilter")._chosen=true;crossStepView.step=null;renderCrossGameResults(ov);};
+  if (filter === 'steps') { renderCrossGameSteps(ov, crossGameDrawerResults?.similar_steps); return; }
   const rows = filter === 'matches' ? (cross.matches || cross.recent.filter(r => r.outcome === 'match'))
     : filter === 'compiler' ? (cross.compiler_leads || cross.recent.filter(r => r.outcome === 'compiler'))
     : filter === 'improved' ? cross.recent.filter(r => r.outcome === 'improved') : cross.recent;
@@ -1073,6 +1083,45 @@ function renderCrossGameResults(ov) {
     if (button) openNoted(button.dataset.slug, button.dataset.transferFunction);
   };
   $("crossGameFilter").onchange = () => {$("crossGameFilter")._chosen=true;renderCrossGameResults(ov);};
+}
+// Sort choices survive the drawer's refreshes; `step` is the step whose close misses are listed.
+const crossStepView = {sort: {key: 'matched', descending: true}, closeSort: {key: 'percent', descending: true}, step: null};
+function crossSortedRows(rows, sort) {
+  return rows.map((row, index) => ({row, index})).sort((a, b) => {
+    const av = a.row[sort.key], bv = b.row[sort.key];
+    if (av == null || bv == null) return av == null ? bv == null ? a.index - b.index : 1 : -1;  // missing values last
+    const order = typeof av === 'number' ? av - bv : String(av).localeCompare(String(bv), undefined, {numeric: true});
+    return order * (sort.descending ? -1 : 1) || a.index - b.index;
+  }).map(item => item.row);
+}
+function crossSortHeads(columns, sort, attr) {
+  return columns.map(([key, label]) => `<th scope="col" aria-sort="${sort.key === key ? sort.descending ? 'descending' : 'ascending' : 'none'}"><button type="button" class="table-sort" ${attr}="${key}">${label}<span aria-hidden="true">${sort.key === key ? sort.descending ? ' ↓' : ' ↑' : ' ↕'}</span></button></th>`).join('');
+}
+function renderCrossGameSteps(ov, report) {
+  const box = $("crossGameSteps");
+  if (!report) { box.innerHTML = '<p class="small muted">Loading what each step found…</p>'; return; }
+  if (!report.steps.length) { box.innerHTML = '<p class="small muted">The similar-code search has not tried this game\'s functions yet. Start a search to see which steps find matches.</p>'; return; }
+  const view = crossStepView;
+  if (view.step) {
+    const step = report.steps.find(s => s.step === view.step);
+    const rows = crossSortedRows(report.close.filter(r => r.step === view.step), view.closeSort);
+    box.innerHTML = `<p><button type="button" class="ghost small-btn" data-cross-steps-back>← All steps</button></p><p class="small muted">${esc(step?.label || view.step)}: open functions whose C from this step compiled to at least 90% of the target. Open one to start from that C.</p>${rows.length ? `<div class="compiler-table"><table><thead><tr>${crossSortHeads([['function','Function'],['percent','Closest'],['similarity','Code similarity'],['donor','Donor'],['game','Game']], view.closeSort, 'data-cross-close-sort')}</tr></thead><tbody>${rows.map(r => `<tr><td><button class="fn" type="button" data-transfer-function="${esc(r.function)}" data-slug="${esc(ov.slug)}">${esc(r.function)}</button></td><td>${r.percent.toFixed(1)}%</td><td>${r.similarity == null ? '—' : `${r.similarity}%`}</td><td>${r.donor_slug ? `<button class="fn" type="button" data-transfer-function="${esc(r.donor)}" data-slug="${esc(r.donor_slug)}">${esc(r.donor)}</button>` : esc(r.donor)}</td><td>${esc(r.game)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="small muted">None of them is open any more.</p>'}`;
+  } else {
+    const rows = crossSortedRows(report.steps, view.sort);
+    box.innerHTML = `<p class="small muted">Each step of the similar-code search, from what it has recorded for this game. A close miss is a function still open whose C from that step compiled to at least 90% of the target.</p><div class="compiler-table"><table><thead><tr>${crossSortHeads([['label','Step'],['functions','Functions tried'],['matched','Matched'],['rate','Match rate'],['close','Close misses'],['unbuilt','Didn\'t build'],['checks','Checks']], view.sort, 'data-cross-step-sort')}</tr></thead><tbody>${rows.map(r => `<tr><td>${esc(r.label)}</td><td>${r.functions.toLocaleString()}</td><td><b>${r.matched.toLocaleString()}</b></td><td>${r.rate == null ? '—' : `${r.rate.toFixed(1)}%`}</td><td>${r.close ? `<button type="button" class="link-btn" data-cross-step-close="${esc(r.step)}" title="List these functions">${r.close.toLocaleString()}</button>` : '0'}</td><td>${r.unbuilt.toLocaleString()}</td><td>${r.checks.toLocaleString()}</td></tr>`).join('')}</tbody></table></div>`;
+  }
+  box.onclick = e => {
+    const sortBy = (state, key) => { state.descending = state.key === key ? !state.descending : true; state.key = key; };
+    const fn = e.target.closest("button[data-transfer-function]");
+    if (fn) return openNoted(fn.dataset.slug, fn.dataset.transferFunction);
+    const stepSort = e.target.closest("[data-cross-step-sort]"), closeSort = e.target.closest("[data-cross-close-sort]");
+    if (stepSort) sortBy(view.sort, stepSort.dataset.crossStepSort);
+    else if (closeSort) sortBy(view.closeSort, closeSort.dataset.crossCloseSort);
+    else if (e.target.closest("[data-cross-step-close]")) view.step = e.target.closest("[data-cross-step-close]").dataset.crossStepClose;
+    else if (e.target.closest("[data-cross-steps-back]")) view.step = null;
+    else return;
+    renderCrossGameSteps(ov, report);
+  };
 }
 function renderCrossGameProgress(p) {
   const known=p.total>0 && p.done!=null;
@@ -2604,6 +2653,7 @@ function openDeepMetric(kind) {
   deepMetricSlug = slug;
   $("dialogBody")._deepMetricHtml = null;
   renderDeepMetricDrawer();
+  if (deepSweepSnapshot?.state === "running" && ["matched", "improved", "attention"].includes(kind)) renderDeepSweep();
 }
 function renderDeepMetricDrawer() {
   if (!S.dialogKind?.startsWith("deep-metric:") || $("dialog").hidden) return;
@@ -2818,7 +2868,7 @@ function renderDeepQueueState(status) {
   }
   const recovering = running && status.progress?.phase === "Rechecking saved matches";
   const recoveryTotal = recovering ? status.progress.total || 0 : 0;
-  const checked = status.progress?.functions_tested;
+  const checked = status.progress?.functions_tested, liveMatches = status.progress?.matches;
   const run = running && status.loop ? `Pass ${status.progress?.cycle || 1} (looping)` : running ? "This run" : "Last run";
   $("deepSweepBar").max = Math.max(1, recovering ? recoveryTotal : total);
   $("deepSweepBar").value = recovering ? status.progress.completed || 0 : done;
@@ -2836,6 +2886,7 @@ function renderDeepQueueState(status) {
       ? `Rechecking saved matches: ${(status.progress.completed || 0).toLocaleString()} / ${recoveryTotal.toLocaleString()} · ${status.progress.matched || 0} recovered`
       : "Looking for saved matches…" : "",
     checked != null ? `${run}: ${checked.toLocaleString()} functions checked` : "",
+    running && liveMatches != null ? `${liveMatches.toLocaleString()} ${liveMatches === 1 ? "match" : "matches"} this run` : "",
     waiting ? `${waiting.toLocaleString()} waiting for saved C` : "",
   ].filter(Boolean).join(" · ") || emptyProgress;
   $("deepSweepLoadingBar").hidden = recovering ? !!recoveryTotal : preparing || !(status.statistics_pending || (running && !total));
@@ -2968,28 +3019,12 @@ async function followDeepSweep(slug, job) {
   const following = {job, finish: () => { if (!finished) { finished = true; done(); } }};
   deepSweepFollowing = following;
   renderDeepQueueState({...deepSweepSnapshot, state:"running"});
-  let lastResults = 0, refreshing = false;
   try {
     await followJob(job, log, (_, state) => {
       const progress = state.progress || {};
       if (S.slug !== slug || deepSweepFollowing !== following) return;
-      // Nobody sees the panel in a minimised window or on another tab: the search runs on in the app, and
-      // finishing (or coming back) redraws it, so drawing the activity and fetching the 10 MB of results now would
-      // only spend the web view's CPU.
       if (document.hidden || (S.tab && S.tab !== "matching")) return;
       renderDeepActivity((state.state || deepSweepSnapshot?.state) !== "running" ? {...progress, workers:[]} : progress);
-      if (!refreshing && $("deepSweepPanel").dataset.statusLoading !== slug && Date.now() - lastResults >= 5000) {
-        refreshing = true; lastResults = Date.now();
-        api(`/api/permuter/pass?slug=${encodeURIComponent(slug)}`).then(status => {
-          if (S.slug === slug && deepSweepFollowing === following) {
-            const live = deepSweepSnapshot;
-            const combined = live && live.job === status.job
-              ? {...status, state:live.state, progress:live.progress, error:live.error} : status;
-            renderDeepSweepResults(combined);
-            renderDeepQueueState(combined);
-          }
-        }).catch(() => {}).finally(() => { refreshing = false; });
-      }
       if (deepSweepSnapshot?.state === "running") {
         renderDeepQueueState({...deepSweepSnapshot, state:state.state || "running", progress, error:state.error || ""});
       }
@@ -3206,16 +3241,7 @@ $("sourcePairTry").onclick = async () => {
 };
 
 
-$("codeAuditBtn").onclick = async () => {
-  const button=$("codeAuditBtn"), log=$("codeAuditLog"), slug=S.slug;
-  const finish=beginWork(log,"Auditing unanalysed code",[button]);
-  try {
-    const {job}=await api("/api/code-audit",{method:"POST",body:{slug}});
-    const result=await followJob(job,log);
-    if (S.slug!==slug) return;
-    renderCodeAudit(result);
-  } catch(e) {showJobError(log,e.message);} finally {finish();button.disabled=false;}
-};
+$("codeAuditBtn").onclick = () => runCoverageAudit(true);
 
 
 async function sourceQueueProgress() {

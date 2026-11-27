@@ -16,7 +16,8 @@ Scripts: if you were not given a path, extract them first (never pull or edit th
 3. `python3 $H try HOLDER /tmp/dd-HOLDER/work.c`. Read the scores and rows, change one thing, try again.
 4. Repeat about 15 times. Do not stop after 2 or 3. Stop early only on MATCHED.
 5. `python3 $H done HOLDER` (add `--note "what you tried, what is left"`). ALWAYS run it, matched or not. It submits
-   your best C, keeps your best under another profile for the next worker, writes the note, releases the claim and
+   your best C, runs the repair library on a close one under another profile (a few minutes; it may match it),
+   keeps your best under another profile for the next worker, writes the note, releases the claim and
    removes the session. Never delete the folder yourself.
 
 Everything else (profiles, submitting, saving a match under another profile, claim token, release) is automatic.
@@ -27,7 +28,8 @@ Do not search the data home or project folders with `grep`/`find`: `next` alread
 
 - **Matched twin shown?** Copy its C and change the names and constants; judge under its profile (marked `(twin)`).
 - **Near-miss shown?** Start from it (`start/near.c`), under its profile.
-- Otherwise **start with a clean rewrite**, not by editing a messy draft: write the C a person would write.
+- Otherwise **start from the `Closest start` file** (`cp` it to `work.c` as printed) and change one thing at a time,
+  even when it looks messy: a rewrite from scratch usually scores far worse. Rewrite only when it stops improving.
 - **Judge under `-O1` too**, not only `(own)`: lots of loads and stores to the stack and unfilled delay slots mean it.
   Then aim for 0 in THAT row; `try` saves it for this function.
 - **Get global types right**: `lb`/`lbu` = s8/u8, `lh`/`lhu` = s16/u16, `lw` = s32 or pointer, `lwc1` = f32.
@@ -48,8 +50,10 @@ Do not search the data home or project folders with `grep`/`find`: `next` alread
 
 ## Rules
 
-- Never fences (`do {} while (0)`), `volatile`, padding, `__repair_` names, or arrays that exist only to pad the stack. `try` refuses
-  them. Never add dead code or wrong stores to lower a score.
+- Never add fences (`do {} while (0)`), `volatile`, padding, `__repair_` names, or arrays that exist only to pad the
+  stack. `try` refuses what you add. What the C you started from (saved C, near-miss, draft, twin) already has may stay
+  while you improve it and in an exact match; say in your report that the match keeps it. Never add dead
+  code or wrong stores to lower a score.
 - A lower score is closer; 0 is a match. Only the app saying MATCHED counts.
 - Never print `connection.json`. Do not run other judges in parallel, the Deep Permuter or `scratch_run.py`.
 - Do not tidy after a match.

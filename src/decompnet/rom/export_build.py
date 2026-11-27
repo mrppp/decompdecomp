@@ -507,7 +507,10 @@ def linker_script(provides: dict[str, str], placed: list[tuple[int, int, str]], 
     from elftools.elf.elffile import ELFFile
 
     auto_addresses = {}
-    for obj in set(provides.values()):
+    # Standalone assembly pieces are not in provides (only functions are), but may
+    # branch to a local address in another object, including a boot entry.
+    scanned = set(provides.values()) | {item["obj"] for item in B.get("assembly", [])} | {item["obj"] for item in B.get("data", [])}
+    for obj in scanned:
         with open(ROOT / obj, "rb") as stream:
             symtab = ELFFile(stream).get_section_by_name(".symtab")
             for symbol in symtab.iter_symbols() if symtab else ():
@@ -592,7 +595,13 @@ def build() -> bool:
             if hashlib.sha1(original).hexdigest() != cartridge["sha1"]:
                 raise ValueError("original cartridge checksum differs from the fixed export target")
             reference = original
-            if boot_ranges := cartridge.get("gzip_boot_ranges"):
+            if cartridge.get("verified_blocks"):
+                from decompnet.consoles.n64.code import verify_unpacked_analysis
+
+                if not verify_unpacked_analysis(original, out):
+                    fail("Rebuilt code differs from the original compressed programs.")
+                out = original
+            elif boot_ranges := cartridge.get("gzip_boot_ranges"):
                 from decompnet.consoles.n64.boot_gzip import verify_analysis
 
                 if not verify_analysis(original, out, boot_ranges):
@@ -603,6 +612,12 @@ def build() -> bool:
 
                 if not verify_analysis(original, out):
                     fail("Rebuilt code differs from the original compressed archive members.")
+                out = original
+            elif rows := cartridge.get("runtime_zlib"):
+                from decompnet.consoles.n64.runtime_zlib import verify_analysis
+
+                if not verify_analysis(original, out, rows):
+                    fail("Rebuilt code differs from the original runtime compressed programs.")
                 out = original
             else:
                 out = rebuild_cartridge(out, original, cartridge["blocks"])

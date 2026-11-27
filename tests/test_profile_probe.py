@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from decompnet import consoles
-from decompnet.app import deep_permuter, profile_probe
+from decompnet.app import deep_permuter, opt_levels, profile_probe
 from decompnet.arch import mips_profile_evidence as evidence
 from decompnet.consoles.n64 import profile_probes as n64_probes
 
@@ -172,6 +172,31 @@ def test_the_plan_is_bounded():
     assert len(profile_probe.plan(N64, facts(words=[LDC1, ADDIU_SP, JR, NOP], sdk=True))) <= profile_probe.MAX_PROBES
 
 
+def test_a_target_that_keeps_a_frame_pointer_is_named_unoptimised_in_the_brief():
+    words = [ADDIU_SP, 0xAFBE0010, 0x03A0F021, JR, NOP]  # ... sw $fp; addu $fp, $sp, $zero
+    code = struct.pack('>5I', *words)
+    own = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-G0', '-mips3', '-O1']}
+    assert '-G0 -mips3 -O0' in profile_probe.unoptimised_hint('mips', own, code)
+    assert profile_probe.unoptimised_hint('mips', {**own, 'flags': ['-O0']}, code) == ''
+    assert profile_probe.unoptimised_hint('mips', {**own, 'toolchain': 'ido-7.1'}, code) == ''
+    assert profile_probe.unoptimised_hint('mips', own, struct.pack('>3I', ADDIU_SP, JR, NOP)) == ''
+
+
+def test_a_prologue_that_saves_everything_before_copying_parameters_names_o1_in_the_brief():
+    store = lambda reg, offset: 0xAFA00000 | reg << 16 | offset  # sw reg, offset($sp)
+    move = lambda to, source: source << 21 | to << 11 | 0x21  # addu to, source, $zero
+    unscheduled = [ADDIU_SP, store(31, 24), store(17, 20), store(16, 16), move(16, 4), move(17, 5), JR, NOP]
+    scheduled = [ADDIU_SP, store(31, 24), store(17, 20), move(17, 5), store(16, 16), move(16, 4), JR, NOP]
+    own = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-G0', '-mips3', '-O2']}
+    hint = lambda profile, words: profile_probe.unscheduled_hint('mips', profile, struct.pack(f'>{len(words)}I', *words))
+    assert '-G0 -mips3 -O1' in hint(own, unscheduled)
+    assert hint(own, scheduled) == ''
+    assert hint({**own, 'flags': ['-O1']}, unscheduled) == ''
+    assert hint({**own, 'flags': ['-O2', '-fno-schedule-insns2']}, unscheduled) == ''
+    assert hint({**own, 'toolchain': 'ido-7.1'}, unscheduled) == ''
+    assert hint(own, [ADDIU_SP, store(31, 24), store(16, 16), move(16, 4), JR, NOP]) == ''  # too few to say
+
+
 def test_another_console_without_hints_still_gets_the_flag_rules_and_no_more():
     ps2 = consoles.get('ps2')
     own = {'toolchain': 'ee-gcc-2.95.3', 'flags': ['-O2', '-G0']}
@@ -232,6 +257,7 @@ def arrange(monkeypatch, scores, plan=None, limit=20):
     monkeypatch.setattr(profile_probe, 'supported', lambda net, proj: True)
     monkeypatch.setattr(profile_probe, 'gather', lambda *a: facts(own={'toolchain': 'o', 'flags': ['-o']}))
     monkeypatch.setattr(profile_probe, 'plan', lambda console, f: items)
+    monkeypatch.setattr(profile_probe, 'level_probes', lambda f: [])  # (the -O levels: their own tests below)
     monkeypatch.setattr(profile_probe, 'finished', lambda *a: None)
     monkeypatch.setattr(profile_probe, 'marker_key', lambda *a: 'marker')
     monkeypatch.setattr(consoles, 'of', lambda cfg: N64)
@@ -381,6 +407,7 @@ def test_the_probe_finds_the_profile_a_function_was_built_with_and_applies_it_to
     proj, fn = net.project_row(slug), net._function(name, slug)
     neighbours = [{'toolchain': default['toolchain'], 'flags': list(default['flags']), 'family': 'test', 'why': 'the project profile'}]
     monkeypatch.setattr(profile_probe, 'plan', lambda console, f: neighbours)
+    monkeypatch.setattr(profile_probe, 'level_probes', lambda f: [])
     monkeypatch.setattr(project_activity, 'active', lambda n, s: True)
     log = Log()
     log.check_cancel = lambda: None
@@ -406,10 +433,12 @@ def test_a_probe_that_is_not_exact_applies_nothing_and_is_not_judged_twice(demo,
     net.attempt(agent, name, source.replace('-v : v', '-v : v + 1'), slug)
     net.release(agent, name, '', slug)
     proj, fn = net.project_row(slug), net._function(name, slug)
+    fn = {**dict(fn), 'seed': None}  # (the demo's machine draft of this one is exact as it stands)
     default = net.cfg(proj)['compiler']
     other = {'toolchain': default['toolchain'], 'flags': [f if f != '-O2' else '-O1' for f in default['flags']],
              'family': 'test', 'why': 'a guess'}
     monkeypatch.setattr(profile_probe, 'plan', lambda console, f: [other])
+    monkeypatch.setattr(profile_probe, 'level_probes', lambda f: [])
     monkeypatch.setattr(project_activity, 'active', lambda n, s: True)
     log = Log()
     log.check_cancel = lambda: None
@@ -435,7 +464,7 @@ def test_the_autopilot_pass_skips_a_function_without_saved_c_and_lets_its_stop_t
             pass
     monkeypatch.setattr(deep_permuter, 'Search', Stopped)
 
-    def stop(*a):
+    def stop(*a, **kw):
         raise deep_permuter.SearchLimit('Stopped')
     monkeypatch.setattr(profile_probe, 'run', stop)
     with pytest.raises(deep_permuter.SearchLimit):
@@ -486,3 +515,308 @@ def test_the_profiles_most_of_the_project_was_proven_under_are_planned_last():
     assert [(p['toolchain'], tuple(p['flags']), p['family']) for p in got] == [(*o1, 'project')]
     own = {'toolchain': o1[0], 'flags': list(o1[1])}
     assert profile_probe.project_common(facts(own=own, common=Counter({o1: 12}))) == []
+
+
+def test_the_brief_says_which_profile_the_neighbours_were_built_with(monkeypatch):
+    from collections import Counter
+
+    from decompnet.app import profile_detection
+
+    own = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-G0', '-mips3', '-O2']}
+    o1 = ('gcc-2.7.2-kmc', ('-G0', '-mips3', '-O1'))
+    votes = {'near': Counter({o1: 6, profile_probe.key(own): 2})}
+    monkeypatch.setattr(profile_detection, 'neighbours', lambda net, proj, cfg, fn: (votes['near'], 8))
+    hint = profile_probe.neighbour_profile_hint(None, {}, {}, {}, own)
+    assert '6 of its 8' in hint and '-O1' in hint and 'compiler_experiments' in hint
+    assert profile_probe.neighbour_profile_hint(None, {}, {}, {}, {**own, 'flags': list(o1[1])}) == ''  # already so
+    votes['near'] = Counter({o1: 4, profile_probe.key(own): 4})
+    assert profile_probe.neighbour_profile_hint(None, {}, {}, {}, own) == ''  # no clear majority
+    assert profile_probe.neighbour_profile_hint(None, {}, {}, {}, {**own, 'cmd': 'cc'}) == ''
+
+
+# --- every -O level ---------------------------------------------------------------------------------------------------
+
+KMC = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-G0', '-mips3', '-mgp32', '-mfp32', '-O2']}
+
+
+def at(level, base=KMC):
+    return [level if f == '-O2' else f for f in base['flags']]
+
+
+def test_every_other_level_of_the_compiler_is_planned_with_the_other_flags_kept():
+    got = profile_probe.level_probes(facts(own=KMC))
+    assert [p['flags'] for p in got] == [at('-O0'), at('-O1'), at('-O3'), at('-Os')]
+    assert {p['toolchain'] for p in got} == {'gcc-2.7.2-kmc'} and {p['family'] for p in got} == {'level'}
+
+
+@pytest.mark.parametrize('toolchain, flags, expected', [
+    ('ido-7.1', ['-O2', '-mips2'], ['-O0', '-O1', '-O3', '-g']),
+    ('mwcps2-3.0.1', ['-O4,p'], ['-O0,p', '-O1,p', '-O2,p', '-O3,p']),
+    ('pspsnc-1.2.7503', ['-O2'], ['-O0', '-O1', '-O4']),
+    ('agbcc', ['-mthumb-interwork', '-O2'], ['-O0', '-O1', '-O3', '-Os']),
+])
+def test_each_compiler_family_has_its_own_levels(toolchain, flags, expected):
+    got = opt_levels.variants(toolchain, flags)
+    assert [next(f for f in v if f not in ('-mips2', '-mthumb-interwork')) for v in got] == expected
+    assert len(got) <= opt_levels.LEVELS_MAX
+
+
+def test_flags_that_name_no_level_get_one_added_and_a_custom_command_has_none():
+    assert opt_levels.variants('gcc-2.7.2-kmc', ['-G0'])[1] == ['-G0', '-O1']
+    assert profile_probe.level_probes(facts(own={'toolchain': 'x', 'flags': ['-O2'], 'cmd': ['cc']})) == []
+    assert profile_probe.level_probes(facts(own=KMC, ready=lambda t: False)) == []
+
+
+def test_a_profile_both_the_evidence_and_the_levels_name_is_judged_once():
+    levels = profile_probe.level_probes(facts(own=KMC))
+    near = {'toolchain': KMC['toolchain'], 'flags': at('-O1'), 'family': 'neighbours', 'why': 'w'}
+    other = {'toolchain': 'sn', 'flags': ['-O2'], 'family': 'sn272', 'why': 'w'}
+    got = profile_probe.with_levels([near, other], levels)
+    assert [p['family'] for p in got] == ['neighbours', 'level', 'level', 'level', 'sn272']
+
+
+def entry(level, score, draft=False):
+    return {'toolchain': KMC['toolchain'], 'flags': at(level), 'family': 'level', 'why': 'w', 'score': score,
+            **({'draft': True} if draft else {})}
+
+
+LEVEL_KEYS = {profile_probe.key(entry(level, 0)) for level in ('-O0', '-O1', '-O3')}
+
+
+def test_a_level_is_closer_when_the_draft_beats_itself_though_not_the_saved_c():
+    # the saved C was climbed under -O2 (145) and is worse under -O1 (450); the draft says -O1 (250 against 600)
+    scores = [entry('-O1', 450), entry('-O1', 250, draft=True), entry('-O3', 300), entry('-O3', 590, draft=True)]
+    lead = profile_probe.closer_level(scores, LEVEL_KEYS, 145, 600)
+    assert [(e['score'], e.get('draft', False)) for e in lead] == [(250, True)] and lead[0]['flags'] == at('-O1')
+
+
+def test_no_level_is_closer_when_neither_text_gains():
+    scores = [entry('-O1', 450), entry('-O1', 580, draft=True)]
+    assert profile_probe.closer_level(scores, LEVEL_KEYS, 145, 600) == []
+    assert profile_probe.closer_level([entry('-O1', 100)], set(), 145, 600) == []  # not a level
+    assert profile_probe.closer_level([entry('-O1', 100)], LEVEL_KEYS, 145, None)[0]['score'] == 100
+
+
+def with_a_closer_draft(monkeypatch, *, matched=False):
+    """The runner on a KMC function whose draft is closer under -O1: returns (search, climbed leads, run)."""
+    from decompnet.app import deep_profiles, profile_climb
+    search, _ = arrange(monkeypatch, {})
+    levels = [{k: v for k, v in entry('-O1', 0).items() if k != 'score'}]
+    search.net._judge_with = lambda *a: None
+    monkeypatch.setattr(profile_probe, 'plan', lambda console, f: [])
+    monkeypatch.setattr(profile_probe, 'level_probes', lambda f: levels)
+    monkeypatch.setattr(profile_probe, 'draft_under_own', lambda *a: 600)
+
+    def probe(search_, agent, proj, fn, source, profile, **kw):
+        search_.tested += 1
+        return 250 if source == 'DRAFT' else 450
+    monkeypatch.setattr(deep_profiles, 'probe', probe)
+    climbed = []
+
+    def explore(search_, agent, proj, fn, leads):
+        climbed.extend(leads)
+        search_.tested += 1
+        return matched
+    monkeypatch.setattr(profile_climb, 'explore_level', explore)
+    fn = {**FN, 'seed': 'DRAFT', 'best_score': 145}
+    return search, climbed, lambda **kw: profile_probe.run(search, None, PROJ, fn, 'C', **kw)
+
+
+def test_the_draft_is_repaired_under_the_closer_level(monkeypatch):
+    search, climbed, run = with_a_closer_draft(monkeypatch)
+    assert run() is False
+    assert climbed == [({'toolchain': KMC['toolchain'], 'flags': at('-O1')}, 'DRAFT', 250)]
+    assert 'machine draft' in search.notes[0][0] and '600 under its own settings' in search.notes[0][0]
+    assert json.loads(search.stored[-1][4])['searched'] is True
+
+
+def test_an_exact_search_under_the_level_is_a_match(monkeypatch):
+    _, _, run = with_a_closer_draft(monkeypatch, matched=True)
+    assert run() is True
+
+
+def test_the_autopilot_pass_leaves_the_search_for_the_deep_permuter(monkeypatch):
+    search, climbed, run = with_a_closer_draft(monkeypatch)
+    assert run(climb=False) is False and not climbed
+    record = json.loads(search.stored[-1][4])
+    assert record['lead'] and not record['searched']
+    # the Deep Permuter finds the pass finished but its level unsearched: it searches, without a second note
+    monkeypatch.setattr(profile_probe, 'finished', lambda *a: record)
+    assert run() is False and climbed and len(search.notes) == 1
+    monkeypatch.setattr(profile_probe, 'finished', lambda *a: {**record, 'searched': True})
+    climbed.clear()
+    assert run() is False and not climbed
+
+
+def test_on_the_demo_game_a_level_alone_finds_an_exact_profile(demo, monkeypatch):
+    """Nothing in the plan: the function's own settings say -O0, and the levels alone find the -O2 it was built with."""
+    from decompnet.app import project_activity
+    from tests.test_consoles import _function
+    net, slug, symbols = demo
+    name, source = _function(net, slug, symbols, 'clamp_s32')
+    proj = net.project_row(slug)
+    default = net.cfg(proj)['compiler']
+    wrong = {'toolchain': default['toolchain'], 'flags': [f if f != '-O2' else '-O0' for f in default['flags']]}
+    fn = net._function(name, slug)
+    net._update_cfg(slug, lambda cfg: cfg.setdefault('compiler_ranges', []).append(
+        {'start': fn['vram'], 'end': fn['vram'] + fn['size'], **wrong}))
+    agent, _ = net.local_agent('level-agent')
+    net.claim(agent, slug, name)
+    assert not net.attempt(agent, name, source, slug)['matched']
+    net.release(agent, name, '', slug)
+    proj, fn = net.project_row(slug), net._function(name, slug)
+    assert profile_probe.pending(net, proj, fn)
+    monkeypatch.setattr(profile_probe, 'plan', lambda console, f: [])
+    monkeypatch.setattr(project_activity, 'active', lambda n, s: True)
+    log = Log()
+    log.check_cancel = lambda: None
+    log.progress = lambda value: None
+    from decompnet.app import profile_probe_autopilot
+    assert profile_probe_autopilot.catch_up(net, slug, fn['id'], 2, 40, log) is True, list(log)
+    assert net._function(name, slug)['status'] == 'matched'
+    assert net.cfg(net.project_row(slug))['compiler'] == default
+
+
+@pytest.mark.parametrize('console_id', ['n64', 'ps2', 'ps3', 'psp', 'gba'])  # (PS1 has no demo game to import)
+def test_every_rom_consoles_demo_finds_its_level(console_id, tmp_path, monkeypatch):
+    """On each ROM console's demo game with its real compiler: a function set to -O0 is matched at the level it was
+    built with, for that function only."""
+    import subprocess
+    import sys
+
+    from decompnet.app import profile_probe_autopilot, project_activity
+    from decompnet.app.engine import RomNetwork
+    from tests.test_consoles import ROOT, _function, _missing
+    console = consoles.get(console_id)
+    if missing := _missing(console):
+        pytest.skip(f"{console.name}'s demo needs {', '.join(missing)}")
+    folder = ROOT / 'projects' / console.demo
+    key = folder / 'build' / 'demo.json'
+    if not key.exists():
+        subprocess.run([sys.executable, str(folder / 'build.py')], check=True)
+    built = json.loads(key.read_text())
+    net = RomNetwork(tmp_path / 'app.db', tmp_path)
+    slug = net.import_rom(folder / 'build' / built['game'], confirmed=True, log=lambda *_: None)
+    name, source = _function(net, slug, built['symbols'], 'clamp_s32')
+    proj, fn = net.project_row(slug), net._function(name, slug)
+    default = net.cfg(proj)['compiler']
+    level = next(f for f in default['flags'] if opt_levels.LEVEL.fullmatch(f))
+    wrong = {'toolchain': default['toolchain'], 'flags': [f if f != level else '-O0' for f in default['flags']]}
+    net._update_cfg(slug, lambda cfg: cfg.setdefault('compiler_ranges', []).append(
+        {'start': fn['vram'], 'end': fn['vram'] + fn['size'], **wrong}))
+    agent, _ = net.local_agent('level-agent')
+    net.claim(agent, slug, name)
+    assert not net.attempt(agent, name, source, slug)['matched'], '-O0 must not match'
+    net.release(agent, name, '', slug)
+    monkeypatch.setattr(profile_probe, 'plan', lambda c, f: [])
+    monkeypatch.setattr(project_activity, 'active', lambda n, s: True)
+    log = Log()
+    log.check_cancel = lambda: None
+    fn = net._function(name, slug)
+    assert profile_probe_autopilot.catch_up(net, slug, fn['id'], 2, 60, log) is True, list(log)
+    assert net._function(name, slug)['status'] == 'matched'
+    assert net.cfg(net.project_row(slug))['compiler'] == default
+
+
+@pytest.mark.parametrize('exact', [True, False])
+def test_the_drafts_record_arrays_are_judged_under_the_old_level(monkeypatch, exact):
+    from decompnet.app import deep_profiles
+    from decomprepair import global_offset_records
+    plan = [{'toolchain': 't', 'flags': ['-O1'], 'family': 'level', 'why': 'w'}]
+    search, seen = arrange(monkeypatch, {'-O1': 50}, plan)
+    sources = []
+
+    def judged(search_, agent, proj, fn, source, profile, **kw):
+        sources.append(source)
+        search_.tested += 1
+        return 0 if exact and source == 'RECORDS' else 300
+    monkeypatch.setattr(deep_profiles, 'probe', judged)
+    monkeypatch.setattr(global_offset_records, 'variants', lambda source, name, header: [('f', 'RECORDS')])
+    assert profile_probe.run(search, None, PROJ, {**FN, 'seed': 'DRAFT'}, 'C', climb=False) is exact
+    assert sources[:3] == ['C', 'DRAFT', 'RECORDS']
+
+
+def test_the_drafts_indexed_tables_are_judged_as_records_under_the_old_level(monkeypatch):
+    from decompnet.app import deep_profiles
+    from decomprepair import global_offset_records, indexed_symbol_records
+    plan = [{'toolchain': 't', 'flags': ['-O1'], 'family': 'level', 'why': 'w'}]
+    search, seen = arrange(monkeypatch, {'-O1': 50}, plan)
+    sources = []
+
+    def judged(search_, agent, proj, fn, source, profile, **kw):
+        sources.append(source)
+        search_.tested += 1
+        return 0 if source == 'INDEXED' else 300
+    monkeypatch.setattr(deep_profiles, 'probe', judged)
+    monkeypatch.setattr(global_offset_records, 'variants', lambda source, name, header: [])
+    monkeypatch.setattr(indexed_symbol_records, 'variants', lambda source, name, header, asm: [('f', 'INDEXED')])
+    assert profile_probe.run(search, None, PROJ, {**FN, 'seed': 'DRAFT'}, 'C', climb=False) is True
+    assert sources[:3] == ['C', 'DRAFT', 'INDEXED']
+
+
+def test_the_drafts_display_list_shapes_are_judged_under_the_old_level(monkeypatch):
+    from decompnet.app import deep_profiles
+    from decomprepair import gbi_param_shapes, global_offset_records, indexed_symbol_records
+    plan = [{'toolchain': 't', 'flags': ['-O1'], 'family': 'level', 'why': 'w'}]
+    search, seen = arrange(monkeypatch, {'-O1': 50}, plan)
+    sources = []
+
+    def judged(search_, agent, proj, fn, source, profile, **kw):
+        sources.append(source)
+        search_.tested += 1
+        return 0 if source == 'SHAPES' else 300
+    monkeypatch.setattr(deep_profiles, 'probe', judged)
+    monkeypatch.setattr(global_offset_records, 'variants', lambda source, name, header: [])
+    monkeypatch.setattr(indexed_symbol_records, 'variants', lambda source, name, header, asm: [])
+    monkeypatch.setattr(gbi_param_shapes, 'variants', lambda source, name, header: [('f', 'SHAPES')])
+    assert profile_probe.run(search, None, PROJ, {**FN, 'seed': 'DRAFT'}, 'C', climb=False) is True
+    assert sources[:3] == ['C', 'DRAFT', 'SHAPES']
+
+
+# lw $a3,0($a0); lui $a2,0x800E; addiu $a2,$a2,-0x2D10; lhu $v1,0($a2); lhu $v0,4($a2); lhu $v0,2($a2); jr $ra; nop
+HELD_ADDRESS = [0x8C870000, 0x3C06800E, 0x24C6D2F0, 0x94C30000, 0x94C20004, 0x94C20002, 0x03E00008, 0]
+
+
+def test_offsets_read_off_a_held_symbol_address_point_to_force_addr():
+    assert evidence.reads_through_held_address(HELD_ADDRESS)
+    own = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-G0', '-mips3', '-O2']}
+    planned = [p for p in profile_probe.mips_gcc(facts(own, words=HELD_ADDRESS)) if p['family'] == 'force_addr']
+    assert [p['flags'] for p in planned] == [['-G0', '-mips3', '-O2', '-fforce-addr'],
+                                             ['-G0', '-mips3', '-O1', '-fforce-addr']]
+
+
+def test_one_offset_or_a_redefined_register_is_no_force_addr_evidence():
+    one = HELD_ADDRESS[:5] + HELD_ADDRESS[6:]
+    reloaded = [*HELD_ADDRESS[:4], 0x8C860000, *HELD_ADDRESS[4:]]  # lw $a2,0($a0) before the offsets
+    assert not evidence.reads_through_held_address(one)
+    assert not evidence.reads_through_held_address(reloaded)
+
+
+def test_the_drafts_float_arguments_and_switch_width_are_one_child():
+    draft = '''M2C_UNK g(s32, M2C_UNK);
+
+void f(s32 arg0) {
+    u32 temp = arg0 & 0xFFFF;
+    switch (temp) {
+    case 1:
+        g(0, 0x42B40000);
+        return;
+    case 2:
+        g(1, 0x43870000);
+        /* fallthrough */
+    default:
+        return;
+    }
+}
+'''
+    asm = 'andi $a0, $a0, 0xFFFF\nsltiu $v0, $a0, 0x3\n'
+    [(family, child)] = profile_probe.draft_constants(draft, 'f', facts(asm=asm), ['-mgp32', '-O1'])
+    assert family == 'draft_constants'
+    assert 'g(0, 90.0f)' in child and 'g(1, 270.0f)' in child and 'case 0:' in child
+    assert profile_probe.draft_constants('void f(void) {}', 'f', facts(asm=asm), ['-mgp32']) == []
+
+
+def test_the_drafts_unsigned_conversions_are_written_back_with_the_constants():
+    draft = 'void f(s32 a) {\n    f64 d;\n    s32 v = a & 0x10;\n    d = (f64) v;\n    if (v < 0) {\n        d += 4294967296.0;\n    }\n    g(d);\n}\n'
+    [(_, child)] = profile_probe.draft_constants(draft, 'f', facts(), ['-mgp32', '-O1'])
+    assert 'd = (f64) (u32) v;' in child and '4294967296' not in child

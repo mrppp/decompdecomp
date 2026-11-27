@@ -47,8 +47,8 @@ from .function_names import rename_identifiers
 log = logging.getLogger("decompdecomp")
 
 # spimdisasm can name a function piece by the numeric label at its first instruction.
-LOCAL_PIECE = re.compile(r"\.L[0-9A-F]+")
-from . import saves
+LOCAL_PIECE = re.compile(r"\.L[0-9A-F]+(?:_code_[0-9A-F]+)?")
+from . import folder_owner, saves
 from .project_lock import ProjectLock
 
 CHECK_SECONDS = 0.25  # a non-forced check of an unchanged folder is this rare per project
@@ -299,7 +299,7 @@ def _repair(net, pid: int, folder: Path, disk: dict[str, str], report) -> dict[s
         if added:
             manifest["layout"].sort(key=lambda entry: (entry.get("vram") if isinstance(entry.get("vram"), int)
                                                        else -1, str(entry.get("name"))))
-            disk[saves.MANIFEST] = (saves.manifest_text(manifest) if manifest.get("format") == saves.FORMAT
+            disk[saves.MANIFEST] = (saves.manifest_text(manifest) if manifest.get("format") in saves.SPLIT_FORMATS
                                     else json.dumps(manifest, indent=1) + "\n")
             for name, text in saves.split_manifest(disk[saves.MANIFEST]).items():
                 (folder / name).write_text(text, encoding="utf-8")
@@ -386,6 +386,8 @@ def _manifest(files: dict[str, str], cfg: dict, known_names=()) -> dict:
                     or not isinstance(entry["size"], int) or entry["size"] <= 0
                     or entry.get("status", "open") not in ("open", "asm")):
                 raise ValueError(f"layout entry {name!r} needs a name, an integer vram and a size above 0")
+        from .recovered_saves import validate as validate_recovered
+        validate_recovered(manifest)
         compiler = manifest.get("compiler")
         if compiler is not None and not isinstance(compiler, dict):
             raise ValueError("compiler is not an object")
@@ -465,7 +467,7 @@ def _merge_manifest(old, new, current, key: str = ""):
             else:
                 merged[field] = new[field]
         return merged
-    if key in ("layout", "symbols", "set_aside", "notes", "knowledge", "global_types") \
+    if key in ("layout", "symbols", "set_aside", "notes", "knowledge", "global_types", "recovered") \
             and all(isinstance(value, list) for value in (old, new, current)):
         def identity(item):
             if key == "knowledge":
@@ -558,6 +560,9 @@ def _reconcile_renames(store, pid, saved, rendered, disk, before, pending, remov
             pending.pop(source, None)
             removed[source] = None
     merged["layout"] = list(layout.values())
+    for entry in merged.get('recovered') or []:
+        if isinstance(entry, dict) and entry.get('name') in renames:
+            entry['name'] = renames[entry['name']]
     current_symbols = {(sym["name"], sym["address"]) for sym in local.get("symbols", [])}
     merged["symbols"] = [sym for sym in merged.get("symbols", [])
                          if (renames.get(sym["name"]), sym["address"]) not in current_symbols]
@@ -1020,7 +1025,7 @@ class Progress:
 
     def _project_lock(self, slug: str):
         with self.lock:
-            if slug not in self.project_locks:self.project_locks[slug] = ProjectLock()
+            if slug not in self.project_locks:self.project_locks[slug] = ProjectLock(slug)
             return self.project_locks[slug]
 
     def _baseline(self, project_id: int) -> _Baseline | None:
@@ -2065,6 +2070,9 @@ class Progress:
                 if rom:
                     pid = proj["id"]
                     folder = saves.default_folder(self.net, slug)
+                    # (records this home as the folders' owner: a copy of the database elsewhere then stops at
+                    # default_folder instead of publishing its view here; folder_owner.py)
+                    folder_owner.check(self.net, proj, folder)
                     state = self._state(pid)
                     dirty = self._dirty(pid)
                     config_key = _config_key(proj, self.net.cfg(proj))
@@ -2546,6 +2554,16 @@ class Progress:
             def report(line):
                 self._activity(slug, message=line)
                 destination(line)
+            # Check recovered identities before _repair can move a saved source or synchronization can
+            # remove a missing row. Explicit restore can run discovery first; routine sync must not start it.
+            try:
+                incoming = json.loads(disk[saves.MANIFEST])
+                if isinstance(incoming, dict) and incoming.get('recovered'):
+                    from . import recovered_saves
+                    recovered_saves.validate(incoming)
+                    recovered_saves.ensure(net, slug, incoming, report, scan=False)
+            except (ValueError, TypeError, KeyError) as error:
+                raise NetworkError(f'Fix progress/decompdecomp.json: {error}.') from None
             disk = _repair(net, pid, folder, disk, report)
             known_names = {row["name"] for row in metadata_rows(store, ("name",),
                 "SELECT name FROM functions WHERE project_id=?", pid)}
@@ -2590,6 +2608,7 @@ class Progress:
             compared_manifest = {}
             deferred, recheck_due = set(), False
             judging_change = True  # Unknown import shapes conservatively invalidate in-flight results.
+            needs_judging = True  # Unknown plans still require the shared verification lane.
             pending = {}
             reconciled_renames = False
             database_files = {}
@@ -2747,10 +2766,22 @@ class Progress:
                             and self._baseline(pid) == baseline
                             # Stat each path again, using cached text only for the same file version.
                             and _read(folder, cache=self.file_cache) == disk)
-                # _repair only repairs this project's own folder under its lock;
-                # shared identities, import writes and compiler calls start after
-                # admission. Waiting can release every recursive project lock.
-                admit(current)
+                # _repair only repairs this project's own folder under its lock.
+                # Verification can release every recursive project lock while it waits;
+                # metadata-only no-ops can stay under the project lock instead.
+                def substantive_metadata(value):
+                    # Old manifests may explicitly store empty optional sections.
+                    return {key: item for key, item in value.items()
+                            if key not in ('saved_at', 'revision')
+                            and not (key in ('notes', 'verification') and not item)}
+                unchanged_inputs = (not needs_judging and not (input_changes - {saves.MANIFEST})
+                                    and substantive_metadata(compared_manifest) == substantive_metadata(merged_manifest))
+                if needs_judging or before is not None and not unchanged_inputs:
+                    admit(current)
+                elif not current():
+                    # A first save or a semantically unchanged save has no compiler work.
+                    # Keep the project lock and validate the snapshot without a shared lane.
+                    raise _RestartSync
             # The legacy file keeps credits in the same atomic rollback as the
             # restore. Separate stores resolve shared identities before locking
             # project state, never by opening a nested catalog transaction.

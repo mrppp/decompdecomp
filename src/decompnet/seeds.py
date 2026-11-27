@@ -16,7 +16,7 @@ from pathlib import Path
 
 from decompnet.hostenv import NO_WINDOW
 
-from . import compile_timing, limits, m2c_fp64, m2c_jump_tables, m2c_types, scoring, toolchains
+from . import compile_timing, limits, m2c_call_tails, m2c_fp64, m2c_jump_tables, m2c_types, m2cfix, scoring, toolchains
 from .elfobj import FunctionObj
 
 # What m2c's --valid-syntax output needs to compile: its unknown types and macros, defined the simplest way that
@@ -361,6 +361,10 @@ def intrinsic_leaf(asm_text: str, name: str, toolchain_id: str | None) -> str | 
     return None
 
 
+# ends a context line that the draft itself must declare too (app/callee_prototypes.py)
+CALLEE_MARK = "/* matched callee */"
+
+
 def generate_from_asm(asm_text: str, name: str, toolchain_id: str | None, context_header: str = "",
                       data_asm: str | None = None, timeout: float = 20, valid: bool = False,
                       strict: bool = False, options: tuple[str, ...] = (), *, resolve=None) -> str | None:
@@ -371,6 +375,10 @@ def generate_from_asm(asm_text: str, name: str, toolchain_id: str | None, contex
     if source and valid:
         from decomprepair import m2c_undeclared_drafts
         source = m2c_undeclared_drafts.rewrite(source, name, asm_text, context_header) or source
+        # m2c declares nothing the context declared, and a matched callee's prototype is nowhere else
+        callees = [line for line in context_header.splitlines() if line.endswith(CALLEE_MARK) and line not in source]
+        if callees:
+            source = "\n".join(callees) + "\n" + source
     return source
 
 
@@ -511,6 +519,7 @@ def _compilable(source: str | None, name='', asm='', header='', toolchain=None, 
         source = ido_pointer_steps(source)
     source = pointer_bits_as_float(source, name)
     source = declare_written_arguments(source, name)
+    source = own_call_arguments(source, name, asm)
     # a local m2c typed as a function pointer (`M2C_UNK (*sp24)(M2C_UNK, M2C_UNK);`) that the code also steps (`sp24 += 0xC`):
     # the slot held an address that was both called and walked; the draft keeps the word
     for pointer in re.findall(r"^[ \t]+[A-Za-z_][\w \t\*]*\(\*(\w+)\)\([^;\n]*\);", source, flags=re.M):
@@ -582,6 +591,65 @@ def declare_written_arguments(source: str, name: str) -> str:
     if not missing:
         return source
     return source[:head.end()] + "".join(f"    s32 {a};\n" for a in missing) + source[head.end():]
+
+
+def own_call_arguments(source: str, name: str, asm: str) -> str:
+    """The calls a draft makes to itself agree with its own definition. m2c passes an argument register that still
+    held a value (a loop counter masked into $a3) to a recursive call of a three-parameter function: "too many
+    arguments", and the draft never compiled (40 of 101,190 saved drafts of the user's games). An extra argument
+    the code sets up for that call (a write to its register, or its stack slot, in the straight run before the `jal`
+    or its delay slot) is a parameter the function never reads, so the definition takes it; any other is dropped."""
+    head = re.search(rf"^[^\n;{{}}]*\b{re.escape(name)}\s*\(([^)\n]*)\)\s*\{{[ \t]*\n", source, flags=re.M) if name and asm else None
+    if not head or "..." in head.group(1):
+        return source
+    parameters = [p.strip() for p in head.group(1).split(",") if p.strip() not in ("", "void")]
+    calls = []  # (start, end, arguments) of each call to itself
+    for call in re.finditer(rf"\b{re.escape(name)}\(", source[head.end():]):
+        start = head.end() + call.end()
+        end = m2cfix._closing(source, start) - 1
+        inner = source[start:end]
+        calls.append((start, end, [a.strip() for a in m2cfix._split_top_level(inner)] if inner.strip() else []))
+    if not any(len(arguments) > len(parameters) for _, _, arguments in calls):
+        return source
+    count = len(parameters)
+    if all(re.search(rf"\barg{i}$", p) for i, p in enumerate(parameters)):
+        set_up = _arguments_set_for(asm, name)
+        count = max([count] + [i + 1 for _, _, arguments in calls for i in range(count, len(arguments)) if i in set_up])
+    for start, end, arguments in reversed(calls):
+        kept = arguments[:count] + [f"arg{i}" for i in range(len(arguments), count)]
+        if kept != arguments:
+            source = source[:start] + ", ".join(kept) + source[end:]
+    if count == len(parameters):
+        return source
+    parameters += [f"s32 arg{i}" for i in range(len(parameters), count)]
+    return source[:head.start(1)] + ", ".join(parameters) + source[head.end(1):]
+
+
+def _arguments_set_for(asm: str, name: str) -> set[int]:
+    """The argument positions the MIPS code writes for its calls to `name`: $a0-$a3, and the stack words from 0x10."""
+    lines = [re.sub(r"/\*.*?\*/", "", line).split("#")[0].strip() for line in asm.splitlines()]
+    lines = [line for line in lines if line]
+    written: set[int] = set()
+    for at, line in enumerate(lines):
+        if not re.match(rf"jal\s+{re.escape(name)}$", line):
+            continue
+        run = lines[at + 1:at + 2]
+        for before in reversed(lines[:at]):
+            if before.endswith(":") or before.startswith(("glabel", ".L")):
+                break
+            if before.split()[0] in ("j", "jr", "jal", "jalr", "b"):
+                del run[-1:]  # the line just taken is that call's delay slot, its argument, not this one's
+                break
+            run.append(before)
+        for instruction in run:
+            if found := re.match(r"(\w+)\s+\$a([0-3])\b", instruction):
+                if found.group(1) not in m2cfix._NOT_A_WRITE and not found.group(1).startswith(("bl", "bg", "mt")):
+                    written.add(int(found.group(2)))
+            elif found := re.match(r"s[bhw]\w*\s+\$\w+,\s*(0x[0-9A-Fa-f]+|\d+)\(\$sp\)", instruction):
+                offset = int(found.group(1), 0)
+                if offset >= 0x10:
+                    written.add(offset // 4)
+    return written
 
 
 def pointer_bits_as_float(source: str, name: str) -> str:
@@ -707,8 +775,17 @@ _MIPS_TABLE_LABEL = re.compile(r"^[ \t]*dlabel[ \t]+((jtbl_|D_)([0-9A-Fa-f]{8}))
 _MIPS_DATA_RELOC = re.compile(r"(%(?:hi|lo)\()D_([0-9A-Fa-f]{8})(\))")
 
 
+_MIPS_OFFSET_ALIAS = re.compile(r"^/\* table-alias ([A-Za-z_]\w*)\+0x([0-9A-Fa-f]+) (jtbl_[0-9A-Fa-f]{8}) \*/$", re.M)
+
+
 def _mips_table_aliases(asm: str, data: str) -> str:
-    """Use the supplied table's name when the draft's relocation uses its address alias."""
+    """Use the supplied table's name when the draft's relocation uses its address alias, or spells the table as an
+    offset from the symbol it lies inside (draft_data.offset_tables records those)."""
+    for symbol, offset, table in _MIPS_OFFSET_ALIAS.findall(data):
+        offset = int(offset, 16)
+        spelled = re.compile(r"(%(?:hi|lo)\()\s*" + symbol + r"\s*\+\s*(?:0x0*" + f"{offset:X}" + rf"|{offset})\s*(\))",
+                             re.I)
+        asm = spelled.sub(rf"\g<1>{table}\g<2>", asm)
     aliases = {}
     for match in _MIPS_TABLE_LABEL.finditer(data):
         name, prefix, address = match[1], match[2], match[3].lower()
@@ -940,6 +1017,10 @@ def run_m2c(asm_text: str, name: str, target: str, context_header: str = "", dat
     return drafted
 
 
+# m2c numbers the switches of a function that has several: `/* switch 1; irregular */`
+_IRREGULAR_SWITCH = re.compile(r"/\*\s*(?:switch \d+;\s*)?irregular\s*\*/")
+
+
 def _run_m2c(asm_text: str, name: str, target: str, context_header: str = "", data_asm: str | None = None,
              timeout: float = 20, valid: bool = False, strict: bool = False, options: tuple[str, ...] = ()) -> str | None:
     if any(option not in ('--no-switches', '--no-stack-spill', '--gotos-only', '--stack-structs') for option in options):
@@ -956,6 +1037,7 @@ def _run_m2c(asm_text: str, name: str, target: str, context_header: str = "", da
             asm_text = m2c_jump_tables.inline_tables(asm_text, data_asm)
         if data_asm:
             asm_text = draft_asm(_mips_table_aliases(asm_text, data_asm), name, data_asm=data_asm)
+        asm_text = m2c_call_tails.write_out(asm_text)
     if target.startswith("gba"):  # a public GBA decomp (pret style): function macros, pre-UAL load mnemonics
         asm_text = re.sub(r"^\s*(?:non_word_aligned_)?thumb_func_start\s+(\w+)", r"glabel \1", asm_text, flags=re.M)
         asm_text = re.sub(r"^\s*arm_func_start\s+(\w+)", r"glabel \1", asm_text, flags=re.M)
@@ -1005,7 +1087,7 @@ def _run_m2c(asm_text: str, name: str, target: str, context_header: str = "", da
             if strict:
                 raise DraftError(reason or (_failure(res) if out or res.stderr or res.returncode else 'm2c produced no C for this function.'))
             return None
-        if valid and "--no-switches" not in options and "/* irregular */" in out:
+        if valid and "--no-switches" not in options and _IRREGULAR_SWITCH.search(out):
             # a switch m2c could not structure leaves `case` labels outside any `switch`; as gotos it compiles
             return _run_m2c(original, name, target, context_header, data_asm, timeout, valid, strict,
                             (*options, "--no-switches"))

@@ -16,6 +16,18 @@ def fixture(order='big'):
     return image,[dict(rom_start=0x1100,rom_end=0x1108,vram=0x80001100)]
 
 
+def test_callback_candidate_matching_checks_for_cancellation(monkeypatch):
+    from decompnet.arch import mips_indirect
+
+    monkeypatch.setattr(mips_indirect, 'calls', lambda *args: ([], False))
+
+    def stopped():
+        raise RuntimeError('Stopped')
+
+    with pytest.raises(RuntimeError, match='Stopped'):
+        consumers(bytes(64), [], [{'pointer_references': []}], 'big', [], [], check=stopped)
+
+
 def test_guarded_switch_follows_all_cases_only_with_explicit_mapping():
     for order in ('big','little'):
         image,ranges=fixture(order)
@@ -26,6 +38,59 @@ def test_guarded_switch_follows_all_cases_only_with_explicit_mapping():
         assert result['flow_closed'] and not result['direct_flow_closed']
         assert result['return_sites']==3 and result['jump_tables'][0]['entry_count']==2
         assert not result['unresolved_transfers']
+
+
+@pytest.mark.parametrize('order', ['big', 'little'])
+def test_unoptimized_switch_reloads_the_checked_frame_slot(order):
+    words = [0x8fc20018, 0x2c430002, 0x1060000e, 0, 0x8fc20018,
+             0x00401821, 0x00031080, 0x3c038000, 0x24631100, 0x00431021,
+             0x8c430000, 0x00600008, 0, 0x03e00008, 0, 0x03e00008, 0,
+             0x03e00008, 0]
+    image = bytearray(0x1200)
+    image[0x1000:0x104c] = b''.join(w.to_bytes(4, order) for w in words)
+    image[0x1100:0x1108] = b''.join(w.to_bytes(4, order) for w in (0x80001034, 0x8000103c))
+    ranges = [dict(rom_start=0x1100, rom_end=0x1108, vram=0x80001100)]
+    result = jump_table(image, 0x1000, 0x104c, 0x80001000, 0x102c, order, ranges)
+    assert result['state'] == 'validated' and result['entry_count'] == 2
+    assert extent(image, 0x1000, 0x104c, 0x80001000, order, table_ranges=ranges)['flow_closed']
+    for offset, word in ((0x1010, 0x8fc2001c),  # different stack slot
+                         (0x100c, 0xafc00018),  # delay slot writes the checked slot
+                         (0x1044, 0x08000401)):  # branch into the guard, skipping its load
+        changed = bytearray(image)
+        changed[offset:offset+4] = word.to_bytes(4, order)
+        found = jump_table(changed, 0x1000, 0x104c, 0x80001000, 0x102c, order, ranges)
+        assert found is None or found['state'] != 'validated'
+
+
+@pytest.mark.parametrize('order', ['big', 'little'])
+def test_guarded_switch_uses_a_separate_address_pair(order):
+    words = [0x2c430002, 0x1060000b, 0, 0x00021880, 0x3c048000, 0x24841100,
+             0x00641021, 0x8c430000, 0x00600008, 0, 0x03e00008, 0,
+             0x03e00008, 0, 0x03e00008, 0]
+    image = bytearray(0x1200)
+    image[0x1000:0x1040] = b''.join(w.to_bytes(4, order) for w in words)
+    image[0x1100:0x1108] = b''.join(w.to_bytes(4, order) for w in (0x80001028, 0x80001030))
+    ranges = [dict(rom_start=0x1100, rom_end=0x1108, vram=0x80001100)]
+    result = jump_table(image, 0x1000, 0x1040, 0x80001000, 0x1020, order, ranges)
+    assert result['state'] == 'validated' and result['entry_count'] == 2
+    for offset, word in ((0x1008, 0x24420001),  # changes the checked index
+                         (0x1014, 0x24851100),  # low half writes a different register
+                         (0x1038, 0x08000404)):  # enters after the guard
+        changed = bytearray(image)
+        changed[offset:offset+4] = word.to_bytes(4, order)
+        found = jump_table(changed, 0x1000, 0x1040, 0x80001000, 0x1020, order, ranges)
+        assert found is None or found['state'] != 'validated'
+
+
+def test_explicit_loader_edges_follow_every_case_and_reject_invalid_offsets():
+    image, _ = fixture()
+    assert not extent(image, 0x1000, 0x103c, 0x80001000, 'big')['flow_closed']
+    result = extent(image, 0x1000, 0x103c, 0x80001000, 'big', resolved_indirect={28: [36, 44]})
+    assert result['flow_closed'] and not result['direct_flow_closed']
+    assert result['return_sites'] == 3 and result['jump_tables'][0]['source'] == 'loader relocation'
+    for edges in ({28: [36, 0x100]}, {28: [37]}, {28: []}, {2: [36]}):
+        with pytest.raises(ValueError):
+            extent(image, 0x1000, 0x103c, 0x80001000, 'big', resolved_indirect=edges)
 
 
 @pytest.mark.parametrize('word,valid', [

@@ -18,6 +18,22 @@ from GitHub. `main` is what users update from.
 This fork defaults to `~/Decomp-RetroReversing` (checkouts: `~/Decomp-RetroReversing-dev`),
 separate from upstream databases. Respect explicit `DECOMP_HOME` settings; do not auto-migrate old data.
 
+## Keep the app checkout on main
+
+The user's app checkout is `/Users/a/Documents/GitHub/decompdecomp-rr`. Treat it as read-only for
+implementation work. Only change its branch, files or Python environment when the user specifically asks
+you to work on that checkout. A request to implement, test or merge a change does not authorize that.
+
+- Before the first edit, fetch `origin/main` and create a fresh sibling worktree on a task branch, for
+  example `git worktree add -b fix/short-name ../decompdecomp-rr-short-name origin/main`.
+- Check `git rev-parse --show-toplevel` and `git status --short --branch` in the new worktree. Use its
+  absolute path as the working directory for commands and as the target for edits. Check the path again
+  when resuming or handing off work. Run dependency sync and tests there, using that worktree's own environment.
+- Commit in the task worktree, open a pull request, and merge it once required checks pass so the user
+  can test from `main`. Leave pulling and syncing the app checkout to the user unless they ask you to do it.
+- If you accidentally touch the app checkout, stop editing there. Inspect the diff, preserve any changes
+  you did not make, and tell the user before changing a checkout in use by the app.
+
 ## Commands
 
 ```bash
@@ -46,8 +62,13 @@ Testing a change must not touch it:
   app runs from this checkout's `.venv`, run them in another environment so uv doesn't rebuild it underneath:
   `UV_PROJECT_ENVIRONMENT=<scratch venv> uv run pytest -q`.
 - To try a change on a real project, work on a copy: `sqlite3 "file:$HOME/Decomp-RetroReversing/.decomp/decomp.db?mode=ro"
-  ".backup <copy>/.decomp/decomp.db"`, copy the project folder, point `projects.root` in the copy at it. Read the
-  live database only with `?mode=ro`.
+  ".backup <copy>/.decomp/decomp.db"` (and the project's own `project-databases/<id>.sqlite3`), copy the project
+  folder, point `projects.root` in the copy at it, and point every folder its settings name at the copy too
+  (`progress_folder`, `save_folder`, `auto_commit_folder`, `repository_sync_folder`, `export`; turn off
+  `auto_commit_matches`/`auto_push`): opening the copy syncs them. A copy that kept the user's save folder deleted the
+  saved C of eight functions it reopened, and the user's app reopened those matches. The app now refuses a copy that
+  names another home's folders (`app/folder_owner.py`), but only once that home has recorded them. Read the live
+  database only with `?mode=ro`.
 - Don't restart, update or quit the user's app, and don't change its projects, without asking.
 
 Compilers and tools (objdiff, dtk, wibo, Ghidra, m2c, decomp-permuter, period compilers) are pinned with checksums
@@ -373,23 +394,26 @@ linting). In short:
 
 ## RetroReversing contribution workflow
 
-Always submit decompdecomp changes on a feature or fix branch through a pull request; do not commit directly to main.
+Always start every change in its own worktree, submit it on a feature or fix branch through a pull request, and merge it after required checks pass. Do not commit directly to main or report a change as complete while it exists only locally or in an unmerged PR; report any blocker explicitly.
 
 Keep the primary checkout on `main`. Start each change in its own Git worktree based on the latest
 `origin/main`, and make edits and run tests from that worktree. After the PR is merged and any local
 work you still need is safely saved, remove the task worktree. In Codex, archive managed worktrees to
 preserve a recoverable snapshot. Leave other tasks' worktrees alone.
 
-The user has asked that completed PRs be merged to main right after creation, once any required checks pass,
-until they revoke this preference. The user updates their running app themselves: merging a PR does not authorize
-pulling into its checkout, stopping, updating or restarting it. Leave the running app alone unless the user
-explicitly requests deployment.
+The user has asked that completed PRs be merged to main once required checks pass, and that the primary
+checkout's `main` be fast-forwarded to the merged `origin/main`, until they revoke this preference. Do not
+restart or quit the running app. If a check, conflict or permission prevents the merge or update, report
+the blocker instead of leaving an unmerged branch unnoticed.
 
 The user works on more than one computer, and the folders differ between them: never take a checkout or data home
 from a path written down here or remembered from another session. Find the running app on this machine instead:
-- `ps -E -o pid,command | grep -E 'bin/decomp( |$)'` shows each app's process, its checkout (the `.venv` it runs
-  from) and, in its environment, `DECOMP_HOME` and `DECOMP_PORT` (none: the defaults, `~/Decomp-RetroReversing`
-  on 6464 for an installed copy, `~/Decomp-RetroReversing-dev` on 6474 for a checkout, app/edition.py).
+- `ps -ax -o pid,command | grep -E 'bin/decomp( |$)'` shows each app's process and its checkout (the `.venv` it
+  runs from).
+- `ps -E -o command= -p <pid> | grep -oE '(^| )DECOMP_(HOME|PORT)=[^ ]*'` then shows that process's `DECOMP_HOME`
+  and `DECOMP_PORT` (none: the defaults, `~/Decomp-RetroReversing` on 6464 for an installed copy,
+  `~/Decomp-RetroReversing-dev` on 6474 for a checkout, app/edition.py). Never run `ps -E` without that filter, or
+  otherwise print a process's environment: the app's holds secrets.
 - `<home>/.decomp/server.json` names the port and pid of the app serving that home.
 - More than one app running, or none: ask the user which one they mean.
 

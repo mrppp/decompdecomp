@@ -514,6 +514,12 @@ def test_a_mac_iconv_shim_writes_a_backslash_after_japanese_text_as_one_byte(tmp
     long_form = subprocess.run([str(folder / "iconv"), "--from-code=UTF-8", "--to-code=EUC-JP", str(source)],
                                capture_output=True)  # (the spelling a decomp's Makefile uses)
     assert long_form.stdout == b"\xa5\xc8\\n\n"
+    shifted = tmp_path / "shifted.c"
+    source_text = 'if (x != (~y & 1)) { char *s = "ト\\n"; }\n'
+    result = subprocess.run([str(folder / "iconv"), "--from-code=UTF-8", "--to-code=Shift-JIS", "-o", str(shifted)],
+                            input=source_text.encode(), capture_output=True)
+    assert result.returncode == 0 and result.stdout == b""
+    assert shifted.read_bytes() == source_text.encode("shift_jis")
 
 
 def test_n64_gets_wibo_and_an_o32_assembler(tmp_path, monkeypatch):
@@ -1269,3 +1275,41 @@ def test_n64_copies_the_installed_ido_where_a_project_builds_its_own_and_never_l
     assert not folder.is_symlink() and (folder / "cc").read_text() == "cc" and not (folder / "cc.c").exists()
     assert (folder / "cc").stat().st_mtime > (root / "build/recomp/recomp").stat().st_mtime
     assert (ido / "cc").read_text() == "cc"
+
+
+def test_kmc_release_folder_uses_pinned_driver_with_its_program_prefix(tmp_path, monkeypatch):
+    import subprocess
+
+    from decompnet.consoles.n64 import buildtools
+
+    installed = tmp_path / "pinned compiler"
+    installed.mkdir()
+    driver = installed / "gcc"
+    driver.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    driver.chmod(0o755)
+    monkeypatch.setattr(buildtools.toolchains, "installed", lambda tid: {"id": tid})
+    monkeypatch.setattr(buildtools.toolchains, "require", lambda tid: installed)
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "Makefile").write_text(
+        "KMC_URL := https://example.invalid/mips-gcc-2.7.2/release.tar.gz\n"
+        "KMC := $(TOOLS_DIR)/gcc-kmc\nCC := $(KMC)/gcc\n")
+    buildtools._provide_compiler_dirs(SimpleNamespace(root=root))
+    wrapper = root / "tools/gcc-kmc/gcc"
+    result = subprocess.run([str(wrapper), "-c", "source.c"], capture_output=True, text=True, check=True)
+    assert result.stdout.splitlines() == [f"-B{installed}/", "-c", "source.c"]
+    wrapper.write_text("user compiler")
+    buildtools._provide_compiler_dirs(SimpleNamespace(root=root))
+    assert wrapper.read_text() == "user compiler"
+
+
+def test_kmc_named_folder_without_version_evidence_is_not_replaced(tmp_path, monkeypatch):
+    from decompnet.consoles.n64 import buildtools
+
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "Makefile").write_text("CC := $(TOOLS_DIR)/gcc-kmc/gcc\n")
+    monkeypatch.setattr(buildtools.toolchains, "installed", lambda tid: {"id": tid})
+    monkeypatch.setattr(buildtools.toolchains, "require", lambda tid: pytest.fail("unknown compiler build"))
+    buildtools._provide_compiler_dirs(SimpleNamespace(root=root))
+    assert not (root / "tools/gcc-kmc").exists()

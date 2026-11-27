@@ -524,6 +524,8 @@ class _ThreadReader:
 
 
 class Store:
+    project_slug = None  # set on a project's own database, for diagnostics (db_diagnostics)
+
     def __init__(self, path: str | Path, *, repair_archive=None, project_namespace=None, stable_ids=False, require_existing=False):
         self.path = str(path)
         self.require_existing = require_existing
@@ -747,7 +749,9 @@ class Store:
         from .project_views import install as install_views
         install_views(self.conn)
         # what the last run left in the log goes into the database now, and the log starts empty
-        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # This pragma returns a row. Leaving its cursor active can make the
+        # savepoint below fail until Python happens to collect the cursor.
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").close()
         self.conn.execute("CREATE TABLE IF NOT EXISTS read_revisions(kind TEXT PRIMARY KEY, revision INTEGER NOT NULL)")
         self.read_cache = ReadCache(lambda: getattr(getattr(self, '_local', None), 'in_tx', False))
         for table, columns in (
@@ -1046,7 +1050,8 @@ class Store:
                     if queued:
                         last = self._last_writer
                         db_diagnostics.write_waited(began-queued[0], where,
-                                                    last[0] if last and last[1] >= queued[0] else None)
+                                                    last[0] if last and last[1] >= queued[0] else None,
+                                                    self.project_slug)
                     self._local.in_tx = True
                     self._local.after_commit = []
                     _transactions.depth = getattr(_transactions, 'depth', 0) + 1
@@ -1125,13 +1130,15 @@ class Store:
         for reader in readers:
             reader.conn.close()
 
-    def _read(self, sql: str, args: tuple, single: bool):
+    def _read(self, sql: str, args: tuple, single: bool, *, consume=None):
         started = time.monotonic()
         # Two CPU clock reads per query; finer per-phase clocks materially tax fast reads.
         started_cpu = thread_time()
         self._local.read_phases = {}  # durations only: request_timing.sql_read adds them up
         self._local.read_via = 'reader'
         try:
+            if consume is not None:
+                return self._read_rows(sql, args, single, consume)
             return self._read_rows(sql, args, single)
         finally:
             elapsed = time.monotonic() - started
@@ -1153,7 +1160,7 @@ class Store:
                         *(phases.get(k, 0) for k in ('connection', 'lock_wait', 'execute', 'fetch')),
                         self._local.read_via, self._plan_shape(sql, args), cpu_elapsed)
 
-    def _read_rows(self, sql: str, args: tuple, single: bool):
+    def _read_rows(self, sql: str, args: tuple, single: bool, consume=None):
         started = time.perf_counter()
         phases = self._local.read_phases
         try:
@@ -1162,12 +1169,12 @@ class Store:
             phases['connection'] = time.perf_counter() - started
         if conn is not None and getattr(self._local, "readers", 0):
             try:
-                return self._query(conn, sql, args, single)
+                return self._query(conn, sql, args, single, consume)
             finally:
                 self._release_reader()
-        return self._query(conn, sql, args, single)
+        return self._query(conn, sql, args, single, consume)
 
-    def _query(self, conn, sql, args, single):
+    def _query(self, conn, sql, args, single, consume):
         phases = self._local.read_phases
         def query(connection):
             executing = time.perf_counter()
@@ -1178,6 +1185,8 @@ class Store:
                 phases['execute'] = time.perf_counter() - executing
             fetching = time.perf_counter()
             try:
+                if consume is not None:
+                    return consume(cur)
                 return cur.fetchone() if single else cur.fetchall()
             finally:
                 cur.close()
@@ -1208,3 +1217,7 @@ class Store:
 
     def all(self, sql: str, *args) -> list[sqlite3.Row]:
         return self._read(sql, args, single=False)
+
+    def scan(self, sql, consume, *args):
+        """Consume a query's rows before releasing its reader, without a temporary result list."""
+        return self._read(sql, args, single=False, consume=consume)

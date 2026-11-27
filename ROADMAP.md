@@ -141,6 +141,35 @@
   fall inside a listed function as split evidence (`automatic_boundaries`), the browser
   build's entries, and a body that tail-jumps into the next function in its gap.
 
+- A full N64 coverage scan can use the installed reversing emulator to corroborate called, closed candidates in
+  an exclusive overlay slot when their caller and bytes coexist in two RAM snapshots. It reports evidence for
+  review, not execution proof. It also reports an observed RAM address for a review candidate whose unique,
+  complete body is present there and closes at that mapping, including when its original guessed address was
+  different. It checks breakpoints in bounded pages and records execution only when the captured RAM at that
+  breakpoint still matches the complete body. Completed checks survive Stop and are reused only for the same
+  original image, analysis image and project layout. A captured return address that points to a direct call
+  to the entry is stronger review evidence, but need not be the last edge taken. Neither a RAM copy nor a sampled execution
+  authorizes an import or proves all game states were covered. **Add missed functions** follows these calls to a fixed point and can recover
+  uniquely mapped scoped bodies after a temporary export split preserves existing project entries and each new body;
+  their overlay scopes and existing symbols are retained. Conflicting groups are subdivided; a stopped search
+  retains its verified groups and rechecks them on resume. The cartridge split is checked separately from appended
+  relocatable analysis banks, whose records remain intact. Games with unverified mappings remain for review.
+  Planned: equivalent runtime adapters for the other consoles and project-mode targets.
+
+- N64 imports also recognize cartridge tables of headerless, chunked MIO0 executables whose back-references can
+  reach earlier chunks. A decoded program is included only when a called entry and a long prefix match the game's
+  observed RAM; its analysis image is reconstructed from the original cartridge again during export verification.
+  Existing projects need a saved-project restore or another supported migration to use the expanded image.
+
+- Saved projects retain fingerprints for post-import discoveries and re-run verified discovery before applying
+  their saved layout. A restore stops without changing the save if a discovery cannot be recreated. Planned:
+  replay reviewed donor and runtime-only mappings without requiring rediscovery, and carry the same verified
+  identities through rooms: a room layout alone cannot safely recreate an entry missing from a guest's image map.
+
+- N64 reimport stages non-overlapping existing entries omitted by the new split when the analysis image and each
+  body still match. It retains them only when a temporary split reproduces both the new and existing bodies.
+  Planned: equivalent staged reimport adapters for the other ROM consoles and review for competing boundaries.
+
 - Done: N64 imports scan all unowned intervals in corroborated loader banks,
   following newly recovered calls and materialized callback addresses to completion.
   Quiet balanced frames need adjacency or independently corroborated callees and
@@ -787,8 +816,9 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 
 | Feature | N64 | PS1 | PS2 | PS3 | PS4 | PSP | GBA | GameCube · Wii | Windows PC | Xbox | DS | Public decomps | DOS (32-bit) |
 | :-- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
+| Closest attempt under another compiler profile kept for the next worker | ✓ ROM | ✓ ROM | ✓ ROM | ✓ ROM | — project build owns the compiler | ✓ ROM | ✓ ROM | ✓ per-file compiler | ✓ per-file compiler and flags | ✓ as PC | ✓ per-file compiler | — build owns the compiler | — |
 | Loader/buffer tracing, named contracts and small wrappers | ✓ MIPS / named PI DMA | ✓ MIPS static | ✓ MIPS EE EABI | — | — | ✓ shared MIPS reader | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
-| Automatic texture banks (CI4/CI8, mixed CI8 palettes, RGBA32, RGBA16 mipmaps, RNC 1/2 and byte-sum RNC banks, named four-block banks, embedded ZIP packs, textures loaded by uncompressed display lists, I64 images in a chunked-RNC filesystem, model textures in a deflated asset table, UVTX files in a UV FORM filesystem, a texture table of back-reference-packed textures with inferred widths, display-list textures and sprites in a table of relocatable VPK0 files, image packs and model bitmaps in a party-game series' main filesystem, FLA2-packed texture banks, zlib RGBA members with stored dimensions, named textures in Iain block archives, RDP textures in paired ROM resource directories; a fork's own splat image segments, JSON asset lists and sno texture sheets) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — image adapter | — image adapter | — | — image adapter | ✓ forks with the game file (N64 checked) | — |
+| Automatic texture banks (CI4/CI8, mixed CI8 palettes, RGBA32, RGBA16 mipmaps, RNC 1/2 and byte-sum RNC banks, named four-block banks, embedded ZIP packs, textures loaded by uncompressed display lists, emulator-observed display-list textures with uniquely matched ROM pixels, I64 images in a chunked-RNC filesystem, model textures in a deflated asset table, UVTX files in a UV FORM filesystem, a texture table of back-reference-packed textures with inferred widths, display-list textures and sprites in a table of relocatable VPK0 files, image packs and model bitmaps in a party-game series' main filesystem, FLA2-packed texture banks, zlib RGBA members with stored dimensions, named textures in Iain block archives, RDP textures in paired ROM resource directories; a fork's own splat image segments, JSON asset lists and sno texture sheets) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — image adapter | — image adapter | — | — image adapter | ✓ forks with the game file (N64 checked) | — |
 | Audio browser, filters, sortable samples and explicit WAV preparation | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | Indexed dialogue scripts with scene and speaker browsing, verified voice playback and related cutscene scripts | ✓ ROM | — | — | — | — | — | — | — | — | — | — | — | — |
 | Port settings menu (Tab or F1 in the game's window; recomp-ui's menu model when built: docs/PORTING.md) | ✓ SDL3 window; RT64 window (adapter ABI 4; drawn over a real game, key presses there not yet tried); browser build (web/settings.js); — Miyoo build | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -797,9 +827,9 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Native directory roles: animation, collision, placements, grid, sequences and demos | ✓ validated schema / linked records | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | Native ADPCM animation, linked textures and source-family I4 fonts | ✓ bounded native previews | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | Text/pointer record inspectors and PSF2 glyph atlas | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
-| Model browser and automatic indexed geometry / local mesh wireframes (raw, RNC 1/2, EMsh in byte-sum RNC and RNX with linked effect textures, embedded ZIP, zlib packed vertex-cache commands, named Iain scene meshes, paired cartridge F3DEX2 lists) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
+| Model browser and automatic indexed geometry / local mesh wireframes (raw, RNC 1/2, EMsh in byte-sum RNC and RNX with linked effect textures, embedded ZIP, zlib packed vertex-cache commands, named Iain scene meshes, Fast3D local display lists, paired cartridge F3DEX2 lists) | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | PD3V textures, static assemblies, linked scenery and glTF export | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
-| B1 (including relocated and bit-packed controls and parallel cartridge tables) / libmus PtrTablesV2 audio banks, table evidence and mono VADPCM/PCM16 previews | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
+| B1 (including relocated and bit-packed controls, parallel tables and repeated cartridge-address records) / libmus PtrTablesV2 audio banks, table evidence and mono VADPCM/PCM16 previews | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | Native frame/palette/mip selection and explicit animation | ✓ ROM | — native formats planned | — native formats planned | — | — | — native formats planned | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
 | Image, texture/palette and audio previews (including split libmus songs, sequenced effects and compressed multi-bank cartridge scores on N64) | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | ✓ forks with the game file (N64 checked) | — |
 | Agent asset discovery, automatic checks, independent review and similar regions | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — original image adapter | — original image adapter | — | — original image adapter | — original image adapter | — |
@@ -836,14 +866,14 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Compile-tested draft refresh and saved diagnostics | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ m2c | ✓ Ghidra | — | — draft generator planned | ✓ supported draft generators | ✓ Ghidra (`redraft`) |
 | Initial callback, forwarded-argument and overlapping-frame recovery | ✓ bounded MIPS | ✓ bounded MIPS | ✓ bounded MIPS | — | — | ✓ bounded MIPS | — | — processor reader planned | — processor reader planned | — | — processor reader planned | ✓ MIPS C; other readers planned | — |
 | Autopilot: free matches from drafts | ✓ | ✓ | ✓ | twins only | — | ✓ | ✓ (demo: 34 matches) | ✓ | ✓ exact drafts of tiny shapes (32-bit); Ghidra's made compilable | ✓ as PC | twins only (no drafts yet) | — | ✓ Ghidra's drafts made compilable (demo: 3 matches) |
-| Drafts follow the header, made in the background; `redraft` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ (m2c and `redraft`) | — | ✓ Ghidra's | ✓ Ghidra's | — | — | ✓ Ghidra's |
+| Drafts follow the header (and, in ROM mode, matched callees' own prototypes), made in the background; `redraft` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ (m2c and `redraft`) | — | ✓ Ghidra's | ✓ Ghidra's | — | — | ✓ Ghidra's |
 | C++ methods drafted as `Class::method` | ✓ | ✓ | ✓ | — | — | ✓ | — | — | ✓ (RTTI, and classes from the vtables constructors store) | ✓ (RTTI, vtables) | — | — | — C games |
 | Twins: free matches from identical code | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ (ran; no pairs in demo) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (a shareware game: 25 groups) |
 | Resumable source/profile queue and explicit assembly reconsideration | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — owned-build adapter planned | — owned-build adapter planned | — | — owned-build adapter planned | — owned-build adapter planned | — |
 | Supplied assembly code/data verification | ✓ ROM driver | ✓ ROM driver | ✓ ROM driver | — | — | ✓ ROM driver | — | — own build adapter planned | — own build adapter planned | — | — own build adapter planned | — own build adapter planned | — |
 | Indexed SDK object assembly proof | ✓ MIPS ROM | ✓ MIPS ROM | ✓ MIPS ROM | — | — | ✓ MIPS ROM | — | — owned-build adapter planned | — owned-build adapter planned | — | — owned-build adapter planned | — owned-build adapter planned | — |
 | Library C that library detection finds set aside (opt-in, Libraries for this game; linked when your SDK has it) | ✓ MIPS ROM, built-in ultralib table; port glue and replaced, and n_audio (no public source) | ✓ MIPS ROM | ✓ MIPS ROM | — | — | ✓ MIPS ROM | — | — owned-build adapter planned | — owned-build adapter planned | — | — owned-build adapter planned | — owned-build adapter planned | ✓ Watcom's C library from your copy, by its bytes and its calls (a shareware game: 101 functions, set aside and named) |
-| Built-in exact SDK assembly detection before claims | ✓ bcmp/bzero | — pack planned | — pack planned | — | — | — pack planned | — | — pack planned | — pack planned | — | — pack planned | — owned-build adapter planned | — |
+| Built-in exact SDK assembly detection before claims | ✓ exact libultra bodies | — pack planned | — pack planned | — | — | — pack planned | — | — pack planned | — pack planned | — | — pack planned | ✓ N64 ELF references without relocations; other packs planned | — |
 | Exact C / verified source assembly / verified SDK assembly / other assembly / open counts | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ counts | ✓ counts | — | ✓ counts | ✓ counts | ✓ counts |
 | Local mapped source preparation | ✓ | ✓ | ✓ | — | — | ✓ | — | body only¹ | body only¹ | — | body only¹ | body only¹ | — |
 | Verified neighbour context hypotheses and separate body/header bundles | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — own build adapter planned | — own build adapter planned | — | — own build adapter planned | — own build adapter planned | — |
@@ -868,6 +898,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Reviewed existing raw-tail recovery (local ROM) | ✓ | ✓ | ✓ (scalar decoder) | — | — | ✓ | — | — | — | — | — | — | — |
 | Derived incomplete state / raw coverage / completion audit | ✓ | ✓ | ✓ (scalar decoder) | — | — | ✓ | — | — | — | — | — | — | — |
 | Read-only gap/pointer/interior audit / incomplete-target warnings | ✓ | ✓ | ✓ (scalar decoder) | — | — | ✓ | — | — | — | — | — | — | — |
+| Runtime corroboration of scoped coverage leads | ✓ N64 ROM, sampled | — runtime adapter | — runtime adapter | — runtime adapter | — | — runtime adapter | — runtime adapter | — runtime adapter | — runtime adapter | — runtime adapter | — runtime adapter | — runtime adapter | — |
 | Guarded jump-table / local callback-consumer audit (scalar MIPS ROM) | ✓ | ✓ | ✓ | — | — | ✓ | — | — | — | — | — | — | — |
 | Saved code-audit decisions and evidence (local) | ✓ | ✓ | ✓ | — | — | ✓ | — | — | — | — | — | — | — |
 | Called whole-gap recovery (conservative import rule) | ✓ | — | — | — | — | — | — | — | — | — | — | — | — |
@@ -886,6 +917,8 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Verified cleanup of rare compiler profiles | ✓ ROM mode | ✓ ROM mode | ✓ ROM mode | — | — | ✓ ROM mode | — | — | — | — | — | — | — |
 | Deep Permuter detects a near-match's compiler (`profile_detection`: its saved C under every installed profile, matched neighbours, the compiler map, code habits; told and tried first) | ✓ demo; copies of three real games | ✓ shared ROM path, unchecked | ✓ shared ROM path, unchecked | ✓ judge and neighbours, unchecked (code habits: MIPS only) | — | ✓ shared ROM path, unchecked | — | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build | — |
 | Profile probe: the few per-function profiles an open function's target points to (`-mfp32`, `-G8`, SN 2.7.2's builds, the 0001 + 0004-assembler pack for any `ldc1` target, KMC for libultra, the profile most matched neighbours use, the project's most used per-function profiles), judged once per saved C by the Deep Permuter and the autopilot's saved-source pass, an exact pair applied for that function only (`profile_probe`) | ✓ demo; the rules from ~1,000 hand matches of one SN 2.8.1 game | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules, unchecked | — | ✓ flag and neighbour rules, unchecked | — | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build | — |
+| Profile probe: the few per-function profiles an open function's target points to (`-mfp32`, `-G8`, SN 2.7.2's builds, the 0001 + 0004-assembler pack for any `ldc1` target, KMC for libultra, the profile most matched neighbours use, the project's most used per-function profiles, `-fforce-addr` for a target that reads offsets off a held symbol address), and every other -O level of the function's compiler (for the saved C and the machine draft, a clearly closer level then repaired by the Deep Permuter), judged once per saved C by the Deep Permuter and the autopilot's saved-source pass, an exact pair applied for that function only (`profile_probe`) | ✓ demo; the rules from ~1,000 hand matches of one SN 2.8.1 game | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules, unchecked | — | ✓ flag and neighbour rules, unchecked | ✓ -O levels and neighbour rules, unchecked | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build | — |
+| Drafts under other profiles: after the background drafts, each open function's stored draft, a fresh draft and its saved C judged under the profiles the project's matched functions use (and the other `-mfp` flag where the target's float registers point to it), an exact pair applied for that function only, the closest kept as its closest attempt (`profile_drafts`) | ✓ demo, `-mfp32`/`-mfp64` variants | ✓ shared ROM path, unchecked (no demo compiler here) | ✓ shared ROM path, unchecked | — no machine drafts: m2c can't read its code | — the project's build | ✓ shared ROM path, unchecked | ✓ shared ROM path, unchecked | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build | — |
 | Repair rules learnt from the Deep Permuter's matches (`mined_rules`): a statement-sized change that made two different matches becomes a rule, tried first on other functions (C only) | ✓ unit tests; extraction measured on saved matches | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | — |
 | Flag search (`search_flags`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | — (the project's flags only) | per source file (/Oy- on 32-bit, /O1, /Ob1) | per source file | — (the project's flags only) | the project's build | per source file (-3r to -6r, -ox to -os) |
 | Compiler map and the judge's survey | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | ✓ per source file, Rich header | the XDK build's compiler (no Rich header: one per game) | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | — | — |
@@ -902,6 +935,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Grouped ROM variants: selector, identities, checked shared C and single-repository export | ✓ demo + two real releases verified | — adapter validation pending | — adapter validation pending | — | — | — adapter validation pending | — | — object adapter planned | — object adapter planned | — | — object adapter planned | — object adapter planned | — |
 | Other releases of a game: found, paired, names, header types and code brought over | ✓ | — not yet run | — not yet run | — | — | — not yet run | — | — object pairing planned | — object pairing planned | — | — object pairing planned | — object pairing planned | — |
 | Automatic attempts from similar verified C | ✓ (ROM) | ✓ (ROM) | ✓ (ROM) | — | — | ✓ (ROM) | — | — | — | — | — | — | — |
+| Look-alikes in a game get a match's C at once, with its compiler profile and the target's constants (`lookalike_profiles`) | ✓ (ROM) | ✓ (ROM) not run yet | ✓ (ROM) not run yet | — | — | ✓ (ROM) not run yet | — | — no per-function profiles in project mode | — no per-function profiles in project mode | — | — no per-function profiles in project mode | — | — |
 | Bounded automatic reuse, tiny templates and local SDK C | ✓ (ROM) | ✓ (ROM) | ✓ (ROM) | — | — | ✓ (ROM) | — | — | — | — | — | — | — |
 | Shared knowledge (two models agree) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Tidy each source file once it's polished (shared types in one header, names, dead declarations) | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | — |
@@ -924,7 +958,6 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Behaviour checked against the original (`compare_behaviour`, docs/N64RECOMP.md phase 1) | ✓ (recorded in mupenRE, run through N64Recomp's C and the WebAssembly port's) | — no emulator or recompiler yet | — no emulator or recompiler yet | — | — | — no emulator or recompiler yet | — | — no emulator or recompiler yet | — no emulator or recompiler yet | — | — no emulator or recompiler yet | — no ROM to run | — |
 | Pictures checked against the console (Check pictures, Porting tab: both sides drawn from RAM by the port's renderer) | ✓ (mupenRE writes the console's RAM at each graphics task; the port starts from the console's save and replays its pacing) | — no emulator yet | — no emulator yet | — no emulator yet | — no emulator yet | — no emulator yet | — no emulator yet | — no emulator yet | — no emulator yet | — no emulator yet | — no emulator yet | — no emulator yet | — |
 | Open-candidate behavior checks (`compare_candidate_behaviour`) | ✓ (sampled emulator calls against a disposable candidate port) | — no recorded-call harness | — no recorded-call harness | — | — | — no recorded-call harness | — | — no recorded-call harness | — no recorded-call harness | — no recorded-call harness | — no ROM to run | — | — |
-|Scan for rendering faults (Porting tab, `port/render_scan.py`: the port's frames searched for static, flat colour, streaked textures and half-drawn frames)| ✓ (the native port run headless with a scripted controller; its findings name the graphics task for `n64_frame_compare.py`)| — no native port yet| — no native port yet| — no native port yet| — no native port yet| — no native port yet| — no native port yet| — no native port yet| — no native port yet| — no native port yet| — no ROM to run | — | — |
 | Port readiness report (docs/PORTING.md, phase 0) | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared ROM/project report; kit where available | ✓ shared project report |
 | Data in C, judged by bytes (`compile_data`, docs/PORTING.md phase 1) | ✓ (data after the last code segment, `.bss`; Start agents → Write data as C) | — no `bss_start` reader | — no `bss_start` reader | — | — | — no `bss_start` reader | — | — project mode: data is in the project's sources | — project mode | — | — project mode | — | — |
 | The game's C compiled for a PC (Porting → Compile for PC, docs/PORTING.md phase 3) | ✓ (pinned Zig's clang, 64-bit x86 Linux target; nothing linked yet) | — no port kit yet | — no port kit yet | — | — | — no port kit yet | — | — project mode not read yet | — project mode not read yet | — | — project mode not read yet | — | — |
@@ -1063,6 +1096,11 @@ n_audio, which ultralib has no C for): waiting for that C had left a racing game
 `n_alFxNew`, named from exact signatures, to agents and deep passes. The port runs their original code. Check again,
 and the deep permuter before it searches a function, set library code aside too.
 
+SDK sample code is set aside the same way (`Console.sdk_sample_code`: the N64's scheduler, sched.c). The port runs
+the game's own copy of it (recompiled where it has no matched C), and that had kept `__scExec` and the rest, named
+from exact signatures, open for agents. Matched copies stay matched. Left: the native libultraship build (Compile
+for PC) has no C for a scheduler function set aside; it could read ultralib's sched.c as it reads the math.
+
 Library code the port compiles from C (`gu*` math, libultra's synthesizer) is set aside too once the user installs
 libultra source (decompals/ultralib at the table's commit, a proprietary pack: its C is SGI's and Nintendo's), and
 the WebAssembly build compiles ultralib's C for it (port/ultralib.py, docs/PORTING.md). On that racing game 15 more
@@ -1178,6 +1216,25 @@ profiles. The destination judge verifies the resulting C.
 Project-mode similar-transfer support is planned: align target-object relocations and adapt file-local declarations before trying
 similar C through objdiff. Other processors need an instruction reader for this search.
 
+A matched function's open look-alikes in its own ROM game are tried as soon as it matches: its C with their names, with
+the donor's own per-function compiler profile (published for the receiver only on an exact judge's verdict) and a
+compile-guided search for the constants they differ in (32-bit LUI/ORI pairs, negative, repeated and swapped values;
+`app/lookalike_profiles.py`, `arch/mips_immediates.value_sites`). Planned: project mode, once its sources carry a
+per-file compiler the same way (DS's `set_file_compiler`) and its objects are aligned like the similar-code pass; other
+processors need their immediate reader.
+
+The similar-code pass now finds donors by content across every game (a shingle index of four-instruction runs,
+`similarity.ShingleIndex`, before the size-ordered shortlist), works best-first through a game's open functions by how
+alike their closest donor is, compares compiler profiles by the flags that change code (`similar_matches.codegen_key`),
+renames donors with another relocation layout from their aligned instruction runs, tries another game's donor with that
+game's profile the same way as a donor in its own game, and sends a new match to its look-alikes in the user's other active
+games at once. A transfer that doesn't build is tried once more with the donor header's missing types. Still ROM mode
+and MIPS only (project mode: the paragraph above); an idle game keeps a new match in a queue in the catalog and tries
+it first on its next pass. Struct fields at other offsets are moved (`decomprepair.field_offsets`: `p->f`, `p->a.b`,
+`a[i].f`, each dereference of a chain), calls are fitted to this game's prototypes (`call_arity`), numbers that differ
+between several games' C are set from the target's instructions (`similar_matches.consensus`), and the results drawer
+shows what each step found ("What each similar-code step found"). Planned: a callee inlined in one game but not the other.
+
 Cross-game C++ constructor entry replay currently covers N64 overlays with IDO. Main-ROM linking and owned-build
 projects need their own verified constructor-entry selection and export handling before this retry can reach them.
 Cross-game switch-label recovery currently uses verified N64 overlay tables. Other ROM and owned-build modes need
@@ -1269,6 +1326,11 @@ compilers have their years so far; every other console's compiler counts as unre
   words-only suggestion. The permuter probes every candidate under that profile first and climbs under it. Nothing
   changes a function's compiler by itself (`app/profile_detection.py`). ROM projects only (see "Compiler detection
   for project mode").
+
+- **A near-match is repaired under the profiles matched functions use.** Even when its saved C scores worse there, the
+  Deep Permuter now runs a short best-child chain of the repair families under the matched neighbours' profile and the
+  project's most used per-function profiles (`profile_climb.explore_usual`; an N64 function at 15 under its own
+  settings and 25 under the right ones was exact there two repairs later). ROM projects, like the rest of the climb.
 
 - **Scores follow the flow, not the instruction count (score version 3).** On a large function one instruction added
   or removed shifted every later branch (and jump to the function's own symbol), and each one cost 10 or, for a
@@ -2365,6 +2427,12 @@ reuse the saved map. See [ROM Explorer](docs/ROM_EXPLORER.md) for support and li
 
 ## Next
 
+### Matched callees' prototypes in project-mode drafts
+
+ROM drafts take the prototype of each matched callee the shared header does not declare (`app/callee_prototypes.py`).
+Project-mode drafts (GameCube/Wii and DS started from scratch, forks, Ghidra's) see only their source file's headers:
+find the matched definition in the project's sources and give it to m2c or Ghidra the same way.
+
 ### Side-by-side viewer: more games, more consoles
 
 Play beside the console (Porting tab; `port/wasm/side_by_side.py`, docs/PORTING.md "Side by side, live") runs the port and the
@@ -2389,12 +2457,36 @@ Rules are learnt only from the Deep Permuter's matches whose starting C is still
 for C (the rewrites leave C++ classes alone). Next: learn from agents' and hand matches, from changes in two places, and
 check the pass on each console in the table, GBA, PS4 and project mode included.
 
+### Closer attempts under another profile: what is left
+
+The app keeps each open function's closest compile under another compiler profile and the briefs hand it on
+(`app/profile_attempts.py`). Not covered yet: PS4 and public decomps, whose own build owns the compiler and flags, so
+there is no other profile to try; carrying the attempt in saves, rooms and hosted projects (it stays in this computer's
+project database); compiles by the profile probes and the Deep Permuter's sweeps, which keep their own records (the
+drafts under other profiles, `app/profile_drafts.py`, keep their closest here); and judging an ordinary compile_and_diff
+under other profiles unasked.
+
+### Drafts under other profiles in project mode, and on the PS3
+
+After the background drafts, a ROM project's open functions have their stored draft, a fresh draft and their saved C
+judged under the profiles its matched functions use, and an exact pair is applied for that function only
+(`app/profile_drafts.py`, run by the drafter, `app/drafts.py`). Not covered yet: project mode (GameCube, Wii, Windows
+PC, Xbox, DS and public decomps), where a source file owns its compiler and flags (`Console.file_compiler`), so "the
+profiles matched functions use" are the compilers and flags of the other files. Next: take those from the files with
+matches, judge each function's draft and saved C through `try_compiler`'s per-file path (`app/filecompilers.py`),
+which switches a file only when the function matches and the file's other matches still do. The PS3 has no machine
+drafts (m2c can't read PPU code), so the drafter never starts there: its saved C could still be judged by the same pass
+started without drafts. The PS1, PS2, PSP and GBA columns run the shared ROM path but were not run on their demos here
+(their compilers were not installed); the float-register variant is MIPS GCC with an `-mfp` flag only.
+
 ### Profile probes for project mode
 
 The profile probe (`app/profile_probe.py`) judges a ROM project's open function under the few per-function profiles its
-target points to and applies an exact one for that function only. Project mode does not get it yet, for the same reason
-as compiler detection: a source file owns its compiler (`Console.file_compiler`, `set_file_compiler`) and a fork's build
-owns its flags. Next: plan the probes from the unit's own objdiff rows, judge them through `try_compiler`'s per-file path
+target points to, and at every other -O level of its compiler (`app/opt_levels.py`), and applies an exact one for that
+function only. Project mode does not get it yet, for the same reason as compiler detection: a source file owns its
+compiler (`Console.file_compiler`, `set_file_compiler`) and a fork's build owns its flags, so the Deep Permuter skips
+this first move there. The levels would apply where files have their own flags (Windows PC and Xbox: /Od, /O1, /O2,
+/Ox through `set_file_flags`; CodeWarrior's -O0 to -O4 on GameCube, Wii and DS). Next: plan the probes from the unit's own objdiff rows, judge them through `try_compiler`'s per-file path
 (`app/filecompilers.py`) and offer an exact one as the file's compiler change. Every project-mode console. The PS1, PS2,
 PS3 and PSP columns run only the flag rules (`-G`) and the neighbours' vote today, unchecked on a real game: their
 consoles have no hints of their own (`Console.profile_probes`) yet, such as an earlier compiler a game mixed in.
@@ -2475,7 +2567,7 @@ The N64 import runs the game too, when the emulator is installed (consoles/n64/l
 about two, pressing Start and A, with RAM written five times. A function the known code calls that's in no segment
 and is code in RAM byte for byte as a stretch of the ROM gives its segment exactly, ROM range and load address; the
 stretch the split has some of comes in as its gaps, a leaf function before the first frame starts it, and each one
-found is followed for its own calls. A racing game whose small overlays each load at their own address had 48
+found is followed for its own calls. When many cross-bank calls enter the middle of framed code, a longer run without controller input checks whether multiple callers and targets prove a different bank at the same RAM address; verified disjoint ROM ranges get separate scopes. A racing game whose small overlays each load at their own address had 48
 functions its code calls in no segment (its main thread's code among them): its old split had 1,125 functions, a new
 one 1,269, 39 KiB of code found only by running it. Left: code the game decodes as it loads (counted, not added),
 a known segment the game runs elsewhere (reported, not moved), leaf functions just before a known segment's start,
@@ -3754,6 +3846,14 @@ adapter; these source families do not change that limitation or any match verdic
 - Planned: non-MIPS boundary readers and object-project segment adapters for gap audits;
   EE-specific instruction decoding, function-pointer-only entry evidence and code/data
   subsegment audits. Existing MIPS diagnostics remain advisory when a decoder cannot close flow.
+- Planned: object-project coverage must also check callable symbols inside reported functions. A target
+  generator can give a directly called entry a zero-size untyped symbol and include its instructions in the
+  preceding function's size; report-to-database agreement then hides the entry. In one isolated comparison,
+  correcting only the target symbol sizes exposed an eight-byte source-defined function and changed the
+  preceding function's match from 85.7% to 100%, with text and relocations unchanged. Review direct calls,
+  source and control flow before proposing a boundary: internal labels, shared tails and microcode are not
+  automatically separate functions. A durable correction belongs in the project's target generator and must
+  keep the project's own objdiff judge; do not patch its generated objects behind its back.
 - Planned: the agents' `split_function` refuses, on MIPS ROM projects, a cut that leaves the first part running on
   into the second or starts the second on a delay slot (`EditMixin._split_runs_on`, through the processor's
   `boundary_instruction`); GBA (ARM/Thumb) and PS3 (PPC64) ROM splits need those instruction facts before they get it.
@@ -4799,9 +4899,12 @@ similarity alone is insufficient. Their ordinary assembly classifications still 
 - Done: N64 local-ROM import classifies exact, self-contained libultra bcmp/bzero
   byte variants before claims and names unique entries. Active existing projects
   receive classification/display-name backfill without replacing source symbols.
-- Planned: additional independently verified reference-free SDK bodies and imported
-  project/other-console adapters. Relocated code still needs the full linker proof;
-  partial SDK signatures never establish handwritten assembly.
+- Done: N64 imported projects identify the same exact SDK bodies in sized ELF reference
+  symbols without relocations. Matches, user reopenings and agent claims stay untouched;
+  a proof is rechecked against the reference object when read.
+- Planned: additional independently verified reference-free SDK bodies and other-console
+  adapters. Relocated code still needs the full linker proof; partial SDK signatures
+  never establish handwritten assembly.
 
 Asset discovery now records automatic layout/decompression checks, comparisons with
 static loader extents and independent worker critiques. Use at least two discovery

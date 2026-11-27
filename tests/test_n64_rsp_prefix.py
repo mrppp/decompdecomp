@@ -52,7 +52,7 @@ def test_audio_text_after_bootstrap_requires_vector_program(entry):
         struct.pack_into('>I', image, 0x100 + 4 * i, 0x4a000000)
     for i in range(3):
         struct.pack_into('>I', image, 0x200 + 4 * i, 0x09000400 + i)
-    assert list(audio_spans(image)) == [(0xd0, 0x10d0)]
+    assert list(audio_spans(image)) == [(0, 0x10d0)]
     image[0x100:0x200] = bytes(0x100)
     assert not list(audio_spans(image))
 
@@ -71,6 +71,20 @@ def test_audio_text_before_bootstrap_accepts_pointer_first_entry(boot):
     image[0x1000:0x1000+len(signature)] = signature
     assert list(audio_spans(image)) == [(0, 0x1000)]
     image[0x100:0x200] = bytes(0x100)
+    assert not list(audio_spans(image))
+
+
+def test_standalone_audio_program_needs_entry_vectors_and_imem_jumps():
+    from decompnet.consoles.n64.rsp_prefix import audio_spans
+
+    image = bytearray(0x1100)
+    image[0x100:0x10c] = bytes.fromhex('400558008c3c00308c3b0034')
+    for i in range(64):
+        struct.pack_into('>I', image, 0x200 + i*4, 0x4a000000)
+    for i in range(3):
+        struct.pack_into('>I', image, 0x300 + i*4, 0x09000400+i)
+    assert list(audio_spans(image)) == [(0x100, 0x1100)]
+    image[0x300:0x30c] = bytes(12)
     assert not list(audio_spans(image))
 
 
@@ -128,4 +142,71 @@ def test_standard_boot_and_jump_to_vector_graphics():
         struct.pack_into('>I', image, 0x200 + 4*i, 0x09000400 + i)
     assert list(graphics_spans(image)) == [(0, len(image))]
     image[0x100:0x200] = bytes(0x100)
+    assert not list(graphics_spans(image))
+
+
+def test_bootstrapped_vector_overlay_stops_before_a_cpu_frame():
+    from decompnet.consoles.n64.port import RSPBOOT
+    from decompnet.consoles.n64.rsp_prefix import graphics_spans
+
+    image = bytearray(0x1600)
+    image[:len(RSPBOOT)] = RSPBOOT
+    code = 0xd0
+    image[code:code+12] = bytes.fromhex('4a00002cc81f201bc81e201c')
+    for i in range(64):
+        struct.pack_into('>I', image, code+0x100+i*4, 0x4a000037)
+        struct.pack_into('>I', image, code+0x1100+i*4, 0x4a000037)
+    for i in range(3):
+        struct.pack_into('>I', image, code+0x300+i*4, 0x0c000400+i)
+    struct.pack_into('>I', image, code+0xffc, 0x080007f6)
+    stop = code+0x1420
+    struct.pack_into('>2I', image, stop-24, 0x08000513, 0x4a952748)
+    struct.pack_into('>5I', image, stop, 0x27bdffe8, 0xafbf0010, 0x8fbf0010, 0x03e00008, 0x27bd0018)
+    assert (0, stop) in list(graphics_spans(image))
+    image[stop-20:stop-16] = bytes(4)  # no vector delay-slot evidence
+    assert (0, stop) not in list(graphics_spans(image))
+
+
+def test_graphics_boot_marker_after_return_is_not_cpu_code():
+    from decompnet.consoles.n64.port import RSPBOOT
+    from decompnet.consoles.n64.rsp_prefix import graphics_spans
+
+    image = bytearray(0x20 + 0xd0 + 0x1000)
+    image[0x14:0x20] = bytes.fromhex('03e00008000000006e736967')
+    image[0x20:0x44] = bytes.fromhex('342100010900041a') + RSPBOOT[4:]
+    for i in range(64):
+        struct.pack_into('>I', image, 0x120 + 4*i, 0x4a000000)
+    for i in range(3):
+        struct.pack_into('>I', image, 0x220 + 4*i, 0x09000400+i)
+    assert list(graphics_spans(image)) == [(0x1c, len(image))]
+    image[0x14:0x18] = bytes(4)
+    assert list(graphics_spans(image)) == [(0x20, len(image))]
+    image[0x120:0x220] = bytes(0x100)
+    assert not list(graphics_spans(image))
+
+
+def test_standard_boot_and_vector_setup_needs_rsp_body_evidence(tmp_path):
+    import yaml
+
+    from decompnet.consoles.n64.inline_data import apply
+    from decompnet.consoles.n64.port import RSPBOOT
+    from decompnet.consoles.n64.rsp_prefix import graphics_spans
+    from decompnet.rom.split import code_ranges
+
+    image = bytearray(0xd0 + 0x1000)
+    image[:len(RSPBOOT)] = RSPBOOT
+    image[0xd0:0xdc] = bytes.fromhex('4a00002cc81f201bc81e201c')
+    for i in range(64):
+        struct.pack_into('>I', image, 0x100 + 4*i, 0x4a000000)
+    for i in range(3):
+        struct.pack_into('>I', image, 0x300 + 4*i, 0x0c000400 + i)
+    assert list(graphics_spans(image)) == [(0, len(image))]
+    padded = bytes(0x100) + image + bytes(0x100)
+    config = tmp_path / 'game.yaml'
+    config.write_text(yaml.safe_dump({'segments': [
+        {'type': 'code', 'start': 0, 'vram': 0x80000000, 'subsegments': [[0, 'c', 'text']]}, [len(padded)]]}))
+    apply(config, padded, lambda *_: None)
+    assert code_ranges(config) == [(0, 0x100, 0x80000000),
+                                   (0x11d0, len(padded), 0x800011d0)]
+    image[0x300:0x30c] = bytes(12)
     assert not list(graphics_spans(image))

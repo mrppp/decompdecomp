@@ -219,14 +219,19 @@ def _lead(net,proj,fn,hint,neighbours=()):
     A library no public source builds (`Console.sdk_without_source`: the N64's n_audio) is set aside whatever the
     kit calls the name: waiting for ultralib's C left a racing game's `n_alSynNew`, `n_alSeqpNew` and the rest,
     named from exact signatures, open for agents and the deep permuter for good. The port runs their original code,
-    as it does for any function with no C."""
+    as it does for any function with no C.
+
+    SDK sample code the port runs as the game's own (`Console.sdk_sample_code`: the N64's scheduler, sched.c) is
+    set aside too. The port kit's "the game's own code" only says whose copy the port runs; read as "keep matching
+    it", it left `__scExec`, named from an exact signature, open for agents in game after game."""
     meta=json.loads(fn['meta'] or '{}')
     if meta.get('reopened'):return None
     names=hint.get('names') or []
     if len(names)!=1 or not names[0] or ' / ' in names[0]:return None
     kit=net.console(proj).port_kit
     group=kit.sdk_group(names[0]) if kit is not None else 'replaced'
-    if group in ('replaced','glue') or net.console(proj).sdk_without_source(hint.get('corpora') or []):
+    console=net.console(proj)
+    if group in ('replaced','glue') or console.sdk_without_source(hint.get('corpora') or []) or console.sdk_sample_code(names[0]):
         return names[0],list(hint.get('corpora') or []),None
     if group!='native':return None
     from ..port import ultralib
@@ -455,6 +460,20 @@ def known_proof(console, proj, fn):
         evidence = 'Exact complete bytes of a verified self-contained handwritten SDK routine; no C coverage.'
     return {**found, 'verified': True, 'kind': 'sdk', 'verification_method': 'builtin-sdk-digest',
             'alias_schema': 1, 'fingerprint': fingerprint(proj, fn), 'evidence': evidence, 'at': time.time()}
+
+
+def classify_recovered(console, proj, fn, status, meta):
+    """Classify a new target before it can enter the agents' claim queue."""
+    if proof := known_proof(console, proj, fn):
+        meta['verified_assembly'] = proof
+        meta['sdk_display'] = {'name': proof['name'], 'names': proof['names'], 'corpora': [proof['corpus']]}
+        meta['asm_code'] = (proof['evidence'] if proof.get('from_c') else
+                            'Verified handwritten SDK assembly; no C matching required.')
+        return 'asm', meta
+    if why := console.asm_reason(fn['target']):
+        meta['asm_code'] = why
+        return 'asm', meta
+    return status, meta
 
 
 def discover_known(net, proj, *, function_id=None, check_cancel=None):

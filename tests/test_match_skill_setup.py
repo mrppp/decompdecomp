@@ -560,7 +560,7 @@ def test_a_failed_renewal_is_retried_at_once_and_lost_only_when_the_claim_must_h
         calls = []
 
         class Slow:
-            def function(self, slug, name):
+            def function(self, slug, name, quick=False):
                 calls.append(name)
                 if len(calls) < 3:
                     raise setup.McpError("timed out")
@@ -571,7 +571,7 @@ def test_a_failed_renewal_is_retried_at_once_and_lost_only_when_the_claim_must_h
         assert not (root / "LOST").exists()
 
         class Down:
-            def function(self, slug, name):
+            def function(self, slug, name, quick=False):
                 raise OSError("connection refused")
 
         assert setup.renew_once(root, info, Down(), flaky, time.time(), pause=0) == "failed"
@@ -806,3 +806,169 @@ def test_a_refused_claim_at_start_prints_the_hint_and_leaves_nothing_behind(worl
     with pytest.raises(SystemExit, match="What to do: another agent"):
         start(setup, home, primary, "--holder", "claude-e2", "func_9")
     assert not setup.session_dir("claude-e2").exists()
+
+
+def test_a_function_this_session_matched_is_said_once_and_is_not_a_lost_claim(world, capsys):
+    setup, app, home, primary = world
+    assert start(setup, home, primary, "--holder", "claude-m1", "--interval", "3600") == 0
+    root = setup.session_dir("claude-m1")
+    claimlost = sys.modules["claimlost"]
+    try:
+        assert wait_for(lambda: (root / "renew.log").exists())
+        app.answers = ["✅ MATCH! func_8001 is byte-identical to the target (3 instructions). Credited to x."]
+        (root / "c.c").write_text("int f(void){return 0;}")
+        assert setup.main(["try", "claude-m1", str(root / "c.c")]) == 0
+        app.status, app.answers = "matched", ['{"claims": []}']
+        capsys.readouterr()
+        assert setup.main(["check", "claude-m1"]) == 0
+        out = capsys.readouterr()
+        assert "matched by this session" in out.out and "CLAIM LOST" not in out.out + out.err
+        assert out.err.count("MATCHED by this session") == 1
+        assert not claimlost.warn(root) and capsys.readouterr().err == ""  # said once
+        with pytest.raises(SystemExit, match="already matched by this session"):
+            setup.main(["try", "claude-m1", str(root / "c.c")])
+    finally:
+        setup.main(["stop", "claude-m1"])
+
+
+@pytest.mark.parametrize("author,ours", [("manual-abc", True), ("manual-other", False)])
+def test_a_match_with_no_verdict_is_attributed_by_the_apps_brief(world, capsys, author, ours):
+    """A match applied with `suggest` leaves no verdict behind: the app says who matched it."""
+    setup, app, home, primary = world
+    assert start(setup, home, primary, "--holder", "claude-m2", "--interval", "3600") == 0
+    root = setup.session_dir("claude-m2")
+    try:
+        assert wait_for(lambda: (root / "renew.log").exists())
+        app.status = "matched"
+        app.answers = ['{"claims": []}', f"## VIEW: demo/func_8001\nMATCHED by {author} 1 min ago:\n"]
+        capsys.readouterr()
+        assert setup.main(["check", "claude-m2"]) == (0 if ours else 1)
+        out = capsys.readouterr()
+        assert ("CLAIM LOST" in out.out + out.err) is (not ours)
+    finally:
+        setup.main(["stop", "claude-m2"])
+
+
+def test_reclaim_removes_the_previous_functions_start_files(world):
+    setup, app, home, primary = world
+    assert start(setup, home, primary, "--holder", "claude-s1") == 0
+    root = setup.session_dir("claude-s1")
+    try:
+        (root / "start").mkdir()
+        (root / "start" / "best.c").write_text("old")
+        assert setup.main(["reclaim", "claude-s1", "func_8001"]) == 0  # the same function keeps them
+        assert (root / "start" / "best.c").exists()
+        assert setup.main(["release", "claude-s1"]) == 0
+        assert setup.main(["reclaim", "claude-s1", "func_9100"]) == 0
+        assert not (root / "start").exists()
+    finally:
+        setup.main(["stop", "claude-s1"])
+
+
+@pytest.mark.parametrize("word", ["stop-nothing", "recliam", "help"])
+def test_a_mistyped_command_is_not_taken_as_a_project(world, word):
+    setup, app, home, primary = world
+    with pytest.raises(SystemExit, match="not a command"):
+        setup.main([word, "--home", str(home), "--repo", str(primary), "--no-sync"])
+    assert not list(setup.TMP.iterdir()) and not app.creates
+
+
+def test_a_function_the_app_renamed_after_matching_is_not_a_lost_claim(world, capsys, tmp_path):
+    """The app renames a matched function; looking up the old name read as a lost claim."""
+    setup, app, home, primary = world
+
+    class Renaming:
+        def __init__(self, records):
+            self.records, self.asked = records, []
+
+        def function(self, slug, name, quick=False):
+            self.asked.append(name)
+            return self.records.get(name, {"HTTP": 400})
+
+    root = tmp_path / "dd-renamed"
+    root.mkdir()
+    info = {"slug": "demo", "function": "func_80010000", "address": "0x80010000", "function_id": 5,
+            "matched_here": ["func_80010000"]}
+    setup.write_connection(root, info)
+    asking = Renaming({"0x80010000": {"id": 5, "name": "fixedSqrt", "status": "matched"}})
+    assert setup.renew_once(root, dict(info), asking, None, time.time()) == "matched"
+    saved = json.loads((root / "connection.json").read_text())
+    assert saved["function"] == "fixedSqrt" and "fixedSqrt" in saved["matched_here"]
+    assert setup.claimlost.read(root)["ours"] and not setup.claimlost.warning(root)
+
+    # another function at the same address (an overlay) is not taken for this one
+    setup.write_connection(root, info)
+    shared = Renaming({"0x80010000": {"id": 9, "name": "overlayThing", "status": "open"},
+                       "func_80010000": {"id": 5, "name": "func_80010000", "status": "open"}})
+    assert setup.look_up(root, shared, dict(info))[1] == "func_80010000"
+    assert json.loads((root / "connection.json").read_text())["function"] == "func_80010000"
+
+
+def test_the_address_is_recorded_for_the_claimed_function(monkeypatch):
+    setup = load("setup")
+
+    class App:
+        def __init__(self, home):
+            pass
+
+        def function(self, slug, name, quick=False):
+            return {"id": 5, "name": name, "vram": 0x80010000}
+
+    monkeypatch.setattr(setup.judge, "App", App)
+    assert setup.identity("home", "demo", "func_80010000") == {"address": "0x80010000", "function_id": 5}
+
+
+def test_a_match_is_known_from_its_verdict_while_the_app_is_too_busy_to_say(world, capsys):
+    """The app answers "Continuation state: ..." above the MATCH line, and a busy app refuses the full record of the
+    renamed function: both read as CLAIM LOST right after a match."""
+    setup, app, home, primary = world
+    assert start(setup, home, primary, "--holder", "claude-m3", "--interval", "3600") == 0
+    root = setup.session_dir("claude-m3")
+    claimlost = sys.modules["claimlost"]
+    try:
+        assert wait_for(lambda: (root / "renew.log").exists())
+        app.answers = ["Continuation state: function=func_8001; status=matched.\n\n\u2705 MATCH! func_8001 is "
+                       "byte-identical to the target (3 instructions). Credited to x."]
+        (root / "c.c").write_text("int f(void){return 0;}")
+        assert setup.main(["try", "claude-m3", str(root / "c.c")]) == 0
+        assert json.loads((root / "connection.json").read_text())["matched_here"] == ["func_8001"]
+
+        class Busy:
+            def function(self, slug, name, quick=False):
+                return {"HTTP": 400, "error": "Shared metadata is still being prepared. Try again shortly."}
+
+        info = json.loads((root / "connection.json").read_text())
+        assert setup.renew_once(root, info, Busy(), None, time.time(), pause=0) == "matched"
+        capsys.readouterr()
+        assert setup.main(["check", "claude-m3"]) == 0
+        out = capsys.readouterr()
+        assert "CLAIM LOST" not in out.out + out.err and not claimlost.warning(root)
+    finally:
+        setup.main(["stop", "claude-m3"])
+
+
+def test_check_does_not_call_a_claim_lost_while_the_app_cannot_say_whether_it_is_matched(world, capsys, monkeypatch):
+    setup, app, home, primary = world
+    assert start(setup, home, primary, "--holder", "claude-m4", "--interval", "3600") == 0
+    root = setup.session_dir("claude-m4")
+    asked = []
+
+    class Busy:
+        def __init__(self, home):
+            pass
+
+        def function(self, slug, name, quick=False):
+            asked.append(quick)
+            return {"HTTP": 400, "error": '{"error":"Shared metadata is still being prepared. Try again shortly."}'}
+
+    try:
+        assert wait_for(lambda: (root / "renew.log").exists())
+        app.answers = ['{"claims": []}']
+        capsys.readouterr()
+        with monkeypatch.context() as patched:  # the fixture's own patches stay
+            patched.setattr(setup.judge, "App", Busy)
+            assert setup.main(["check", "claude-m4"]) == 1
+        assert "try again" in capsys.readouterr().out and not (root / "LOST").exists()
+        assert asked and all(asked)  # only the quick record
+    finally:
+        setup.main(["stop", "claude-m4"])
