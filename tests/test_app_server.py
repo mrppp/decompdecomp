@@ -38,6 +38,124 @@ def test_agent_local_pass_settings_can_be_disabled_and_validate_budgets(app):
     assert response.status_code==200 and not net.agent_local_repairs['enabled']
 
 
+def test_code_audit_job_is_scoped_to_its_project(app, monkeypatch):
+    from decompnet.app import rom_gap_audit
+
+    from .test_loading import tiny_game
+
+    client, net, *_ = app
+    tiny_game(net, 'audit-scope')
+    entered, release = threading.Event(), threading.Event()
+
+    def scan(_net, slug, log, *, full_scan):
+        assert full_scan
+        entered.set()
+        assert release.wait(5)
+        return {'candidates': []}
+
+    monkeypatch.setattr(rom_gap_audit, 'run', scan)
+    try:
+        response = client.post('/api/code-audit', headers={'X-Decomp': '1'}, json={'slug': 'audit-scope','full_scan':True})
+        assert response.status_code == 200, response.text
+        assert entered.wait(2)
+        job = client.get('/api/job', params={'id': response.json()['job']}).json()
+        assert job['state'] == 'running' and job['activity_project'] == 'audit-scope'
+        active = client.get('/api/code-audit', params={'slug': 'audit-scope'}).json()['job']
+        assert active['id'] == job['id']
+        duplicate = client.post('/api/code-audit', headers={'X-Decomp':'1'},
+                                json={'slug':'audit-scope','full_scan':True}).json()
+        assert duplicate['job'] == job['id']
+    finally:
+        release.set()
+
+
+def test_missed_function_job_is_scoped_and_coalesces_duplicate_starts(app, monkeypatch):
+    from .test_loading import tiny_game
+
+    client, net, *_ = app
+    tiny_game(net, 'missed-scope')
+    tiny_game(net, 'missed-other')
+    entered, release = threading.Event(), threading.Event()
+
+    def search(slug, log):
+        entered.set()
+        assert release.wait(5)
+        return {'added': [], 'message': 'No functions were added.'}
+
+    monkeypatch.setattr(net, 'find_missed_functions', search)
+    headers = {'X-Decomp': '1'}
+    try:
+        first = client.post('/api/missed-functions', headers=headers, json={'slug': 'missed-scope'}).json()['job']
+        assert entered.wait(2)
+        assert client.get('/api/missed-functions', params={'slug': 'missed-scope'}).json()['job']['id'] == first
+        assert client.get('/api/missed-functions', params={'slug': 'missed-other'}).json()['job'] is None
+        assert client.post('/api/missed-functions', headers=headers, json={'slug': 'missed-scope'}).json()['job'] == first
+    finally:
+        release.set()
+
+
+def test_missed_function_job_can_be_stopped(app, monkeypatch):
+    from .test_loading import tiny_game
+
+    client, net, *_ = app
+    tiny_game(net, 'missed-stop')
+    entered = threading.Event()
+
+    def search(slug, log):
+        entered.set()
+        while True:
+            log.check_cancel()
+            time.sleep(.01)
+
+    monkeypatch.setattr(net, 'find_missed_functions', search)
+    headers = {'X-Decomp': '1'}
+    job = client.post('/api/missed-functions', headers=headers, json={'slug': 'missed-stop'}).json()['job']
+    assert entered.wait(2)
+    assert client.post('/api/job/cancel', headers=headers, json={'id': job}).json()['cancelled']
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        snapshot = client.get('/api/job', params={'id': job}).json()
+        if snapshot['state'] != 'running':
+            break
+        time.sleep(.01)
+    assert snapshot['state'] == 'cancelled'
+    assert 'Finding missed functions stopped' in snapshot['error']
+
+
+def test_full_code_audit_waits_for_a_running_bounded_scan(app, monkeypatch):
+    from decompnet.app import rom_gap_audit
+
+    from .test_loading import tiny_game
+
+    client, net, *_ = app
+    tiny_game(net, 'audit-queue')
+    bounded_entered, release, full_entered = threading.Event(), threading.Event(), threading.Event()
+
+    def scan(_net, slug, log, *, full_scan):
+        if full_scan:
+            full_entered.set()
+        else:
+            bounded_entered.set()
+            assert release.wait(5)
+        return {'candidates': []}
+
+    monkeypatch.setattr(rom_gap_audit, 'run', scan)
+    headers = {'X-Decomp': '1'}
+    try:
+        first = client.post('/api/code-audit', headers=headers, json={'slug':'audit-queue'}).json()['job']
+        assert bounded_entered.wait(2)
+        second = client.post('/api/code-audit', headers=headers,
+                             json={'slug':'audit-queue','full_scan':True}).json()['job']
+        assert first != second and not full_entered.is_set()
+        duplicate = client.post('/api/code-audit', headers=headers,
+                                json={'slug':'audit-queue','full_scan':True}).json()['job']
+        assert duplicate == second
+        release.set()
+        assert full_entered.wait(3)
+    finally:
+        release.set()
+
+
 def test_try_route_keeps_exact_credit_and_adoption_separate(app,monkeypatch):
     from .test_loading import tiny_game
     client,net,_=app
@@ -3833,7 +3951,13 @@ def test_reimport_uses_the_saved_original_and_reattaches_the_same_project_job(ap
         game.write_bytes(b'wrong copy')
         assert not client.get('/api/reimport?slug=retained').json()['available']
         response=client.post('/api/reimport',json={'slug':'retained','confirmed':True},headers=h)
-        assert response.status_code==400 and len(calls)==1
+        assert response.status_code==200
+        job_id=response.json()['job']
+        for _ in range(100):
+            job=client.get('/api/job?id='+job_id).json()
+            if job['state']!='running':break
+            time.sleep(.01)
+        assert job['state']=='error' and len(calls)==1
     finally:release.set()
 
 
@@ -4358,3 +4482,38 @@ def test_a_long_job_keeps_only_its_recent_log_lines():
     assert jobs.jobs[jid]["state"] == "done"
     assert len(lines) <= support.JOB_LOG_LINES * 2
     assert lines[-1] == f"line {support.JOB_LOG_LINES * 3 - 1}"
+
+
+def test_reimport_admission_returns_a_job_while_saved_source_waits(app, tmp_path, monkeypatch):
+    client, net, manager = app
+    root = tmp_path/'queued-reimport';root.mkdir()
+    with net.store.tx() as db:
+        db.execute('INSERT INTO projects(slug,name,arch,root,config) VALUES(?,?,?,?,?)',
+                   ('queued-reimport','Game','mips',str(root),json.dumps({'kind':'rom','platform':'n64'})))
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    def stored(*_):
+        entered.set()
+        assert release.wait(5)
+        return root/'game.z64'
+    monkeypatch.setattr('decompnet.app.reimport_source.stored',stored)
+    monkeypatch.setattr(manager,'stop_project',lambda *_:calls.append('stop'))
+    headers = {'X-Decomp':'1'}
+    try:
+        response = client.post('/api/reimport',json={'slug':'queued-reimport'},headers=headers)
+        assert response.status_code == 200
+        job_id = response.json()['job']
+        assert entered.wait(5)
+        second = client.post('/api/reimport',json={'slug':'queued-reimport'},headers=headers)
+        assert second.json()['job'] == job_id
+        assert client.get('/api/reimport?slug=queued-reimport').json()['job'] == job_id
+        client.post('/api/job/cancel',json={'id':job_id},headers=headers)
+        release.set()
+        for _ in range(100):
+            job = client.get('/api/job?id='+job_id).json()
+            if job['state'] != 'running':break
+            time.sleep(.01)
+        assert job['state'] == 'cancelled'
+        assert not calls
+    finally:
+        release.set()
