@@ -152,8 +152,20 @@ def _pointer_find(rom, boot_ranges):
     return next(iter(matches.values())) if len(matches) == 1 else None
 
 
+def _coalesce_boot_ranges(ranges):
+    """Restore contiguous mappings after function-level splitting of boot code."""
+    result = []
+    for start, end, vram in sorted(ranges):
+        if result and start == result[-1][1] and vram-start == result[-1][2]-result[-1][0]:
+            result[-1] = (result[-1][0], end, result[-1][2])
+        else:
+            result.append((start, end, vram))
+    return result
+
+
 def find(rom, boot_ranges):
     """Use the boot DMA, inflater arguments and saved ROM bounds to identify both programs."""
+    boot_ranges = _coalesce_boot_ranges(boot_ranges)
     matches = {}
     for start, end, base in boot_ranges:
         if start >= 0x10000:
@@ -203,7 +215,16 @@ def find(rom, boot_ranges):
 
 def verify_analysis(rom, expanded, boot_ranges):
     """Verify the original compressed members against the separately linked program bytes."""
-    programs = find(rom, boot_ranges)
+    # A later split can divide one boot loader into many adjacent source units.
+    # Rejoin only a continuous ROM-to-RAM mapping so its cross-unit loader
+    # evidence remains available when verifying an existing analysis image.
+    merged = []
+    for start, end, address in sorted(boot_ranges):
+        if merged and merged[-1][1] == start and merged[-1][2] + start - merged[-1][0] == address:
+            merged[-1] = (merged[-1][0], end, merged[-1][2])
+        else:
+            merged.append((start, end, address))
+    programs = find(rom, merged)
     if programs is None or expanded[:len(rom)] != rom:
         return False
     cursor = len(rom)
@@ -231,9 +252,10 @@ def add(config, workdir, image, rom, boot_ranges, log):
     if not (programs := find(rom, boot_ranges)):
         return None
     from . import boot_brs, boot_lzss, boot_rnc2, boot_two_bit
-    from .boot_mapping import extend_startup_trap
+    from .boot_mapping import extend_startup_descriptor, extend_startup_trap
 
     extend_startup_trap(config, rom, log)
+    extend_startup_descriptor(config, rom, log)
     if boot_lzss.find(rom, boot_ranges):
         boot_lzss.extend_boot(config, rom, log)
     cfg = yaml.safe_load(config.read_text(encoding='utf-8'))
