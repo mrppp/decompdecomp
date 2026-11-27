@@ -355,3 +355,52 @@ def test_kmc_priorities_offers_the_cse_skip_variant():
     load = 'lhu $a0, 0x24($t4)'
     rows = [(' ', load, load), ('>', '', load), ('>', '', load)]
     assert ('-O2',) in kmc_priorities(own, '', rows)
+
+
+def test_kmc_cse_hoist_probe_turns_both_block_options_off_for_a_hoisted_address():
+    from decompnet.app.profile_hypotheses import kmc_cse_hoist_probe
+
+    own = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O2']}
+    rows = [('r', 'lui $a0, %hi(D_800DE058)', 'lui $s2, %hi(D_800DE058)'),
+            ('>', '', 'addiu $s2, $s2, %lo(D_800DE058)'),
+            ('|', 'addiu $a0, $a0, %lo(D_800DE058)', 'move $a0, $s2'),
+            ('<', 'lui $a0, %hi(D_800DE058)', ''),
+            ('|', 'addiu $a0, $a0, %lo(D_800DE058)', 'move $a0, $s2')]
+    assert kmc_cse_hoist_probe(own, rows) == ['-O2', '-fno-cse-follow-jumps', '-fno-cse-skip-blocks']
+    # one copy, a target that builds it once too, or another compiler is no evidence
+    assert kmc_cse_hoist_probe(own, rows[:3]) is None
+    assert kmc_cse_hoist_probe(own, [rows[1], rows[2], ('|', 'move $a0, $v1', 'move $a0, $s2')]) is None  # built once
+    assert kmc_cse_hoist_probe({'toolchain': 'ido-7.1', 'flags': ['-O2']}, rows) is None
+    assert kmc_cse_hoist_probe({'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O2', '-fno-cse-skip-blocks']}, rows) is None
+
+
+def test_deep_climb_tries_the_jump_threader_off_under_the_closest_kmc_level(monkeypatch):
+    own = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O2']}
+    monkeypatch.setattr(cf, 'ranked', lambda *a, **k: [(0, {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O1']})])
+    search = Search({})
+    search.net.cfg = lambda p: {'compiler': own}
+    search.net.project_store = lambda ident: SimpleNamespace(all=lambda *a: [])
+    tried = []
+
+    def judge(proj, fn, toolchain, flags, source):
+        tried.append(list(flags))
+        score = 0 if flags == ['-O1', '-fno-thread-jumps'] else 10 if flags == ['-O1'] else 500
+        return score == 0, SimpleNamespace(score=score), ''
+
+    search.net._judge_with = judge
+    exact = {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O1', '-fno-thread-jumps']}
+    assert profile_climb.lead(search, None, PROJ, FN, FN['best_source'], 155) == (exact, 0)
+    assert tried == [['-O1'], ['-O1', '-fno-thread-jumps']]
+
+
+def test_the_jump_threader_probe_keeps_flags_spelled_as_one_string_whole(monkeypatch):
+    """A project's settings may spell its flags as one string: the probe added -fno-thread-jumps to its characters."""
+    monkeypatch.setattr('decompnet.project.compiler_for',
+                        lambda cfg, vram, fn: {'toolchain': 'gcc-2.7.2-kmc', 'flags': '-O2 -g'})
+    monkeypatch.setattr(cf, 'ranked', lambda *a, **k: [])
+    monkeypatch.setattr(cf, 'own_agreement', lambda *a: None)
+    tried = []
+    search = Search({})
+    search.net._judge_with = lambda proj, fn, tc, flags, source: tried.append(flags) or (False, None, '')
+    assert profile_climb.lead(search, None, PROJ, FN, FN['best_source'], 155) is None
+    assert tried == [['-O2', '-g', '-fno-thread-jumps']]

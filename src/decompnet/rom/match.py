@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import re
 import struct
+from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Callable
 
 from elftools.elf.elffile import ELFFile
@@ -52,6 +54,10 @@ _WIDTH = {0x20: 1, 0x24: 1, 0x28: 1, 0x21: 2, 0x25: 2, 0x29: 2, 0x23: 4, 0x27: 4
           0x3A: 4, 0x35: 8, 0x3D: 8, 0x37: 8, 0x3F: 8, 0x1E: 16, 0x1F: 16, 0x36: 16, 0x3E: 16}
 
 ReadFn = Callable[[int, int], "bytes | None"]
+# Only the hosted worker's per-request protocol can install this routine; ordinary attempts stay in-process.
+instruction_linker: ContextVar[Callable[..., tuple[bytes, bool]] | None] = ContextVar("instruction_linker", default=None)
+elf_preparer: ContextVar[Callable[[bytes, str], dict | None] | None] = ContextVar("elf_preparer", default=None)
+rom_linker: ContextVar[Callable[..., LinkResult | None] | None] = ContextVar("rom_linker", default=None)
 
 
 @dataclass
@@ -220,14 +226,15 @@ def compiler_library_name(name: str) -> bool:
 
 class _Linker:
     def __init__(self, obj: bytes, name: str, target: RomTarget, symbols: SymbolTable, read: ReadFn, *,
-                 prefer_base: bool = False):
+                 prefer_base: bool = False, prepared: dict | None = None):
         self.prefer_base = prefer_base  # place own unnamed data by the voted base even where the target refers elsewhere
-        self.elf = candidate_elf(obj, ELFFile)
+        self.obj, self.prepared = obj, prepared
         self.name, self.target, self.symbols, self.read = name, target, symbols, read
-        self.symtab = self.elf.get_section_by_name(".symtab")
         self.problems: list[str] = []
         self.library_names: dict[str, int] = {}  # compiler-emitted library call -> the address the game's call has
         self.data_mismatches: list[DataMismatch] = []
+        self.missing_data_reads: list[tuple[int, int]] = []
+        self.required_data_reads: list[tuple[int, int, bytes | None]] = []
         self.local_map: dict[tuple[int, int], int] = {}  # (section index, offset) -> ROM address
         self.target_at = {off: (rtype, addr) for off, rtype, addr in target.relocs}
         self.data: dict[tuple[int, int], int] = {}  # every datum of its own the candidate uses -> ROM address
@@ -236,11 +243,22 @@ class _Linker:
         self._holds: dict[tuple[int, int, int], bool] = {}  # holds_own_word's answers
         self.words: list[int] = []
         self.fn_shndx = None
+
+    @cached_property
+    def elf(self):
+        return candidate_elf(self.obj, ELFFile)
+
+    @cached_property
+    def symtab(self):
+        return self.elf.get_section_by_name(".symtab")
+
+    @cached_property
+    def gp0(self):
         # the $gp the assembler assumed (.reginfo's ri_gp_value): a $gp-relative reference to the object's own data
         # holds its offset less this (EE-GCC: -0x4000 for the first small datum)
         reginfo = self.elf.get_section_by_name(".reginfo")
         raw = reginfo.data() if reginfo is not None else b""
-        self.gp0 = struct.unpack_from("<i" if self.elf.little_endian else ">i", raw, 20)[0] if len(raw) >= 24 else 0
+        return struct.unpack_from("<i" if self.elf.little_endian else ">i", raw, 20)[0] if len(raw) >= 24 else 0
 
     def problem(self, text: str) -> None:
         if text not in self.problems:
@@ -289,7 +307,9 @@ class _Linker:
                 self.problem('R_MIPS_LITERAL (8) literal-pool linking is not supported here yet, even with a known '
                              'target $gp. Do not guess literal placement.')
             return None
-        if r["type"] == R_MIPS_GPREL16:
+        if self.prepared is not None:
+            residual = r["residual"]
+        elif r["type"] == R_MIPS_GPREL16:
             residual = r["value"] - 0x10000 if r["value"] & 0x8000 else r["value"]
         else:
             residual = section_target("mips", raw, k, pairs=pairs)
@@ -299,17 +319,24 @@ class _Linker:
         if r["type"] == R_MIPS_GPREL16 and not self.target.gp:
             self.problem("your code uses $gp-relative data, but this game doesn't: compile with -G0")
             return None
-        sym = r["symtab"].get_symbol(r["symidx"])
-        shndx = sym["st_shndx"]
-        if r["type"] == R_MIPS_GPREL16 and sym["st_info"]["bind"] == "STB_LOCAL":
-            residual += self.gp0  # (a C static, or C++'s definitions: global data a C file only declares)
-        if shndx in ("SHN_UNDEF", "SHN_COMMON") or shndx in (0xFF03, 0xFF04):  # + MIPS small common / small undefined
-            name = canonical_symbol(sym.name, sym["st_info"]["bind"])
-            if (base := self.library_call(name, r, residual)) is None:
-                base = self.resolve_name(name)
+        if self.prepared is None:
+            sym = r["symtab"].get_symbol(r["symidx"])
+            shndx = sym["st_shndx"]
+            local = sym["st_info"]["bind"] == "STB_LOCAL"
+            section_symbol = sym["st_info"]["type"] == "STT_SECTION"
+            if r["type"] == R_MIPS_GPREL16 and local:
+                residual += self.gp0
+            external = canonical_symbol(sym.name, sym["st_info"]["bind"]) if shndx in (
+                "SHN_UNDEF", "SHN_COMMON", 0xFF03, 0xFF04) else None
+            off = residual if section_symbol else sym["st_value"] + residual
+            named = symbol_at(self.symtab, shndx, off) if external is None else None
+        else:
+            shndx, local, section_symbol = r["section"], r["local"], r["section_symbol"]
+            external, off, named = r["external"], r["section_off"], self.prepared_name(r)
+        if external is not None:
+            if (base := self.library_call(external, r, residual)) is None:
+                base = self.resolve_name(external)
             return None if base is None else (base + residual) & 0xFFFFFFFF
-        off = residual if sym["st_info"]["type"] == "STT_SECTION" else sym["st_value"] + residual
-        named = symbol_at(self.symtab, shndx, off)
         if shndx == fn_shndx:
             if named and named[0] == self.name:
                 return self.target.vram + named[1]
@@ -322,7 +349,7 @@ class _Linker:
         base = self.symbols.resolve(named[0]) if named else None
         if base is not None:
             addr = base + named[1]
-            if sym["st_info"]["type"] == "STT_SECTION" or sym["st_info"]["bind"] == "STB_LOCAL":
+            if section_symbol or local:
                 self.local_map.setdefault((shndx, off), addr)  # g++'s `.sdata+4`: the export places the section
         else:
             want = self.target_at.get(r["off"])
@@ -344,6 +371,12 @@ class _Linker:
             prev_width = self.widths.get((shndx, off), 0)
             self.widths[(shndx, off)] = None if width is None or prev_width is None else max(prev_width, width)
         return addr
+
+    def prepared_name(self, row):
+        if (row["named"] is None and row["section_off"] is not None and self.prepared["mdebug"]):
+            # IDO can leave private procedures only in ECOFF metadata.
+            return symbol_at(self.symtab, row["section"], row["section_off"])
+        return row["named"]
 
     # ------------------------------------------------------------------ the candidate's own data
 
@@ -370,15 +403,21 @@ class _Linker:
         for k, r in enumerate(raw):
             if r["type"] not in (R_MIPS_HI16, R_MIPS_LO16):
                 continue
-            sym = r["symtab"].get_symbol(r["symidx"])
-            shndx = sym["st_shndx"]
-            if not isinstance(shndx, int) or shndx == fn_shndx or shndx >= 0xFF00:
-                continue
-            residual = section_target("mips", raw, k, pairs=pairs)
-            if residual is None:
-                continue
-            off = residual if sym["st_info"]["type"] == "STT_SECTION" else sym["st_value"] + residual
-            named = symbol_at(self.symtab, shndx, off)
+            if self.prepared is None:
+                sym = r["symtab"].get_symbol(r["symidx"])
+                shndx = sym["st_shndx"]
+                if not isinstance(shndx, int) or shndx == fn_shndx or shndx >= 0xFF00:
+                    continue
+                residual = section_target("mips", raw, k, pairs=pairs)
+                if residual is None:
+                    continue
+                off = residual if sym["st_info"]["type"] == "STT_SECTION" else sym["st_value"] + residual
+                named = symbol_at(self.symtab, shndx, off)
+            else:
+                shndx, off = r["section"], r["section_off"]
+                if off is None or shndx == fn_shndx or shndx >= 0xFF00:
+                    continue
+                named = self.prepared_name(r)
             if named and self.symbols.resolve(named[0]) is not None:
                 continue
             tally = votes.setdefault(shndx, {})
@@ -394,8 +433,11 @@ class _Linker:
 
     def holds_own_word(self, shndx: int, off: int, base: int) -> bool:
         """Can the ROM keep the candidate's datum at `off` at `base + off`: the ROM's bytes there are the datum's
-        (its first word, or less when the section ends sooner). A word with a relocation in it (a jump table's
-        entry) and a section with no bytes (.bss) always can: their bytes are only known after linking.
+        (its first word, or less when the section ends sooner). A word with a relocation in it and a section with
+        no bytes (.bss) can: their bytes are only known after linking. A jump table's entry is the exception: it
+        is relocated against this function's own code, so the ROM's word there must be an address inside the
+        target function. A switch whose table was voted onto a record array the function indexes more often than
+        its table showed two wrong `%hi`/`%lo` rows (300 points) that the source did not have.
 
         A 72-instruction SN function with one `li.s` literal had it voted to a global pointer's address, because
         that global's %lo appears three times within BASE_WINDOW and the pool's own address only once per half
@@ -407,7 +449,14 @@ class _Linker:
             sec = self.elf.get_section(shndx)
             mine = b"" if sec["sh_type"] == "SHT_NOBITS" else sec.data()[off:off + 4]
             relocated = any(off - 4 < at < off + 4 for at, _, _ in self._relocs_in(shndx))
-            if not mine or relocated:
+            entry = any(at == off and rtype == R_MIPS_32 and symbol["st_shndx"] == self.fn_shndx
+                        for at, rtype, symbol in self._relocs_in(shndx))
+            if entry:
+                word = self.read((base + off) & 0xFFFFFFFF, 4)
+                at = int.from_bytes(word, self.target.order) | 0x80000000 if word and len(word) == 4 else 0
+                start = self.target.vram | 0x80000000  # some games store the words without the KSEG0 bit
+                cache[key] = start <= at < start + len(self.target.code)
+            elif not mine or relocated:
                 cache[key] = True
             else:
                 cache[key] = self.read((base + off) & 0xFFFFFFFF, len(mine)) == mine
@@ -477,7 +526,11 @@ class _Linker:
                 if rtype != R_MIPS_32 or not off <= at <= off + length - 4:
                     continue
                 _, own = self._pointee(s, int.from_bytes(data[at:at + 4], self.target.order))
-                if own is None or own in self.data or (rom := self.read(addr + at - off, 4)) is None:
+                if own is None or own in self.data:
+                    continue
+                pointer = addr + at - off
+                rom = self.required_read(pointer, 4)
+                if rom is None:
                     continue
                 self.local_map[own] = self.data[own] = int.from_bytes(rom, self.target.order)
                 self.widths[own] = None
@@ -499,11 +552,18 @@ class _Linker:
             instruction = int.from_bytes(code[at:at+4],order)
             if instruction & 0xfc1fffff != 8 or instruction >> 21 & 31 == 31:
                 continue
-            witness = jump_table(code,0,len(code),self.target.vram,at,order,reader=self.read)
+            witness = jump_table(code,0,len(code),self.target.vram,at,order,reader=self.required_read)
             if (witness and witness['state']=='validated' and witness['table_address']==address
                     and witness['entry_count']==len(offsets)):
                 return witness['entry_count']*4
         return None
+
+    def required_read(self, addr: int, size: int) -> bytes | None:
+        data = self.read(addr, size)
+        self.required_data_reads.append((addr, size, data))
+        if data is None:
+            self.missing_data_reads.append((addr, size))
+        return data
 
     def verify_data(self, shndx: int, off: int, addr: int, *, instructions_exact: bool = False) -> None:
         """Data the candidate defines must be identical to the ROM data it stands for."""
@@ -534,9 +594,11 @@ class _Linker:
             # stream. Prove the dispatch extent before checking the rest.
             if extent := self.switch_extent(addr, code_pointers):
                 n = extent
-        rom = self.read(addr, n)
+        rom = self.required_read(addr, n)
         if rom is None:
-            return  # the ROM has no bytes there (e.g. .bss in the ROM): nothing to compare
+            # Normal judging allows a datum in BSS. A standalone export with an
+            # incomplete image map must instead prove that omission is safe.
+            return
         if bytes(mine[:n]) != rom:
             # The switch diagnostic needs the actual relocated words, not an
             # interpretation of the abbreviated comparison message.
@@ -555,38 +617,53 @@ class _Linker:
                          f"{'…' if n > 24 else ''}, ROM {rom[:24].hex(' ')}{'…' if n > 24 else ''}; differing range 0x{addr+first:X}-0x{addr+last+1:X} (end exclusive)")
 
     def run(self) -> LinkResult:
-        fsym = self.function()
-        if fsym is None:
-            return LinkResult(None, False, [f"the object has no function named `{self.name}`"])
-        shndx, start, size = fsym
+        if self.prepared is None:
+            fsym = self.function()
+            if fsym is None:
+                return LinkResult(None, False, [f"the object has no function named `{self.name}`"])
+            shndx, start, size = fsym
+            code = self.elf.get_section(shndx).data()[start:start + size]
+            raw = raw_relocs(self.elf, shndx, start, size, code)
+            big_endian = not self.elf.little_endian
+            pairs = MipsRelocationPairs(raw)
+        else:
+            shndx, start, size = (self.prepared[key] for key in ("section", "start", "size"))
+            code = self.obj[start:start + size]
+            raw = self.prepared["relocs"]
+            big_endian, pairs = self.prepared["big_endian"], None
         self.fn_shndx = shndx
-        code = self.elf.get_section(shndx).data()[start:start + size]
-        raw = raw_relocs(self.elf, shndx, start, size, code)
-        if self.elf.little_endian == self.target.big_endian:
+        if big_endian != self.target.big_endian:
             return LinkResult(None, False, ["the compiler produced code in the wrong byte order for this game"])
         fmt = (">" if self.target.big_endian else "<") + f"{len(code) // 4}I"
         words = list(struct.unpack(fmt, code[:len(code) // 4 * 4]))
         self.words = list(words)
         relocs: list[Reloc] = []
-        pairs = MipsRelocationPairs(raw)
         self.section_bases(raw, shndx, pairs)
+        link_instructions = instruction_linker.get()
+        patches = []
         for k, r in enumerate(raw):
             addr = self.address(raw, k, shndx, start, pairs=pairs)
             if addr is None:
-                sym = r["symtab"].get_symbol(r["symidx"])
-                relocs.append(Reloc(r["off"], r["type"], f"?{sym.name or 'local'}", 0))
+                symbol = r["symtab"].get_symbol(r["symidx"]).name if self.prepared is None else r["symbol"]
+                relocs.append(Reloc(r["off"], r["type"], f"?{symbol or 'local'}", 0))
                 continue
             i = r["off"] // 4
             if i < len(words):
-                words[i] = _patch(words[i], r["type"], addr, self.target.gp)
+                if link_instructions is None:
+                    words[i] = _patch(words[i], r["type"], addr, self.target.gp)
+                else:
+                    patches.append((r["off"], r["type"], addr & 0xFFFFFFFF))
             name, residual = self.symbols.name_at(addr)
             if self.target.vram <= addr < self.target.vram + len(self.target.code):
                 name, residual = self.name, addr - self.target.vram
             relocs.append(Reloc(r["off"], r["type"], name, encode(r["type"], residual)))
         # every place is known before any datum is measured: a datum runs to the next one, whatever the code's order
         self.place_pointees()
-        linked = struct.pack(fmt[0] + f"{len(words)}I", *words)
-        instructions_exact = linked == self.target.code
+        if link_instructions is None:
+            linked = struct.pack(fmt[0] + f"{len(words)}I", *words)
+            instructions_exact = linked == self.target.code
+        else:
+            linked, instructions_exact = link_instructions(code, self.target, patches)
         for (dshndx, off), addr in sorted(self.data.items()):
             self.verify_data(dshndx, off, addr, instructions_exact=instructions_exact)
         exact = not self.problems and instructions_exact
@@ -594,13 +671,21 @@ class _Linker:
         for (dshndx, off), addr in self.local_map.items():
             placements.setdefault(self.elf.get_section(dshndx).name, {})[off] = addr
         return LinkResult(FunctionObj(self.name, "mips", self.target.big_endian, code, relocs), exact, self.problems,
-                          placements, instructions_exact, linked, self.data_mismatches)
+                          placements, instructions_exact, linked, self.data_mismatches, self.missing_data_reads,
+                          self.required_data_reads)
 
 
 def link(obj: bytes, name: str, target: RomTarget, symbols: SymbolTable, read: ReadFn) -> LinkResult:
     """Link a compiled candidate at the target's address and compare it with the ROM."""
     obj = unmangle(obj, lambda n: n in symbols.by_name or bool(AUTO_NAME.match(n)))  # C++ names: the game's
-    first = _Linker(obj, name, target, symbols, read)
+    native = rom_linker.get()
+    if native is not None:
+        result = native(obj, target, symbols, read)
+        if result is not None:
+            return result
+    prepare = elf_preparer.get()
+    prepared = prepare(obj, name) if prepare else None
+    first = _Linker(obj, name, target, symbols, read, prepared=prepared)
     result = first.run()
     if result.exact or not getattr(first, "bases", None):
         return result
@@ -608,7 +693,7 @@ def link(obj: bytes, name: str, target: RomTarget, symbols: SymbolTable, read: R
     # some other datum (a global's %hi), so the first link names the wrong address. Link again placing the own
     # data by its voted base everywhere, and keep whichever has fewer problems (a pool the ROM keeps in pieces
     # gets data mismatches by the base and keeps the first). Only the diff changes: a match was decided above.
-    again = _Linker(obj, name, target, symbols, read, prefer_base=True).run()
+    again = _Linker(obj, name, target, symbols, read, prefer_base=True, prepared=prepared).run()
     return again if len(again.problems) <= len(result.problems) else result
 
 

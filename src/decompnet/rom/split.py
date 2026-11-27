@@ -96,6 +96,24 @@ class Segment:
         return self.vram <= address and address + length <= self.vram + (self.rom_end - self.rom_start)
 
 
+def write_config_atomic(path: Path, text: str) -> None:
+    """Replace a split configuration without exposing a partially written file."""
+    import os
+    import tempfile
+
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                         prefix='.decomp-split-', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+        os.chmod(temporary, path.stat().st_mode & 0o777)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 @dataclass
 class SplitResult:
     functions: list[RomFunction]
@@ -173,8 +191,13 @@ def trailing_data(cfg: dict, rom: bytes, *, big_endian: bool = True) -> list[tup
     every table there. A raw run counts only when its end is another segment (not the ROM's tail, where the assets
     are), it overlaps no segment's and no other run's addresses, and the switches prove it: the run's code has a jump
     table in it, and every table in it (whoever's code reads it) holds an address in that code's own segment. Raw
-    bytes that are packed, or another overlay's at the same addresses, fail that and stay unread."""
-    raw = [s for s in cfg.get("segments", []) if isinstance(s, (dict, list))]
+    bytes that are packed, or another overlay's at the same addresses, fail that and stay unread.
+
+    A raw run with code at the same offset on both sides is inside one linear load, so any code's switches prove it:
+    the run's own need not have a table. An N64 game's first code had no switch and its main code's 32 KB of .rodata
+    sat between the two (eight jump tables, the float constants): unread, so the judge accepted any float literal a
+    candidate wrote for one of them, and `float_literal_global` had no words to propose."""
+    raw =[s for s in cfg.get("segments", []) if isinstance(s, (dict, list))]
 
     def start_of(seg):
         return seg[0] if isinstance(seg, list) else seg.get("start")
@@ -191,6 +214,7 @@ def trailing_data(cfg: dict, rom: bytes, *, big_endian: bool = True) -> list[tup
              if seg.get("type") == "code" and isinstance(seg.get("vram"), int)]
     entries = [entry for entry in entries if entry[2] <= len(rom)]
     found = []  # (rom_start, vram, vram_end, the run's code as (rom_start, rom_end))
+    between = set()  # rom_start of the runs whose next segment is code at the same offset
     run = None  # (delta, rom end, code ranges)
     for seg, start, end, bounded in entries:
         vram = seg.get("vram")
@@ -202,6 +226,9 @@ def trailing_data(cfg: dict, rom: bytes, *, big_endian: bool = True) -> list[tup
         elif seg.get("type") == "bin" and vram is None and run is not None and run[1] == start:
             if bounded:
                 found.append((start, start + run[0], end + run[0], run[2]))
+                if any(other.get("type") == "code" and begin == end and other.get("vram") == begin + run[0]
+                       for other, begin, _, _ in entries):
+                    between.add(start)
             run = (run[0], end, run[2])
         else:
             run = None
@@ -218,7 +245,7 @@ def trailing_data(cfg: dict, rom: bytes, *, big_endian: bool = True) -> list[tup
         inside = [(table, v, e, where in code) for table, v, e, where in tables if lo <= table and table + 4 <= hi]
         # Every switch whose table lies here, the run's own and any other code's, must jump into its own segment:
         # the bytes of another overlay at these addresses, or packed data, fail that and the run stays unread.
-        if any(own for *_, own in inside) and all(
+        if inside and (start in between or any(own for *_, own in inside)) and all(
                 v <= int.from_bytes(rom[start + table - lo:start + table - lo + 4], order) < e
                 for table, v, e, _ in inside):
             out.append((start, lo, hi))
@@ -258,6 +285,24 @@ def code_ranges(path: Path) -> list[tuple[int, int, int]]:
             if len(sub) > 1 and sub[1] in ("c", "asm", "hasm"):
                 end = next((int(t[0]) for t in subs[i + 1:]), seg.rom_end)
                 out.append((int(sub[0]), end, seg.vram + int(sub[0]) - seg.rom_start))
+    return out
+
+
+def source_units(path: Path) -> list[tuple[int, int, int, str]]:
+    """Named C subsegments with their ROM and RAM bounds, for functions recovered inside an existing parent."""
+    import yaml
+
+    cfg = yaml.safe_load(path.read_text(encoding='utf-8'))
+    out = []
+    for seg in segments_from_config_data(cfg):
+        raw = next(s for s in cfg['segments'] if isinstance(s, dict) and s.get('type') == 'code'
+                   and s.get('start') == seg.rom_start)
+        subs = [s for s in raw.get('subsegments', []) or [] if isinstance(s, list) and s]
+        for i, sub in enumerate(subs):
+            if len(sub) < 3 or sub[1] != 'c' or not isinstance(sub[2], str):
+                continue
+            end = int(subs[i+1][0]) if i+1 < len(subs) else seg.rom_end
+            out.append((int(sub[0]), end, seg.vram + int(sub[0]) - seg.rom_start, sub[2]))
     return out
 
 

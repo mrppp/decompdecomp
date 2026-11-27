@@ -311,15 +311,32 @@ class Console:
         Returns the image splat reads."""
         return image
 
+    def runtime_audit_candidates(self, root, cfg, image, segments, functions, log, candidates=(), checkpoint=None):
+        """Optional game-run evidence for audit leads; other consoles need a runtime adapter."""
+        return []
+
     def donor_text_regions(self, image: bytes) -> list:
         """Original code regions with separate module-relative addresses."""
         return []
 
-    def missed_functions(self, config: Path, image: bytes, log=print, known=()) -> list[tuple[int, int, int]] | None:
+    def donor_candidate_review(self, code: bytes, vram: int, *, region=None, offset=None) -> str | None:
+        """Why a donor body needs manual CPU-code review, or None when independently corroborated."""
+        return 'This console has no CPU-code evidence reader for donor bodies.'
+
+    def prepare_donor_function(self, fn, region, offset, *, native=False) -> dict:
+        """Attach validated loader metadata to a recovered function, and return it for storage."""
+        return {}
+
+    def missed_functions(self, config: Path, image: bytes, log=print, known=(), *, prepare_split=None,
+                         checkpoint=None, expected_config=None) -> list[tuple[int, int, int]] | None:
         """ROM mode: in a project that exists, the functions its split left as data that an import would now find,
         written into splat's `config` as code segments and returned as (rom_start, rom_end, vram), one function each
         (N64: consoles/n64/code.py). None when the console has no such search yet (ROADMAP.md)."""
         return None
+
+    def preserve_reimport_entries(self, net, project, result, image, rows, log=print):
+        """Optionally stage old entries that a new split missed; other consoles need an adapter."""
+        return 0
 
     def import_table_ranges(self, image, segments):
         """Additional load mappings for jump-table evidence during ROM import."""
@@ -458,6 +475,7 @@ class Console:
         """ROM mode's export: a file of spimdisasm's assembly as GNU as reads it. What it can't read as spimdisasm
         writes it (coprocessor 2's instructions), or would place elsewhere (8-byte data), becomes the raw words it is."""
         from ..arch.mips import raw_cop2, raw_doubles  # (splat's consoles are MIPS)
+        from ..arch.mips_export import backward_delay_highs
 
         # Inferred code can include link instructions whose source is also their destination.
         # GNU as rejects them; the rebuild still needs the original bytes.
@@ -472,7 +490,7 @@ class Console:
 
         text = re.sub(r"^(\s*/\*\s*[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+([0-9A-Fa-f]{8})\s*\*/[ \t]*)[^\n]+",
                       link_word, text, flags=re.M)
-        return raw_doubles(raw_cop2(text, self.big_endian), self.big_endian)
+        return raw_doubles(raw_cop2(backward_delay_highs(text, self.big_endian), self.big_endian), self.big_endian)
 
     def find_gp(self, image: bytes, program: bytes, segments: list) -> int:
         """$gp as the game sets it, when splat didn't say (0: the game keeps no data $gp-relative)."""
@@ -527,6 +545,12 @@ class Console:
         """Whether a detected library routine (`corpora`: the signature collections that name it) is from a library
         no public source builds, so neither a port nor anybody else can have its C from there: it's set aside as SDK
         code on the detection alone (app/sdk_assembly._lead), not left to agents."""
+        return False
+
+    def sdk_sample_code(self, name: str) -> bool:
+        """Whether a detected routine is SDK sample code that a game builds as its own, so the port kit runs the
+        game's copy (`PortKit.sdk_group` None). It is still the SDK's code: set aside like the rest of the library
+        (app/sdk_assembly._lead), not left to agents."""
         return False
 
     def scan_sdk(self, net, proj, job=None) -> None:

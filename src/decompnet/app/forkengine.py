@@ -55,6 +55,7 @@ from ..forks.project import (
     project_macro,
     write_manifest,
 )
+from ..forks.reference_cache import Cache
 from ..hostenv import NO_WINDOW
 from ..network import (
     GAME_CODE,
@@ -73,6 +74,7 @@ from ..request_timing import build as timed_build
 from ..rom import RomError
 from ..scoring import percent_text
 from ..textedit import replace_once
+from . import profile_attempts
 from . import trial_journal
 
 _REPO = re.compile(r"^(https://(github\.com|gitlab\.com|codeberg\.org|git\.[\w.-]+)/[\w.-]+/[\w.-]+?)(\.git)?/?$")
@@ -458,18 +460,34 @@ def _headers_defining(fp: ForkProject, rel: str, include_lines: list[str], names
     return out
 
 
+_DATA_SYMBOLS = Cache()
+
+
 def _data_symbols(target: Path | None) -> set[str]:
-    """The data symbols of a target object: objdiff's report counts data in a code section as a function (a DS
-    program's BuildInfo, the SDK's build information with its RSA text, sits in .text), and agents tried to write it
-    as one. Empty when it can't be read (a COFF object: PC, Xbox)."""
+    """Data symbols objdiff must not count as functions; tolerate non-ELF objects."""
+    from io import BytesIO
+
     from elftools.common.exceptions import ELFError
     from elftools.elf.elffile import ELFFile
 
+    from ..forks.reference_cache import ChangedDuringRead, read
+
+    if target is None:
+        return set()
     try:
-        with open(target, "rb") as f:
-            symtab = ELFFile(f).get_section_by_name(".symtab")
-            return {s.name for s in symtab.iter_symbols() if s["st_info"]["type"] == "STT_OBJECT"} if symtab else set()
-    except (OSError, TypeError, ELFError):
+        path = Path(target)
+        if path.stat().st_size > 8 * 1024 * 1024:
+            # Avoid retaining a large object in memory just to cache its symbol names.
+            with path.open('rb') as source:
+                symtab = ELFFile(source).get_section_by_name('.symtab')
+                return {s.name for s in symtab.iter_symbols() if s['st_info']['type'] == 'STT_OBJECT'} if symtab else set()
+        raw = read(path)
+        digest = hashlib.sha256(raw).digest()
+        def parse():
+            symtab = ELFFile(BytesIO(raw)).get_section_by_name('.symtab')
+            return frozenset(s.name for s in symtab.iter_symbols() if s['st_info']['type'] == 'STT_OBJECT') if symtab else frozenset()
+        return set(_DATA_SYMBOLS.get(digest, parse))
+    except (OSError, TypeError, ELFError, ChangedDuringRead):
         return set()
 
 
@@ -1268,7 +1286,10 @@ class ForkEngine:
             log("building what changed since the last build")
             failed: list[str] = []
             with self._tree(proj).exclusive(), self._build_locks[proj["id"]]:
-                fp.build_all(log=log, failed=failed)
+                ok, output = fp.build_all(log=log, failed=failed)
+                if not ok and not failed:
+                    raise NetworkError("The project build failed without identifying which objects failed, so its "
+                                       f"previous objects cannot be measured safely. Fix the build and try again:\n{_tail(output)}")
                 rep = fp.report()
             # a unit whose source doesn't build keeps its last object: what it matched then doesn't count now
             measures = self.sync(slug, log=log, rep=rep, broken=fp.failed_units(failed))
@@ -1335,7 +1356,10 @@ class ForkEngine:
                 raise NetworkError(f"objdiff couldn't measure the project: {e}") from None
         units = {u.name: u for u in fp.units()}
         addresses = consoles.get(cfg.get("platform")).function_addresses(fp)
-        data = {n: _data_symbols(u.target) for n, u in units.items()}
+        # Reports can contain thousands of data-only assets. Only units with reported functions can
+        # contribute a misclassified data symbol, so opening the others cannot change the result.
+        function_units = {u["name"] for u in rep.get("units", []) if u.get("functions")}
+        data = {n: _data_symbols(u.target) for n, u in units.items() if n in function_units}
         rows = [(u["name"], f) for u in rep.get("units", []) for f in u.get("functions", [])
                 if f["name"] not in data.get(u["name"], ())]
         listed = _set_aside(fp)
@@ -1347,6 +1371,21 @@ class ForkEngine:
         counts: dict[str, int] = defaultdict(int)
         for _, f in rows:
             counts[f["name"]] += 1
+        # Complete relocation-free SDK bodies can be identified in reference objects too.
+        # Read only units with a plausible size and leave COFF and unknown bodies unchanged.
+        from ..forks.sdk_evidence import identities as sdk_identities
+        sdk_sizes = set(console.sdk_assembly_sizes)
+        sdk_units = {uname for uname, f in rows if int(f.get('size', 0)) in sdk_sizes
+                     and (f.get('fuzzy_match_percent') or 0) < 100}
+        sdk_evidence = {uname: sdk_identities(console, fp.root, units[uname].target)
+                        for uname in sdk_units if uname in units}
+        # Reference-only dispatch tables have no C source; check their complete object
+        # bodies before candidate preparation, and recompute on every measurement.
+        from ..forks.assembly_evidence import dispatches
+        assembly_units = {uname for uname, f in rows if int(f.get('size', 0)) in (8, 12)
+                          and (f.get('fuzzy_match_percent') or 0) < 100}
+        assembly_evidence = {uname: dispatches(console, fp.root, units[uname].target)
+                             for uname in assembly_units if uname in units}
         all_rows = self.net.project_store(slug).all("SELECT * FROM functions WHERE project_id=?", proj["id"])
         existing = {(r["unit"], self._meta(r).get("symbol"), self._meta(r).get("nth", 0)): r for r in all_rows}
         confirmed = self._judged_matches(proj, fp, units, rows, all_rows, broken)
@@ -1368,6 +1407,19 @@ class ForkEngine:
         for key in moved:
             by_symbol[key[1]].append(key)
         with self.net.project_store(slug).tx() as db:
+            claimed = ({r['function_id'] for r in db.execute(
+                'SELECT c.function_id FROM claims c JOIN functions f ON f.id=c.function_id WHERE f.project_id=?',
+                (proj['id'],))} if any(sdk_evidence.values()) or any(assembly_evidence.values()) else set())
+            if fp.scope == GAME:
+                for uname, f in rows:
+                    sym = f['name']
+                    proof = sdk_evidence.get(uname, {}).get(sym)
+                    old = existing.get((uname, sym, 0))
+                    if (counts[sym] == 1 and proof and proof['bytes'] == int(f.get('size', 0))
+                            and (f.get('fuzzy_match_percent') or 0) < 100
+                            and not (old is not None and (old['id'] in claimed or old['status'] == 'matched'
+                                                       or self._meta(old).get('reopened')))):
+                        aside.setdefault(sym, 'Verified SDK assembly; excluded from C matching.')
             for uname, f in rows:
                 sym = f["name"]
                 k = nth[(uname, sym)]
@@ -1407,8 +1459,11 @@ class ForkEngine:
                 if old is not None:  # its code grew (pieces joined to it): why it was set aside was about a piece
                     was = self._meta(old)
                     kept = _KEPT_KEYS if old["size"] == size else ("reopened",)
+                    previous_proof = was.get('verified_assembly')
+                    fork_proof = isinstance(previous_proof, dict) and previous_proof.get('verification_method') == 'fork-sdk-digest'
                     meta.update({k: v for k, v in was.items() if k in kept
-                                 and not (k == "asm_code" and was.get("set_aside"))})  # (set aside: decided below)
+                                 and not (k == "asm_code" and (was.get("set_aside") or was.get("fork_dispatch")))
+                                 and not (k == 'sdk_identity' and fork_proof)})  # (set aside: decided below)
                 if sym in generated and not meta.get("reopened"):  # set aside as assembly is, whatever the scope
                     meta["asm_code"] = generated[sym]
                 if sym in aside:  # code the project says isn't the game's own (library code, middleware)
@@ -1419,6 +1474,25 @@ class ForkEngine:
                 if judged:
                     fuzzy = 100.0
                 status = "matched" if fuzzy is not None and fuzzy >= 100 else "open" if u and u.source else "nosource"
+                proof = sdk_evidence.get(uname, {}).get(sym)
+                if (status != 'matched' and counts[sym] == 1 and proof and proof['bytes'] == size
+                        and not meta.get('reopened') and not (old is not None and
+                            (old['id'] in claimed or old['status'] == 'matched'))):
+                    meta.pop('not_c', None)
+                    meta.pop('asm_twin', None)
+                    meta['verified_assembly'] = proof
+                    meta['sdk_identity'] = proof['name']
+                    meta['sdk_display'] = {'name': proof['name'], 'names': proof['names'], 'corpora': [proof['corpus']]}
+                    meta['asm_code'] = 'Verified SDK assembly; excluded from C matching.'
+                    meta['set_aside'] = True
+                    status = 'asm'
+                dispatch = assembly_evidence.get(uname, {}).get(sym)
+                if (status not in ('matched', 'asm') and counts[sym] == 1 and dispatch and dispatch['bytes'] == size
+                        and not meta.get('reopened') and not (old is not None and
+                            (old['id'] in claimed or old['status'] == 'matched' or old['best_source']))):
+                    meta['fork_dispatch'] = dispatch
+                    meta['asm_code'] = dispatch['reason']
+                    status = 'asm'
                 if status == "open" and any(meta.get(k) for k in _ASM_KEYS):
                     status = "asm"  # hand-written assembly (here or in its twin elsewhere): not for agents
                 score = None if fuzzy is None else scaled(fuzzy, n)
@@ -2978,6 +3052,7 @@ class ForkEngine:
             elif seed:
                 lines += ["", "### Machine draft: a starting point, often wrong in types and details", "```c",
                           self._method_draft(fp, cfg, fn, seed).strip(), "```"]
+        lines += profile_attempts.brief_lines(self.net, proj, fn)
         lines += self._class_brief(fp, cfg, fn) + self._struct_brief(fp, cfg, fn)
         lines += self._debug_brief(fp, cfg, fn)
         from .knowledge import service
@@ -3942,6 +4017,9 @@ class ForkEngine:
                                 rel = console.set_file_compiler(fp, unit.source, c)
                             changed = True
                         res = self._attempt(agent, slug, function, source, keep=False, quiet=0, **({"diagnostic":True} if not keep_match else {}))
+                        if c != own and (not res["matched"] or not keep_match):  # (a kept match needs no hand-off)
+                            profile_attempts.keep(self.net, proj, fn, c, console.file_flags(fp, unit.source),
+                                                  res.get("held_score", res["score"]), source)
                         if res["matched"] and c == own:
                             return f"{c}: {res['text']}\nThat's {unit.source}'s own compiler: nothing to switch."
                         if res["matched"]:
@@ -4017,6 +4095,9 @@ class ForkEngine:
                             return f"{shown(flags)}: {res['text']}\n{unit.source} is built with them from now on."
                         why = "breaks the file's matched functions" if res.get("broken") else \
                             "doesn't build" if res["score"] is None else f"score {res['score']}"
+                        if flags != own:
+                            profile_attempts.keep(self.net, proj, fn, console.file_compiler(fp, unit.source) or "",
+                                                  flags, res.get("held_score", res["score"]), source)
                         results.append((res["score"] if res["score"] is not None and not res.get("broken") else None,
                                         flags, why))
                 finally:
@@ -4039,7 +4120,7 @@ class ForkEngine:
 
     # ------------------------------------------------------------------ autopilot
 
-    def autopilot_prepare(self, slug: str) -> list[int]:
+    def autopilot_prepare(self, slug: str, *, all_units=False, stop=None, progress=None) -> list[int]:
         """The open functions autopilot tries in a ready project, smallest first. Raises NetworkError
         when it can't run here. A console with drafts of its own (Console.own_drafts: PC) needs no m2c: its exact
         drafts come from the code, its others from Ghidra when it's installed."""
@@ -4061,13 +4142,34 @@ class ForkEngine:
                 raise NetworkError("autopilot needs m2c, the draft decompiler: install it in Setup")
             from ..forks.scaffold import prepare
 
-            with self._tree(proj).exclusive(), self._build_locks[proj["id"]]:
-                made = prepare(fp)
-            if made:
-                self.sync(slug)
+            # Refresh reference evidence before deciding which source-less units need C.
+            if all_units and not (stop is not None and stop.is_set()):
+                if progress is not None:
+                    progress('Checking reference objects')
+                if not (stop is not None and stop.is_set()):
+                    self.sync(slug)
+            eligible = None
+            while stop is None or not stop.is_set():
+                if all_units:
+                    eligible = {r['unit'] for r in self.net.project_store(slug).all(
+                        "SELECT DISTINCT unit FROM functions WHERE project_id=? AND status='nosource' "
+                        "AND COALESCE(json_extract(meta,'$.set_aside'),0)=0 "
+                        "AND json_extract(meta,'$.asm_code') IS NULL AND json_extract(meta,'$.asm_twin') IS NULL",
+                        proj['id']) if r['unit']}
+                with self._tree(proj).exclusive(), self._build_locks[proj["id"]]:
+                    if all_units:
+                        made = prepare(fp, log=progress or (lambda *_: None), stop=stop, units=eligible)
+                    else:
+                        made = prepare(fp)
+                if made:
+                    self.sync(slug)
+                    if progress is not None:
+                        progress(None, len(made))
+                if not all_units or len(made) < 32:
+                    break
             rows = self.net.project_store(slug).all("SELECT id FROM functions WHERE project_id=? AND status='open' ORDER BY n_insns, id",
                                       proj["id"])
-            if not rows:
+            if not rows and eligible != set() and not (stop is not None and stop.is_set()):
                 raise NetworkError("No writable C candidates are available. This imported project's build needs C scaffolding before Autopilot can try drafts.")
             return [r["id"] for r in rows]
         # m2c reads the assembly a project keeps for its undecompiled functions. A ds-decomp project has none: its
@@ -4233,7 +4335,15 @@ class ForkEngine:
                 _, span = self._find(code, names)
                 if span is None:
                     continue
-                res = self.attempt(agent, proj["slug"], fn["name"], code, keep=False, prelude=prelude)
+                try:
+                    res = self.attempt(agent, proj["slug"], fn["name"], code, keep=False, prelude=prelude)
+                except NetworkError as error:
+                    # One generated variant can contain declarations the fork's editor cannot place.
+                    # Keep earlier scored drafts and try the remaining variants instead of losing the run.
+                    report['trials'] += 1
+                    draft_reports.failure(report, 'candidate', 'project_draft', str(error))
+                    outcomes.append('fail')
+                    continue
                 report['trials'] += 1
                 report['compiled'] |= res.get('score') is not None
                 report['scored'] |= res.get('score') is not None

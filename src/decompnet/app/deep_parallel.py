@@ -43,7 +43,8 @@ def run(net, slug, name, minutes, variants, log, profiles, count, *, rank_candid
     proj, before = deep_permuter.validate_function(net, slug, name)
     from ..candidate_scope import key
     sweeps = getattr(net, 'deep_sweeps', None)
-    scope = key(net, proj, before) if sweeps else None
+    owns_completion = sweeps is not None and not getattr(log, 'sweep_owns_completion', False)
+    scope = key(net, proj, before) if owns_completion else None
     # Partition the allowance, including each path's baseline and diagnostics. More
     # threads must never silently multiply the user's requested compile limit.
     count = min(count, variants)
@@ -88,6 +89,8 @@ def run(net, slug, name, minutes, variants, log, profiles, count, *, rank_candid
             with lock:
                 log(f'Thread {index+1}/{count}: {line}')
         output.compile_pool = getattr(log, "compile_pool", None)
+        output.miss_cache = getattr(log, 'miss_cache', None)
+        output.advisory_turn = getattr(log, 'advisory_turn', None)
         output.check_cancel = check
         output.progress = lambda update: publish(index, update)
         output.maximum_seconds = max(0, shared['deadline']-time.monotonic())
@@ -154,6 +157,6 @@ def run(net, slug, name, minutes, variants, log, profiles, count, *, rank_candid
                   variant_limit=variants + result['extra_variants'])
     log.progress(result)
     log(f'{reason}: {result["tested"]:,} candidates tested across {count} threads. Verified improvements are saved immediately.')
-    if sweeps:
+    if owns_completion:
         sweeps.completed(slug, before, minutes, variants, result, scope)
     return result

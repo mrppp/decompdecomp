@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -110,6 +111,19 @@ def _provide_sn64(project) -> None:
                 link.symlink_to(item)
 
 
+def _provide_mipspro_frontend(project) -> None:
+    """Reuse the installed frontend when a project's own setup knows this compiler layout."""
+    if not (project.root / 'tools' / 'fetch-mipspro721.sh').is_file():
+        return
+    if toolchains.installed('mipspro-7.2.1-cxx') is None:
+        return
+    source = toolchains.require('mipspro-7.2.1-cxx') / 'usr/lib/DCC/edgcpfe'
+    target = project.root / 'tools/ido-static-recomp/build/mipspro721/usr/lib/DCC/edgcpfe'
+    if source.is_file() and not target.exists() and not target.is_symlink():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source)
+
+
 def _provide_compiler_dirs(project) -> None:
     """A project that expects a compiler folder it doesn't ship for this computer (tools/gcc_2.7.2/macos,
     tools/ido/7.1) gets a link to the installed one, in its own tree: the folder is never in git."""
@@ -163,7 +177,22 @@ def _provide_compiler_dirs(project) -> None:
         if host and not mine.exists() and not mine.is_symlink() and (project.root / "tools").is_dir():
             mine.write_text(f'#!/bin/sh\nexec "{host}" "$@"\n', encoding="utf-8")
             mine.chmod(0o755)
+    # Some projects download the KMC 2.7.2 release into tools/gcc-kmc and call
+    # its driver without -B. The pinned driver needs -B to find its cc1 and as.
+    if (re.search(r"(?:tools|\$\(TOOLS(?:_DIR)?\))/gcc-kmc\b", texts)
+            and "mips-gcc-2.7.2" in texts and toolchains.installed("gcc-2.7.2-kmc") is not None):
+        target = project.root / "tools/gcc-kmc"
+        source = toolchains.require("gcc-2.7.2-kmc")
+        driver = source / "gcc"
+        if (driver.is_file() and not target.exists() and not target.is_symlink()
+                and project.root.resolve() in target.resolve().parents):
+            target.mkdir(parents=True)
+            wrapper = target / "gcc"
+            wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(str(driver))} '
+                               f'{shlex.quote("-B" + str(source) + "/")} "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
     _provide_sn64(project)
+    _provide_mipspro_frontend(project)
     _provide_built_ido(project, texts)
     for rel, tid in wanted:
         target = project.root / rel

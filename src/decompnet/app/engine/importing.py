@@ -10,8 +10,10 @@ import json
 import re
 import shutil
 import tempfile
+import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 
 from ... import consoles, scoring, seeds, toolchains
@@ -30,6 +32,36 @@ DEBUG_TYPES_NOTE = """
 """
 DEBUG_TYPES_FILE = "debug_types.h"
 HEADER_CHECK = "int decomp_header_check;"  # a source that needs nothing but the header to compile
+
+
+@contextmanager
+def _reimport_claim(net, slug, name, agent):
+    """Release only the temporary claim made for this saved-source check."""
+    fn = net._function(name, slug)
+    store = net.project_store(fn['project_id'])
+    with store.lock:
+        lock = net._attempt_locks.setdefault((agent.id, fn['id']), threading.RLock())
+    with lock:
+        claimed = None
+        with store.tx() as db:
+            current = db.execute('SELECT * FROM functions WHERE id=?', (fn['id'],)).fetchone()
+            # Saved authors can hold another function in the editor. This scoped claim
+            # retains attribution without taking or releasing that other claim.
+            held = db.execute('SELECT 1 FROM claims WHERE function_id=?', (fn['id'],)).fetchone()
+            if held:
+                raise NetworkError(f'{name} is already claimed; its saved C is kept for a later check.')
+            if current is not None and current['status'] == 'open':
+                claimed = time.time()
+                net._open_claim(db, current, agent, claimed, net._project(slug))
+        try:
+            yield
+        finally:
+            if claimed is not None:
+                with store.tx() as db:
+                    deleted = db.execute('DELETE FROM claims WHERE function_id=? AND agent_id=? AND claimed_at=?',
+                                         (fn['id'], agent.id, claimed)).rowcount
+                    if deleted:
+                        net._event(db, fn['project_id'], agent.id, 'release', fn['name'])
 
 
 def pair_old_functions(rows, functions) -> dict:
@@ -96,16 +128,16 @@ class ImportMixin:
 
     def import_split(self, console: consoles.Console, picked: Picked, *, toolchain: str | None = None,
                      flags: list[str] | None = None, log=print, reimport_slug: str | None = None,
-                     on_new_rom=None) -> str:
+                     on_new_rom=None, rejudge_out: list | None = None) -> str:
         """ROM mode: split the program `console` read from the user's file, store every function as a target."""
         if reimport_slug is None:
             return self._import_split(console, picked, toolchain=toolchain, flags=flags, log=log,
                                       on_new_rom=on_new_rom)
         with self.progress.rebuilding(reimport_slug):
             return self._reimport_split(console, picked, toolchain=toolchain, flags=flags, log=log,
-                                        reimport_slug=reimport_slug)
+                                        reimport_slug=reimport_slug, rejudge_out=rejudge_out)
 
-    def _reimport_split(self, console, picked, *, toolchain, flags, log, reimport_slug):
+    def _reimport_split(self, console, picked, *, toolchain, flags, log, reimport_slug, rejudge_out):
         proj = self._project(reimport_slug)
         cfg = json.loads(proj["config"])
         if cfg.get("kind") != "rom" or self.console(proj).id != console.id:
@@ -121,12 +153,13 @@ class ImportMixin:
         stage = Path(tempfile.mkdtemp(prefix=f".{reimport_slug}-reimport-", dir=root.parent))
         try:
             return self._import_split(console, picked, toolchain=toolchain, flags=flags, log=log,
-                                      reimport=proj, workdir=stage)
+                                      reimport=proj, workdir=stage, rejudge_out=rejudge_out)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
 
     def _import_split(self, console: consoles.Console, picked: Picked, *, toolchain: str | None = None,
-                      flags: list[str] | None = None, log=print, reimport=None, workdir: Path | None = None, on_new_rom=None) -> str:
+                      flags: list[str] | None = None, log=print, reimport=None, workdir: Path | None = None,
+                      on_new_rom=None, rejudge_out: list | None = None) -> str:
         rom, info = picked.data, picked.info
         check_cancel = getattr(log, "check_cancel", lambda: None)
         check_cancel()
@@ -180,6 +213,12 @@ class ImportMixin:
             rom = (workdir / res.image).read_bytes()
 
         analysis_sha1 = hashlib.sha1(rom).hexdigest()
+        retained_reimport_snapshot = None
+        if reimport is not None and json.loads(reimport['config']).get('rom', {}).get('analysis_sha1') == analysis_sha1:
+            old_rows = self.project_store(reimport['id']).all(
+                'SELECT name,rom_offset,vram,size,target,unit FROM functions WHERE project_id=? ORDER BY id', reimport['id'])
+            if console.preserve_reimport_entries(self, reimport, res, rom, old_rows, log):
+                retained_reimport_snapshot = [tuple(row) for row in old_rows]
         if reimport is not None and console.recompiler is not None:
             recompile_review.keep_reviewed_on_reimport(self, reimport, res, rom, analysis_sha1, log)
 
@@ -306,9 +345,15 @@ class ImportMixin:
                     description=f"{info['game_code']} · {info['region']} · {len(res.functions)} functions",
                     arch=console.arch,big_endian=picked.big_endian,root=workdir,config=cfg,
                     existing=reimport["id"] if reimport is not None else None) as (db,pid):
+                same_analysis = False
                 if reimport is None:
                     old_functions, gone, old_names, old_types = {}, {}, [], {}
                 else:
+                    if retained_reimport_snapshot is not None:
+                        current = db.execute('SELECT name,rom_offset,vram,size,target,unit FROM functions '
+                                             'WHERE project_id=? ORDER BY id', (pid,)).fetchall()
+                        if [tuple(row) for row in current] != retained_reimport_snapshot:
+                            raise NetworkError('The project entries changed during reimport. Retry with the current project.')
                     rows = db.execute("SELECT * FROM functions WHERE project_id=?", (pid,)).fetchall()
                     # A bank and address identify renamed functions. A bare address is safe only when
                     # unique on both sides; mutually exclusive overlays share their RAM slots.
@@ -318,11 +363,43 @@ class ImportMixin:
                                and old_counts[r['vram']] == new_counts[r['vram']] == 1}
                     by_unit = {(r['unit'], r['vram']): r for r in rows}
                     by_name = {r["name"]: r for r in rows}
+                    # An improved overlay mapping can move a function's VRAM while its original image bytes
+                    # stay put. Reserve such matches by unique ROM offset before an unrelated function at the old
+                    # virtual address can take their identity. Only identical analysis images and entry bytes
+                    # are safe; changed extents are judged again. A name used by other code cannot be retained.
                     old_functions = {}
-                    for fn in res.functions:
-                        old = by_unit.get((fn.segment, fn.vram)) or by_name.get(fn.name) or by_vram.get(fn.vram)
-                        if old is not None and old["id"] not in {o["id"] for o in old_functions.values()}:
+                    used_ids = set()
+                    blocked_ids = set()
+                    old_image = json.loads(reimport['config']).get('rom', {}).get('analysis_sha1')
+                    same_analysis = bool(old_image and old_image == analysis_sha1)
+                    if same_analysis:
+                        old_offsets = Counter(r['rom_offset'] for r in rows if r['rom_offset'] is not None)
+                        new_offsets = Counter(fn.rom for fn in res.functions)
+                        by_offset = {r['rom_offset']: r for r in rows if r['rom_offset'] is not None
+                                     and old_offsets[r['rom_offset']] == new_offsets[r['rom_offset']] == 1}
+                        order = 'big' if picked.big_endian else 'little'
+                        for fn in res.functions:
+                            old = by_offset.get(fn.rom)
+                            if (old is None or old['vram'] == fn.vram or not old['target'] or not fn.lines
+                                    or old['target'][:4] != fn.lines[0].word.to_bytes(4, order)):
+                                continue
+                            if old['name'] in symbols.by_name and old['name'] != fn.name:
+                                # The old name now belongs to different code. Keep its saved C in notes rather
+                                # than silently assigning it to that code or creating a duplicate function name.
+                                blocked_ids.add(old['id'])
+                                continue
                             old_functions[fn.name] = old
+                            used_ids.add(old['id'])
+                            if old['name'] != fn.name:
+                                symbols.add(Symbol(old['name'], fn.vram, fn.size, 'func'), alias=True, reindex=False)
+                    for fn in res.functions:
+                        if fn.name in old_functions:
+                            continue
+                        old = by_unit.get((fn.segment, fn.vram)) or by_name.get(fn.name) or by_vram.get(fn.vram)
+                        if (old is not None and old['id'] not in used_ids | blocked_ids
+                                and (not same_analysis or old['rom_offset'] is None or old['rom_offset'] == fn.rom)):
+                            old_functions[fn.name] = old
+                            used_ids.add(old['id'])
                     paired = {o["id"] for o in old_functions.values()}
                     gone = {r["name"]: r for r in rows if r["id"] not in paired}
                     # the names agents gave (functions and data), every one: matched C calls them by those names
@@ -349,6 +426,9 @@ class ImportMixin:
                         lost.append(name)
                         db.execute("INSERT INTO notes(project_id,function_id,text,created_at) VALUES(?,NULL,?,?)",
                                    (pid, f"[{name} before reimport: it matched with this C]\n{old['matched_source']}", now))
+                    elif old['best_source']:
+                        db.execute("INSERT INTO notes(project_id,function_id,text,created_at) VALUES(?,NULL,?,?)",
+                                   (pid, f"[{name} before reimport: best saved attempt]\n{old['best_source']}", now))
                     db.execute("DELETE FROM functions WHERE id=?", (old["id"],))
                 if lost:
                     log(f"{len(lost)} matched function(s) aren't in the new split at their address: "
@@ -366,7 +446,7 @@ class ImportMixin:
                     old = old_functions.get(fn.name)
                     target_meta = console.function_target_meta(fn)
                     previous_meta = json.loads(old['meta'] or '{}') if old is not None else {}
-                    same_target = (old is not None
+                    same_target = (old is not None and old['vram'] == fn.vram
                                    and all(previous_meta.get(key) == value for key, value in target_meta.items()) and old["target"] == target.code
                                    and json.loads(old["relocs"] or "[]") == target.to_json())
                     asm = console.function_asm(fn)
@@ -454,21 +534,31 @@ class ImportMixin:
                             db.execute("DELETE FROM claims WHERE function_id=?", (old["id"],))
                         preserved += old["status"] == "matched" and bool(old["matched_source"])
                     else:
-                        if (old is not None and old["status"] == "matched" and old["matched_source"]
-                                and old["target"] == target.code):
-                            # Same bytes, other relocations (a newer reader annotates more references): the C
-                            # may still match, so it's judged again after the import instead of being dropped.
-                            rejudge.append((old["name"], old["matched_source"], old["matched_agent_id"]))
+                        source = agent_id = None
+                        if (old is not None and (old['target'] == target.code
+                                or same_analysis and old['rom_offset'] == fn.rom)):
+                            # Judge saved C against corrected addresses, extents or references instead of
+                            # retaining a stale verdict. Save it before judging so interruption cannot lose it.
+                            source = old['matched_source'] if old['status'] == 'matched' else (
+                                old['best_source'] if same_analysis or old['vram'] != fn.vram else None)
+                            if source:
+                                agent_id = old['matched_agent_id'] if old['status'] == 'matched' else old['best_agent_id']
+                                rejudge.append((old['name'], source, agent_id))
+                        if not source and (saved := old['matched_source'] or old['best_source']):
+                            # A different image or entry can no longer be judged as this function, but the
+                            # user's source is still useful; never erase it when replacing the target.
+                            db.execute('INSERT INTO notes(project_id,function_id,text,created_at) VALUES(?,?,?,?)',
+                                       (pid, old['id'], f"[{old['name']} before reimport: saved C]\n{saved}", now))
                         for table in ("claims", "attempts", "twin_misses"):
                             db.execute(f"DELETE FROM {table} WHERE function_id=?", (old["id"],))
                         db.execute(
                             "UPDATE functions SET size=?,n_insns=?,target=?,relocs=?,asm=?,seed=NULL,unit=?,vram=?,"
-                            "rom_offset=?,meta=?,status=?,best_score=NULL,best_source=NULL,best_agent_id=NULL,"
+                            "rom_offset=?,meta=?,status=?,best_score=?,best_source=?,best_agent_id=?,"
                             "matched_source=NULL,matched_agent_id=NULL,matched_at=NULL,attempts=0,"
                             "last_checked=NULL,last_improved=NULL,abandons=0,"
                             "fingerprint=NULL,boost=0,readable=0,permuted=0,seed_key=NULL WHERE id=?",
                             (fn.size, n_insns, target.code, relocs, asm, unit, fn.vram, fn.rom, meta, status,
-                             old["id"]))
+                             max(1, n_insns)*100 if source else None, source, agent_id, old["id"]))
                 previews = {r[1]: r[4] for r in data_rows}
                 named = set()
                 for addr, name, size, kind in old_names:
@@ -531,6 +621,10 @@ class ImportMixin:
             apply_entry_fixes(self, slug, log)
         except NetworkError as e:
             log(f"function boundaries were not fixed automatically: {e}")
+        # Automatic boundary fixes invalidate earlier shared-entry evidence.
+        # Reprove it against the final stored split before a helper can claim it.
+        from ..boundary_review import refresh_shared_entries
+        refresh_shared_entries(self, self.project_row(slug), console, res.segments, res.functions)
         console.after_import(self, slug, chosen=chosen, log=log)
         if reimport is not None and backup is not None:
             try:
@@ -540,8 +634,8 @@ class ImportMixin:
             log(f"reimport kept {preserved} matched functions whose targets were unchanged")
         if sdk_classified:log(f"Identified {sdk_classified} known SDK library functions; excluded from C agents.")
         log(f"ready: {len(res.functions)} functions to decompile")
-        if reimport is not None and rejudge:
-            self._reimport_rejudge = rejudge
+        if reimport is not None and rejudge_out is not None:
+            rejudge_out.extend(rejudge)
         if reimport is None and on_new_rom is not None:
             on_new_rom(slug)
         return slug
@@ -558,9 +652,9 @@ class ImportMixin:
         console = consoles.identify(data)
         picked = console.read_game(data, name)
         log("Game recognized; starting the replacement split.")
-        self._reimport_rejudge = []
-        self.import_split(console, picked, reimport_slug=slug, log=log)
-        self._judge_kept_matches(slug, self._reimport_rejudge, log)
+        rejudge = []  # Each project owns its rechecks, including during simultaneous reimports.
+        self.import_split(console, picked, reimport_slug=slug, log=log, rejudge_out=rejudge)
+        self._judge_kept_matches(slug, rejudge, log)
         counts = self.project_store(proj['id']).one(
             "SELECT COUNT(*) AS functions, SUM(status='matched') AS matched FROM functions WHERE project_id=?",
             proj["id"])
@@ -568,25 +662,32 @@ class ImportMixin:
         return {"slug": slug, "functions": counts["functions"], "matched": counts["matched"] or 0}
 
     def _judge_kept_matches(self, slug: str, kept: list, log) -> None:
-        """Judge again the matched C of functions whose bytes a reimport left alone but whose relocations it read
-        anew (a newer reader annotates references an older one left as numbers). A reimport used to drop that C:
-        234 matches of a racing game went at once. Each one that still matches keeps its helper's credit."""
+        """Judge saved C again after an address, extent or reference changes; keep it if interrupted or rejected."""
         if not kept:
             return
-        log(f"judging {len(kept)} matched function(s) again: same code, references read anew")
+        log(f"judging {len(kept)} saved function(s) again: addresses, extents or references changed")
         check_cancel = getattr(log, "check_cancel", lambda: None)
         pid = self._project(slug)["id"]
         matched = 0
         for name, source, agent_id in kept:
             check_cancel()
             row = self.store.one("SELECT name FROM agents WHERE id=?", agent_id) if agent_id else None
-            agent = self.attribution_agent(row["name"]) if row else self.local_agent("you")[0]
+            agent = self.attribution_agent(row["name"] if row else "you")
             try:
-                matched += bool(self.attempt(agent, name, source, slug)["matched"])
+                with _reimport_claim(self, slug, name, agent):
+                    matched += bool(self.attempt(agent, name, source, slug)["matched"])
             except NetworkError as error:
                 log(f"{name}: {error}")
-            if self.project_store(pid).one("SELECT status FROM functions WHERE project_id=? AND name=?",
-                                           pid, name)["status"] != "matched":
+            row = self.project_store(pid).one("SELECT status FROM functions WHERE project_id=? AND name=?", pid, name)
+            if row is None:
+                # An automatic boundary repair or concurrent rename can remove an entry before its recheck.
+                # Keep its source as a project note even when there is no function row left to attach it to.
+                with self.project_store(pid).tx() as db:
+                    db.execute('INSERT INTO notes(project_id,function_id,text,created_at) VALUES(?,NULL,?,?)',
+                               (pid, f"[{name} before reimport: saved C]\n{source}", time.time()))
+                log(f"{name}: the entry is no longer present; its saved C is kept in project notes")
+                continue
+            if row["status"] != "matched":
                 with self.project_store(pid).tx() as db:  # kept as the closest attempt, for whoever goes on
                     db.execute("UPDATE functions SET best_source=?,best_score=MAX(1,COALESCE(n_insns,1))*100 "
                                "WHERE project_id=? AND name=? AND best_source IS NULL", (source, pid, name))

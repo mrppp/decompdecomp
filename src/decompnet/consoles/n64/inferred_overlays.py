@@ -9,6 +9,24 @@ _MIN_CALLS = 32
 _MAX_PAIRS = 1_000_000
 
 
+def _unique_closed_mapping(image, lo, hi, targets, scores, mapping, check):
+    """Break a close raw-score tie when other well-supported mappings lack closed callees."""
+    from ...arch.mips_code_recovery import called_extent
+
+    candidates = [candidate for candidate, score in scores.items() if candidate == mapping or score >= 8]
+    if len(candidates) > 32:
+        return False  # heavily ambiguous data stays with boundary review
+    verdicts = {}
+    for candidate in candidates:
+        check()
+        verdicts[candidate] = sum(
+            bool(called_extent(image, at, hi, target, cpu='vr4300'))
+            for target in targets if lo <= (at := target-candidate) < hi-8
+        )
+    return verdicts.get(mapping, 0) >= 12 and all(
+        count < 2 for candidate, count in verdicts.items() if candidate != mapping)
+
+
 def _entry_mapping(image, lo, hi, vram, callers, taken, check):
     """Find a nearby aligned mapping when many calls name complete return-separated entries."""
     old = vram-lo
@@ -117,9 +135,11 @@ def recover(image, found, taken=(), check=lambda: None, *, changed=()):
             continue
         (mapping, score), (_, second) = ranked
         address = lo+mapping
-        if (mapping == vram-lo or score < _MIN_CALLS or score < second*6
+        if (mapping == vram-lo or score < _MIN_CALLS
                 or score < scores[vram-lo]*4
                 or not 0x80000400 <= address < address+hi-lo <= 0x80800000):
+            continue
+        if score < second*6 and not _unique_closed_mapping(image, lo, hi, targets, scores, mapping, check):
             continue
         if any(base < address+hi-lo and address < base+end-start for start,end,base in taken):
             continue
@@ -175,8 +195,33 @@ def runtime_mappings(image, found, ranges, taken=()):
             else:
                 parts.append((start,end,old))
         if corrected:
-            result.extend(parts)
-            changed.update(corrected)
+            # Overlapping RAM observations can cut a corrected bank into tiny
+            # pieces. Carry its independently corroborated mapping into a
+            # neighbouring fragment only when RAM observed that same mapping.
+            verified = set(corrected)
+            while True:
+                extended = False
+                for index, (start, end, address) in enumerate(parts):
+                    if start in verified or end-start >= 128:
+                        continue
+                    candidates = {base+start-first for first,last,base in evidence if first <= start < end <= last}
+                    neighbours = [parts[j] for j in (index-1, index+1) if 0 <= j < len(parts)
+                                  and parts[j][0] in verified]
+                    matches = {start+other[2]-other[0] for other in neighbours} & candidates
+                    if len(candidates) == 1 and len(matches) == 1:
+                        parts[index] = (start, end, matches.pop())
+                        verified.add(start)
+                        extended = True
+                if not extended:
+                    break
+            merged = []
+            for start, end, address in parts:
+                if merged and merged[-1][1] == start and merged[-1][2]-merged[-1][0] == address-start:
+                    merged[-1] = (merged[-1][0], end, merged[-1][2])
+                else:
+                    merged.append((start, end, address))
+            result.extend(merged)
+            changed.update(start for start,end,_ in merged if any(start <= item < end for item in verified))
         else:
             result.append((lo,hi,vram))
     return result, changed
@@ -229,6 +274,50 @@ def scope(config, found, scoped):
                            symbol_name_format_no_rom=f'$VRAM_{name}')
 
 
+def scope_resident_bss(config):
+    """Share an overlay scope when its RAM overlaps only a resident segment's BSS.
+
+    Return false instead of making a guessed scope when a resident code range
+    overlaps or its BSS touches more than one independently scoped group.
+    """
+    rows = config['segments']
+    scoped = []
+    for index, segment in enumerate(rows[:-1]):
+        if not isinstance(segment, dict) or segment.get('type') != 'code':
+            continue
+        if not segment.get('exclusive_ram_id') or not isinstance(segment.get('vram'), int):
+            continue
+        following = rows[index+1]
+        end = following[0] if isinstance(following, list) else following.get('start')
+        if isinstance(end, int):
+            scoped.append((segment['vram'], segment['vram']+end-segment['start'], segment['exclusive_ram_id']))
+    updates = []
+    for index, segment in enumerate(rows[:-1]):
+        if (not isinstance(segment, dict) or segment.get('type') != 'code' or segment.get('exclusive_ram_id')
+                or not segment.get('bss_size') or not isinstance(segment.get('vram'), int)):
+            continue
+        following = rows[index+1]
+        end = following[0] if isinstance(following, list) else following.get('start')
+        if not isinstance(end, int):
+            return False
+        code_start = segment['vram']
+        code_end = code_start+end-segment['start']
+        if not isinstance(segment['bss_size'], int) or segment['bss_size'] < 0:
+            return False
+        bss_end = code_end+segment['bss_size']
+        touching = [(a,b,ident) for a,b,ident in scoped if a < bss_end and code_start < b]
+        if any(a < code_end and code_start < b for a,b,_ in touching):
+            return False
+        identities = {ident for _,_,ident in touching}
+        if len(identities) > 1:
+            return False
+        if identities:
+            updates.append((segment, identities.pop()))
+    for segment, ident in updates:
+        segment['exclusive_ram_id'] = ident
+    return True
+
+
 def drop_pointer_fragments(image, found, taken=()):
     """Leave a terminated pointer table outside text when discovery split it into one-word scopes."""
     ordered = sorted(found)
@@ -268,7 +357,7 @@ def drop_pointer_fragments(image, found, taken=()):
     return [segment for segment in found if segment[0] not in remove]
 
 
-def split_concatenated(image, found, check=lambda: None):
+def split_concatenated(image, found, check=lambda: None, *, taken=()):
     """Split adjacent banks when two called entries share an address and a data gap."""
     from ...arch.mips_code_recovery import called_extent
 
@@ -310,12 +399,81 @@ def split_concatenated(image, found, check=lambda: None):
             if before >= 8 and before >= 4*max(1, before_old) and after >= 8:
                 candidates.append((end, boundary, target))
         if len(candidates) != 1:
-            result.append((lo, hi, vram))
+            separate = _separated_banks(image, lo, hi, targets, entries, check) if not candidates else None
+            if separate:
+                left, right = separate
+                gap_start, gap_end = left[1], right[0]
+                shifts = (left[2]-left[0], right[2]-right[0])
+                for start, end, base in (*taken, *found):
+                    check()
+                    if start < 0 or end > len(image) or start >= end or (start | end) % 4:
+                        continue
+                    words = struct.unpack_from(f'>{(end-start)//4}I', image, start)
+                    calls = (0x80000000 | ((word & 0x3ffffff) << 2) for word in words if word >> 26 == 3)
+                    if any(not (base <= target < base+end-start
+                                and not gap_start <= start+target-base < gap_end)
+                           and any(gap_start <= target-shift < gap_end for shift in shifts) for target in calls):
+                        separate = None
+                        break
+            if separate is None:
+                result.append((lo, hi, vram))
+            else:
+                result.extend(separate)
+                changed.update(start for start, _, _ in separate)
             continue
         end, boundary, target = candidates[0]
         result.extend(((lo, end, target), (boundary, hi, vram + boundary-lo)))
         changed.update((lo, boundary))
     return sorted(result), changed
+
+
+def _separated_banks(image, lo, hi, targets, entries, check):
+    """Separate two independently called banks around a frame-free data gap."""
+    from ...arch.mips_code_recovery import called_extent
+
+    if len(targets)*len(entries) > _MAX_PAIRS:
+        return None
+    scores = collections.Counter(target-at for target in targets for at in entries
+                                 if not (target-at) % 16 and 0x7f000000 < target-at < 0x81000000)
+    mappings = [mapping for mapping, count in scores.items() if count >= 8]
+    if len(mappings) != 2:
+        return None
+    called = {}
+    for mapping in mappings:
+        check()
+        called[mapping] = sorted(at for target in targets if lo <= (at := target-mapping) < hi-8
+                                 and called_extent(image, at, hi, target, cpu='vr4300'))
+    if any(len(called[mapping]) < 8 for mapping in mappings):
+        return None
+    frames = [at for at in entries if is_frame(int.from_bytes(image[at:at+4], 'big'))]
+    candidates = []
+    for first, second in (mappings, mappings[::-1]):
+        ends = set()
+        for at in frames:
+            check()
+            size = called_extent(image, at, hi, at+first, cpu='vr4300')
+            if size:
+                ends.add(at+size)
+        for start in frames:
+            if not called_extent(image, start, hi, start+second, cpu='vr4300'):
+                continue
+            for end in ends:
+                if (not 32 <= start-end <= 8192 or not any(image[end:start])
+                        or any(end <= at < start for at in frames)):
+                    continue
+                if (any(int.from_bytes(image[at:at+4], 'big') == JR_RA for at in range(end, start, 4))
+                        or any(end <= target-mapping < start for target in targets for mapping in mappings)):
+                    continue
+                early = sum(at < end for at in called[first])
+                late = sum(at >= start for at in called[second])
+                if (early < 8 or late < 8 or len(called[first])-early > early//4
+                        or len(called[second])-late > late//4):
+                    continue
+                if not (0x80000400 <= lo+first < end+first <= 0x80800000
+                        and 0x80000400 <= start+second < hi+second <= 0x80800000):
+                    continue
+                candidates.append(((lo, end, lo+first), (start, hi, start+second)))
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def extend_adjacent_frame(image, found):
@@ -337,4 +495,38 @@ def extend_adjacent_frame(image, found):
                 candidates.append(at)
         if len(candidates) == 1:
             result[index] = (lo, next_start, vram)
+    return result
+
+
+def extend_tail_wrapper(image, found, taken=()):
+    """Keep a closed, straight-line tail wrapper split by an inferred bank end."""
+    result = list(sorted(found))
+    mapped = (*taken, *found)
+    for index, (lo, hi, vram) in enumerate(result):
+        following = [start for start, _, _ in (*taken, *result) if start >= hi]
+        limit = min(len(image), min(following, default=len(image)), hi+64)
+        start = hi-8
+        if start < lo+8 or limit < hi+8 or (hi | limit) % 4:
+            continue
+        # A return and its delay slot separate this entry from its predecessor.
+        if int.from_bytes(image[start-8:start-4], 'big') != JR_RA:
+            continue
+        first = int.from_bytes(image[start:start+4], 'big')
+        second = int.from_bytes(image[start+4:start+8], 'big')
+        # This wrapper begins by adjusting an argument and scaling the result.
+        if first >> 26 != 9 or not 4 <= (first >> 21) & 31 <= 7 or second >> 26 or second & 63 != 0:
+            continue
+        for at in range(hi, limit-4, 4):
+            word = int.from_bytes(image[at:at+4], 'big')
+            op = word >> 26
+            if op == 2:
+                target = ((vram+at-lo+4) & 0xf0000000) | ((word & 0x03ffffff) << 2)
+                delay = int.from_bytes(image[at+4:at+8], 'big')
+                if any(base <= target < base+end-begin for begin, end, base in mapped) and delay >> 26 not in (1,2,3,4,5,6,7):
+                    result[index] = (lo, at+8, vram)
+                break
+            if op not in (0, 8, 9, 10, 11, 12, 13, 14, 15, 32, 33, 35, 36, 37, 40, 41, 43):
+                break
+            if op == 0 and word & 63 not in (0, 2, 3, 4, 6, 7, 32, 33, 34, 35, 36, 37, 38, 39, 42, 43):
+                break
     return result

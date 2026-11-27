@@ -36,6 +36,11 @@ def generate(text):
     return out
 
 
+def one_family(text):
+    """The toy children as one family: a step's survey then takes only a few of them."""
+    return [("fix", child) for _, child in generate(text)]
+
+
 def test_the_chain_applies_the_best_child_each_step_until_it_reaches_zero():
     lines = []
     final, best, chain = prove_chain.prove("xyz", generate, score, None, log=lines.append)
@@ -54,7 +59,7 @@ def test_only_the_named_families_are_applied_and_the_chain_stops_when_nothing_im
 
 def test_the_steps_and_children_bounds_hold():
     calls = []
-    prove_chain.prove("xyz", generate, lambda t: calls.append(t) or score(t), None, steps=1, children=1, log=lambda _: None)
+    prove_chain.prove("xyz", generate, lambda t: calls.append(t) or score(t), None, steps=1, max_judged=1, log=lambda _: None)
     assert len(calls) == 2  # the start, and one child at the cap
     with pytest.raises(SystemExit, match="doesn't compile"):
         prove_chain.prove("BROKEN", generate, score, None, log=lambda _: None)
@@ -76,11 +81,13 @@ void f(int *p, int a, int b)
 """
     judge = SimpleNamespace(arch="mips", asm="", compiler={"flags": ["-O2"]}, header="")
     children = prove_chain.generator(judge, "f")(source)
-    assert {"allocation_lever", "identical_arm_collapse"} <= {family for family, _ in children}
-    # scoring by length makes the arm collapse the chain's first step
-    final, best, chain = prove_chain.prove(source, prove_chain.generator(judge, "f"), len, {"identical_arm_collapse"},
+    assert "allocation_lever" in {family for family, _ in children}
+    # the arm collapse is labelled by whichever library family proposes it first (identical_arm_collapse until
+    # float_block_normal_form wrote the same text); scoring by length makes a family that collapses it the first step
+    collapsed = next(family for family, child in children if "else" not in child and "do" not in child)
+    final, best, chain = prove_chain.prove(source, prove_chain.generator(judge, "f"), len, {collapsed},
                                            steps=1, log=lambda _: None)
-    assert chain and chain[0][0] == "identical_arm_collapse" and best < len(source)
+    assert chain and chain[0][0] == collapsed and best < len(source)
 
 
 def test_a_source_saved_before_a_rename_is_proposed_under_the_current_name():
@@ -113,13 +120,24 @@ def test_the_generator_passes_the_functions_jump_tables_and_context_to_the_repai
     assert seen["entry_scope"] == {"language": "c"} and seen["header"] == "h"
 
 
-def test_children_cut_off_by_the_cap_are_reported_and_a_larger_cap_scores_them():
+def test_children_left_out_by_the_cap_are_reported_when_a_batch_improves():
     lines = []
-    prove_chain.prove("xyz", generate, score, None, steps=1, children=1, log=lines.append)
-    assert any("cut off by --children 1" in line for line in lines)
+    prove_chain.prove("xyz", one_family, score, None, steps=1, children=1, log=lines.append)
+    assert any("left out" in line and "--families" in line for line in lines)
     lines.clear()
     prove_chain.prove("xyz", generate, score, None, steps=1, children=50, log=lines.append)
-    assert not any("cut off" in line for line in lines)
+    assert not any("left out" in line for line in lines)
+
+
+def test_a_batch_with_no_improving_child_goes_on_to_the_children_left_out():
+    # the improving child sits behind four of its own family that do not, past the survey's few
+    def late(text):
+        return [("noop", text + str(i)) for i in range(4)] + [("noop", "a" + text[1:])]
+    lines = []
+    final, best, chain = prove_chain.prove("xyz", late, lambda t: score(t[:3]), None,
+                                           steps=1, children=2, log=lines.append)
+    assert chain and chain[0][0] == "noop" and best == 2
+    assert any("judging the other" in line for line in lines)
 
 
 def test_a_stalled_step_merges_the_best_children_in_pairs_and_triples():
@@ -226,3 +244,67 @@ def test_a_rank_signal_demotes_a_child_from_the_combinations_but_never_blocks_an
     prove_chain.prove("s", generate, scores.get, None, steps=1, combine=1, rank_signal=signal, lookahead=0,
                       log=lines.append)
     assert any("dead_end demoted" in line for line in lines)
+
+
+def test_the_run_stops_at_the_cap_on_judged_variants_and_says_how_many_were_left():
+    def many(text):
+        return [("noop", f"{text}{i}") for i in range(1000)]
+    judged, lines = [], []
+    prove_chain.prove("xyz", many, lambda t: judged.append(t) or 3, None, children=80, log=lines.append)
+    assert len(judged) == 1 + prove_chain.DEFAULT_MAX_JUDGED  # the start, then the cap
+    assert any("cap of 400 judged variants: 600 of 1000 children left unjudged" in line for line in lines)
+    assert not any("(scored " in line for line in lines) and lines[-1] == "final score 3"
+    for cap, expected in ((0, 1000), (None, 1000), (2000, 1000), (30, 30)):
+        judged.clear()
+        prove_chain.prove("xyz", many, lambda t: judged.append(t) or 3, None, max_judged=cap, log=lines.append)
+        assert len(judged) == 1 + expected
+
+
+def test_the_cap_covers_all_steps_and_keeps_the_improvement_it_already_found():
+    lines = []
+    # each step: an improving fix first. Batch size 1 and one family, so one variant judged per step.
+    final, best, chain = prove_chain.prove("xyz", one_family, score, None, children=1, max_judged=2, log=lines.append)
+    assert (final, best) == ("abz", 1) and len(chain) == 2
+    assert any(line.startswith("step 3") and "cap of 2" in line and "2 of 2 children" in line for line in lines)
+    lines.clear()
+    final, best, _ = prove_chain.prove("xyz", generate, score, None, max_judged=1, steps=1, log=lines.append)
+    assert best == 2 and any("3 of 4 children left unjudged" in line for line in lines)
+
+
+def test_merges_and_lookahead_children_count_against_the_cap():
+    def generate_pairs(text):
+        return [("a", text + " a"), ("b", text + " b"), ("c", text + " c")] if len(text) < 6 else []
+    for cap in (3, 4, 8):
+        judged, lines = [], []
+        prove_chain.prove("s", generate_pairs, lambda t, seen=judged: seen.append(t) or 10, None, steps=1, combine=4,
+                          max_judged=cap, log=lines.append)
+        assert len(judged) <= 1 + cap
+        assert any(f"cap of {cap} judged variants" in line and "lookahead" in line for line in lines), lines
+
+
+def test_the_generator_gives_the_families_the_assembly_under_the_sources_names(monkeypatch):
+    """The app's families pair the C's calls with the target's `jal`s (#4304): a renamed callee must read the same."""
+    from types import SimpleNamespace
+
+    from decompnet.app import diff_gated_repairs, draft_repairs
+    seen = []
+    monkeypatch.setattr(draft_repairs, "variants", lambda source, name, arch, asm, *a, **k: seen.append(asm) or [])
+    monkeypatch.setattr(diff_gated_repairs, "proposals",
+                        lambda source, name, header, arch, toolchain, rows, asm, **k: seen.append(asm) or [])
+    judge = SimpleNamespace(arch="mips", asm="jal func_8005BB50\n", asm_names={"func_8005BB50": "sprintf"},
+                            compiler={"flags": []}, header="", request={})
+    prove_chain.generator(judge, "f")("void f(char *b) { sprintf(b); }")
+    assert seen == ["jal sprintf\n", "jal sprintf\n"]
+    seen.clear()
+    prove_chain.generator(judge, "f")("void f(char *b) { func_8005BB50(b); }")
+    assert seen == ["jal func_8005BB50\n", "jal func_8005BB50\n"]
+
+
+def test_a_capped_step_sees_every_family_before_it_takes_a_child():
+    def many(text):
+        return [("small", f"s{i}") for i in range(20)] + [("large", "big")] if text == "start" else []
+    scores = {"start": 1030, "big": 330} | {f"s{i}": 1000 for i in range(20)}
+    judged = []
+    final, best, chain = prove_chain.prove("start", many, lambda t: judged.append(t) or scores[t], None, children=3,
+                                           max_judged=10, log=lambda _: None)
+    assert (final, best) == ("big", 330) and chain == [("large", 330)] and len(judged) <= 1 + 10

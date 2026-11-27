@@ -91,6 +91,8 @@ class Unit:
     options: dict | None = None  # the unit's own objdiff options
     mappings: dict | None = None  # objdiff symbol mappings (target name -> base name)
     auto: bool = False  # split off by dtk because no file covers it (auto_00_80003100_text)
+    scaffold: bool = False  # app-created candidate, not an upstream source file
+    scaffold_dir: str | None = None  # nested project whose build owns the candidate
 
 
 @functools.lru_cache(maxsize=64)
@@ -1291,7 +1293,7 @@ class ForkProject:
             text = (self.root / "Makefile").read_text(errors="replace", encoding="utf-8")
             chosen = [f"{var}={_makefile_version_word(text, var, version)}"] if version and (
                 var := _version_var(text)) else []
-            if version and "." in version and re.search(r"^REGION\s*[:?]?=", text, re.M):
+            if version and re.fullmatch(r"[a-z]{2,3}\.v[0-9][\w.-]*", version, re.I) and re.search(r"^REGION\s*[:?]?=", text, re.M):
                 chosen = ["REGION=" + version.split(".")[0], "VERSION=" + version.split(".", 1)[1]]  # (us.v77)
             steps = [["make", *chosen, t] for t in _setup_targets(text)]
             if not steps and re.search(r"^split\s*:", text, re.M):  # (splat's output: *_auto.txt the link reads)
@@ -2003,6 +2005,8 @@ class ForkProject:
                 for wait in range(40):  # configure.py rewrites it when a file is linked: read it whole
                     try:
                         cfg = json.loads(p.read_text(encoding="utf-8"))
+                        from .ninja_candidates import correct_generated_make
+                        cfg = correct_generated_make(self.root, cfg)
                         break
                     except (ValueError, OSError):
                         if wait == 39:
@@ -2031,7 +2035,8 @@ class ForkProject:
             out.append(Unit(u.get("name") or u.get("path") or "?", self.root / t if t else None,
                             self.root / b if b else None, meta.get("source_path"),
                             bool(meta.get("complete", u.get("complete", False))), u.get("scratch"),
-                            u.get("options") or None, u.get("symbol_mappings") or None, bool(meta.get("auto_generated"))))
+                            u.get("options") or None, u.get("symbol_mappings") or None, bool(meta.get("auto_generated")),
+                            bool(meta.get("autopilot_scaffold")), meta.get("autopilot_build_dir")))
         return out
 
     def units(self) -> list[Unit]:
@@ -2060,7 +2065,35 @@ class ForkProject:
         make = cfg.get("custom_make") or "make"
         tool = _tool(make) or make
         rel = self._target(unit.base)  # (named from the build's folder: `-C sub` builds final.o for sub/final.o)
-        return self.run([tool, *cfg.get("custom_args", []), rel], log=log, timeout=UNIT_SECONDS)
+        args = cfg.get("custom_args", [])
+        if unit.scaffold and unit.scaffold_dir:
+            if not isinstance(unit.scaffold_dir, str):
+                return False, 'The nested candidate build directory is invalid.'
+            child = Path(unit.scaffold_dir)
+            root = self.root.resolve()
+            folder = (self.root / child).resolve()
+            if (child.is_absolute() or '..' in child.parts or root not in folder.parents
+                    or folder not in unit.base.resolve().parents or not unit.source
+                    or folder not in (self.root / unit.source).resolve().parents
+                    or Path(tool).stem.lower() not in ('make', 'gmake')
+                    or not (folder / 'Makefile').is_file()
+                    or any(a.startswith(('-C', '--directory', '-f', '--file', '--makefile')) for a in args)):
+                return False, 'The nested candidate build is not inside its project or has no supported Makefile.'
+            target = unit.base.resolve().relative_to(folder).as_posix()
+            return self.run([tool, '-C', child.as_posix(), *args, target], log=log, timeout=UNIT_SECONDS)
+        if unit.scaffold and Path(tool).stem.lower() == "ninja":
+            from .ninja_candidates import build
+            result = build(self, unit, tool, args, log, UNIT_SECONDS)
+            if result is not None and (result[0] or 'multiple rules generate' not in result[1]):
+                return result
+            if result is None:
+                # Ninja calls an existing file with no rule "no work", even when its C changed.
+                # Accept the normal graph only when it really has a build rule for this target.
+                ok, query = self.run([tool, *args, '-t', 'query', rel], log=log, timeout=UNIT_SECONDS)
+                if not ok or not re.search(r'^\s+input:\s*(?!phony(?:\s|$))\S+', query, re.M):
+                    return False, 'This Ninja project has no usable C build rule for the candidate.'
+            # A project may later add the candidate to its own graph.
+        return self.run([tool, *args, rel], log=log, timeout=UNIT_SECONDS)
 
     def build_units(self, units: list[Unit], log=lambda *_: None) -> list[tuple[bool, str]]:
         """Build several units' objects in one run of the build: (built, the log) for each, in the order given.
@@ -2076,7 +2109,7 @@ class ForkProject:
         cfg = self.objdiff_config()
         make = cfg.get("custom_make") or "make"
         tool = _tool(make) or make
-        if len(units) < 2 or any(u.base is None for u in units) or Path(tool).stem.lower() != "ninja":
+        if len(units) < 2 or any(u.base is None or u.scaffold for u in units) or Path(tool).stem.lower() != "ninja":
             return [self.build_unit(u, log=log) for u in units]
 
         def alone(u: Unit):

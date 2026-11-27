@@ -86,6 +86,29 @@ def matched(platform: str, skip: tuple[str, ...] = ()) -> list[str]:
     return [f for f in FUNCTIONS if f not in NEAR_MISSES.get(platform, ()) and f not in skip]
 
 
+def test_export_rejudges_a_saved_match_with_an_extra_function(tmp_path):
+    if not _ready('n64'):
+        pytest.skip('needs the N64 compiler and binutils')
+    net, slug = _decompile(tmp_path, 'n64', skip=('abs_s32',))
+    agent, _ = net.local_agent('extra-function-test')
+    body = csource.get((GAME / 'game.c').read_text(), 'abs_s32')
+    source = body + '\ns32 unrelated_export_helper(s32 x) { return x + 7; }\n'
+    assert net.attempt(agent, 'abs_s32', source, slug)['matched']
+    out = net.export_rom(slug, log=lambda *_: None)
+    assert out['identical'] and out['matched'] == len(matched('n64')) and not out['fallback']
+    tree = Path(out['path'])
+    manifest = json.loads((tree / 'build.json').read_text())
+    fn = next(f for f in manifest['functions'] if f['name'] == 'abs_s32')
+    assert fn['entry_only'] and 'unrelated_export_helper' in (tree / fn['c']).read_text()
+    # An edited candidate must be recompiled and compared again; the stored target is never a fallback.
+    src = tree / fn['c']
+    text = src.read_text()
+    assert '-v : v' in text
+    src.write_text(text.replace('-v : v', '-v : v + 1'))
+    result = subprocess.run([sys.executable, 'build.py', 'check', 'abs_s32'], cwd=tree, capture_output=True, text=True)
+    assert result.returncode != 0
+
+
 @pytest.mark.parametrize("platform", ["n64", "ps2", "psp"])
 def test_export_rebuilds_the_game(tmp_path, platform):
     if not _ready(platform):
@@ -220,7 +243,7 @@ def test_generated_address_references_link_across_objects(tmp_path):
     from decompnet.rom import export
 
     shutil.copyfile(Path(export.__file__).with_name("export_build.py"), tmp_path / "build.py")
-    config = {"image": "baserom.z64", "symbols": {}, "functions": [
+    config = {"image": "baserom.z64", "symbols": {}, "assembly": [{"obj": "first.o"}], "functions": [
         {"name": "first", "rom": 0, "vram": 0x80000000},
         {"name": "second", "rom": 16, "vram": 0x80000010}], "segments": [
         {"name": "code", "kind": "code", "start": 0, "end": 24, "vram": 0x80000000,
@@ -238,7 +261,7 @@ def test_generated_address_references_link_across_objects(tmp_path):
         subprocess.run([assembler, "-EB", "-mips2", "-no-pad-sections", "-o", f"{name}.o", f"{name}.s"],
                        cwd=tmp_path, check=True, capture_output=True)
     script = runpy.run_path(str(tmp_path / "build.py"))
-    text = script["linker_script"]({"first": "first.o", "second": "second.o"},
+    text = script["linker_script"]({"second": "second.o"},
                                       [(0x80000000, 0, "first.o"), (0x80000010, 16, "second.o")], [])
     (tmp_path / "game.ld").write_text(text)
     linked = subprocess.run([linker, "-EB", "-T", "game.ld", "-o", "game.elf", "first.o", "second.o"],
@@ -251,7 +274,7 @@ def test_generated_address_references_link_across_objects(tmp_path):
     (tmp_path / "first.s").write_text(sources["first"].replace("D_80001000", "unknown_data"))
     subprocess.run([assembler, "-EB", "-mips2", "-no-pad-sections", "-o", "first.o", "first.s"],
                    cwd=tmp_path, check=True, capture_output=True)
-    text = script["linker_script"]({"first": "first.o", "second": "second.o"},
+    text = script["linker_script"]({"second": "second.o"},
                                       [(0x80000000, 0, "first.o"), (0x80000010, 16, "second.o")], [])
     (tmp_path / "game.ld").write_text(text)
     linked = subprocess.run([linker, "-EB", "-T", "game.ld", "-o", "game.elf", "first.o", "second.o"],
@@ -295,6 +318,15 @@ def test_export_moves_data_boundary_past_known_function_tail():
     assert result['segments'][0]['subsegments'][1][0] == 0x11c
     assert config['segments'][0]['subsegments'][1][0] == 0x118  # the project's config stays unchanged
     assert _export_segments(config, [{'vram': 0x80000010, 'size': 8}])['segments'] == config['segments']
+
+
+def test_export_split_uses_its_generated_symbol_file():
+    from decompnet.rom.export import _export_segments
+
+    config = {'options': {'symbol_addrs_path': ['custom/game-symbols.txt']}, 'segments': [[0]]}
+    result = _export_segments(config, [])
+    assert result['options']['symbol_addrs_path'] == ['symbol_addrs.txt']
+    assert config['options']['symbol_addrs_path'] == ['custom/game-symbols.txt']
 
 
 def test_export_refuses_to_consume_an_entire_data_segment():
@@ -549,7 +581,7 @@ def test_export_preserves_bss_extent_when_text_owns_its_labels(tmp_path):
 
 
 def test_export_symbols_use_rom_scopes_for_overlapping_banks():
-    from decompnet.rom.export import _symbol_lines
+    from decompnet.rom.export import ExportError, _symbol_lines
 
     class Symbols:
         by_name = {}
@@ -567,6 +599,29 @@ def test_export_symbols_use_rom_scopes_for_overlapping_banks():
         'first = 0x80001000; // type:func size:0x8 rom:0x100 segment:bank_a',
         'second = 0x80001000; // type:func size:0xC rom:0x200 segment:bank_b',
     ]
+    banks[0].pop('exclusive_ram_id')
+    with pytest.raises(ExportError, match='first.*ROM offset 0x100.*Review its ROM-to-memory mapping'):
+        _symbol_lines(Network(),{'id':1},rows,segments=banks)
+
+
+def test_export_uses_the_current_function_address_when_a_stale_symbol_has_the_same_name():
+    from types import SimpleNamespace
+
+    from decompnet.rom.export import _symbol_lines
+
+    stale = SimpleNamespace(name='moved_function', address=0x80002000)
+    other = SimpleNamespace(name='other_data', address=0x80003000)
+    class Symbols:
+        by_name = {stale.name: stale, other.name: other}
+        def name_at(self, address):
+            return (next(s.name for s in self.by_name.values() if s.address == address),)
+    class Network:
+        def symbols(self, project):
+            return Symbols()
+
+    rows = [dict(name='moved_function', vram=0x80001000, rom_offset=0x100, size=8)]
+    assert _symbol_lines(Network(), {'id': 1}, rows) == [
+        'moved_function = 0x80001000; // type:func size:0x8', 'other_data = 0x80003000;']
 
 
 def test_export_gap_objects_are_scoped_to_their_rom_bank(tmp_path):
@@ -657,3 +712,105 @@ def test_unresolved_scoped_automatic_names_keep_their_address():
     assert _auto_addresses([text], {'D_80028D68_code_80027AF0'}) == {
         'func_80123400_code_80120000': 0x80123400,
     }
+    assert _auto_addresses(['jal func_8026E0B4_\n.word func_8026A964_'], set()) == {
+        'func_8026E0B4_': 0x8026E0B4, 'func_8026A964_': 0x8026A964,
+    }
+
+
+def test_export_removes_foreign_bank_labels_only(tmp_path):
+    from decompnet.rom.export import remove_foreign_bank_labels
+
+    folder = tmp_path/'asm'/'nonmatchings'
+    folder.mkdir(parents=True)
+    source = folder/'bank.s'
+    source.write_text('nonmatching entry\nalabel entry\n/* 000200 80001000 00000000 */ .word 0\n'
+                      'nonmatching real\nglabel real\n/* 000204 80001004 03E00008 */ jr $ra\n')
+    remove_foreign_bank_labels(tmp_path, [dict(name='entry', rom_offset=0x100),
+                                          dict(name='real', rom_offset=0x204)])
+    assert source.read_text() == ('/* 000200 80001000 00000000 */ .word 0\n'
+                                  'nonmatching real\nglabel real\n/* 000204 80001004 03E00008 */ jr $ra\n')
+
+
+def test_export_removes_a_foreign_entrys_matching_endlabel(tmp_path):
+    from decompnet.rom.export import remove_foreign_bank_labels
+
+    folder = tmp_path/'asm'/'nonmatchings'
+    folder.mkdir(parents=True)
+    source = folder/'bank.s'
+    source.write_text('glabel foreign\n/* 000200 80001000 00000000 */ .word 0\nendlabel foreign\n'
+                      'glabel own\n/* 000204 80001004 03E00008 */ jr $ra\nendlabel own\n')
+    remove_foreign_bank_labels(tmp_path, [dict(name='foreign', rom_offset=0x100),
+                                          dict(name='own', rom_offset=0x204)])
+    assert source.read_text() == ('/* 000200 80001000 00000000 */ .word 0\n'
+                                  'glabel own\n/* 000204 80001004 03E00008 */ jr $ra\nendlabel own\n')
+
+
+def test_export_keeps_scoped_local_labels_only_in_their_rom_bank(tmp_path):
+    from decompnet.rom.export import remove_foreign_bank_labels
+
+    folder = tmp_path/'asm'/'nonmatchings'
+    folder.mkdir(parents=True)
+    source = folder/'bank.s'
+    source.write_text('nonmatching .L80001004_code_80001000\nalabel .L80001004_code_80001000\n'
+                      '/* 000204 80001004 00000000 */ .word 0\n'
+                      'nonmatching .L80001004_code_80001000\nalabel .L80001004_code_80001000\n'
+                      '/* 000104 80001004 00000000 */ .word 0\n')
+    segments = [dict(type='code', name='code_80001000', start=0x100, end=0x110, vram=0x80001000)]
+    remove_foreign_bank_labels(tmp_path, [], segments)
+    assert source.read_text() == ('/* 000204 80001004 00000000 */ .word 0\n'
+                                  'nonmatching .L80001004_code_80001000\nalabel .L80001004_code_80001000\n'
+                                  '/* 000104 80001004 00000000 */ .word 0\n')
+
+
+def test_export_removes_shadowed_data_labels_but_keeps_original_bytes(tmp_path):
+    from decompnet.rom.export import remove_shadowed_bss
+
+    data = tmp_path/'asm'/'data'
+    text = tmp_path/'asm'/'nonmatchings'
+    data.mkdir(parents=True)
+    text.mkdir()
+    (text/'unit.s').write_text('glabel entry\n    nop\n')
+    source = data/'layout.data.s'
+    source.write_text('nonmatching entry\nalabel entry\n    .word 7\ndlabel other\n    .word 9\n')
+    remove_shadowed_bss(tmp_path, [{'name': 'entry'}])
+    assert source.read_text() == '    .word 7\ndlabel other\n    .word 9\n'
+
+
+@pytest.mark.parametrize("platform", ["n64", "ps1", "ps2", "psp"])
+def test_export_keeps_backward_delay_slot_address_high(platform):
+    """A loop's delay-slot HI16 uses the LO16 at its backwards branch target."""
+    from decompnet.consoles import get
+
+    console = get(platform)
+    order = 'big' if console.big_endian else 'little'
+    words = [0x8c22e79c, 0x1440fffe, 0x3c01800c]
+    instructions = [
+        'lw $v0, %lo(D_80057698 + (0x67104 & 0xFFFF))($at)',
+        'bnez $v0, target',
+        'lui $at, %hi(D_80057698 + 0x67104)',
+    ]
+    text = ''.join(f'/* {i * 4:06X} {0x80001000 + i * 4:08X} '
+                   f'{word.to_bytes(4, order).hex()} */ {instruction}\n'
+                   for i, (word, instruction) in enumerate(zip(words, instructions)))
+    result = console.export_asm(text)
+    assert '.word 0x3C01800C' in result
+    assert console.export_asm(result) == result
+    assert console.export_asm(text.replace('0x67104 &', '0x67105 &')) == text.replace('0x67104 &', '0x67105 &')
+    forward = text.replace(words[1].to_bytes(4, order).hex(), (0x14400001).to_bytes(4, order).hex())
+    assert console.export_asm(forward) == forward
+
+
+def test_foreign_scoped_local_labels_are_not_exported_twice(tmp_path):
+    from decompnet.rom.export import remove_foreign_bank_labels
+
+    root = tmp_path / 'asm' / 'nonmatchings'
+    foreign = root / 'code_80002000' / 'foreign.s'
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text('nonmatching .L80001010_code_80001000\nalabel .L80001010_code_80001000\n/* 200 80001010 00000000 */ .word 0\n')
+    own = root / 'code_80001000' / 'own.s'
+    own.parent.mkdir(parents=True)
+    own.write_text('nonmatching .L80001010_code_80001000\nalabel .L80001010_code_80001000\n/* 100 80001010 00000000 */ .word 0\n')
+    remove_foreign_bank_labels(tmp_path, [])
+    assert '.L80001010_code_80001000' not in foreign.read_text()
+    assert 'alabel .L80001010_code_80001000' in own.read_text()
+    assert '.word 0' in foreign.read_text()

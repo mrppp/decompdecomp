@@ -89,7 +89,9 @@ function setup(){
     const second=t.run('loadRomExplorer()');await tick();
     assert.equal(t.calls.filter(c=>c.options?.method==='POST').length,1);
     start.resolve({job:'pending'});await Promise.all([first,second]);
-    assert.equal(t.renders.length,1);
+    // The saved map is drawn at once, and once more by the one job both loads share.
+    assert.equal(t.calls.filter(c=>c.url?.includes('cached=1')).length,1);
+    assert.equal(t.renders.length,2);
   }
   // Fresh windows discover active work before any large saved-map request.
   {
@@ -348,6 +350,24 @@ function setup(){
     t.run("romView().report={regions:[{id:'b',kind:'compressed',symbols:[],mappings:[],functions:[],archive_path:'Stages/stage2.V3S'},{id:'a',kind:'compressed',symbols:[],mappings:[],functions:[],archive_path:'Stages/stage1.V3S'},{id:'c',kind:'unknown',symbols:[],mappings:[],functions:[]}]};romView().sort='name';romView().direction=1");
     assert.equal(t.run("romRows(romView()).map(r=>r.id).join(',')"),'c,a,b');
     t.run("romView().query='stage2.v3s'");assert.equal(t.run("romRows(romView()).map(r=>r.id).join(',')"),'b');
+  }
+  // A split region still opens the detected container at its true start.
+  {
+    const t=setup();
+    const html=t.run("romAssetHTML({start:0x2000,size:64,detected_asset:{offset:0x1800,media:'metadata',preview_settings:{format:'auto'}}})");
+    assert.match(html,/data-asset-block_offset value="0x1800"/);
+  }
+  // A separate compressed palette is sent only for a decoded indexed image.
+  {
+    const t=setup(),body=element();t.context.body=body;
+    for(const [key,value] of Object.entries({source:'decoded',format:'ci8',palette_block_offset:'0x1200',palette_offset:'0'}))body.querySelector(`[data-asset-${key}]`).value=value;
+    assert.equal(t.run('romAssetOptions(body).palette_block_offset'),'0x1200');
+    body.querySelector('[data-asset-palette_rom_offset]').value='0x1000';body.querySelector('[data-asset-flip_y]').value='true';
+    assert.equal(t.run('romAssetOptions(body).palette_rom_offset'),'0x1000');assert.equal(t.run('romAssetOptions(body).flip_y'),true);
+    body.querySelector('[data-asset-source]').value='rom';
+    assert.equal(t.run('romAssetOptions(body).palette_block_offset'),undefined);
+    body.querySelector('[data-asset-source]').value='decoded';body.querySelector('[data-asset-format]').value='rgba5551-be';
+    assert.equal(t.run('romAssetOptions(body).palette_block_offset'),undefined);
   }
   console.log('ROM Explorer lifecycle, sorting and notes passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});

@@ -62,6 +62,32 @@ def test_sine_cycle_is_split_out_of_mapped_text(tmp_path):
     assert not list(inline_data.spans(image[:1024] + b'\0\0' + image[1026:]))
 
 
+def test_audio_bootstrap_is_not_cpu_code_when_followed_by_verified_audio(tmp_path):
+    import struct
+
+    from decompnet.consoles.n64.port import RSPBOOT
+
+    boot = 0x20
+    image = bytearray(boot + 0xd0 + 0x1000)
+    image[boot:boot + len(RSPBOOT)] = RSPBOOT
+    image[boot + 0xd0:boot + 0xe0] = bytes.fromhex('2018036020170f908c3c00308c3b0034')
+    for i in range(64):
+        struct.pack_into('>I', image, boot + 0x100 + i * 4, 0x4a000000)
+    for i in range(3):
+        struct.pack_into('>I', image, boot + 0x200 + i * 4, 0x09000400 + i)
+    config = tmp_path / 'game.yaml'
+    end = boot + 0x180  # the guessed CPU range ends in the verified RSP program
+    config.write_text(yaml.safe_dump(dict(segments=[
+        dict(type='code', start=0, vram=0x80000000, subsegments=[[0, 'c', 'program']]),
+        dict(type='bin', start=end), [len(image)],
+    ])))
+    inline_data.apply(config, image, lambda _: None)
+    assert code_ranges(config) == [(0, boot, 0x80000000)]
+    assert yaml.safe_load(config.read_text())['segments'][0]['subsegments'] == [
+        [0, 'c', 'program'], [boot, 'rodata', 'program_data_20'],
+    ]
+
+
 def test_audio_coprocessor_suffix_is_data_even_if_the_text_mapping_ends_inside_it(tmp_path):
     import struct
 
@@ -168,3 +194,51 @@ def test_terminal_header_does_not_leave_a_code_fragment(tmp_path, monkeypatch):
         subsegments=[[0, 'c', 'program']]), [20], [len(context)]])))
     inline_data.apply(config, context, lambda _: None)
     assert code_ranges(config) == [(0, 8, 0x80000000)]
+
+
+def test_leading_code_pointer_table_requires_mapped_targets_and_a_frame(tmp_path):
+    import struct
+
+    words = [0x80010000, 0x80010004, 0x80010000, 0, 0x27bdffe8, 0x03e00008, 0x27bd0018]
+    image = struct.pack('>7I', *words) + bytes(0x100)
+    ranges = [(0, 28, 0x80000000), (28, len(image), 0x80010000)]
+    assert list(inline_data._leading_code_pointer_tables(image, ranges)) == [(0, 16)]
+    assert not list(inline_data._leading_code_pointer_tables(image, ranges[:1]))
+    changed = bytearray(image); struct.pack_into('>I', changed, 4, 0x80020000)
+    assert not list(inline_data._leading_code_pointer_tables(bytes(changed), ranges))
+    changed = bytearray(image); struct.pack_into('>I', changed, 16, 0)
+    assert not list(inline_data._leading_code_pointer_tables(bytes(changed), ranges))
+
+
+def test_unentered_call_word_between_return_and_frame_is_data():
+    import struct
+
+    image = bytearray(64)
+    struct.pack_into('>4I', image, 16, 0x03e00008, 0x27bd0018, 0x0c000100, 0x27bdffe0)
+    ranges = [(0, len(image), 0x80000000)]
+    assert list(inline_data._unentered_call_words(image, ranges)) == [(24, 28)]
+    struct.pack_into('>I', image, 0, 0x0c000006)
+    assert not list(inline_data._unentered_call_words(image, ranges))
+    struct.pack_into('>I', image, 0, 0x80000018)
+    assert not list(inline_data._unentered_call_words(image, ranges))
+    struct.pack_into('>2I', image, 0, 0x3c048000, 0x24840018)
+    assert not list(inline_data._unentered_call_words(image, ranges))
+
+
+def test_unentered_invalid_jump_before_closed_frame_is_data():
+    import struct
+
+    # The first word is not a viable RDRAM jump; the following framed leaf is closed.
+    image = bytearray(128)
+    struct.pack_into('>5I', image, 16, 0x0a7d2044, 0x27bdffe0, 0xafbf001c, 0x03e00008, 0x27bd0020)
+    ranges = [(16, 36, 0x80001000)]
+    assert list(inline_data._unentered_invalid_jump_prefixes(bytes(image), ranges)) == [(16, 20)]
+    # An address reference, a call, a reachable jump or an unclosed successor retains it.
+    struct.pack_into('>I', image, 0, 0x80001000)
+    assert not list(inline_data._unentered_invalid_jump_prefixes(bytes(image), ranges))
+    struct.pack_into('>I', image, 0, 0)
+    struct.pack_into('>I', image, 16, 0x08000408)
+    assert not list(inline_data._unentered_invalid_jump_prefixes(bytes(image), ranges))
+    struct.pack_into('>I', image, 16, 0x0a7d2044)
+    struct.pack_into('>I', image, 28, 0)
+    assert not list(inline_data._unentered_invalid_jump_prefixes(bytes(image), ranges))

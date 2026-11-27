@@ -19,6 +19,7 @@ from ...request_timing import build as timed_build
 from ...request_timing import timed_lock
 from ...rom import match
 from ...rom.symbols import SymbolTable
+from ...store import in_transaction
 from .. import attempt_workers
 from ..function_names import canonical_source
 from .common import _AUTO_TOKEN, BATCH_INSNS
@@ -48,18 +49,36 @@ class JudgeMixin:
         return super()._compile_batch(proj, header, sources, fn)
 
     def _rom_target(self, fn) -> match.RomTarget:
-        cfg = self.cfg(self.project_store(fn['project_id']).one("SELECT config FROM projects WHERE id=?", fn["project_id"]))
+        project_id = fn['project_id']
+        store = self.project_store(project_id)
         session = compile_sessions.current()
-        key = None
-        if session is not None:
-            row = dict(fn)
-            key = ('rom', id(self), fn['project_id'], repr(cfg),
-                   tuple((k, row.get(k)) for k in ('name', 'target', 'relocs', 'vram', 'meta')))
-            if key in session.targets:return session.targets[key]
+
+        def load_config():
+            return self.cfg(store.one("SELECT config FROM projects WHERE id=?", project_id))
+
+        if session is None or in_transaction():
+            cfg = load_config()
+            return consoles.of(cfg).target_from_row(fn, cfg)
+
+        # A session's target hit needs only the committed project revision. Bypass
+        # target caching in write transactions because rollback can reuse a revision.
+        tracked = getattr(store, 'project_rows_tracked', False)
+        if tracked:
+            revision = store.read_version('project_rows', project_id)
+        else:
+            cfg = load_config()
+            revision = repr(cfg)
+        row = dict(fn)
+        key = ('rom', id(self), project_id, revision,
+               tuple(row.get(k) for k in ('name', 'target', 'relocs', 'vram', 'rom_offset', 'meta')))
+        if key in session.targets:
+            return session.targets[key]
+        if tracked:
+            cfg = store.read_cache.get(('rom-target-config', project_id), revision, load_config)
         target = consoles.of(cfg).target_from_row(fn, cfg)
-        if session is not None:
-            session.targets[key] = target
-            while len(session.targets) > 16:session.targets.popitem(last=False)
+        session.targets[key] = target
+        while len(session.targets) > 16:
+            session.targets.popitem(last=False)
         return target
 
     def _make_target(self, proj, rf, syms: SymbolTable):
@@ -88,14 +107,14 @@ class JudgeMixin:
             while len(session.targets) > 16:session.targets.popitem(last=False)
         return obj
 
-    def _evaluate(self, fn, proj, obj: bytes):
+    def _evaluate(self, fn, proj, obj: bytes, *, diagnostics=True):
         from ...attempt_status import update
         update('checking', fn['name'])
         if not self.is_rom(proj):
             return super()._evaluate(fn, proj, obj)
         # The verdict needs only the link. The advisory diagnostics and their search cache belong to the full engine;
         # an engine without them (a bare Core, as tests/test_overlay_reader.py judges with) gets the verdict alone.
-        diagnose = getattr(self, '_link_diagnostics', None)
+        diagnose = getattr(self, '_link_diagnostics', None) if diagnostics else None
         link_scope = self._diagnostic_scope(fn, proj) if diagnose is not None else None
         with compile_timing.phase('link'):
             target = self._rom_target(fn)
@@ -117,7 +136,12 @@ class JudgeMixin:
                 console = console(proj)
 
             def local_link():
-                read = self.reader(proj, fn)
+                from ...rom.verifier_link import PackReader, project_inputs
+
+                if project_inputs.get() and type(target) is match.RomTarget and "rom_offset" in fn.keys():
+                    read = PackReader(self, proj, fn)
+                else:
+                    read = self.reader(proj, fn)
                 session = compile_sessions.current()
                 if not (_search_evaluation.get() and link_scope is not None and session is not None):
                     return console.link_function(obj, fn["name"], target, symbols, read)
@@ -701,9 +725,9 @@ class JudgeMixin:
 
     @timed_build
     @trial
-    def _judge_with(self, proj, fn, toolchain: str, flags: list[str], source: str):
+    def _judge_with(self, proj, fn, toolchain: str, flags: list[str], source: str, *, evidence=False):
         """(matched, diff or None, log) for C built with this compiler and flags, judged like an attempt, recording
-        nothing. The candidate's advisory checks stay in `_last_judge_checks` for the caller that wants them (`jump_tables`:
+        nothing. A queued score-only judge can request aligned evidence in place of a rendered diff. Advisory checks stay in `_last_judge_checks` for the caller that wants them (`jump_tables`:
         the cases whose compiled table entry differs, when every instruction is exact and only the table's data is not)."""
         self._last_judge_checks = {}
         from ...compiler import compile_source
@@ -719,12 +743,15 @@ class JudgeMixin:
         if not result.ok:
             compiler_flags.remember(self,toolchain,flags,result.log)
             return False, None, result.log
-        cand, verdict, problems = self._evaluate(fn, proj, result.obj)
+        # The queue consumes a score and link problems; full diagnostics would analyse the same table again.
+        options = {"diagnostics": False} if evidence else {}
+        cand, verdict, problems = self._evaluate(fn, proj, result.obj, **options)
         if cand is None:
             return False, None, "the function isn't in what it compiled to"
-        d = scoring.diff(self._target_obj(fn, proj), cand)
+        compare = scoring.score_evidence if evidence else scoring.diff
+        d = compare(self._target_obj(fn, proj), cand)
         matched = verdict if verdict is not None else d.bytes_match
-        if not matched and proj['arch'] == 'mips':
+        if not evidence and not matched and proj['arch'] == 'mips':
             self._last_judge_checks = dict(self._candidate_checks(fn, proj, result.obj))
         return matched, d, "\n".join(problems)
 

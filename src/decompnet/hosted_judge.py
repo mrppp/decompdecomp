@@ -20,7 +20,8 @@ Requests:
   carries "code", a digest of the candidate's instructions: two sources with one digest compiled the same (the skill's
   invariant-spelling hint, invariant.py).
 - {"op": "function", "slug", "name", "vram" (optional, for overlays)} -> {"name", "vram", "target" (hex), "unit",
-  "arch", "asm" (the target's assembly text), "header" (the project's typedefs and externs the judge prepends),
+  "arch", "asm" (the target's assembly text), "asm_names" ({split name: current name} of its renamed symbols),
+  "header" (the project's typedefs and externs the judge prepends),
   "compiler": {"toolchain", "flags"} (this function's own profile), "tables" ([[low, [targets...]], ...]: its jump
   tables, as switch_tables.read), "callees" (its callees' matched C, capture_followup_repairs.callee_evidence) and
   "entry_scope" (promoted_entry_repairs.scope), "words" ({symbol: word} of its float constants, float_literal_words.read): the context the app's draft path hands draft_repairs.variants}: everything a local search needs to judge without being told the function's bytes
@@ -86,6 +87,7 @@ def _installed(toolchains, tid) -> bool:
 
 def judge(net, request: dict) -> dict:
     from .network import Network
+    from .scoring import SCORE_VERSION
     slug = str(request.get("slug") or "")
     wanted = request.get("function") or {}
     compiler = request.get("compiler") or {}
@@ -110,12 +112,26 @@ def judge(net, request: dict) -> dict:
         return {"error": "the target bytes aren't hex"}
     if bytes(fn["target"] or b"") != expected:
         return {"error": f"{slug}'s {fn['name']} here has other target bytes: another build of the game"}
+    if expected_header := request.get("header_sha256"):
+        import hashlib
+
+        header = net._context(proj["id"], fn["unit"])["header"]
+        if hashlib.sha256(header.encode()).hexdigest() != expected_header:
+            return {"error": "the verification pack has a different context header"}
     toolchain = compiler.get("toolchain")
     flags = compiler.get("flags") or []
     if not toolchain:
         return {"error": "no compiler named"}
     net._last_judge_checks = {}
-    matched, diff, log = net._judge_with(proj, fn, toolchain, list(flags), source)
+    evidence = request.get("score_evidence") == SCORE_VERSION and not (request.get("diff") or request.get("raw_rows"))
+    options = {"evidence": True} if evidence else {}
+    matched, diff, log = net._judge_with(proj, fn, toolchain, list(flags), source, **options)
+    if evidence and diff is not None:
+        from dataclasses import asdict
+
+        detail = "byte-identical" if matched else (log or "")[-2000:]
+        return {"score_evidence": {"version": SCORE_VERSION, "matched": matched, "comparison": asdict(diff)},
+                "detail": detail}
     checks = getattr(net, "_last_judge_checks", None) or {}
     rows = request.get("rows")  # how many rows the diff shows (default 60); the rest is counted in its last line
     shown = {}
@@ -169,12 +185,14 @@ def function_info(net, request: dict) -> dict:
     if isinstance(found, dict):
         return found
     proj, fn = found
-    from .app import draft_repairs, float_literal_words, switch_tables
+    from .app import draft_repairs, float_literal_words, repair_asm, switch_tables
     profile = compiler_for(net.cfg(proj), fn["vram"], fn)
     # What draft_repairs.variants needs beyond the source: families like switch_gap_goto read the jump tables, so a
     # script that calls variants without them never sees those families fire.
     return {"name": fn["name"], "vram": fn["vram"], "target": bytes(fn["target"] or b"").hex(), "unit": fn["unit"],
             "arch": proj["arch"], "big_endian": bool(proj["big_endian"]), "asm": fn["asm"] or "",
+            # the assembly's automatic names that have been renamed since: the families read the C's spelling (#4304)
+            "asm_names": repair_asm.renames(net, proj, fn["asm"] or ""),
             "header": net._context(proj["id"], fn["unit"])["header"],
             "tables": [[low, list(targets)] for low, targets in switch_tables.read(net, proj, fn)],
             "callees": draft_repairs.capture_followup_repairs.callee_evidence(net, proj, fn, fn["best_source"] or ""),
@@ -376,7 +394,7 @@ class Packs:
 
     def __init__(self, folder: Path, cache: Path):
         self.folder, self.cache = Path(folder), Path(cache)
-        self.nets: dict[str, tuple[tuple, object]] = {}
+        self.nets: dict[str, tuple[tuple, object, str]] = {}
 
     def slugs(self) -> list[str]:
         return sorted(p.stem for p in self.folder.glob("*.sqlite3"))
@@ -385,15 +403,20 @@ class Packs:
         path = self.folder / f"{slug}.sqlite3"
         if not path.is_file():
             return None
-        version = (path.stat().st_mtime_ns, path.stat().st_size)
+        stat = path.stat()
+        version = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
         if slug not in self.nets or self.nets[slug][0] != version:  # (a newer pack: a new scratch project)
             from .app.tool_reader import reader_progress
-            from .hosted_pack import scratch
+            from .hosted_pack import digest, scratch
+            pack_sha256 = digest(path)
             net, found = scratch(path, self.cache)
             if found != slug:
                 raise ValueError(f"{path.name} is the pack of {found!r}")
             reader_progress(net)
-            self.nets[slug] = (version, net)
+            stat = path.stat()
+            if version != (stat.st_ino, stat.st_mtime_ns, stat.st_size):
+                raise ValueError(f"the pack for {slug} changed while it was opening")
+            self.nets[slug] = (version, net, pack_sha256)
         return self.nets[slug][1]
 
     def describe(self) -> dict:
@@ -402,22 +425,81 @@ class Packs:
         return {"projects": self.slugs(), "toolchains": installed, "version": __version__}
 
     def judge(self, request: dict) -> dict:
-        net = self.net(str(request.get("slug") or ""))
+        slug = str(request.get("slug") or "")
+        net = self.net(slug)
         if net is None:
             return {"error": f"this computer has no verification pack for {request.get('slug')!r}"}
-        return judge(net, request)
+        pack_sha256 = request.get("pack_sha256")
+        if pack_sha256 and pack_sha256 != self.nets[slug][2]:
+            return {"error": "the verification pack is a different revision"}
+        reply = judge(net, request)
+        if pack_sha256 and "error" not in reply:
+            reply["pack_sha256"] = pack_sha256
+        return reply
+
+
+def _judge_with_mips_linker(packs, request, lines, out):
+    from .rom.match import elf_preparer, instruction_linker, rom_linker
+    from .rom.verifier_link import project_inputs
+
+    def exchange(operation, plan, lookup=None):
+        out.write(json.dumps({operation: plan}) + "\n")
+        out.flush()
+        for line in lines:
+            reply = json.loads(line)
+            if isinstance(reply, dict) and "error" in reply:
+                raise RuntimeError(reply["error"])
+            if lookup is None or not isinstance(reply, dict) or "rom_lookup" not in reply:
+                return reply
+            try:
+                value = {"rom_value": lookup(reply["rom_lookup"])}
+            except Exception as error:
+                value = {"error": str(error)}
+            out.write(json.dumps(value) + "\n")
+            out.flush()
+        raise EOFError("verifier ended during a MIPS link request")
+
+    def link(code, target, patches):
+        plan = {"code": code.hex(), "target": target.code.hex(), "big_endian": target.big_endian,
+                "gp": target.gp & 0xFFFFFFFF, "patches": patches}
+        reply = exchange("link_mips", plan)
+        return bytes.fromhex(reply["linked"]), reply["instructions_exact"]
+
+    def prepare(obj, name):
+        return exchange("parse_mips", {"object": obj.hex(), "name": name})
+
+    def link_rom(obj, target, symbols, read):
+        from .rom.verifier_link import link_rom as run
+
+        return run(obj, target, symbols, read, exchange)
+
+    inputs_token = project_inputs.set(request.get("rom_mips") == 1 and request.get("project_mips") == 1)
+    rom_token = rom_linker.set(link_rom if request.get("rom_mips") == 1 else None)
+    link_token = instruction_linker.set(link)
+    prepare_token = elf_preparer.set(prepare if request.get("parse_mips") == 1 else None)
+    try:
+        return packs.judge(request)
+    finally:
+        elf_preparer.reset(prepare_token)
+        instruction_linker.reset(link_token)
+        rom_linker.reset(rom_token)
+        project_inputs.reset(inputs_token)
 
 
 def serve(net, lines=sys.stdin, out=sys.stdout) -> None:
     """Answer requests from a home's network, or from Packs."""
     packs = net if isinstance(net, Packs) else None
+    lines = iter(lines)
     for line in lines:
         try:
             request = json.loads(line)
             if request.get("op") == "describe":
                 reply = packs.describe() if packs else describe(net)
             elif request.get("op") == "judge":
-                reply = packs.judge(request) if packs else judge(net, request)
+                if packs and request.get("pack_sha256") and request.get("link_mips") == 1:
+                    reply = _judge_with_mips_linker(packs, request, lines, out)
+                else:
+                    reply = packs.judge(request) if packs else judge(net, request)
             elif request.get("op") == "function" and not packs:
                 reply = function_info(net, request)
             elif request.get("op") == "passes" and not packs:
