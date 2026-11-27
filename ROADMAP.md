@@ -836,7 +836,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Compile-tested draft refresh and saved diagnostics | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ m2c | ✓ Ghidra | — | — draft generator planned | ✓ supported draft generators |
 | Initial callback, forwarded-argument and overlapping-frame recovery | ✓ bounded MIPS | ✓ bounded MIPS | ✓ bounded MIPS | — | — | ✓ bounded MIPS | — | — processor reader planned | — processor reader planned | — | — processor reader planned | ✓ MIPS C; other readers planned |
 | Autopilot: free matches from drafts | ✓ | ✓ | ✓ | twins only | — | ✓ | ✓ (demo: 34 matches) | ✓ | ✓ exact drafts of tiny shapes (32-bit); Ghidra's made compilable | ✓ as PC | twins only (no drafts yet) | — |
-| Drafts follow the header, made in the background; `redraft` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ (m2c and `redraft`) | — | ✓ Ghidra's | ✓ Ghidra's | — | — |
+| Drafts follow the header (and, in ROM mode, matched callees' own prototypes), made in the background; `redraft` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ (m2c and `redraft`) | — | ✓ Ghidra's | ✓ Ghidra's | — | — |
 | C++ methods drafted as `Class::method` | ✓ | ✓ | ✓ | — | — | ✓ | — | — | ✓ (RTTI, and classes from the vtables constructors store) | ✓ (RTTI, vtables) | — | — |
 | Twins: free matches from identical code | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ (ran; no pairs in demo) | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Resumable source/profile queue and explicit assembly reconsideration | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — owned-build adapter planned | — owned-build adapter planned | — | — owned-build adapter planned | — owned-build adapter planned |
@@ -885,7 +885,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Compiler ranges and suggestions | ✓ | ✓ | ✓ | ✓ (ps3dev GCC, your SDK's) | — | ✓ | — | from scratch: per source file (`try_compiler`, Settings); else the project's build | per source file (`try_compiler`, Settings) | per source file (`try_compiler`, Settings): Visual C++ 7.0 / 7.1, your XDK's own | from scratch: per source file (`try_compiler`, Settings); else the project's build | the project's build |
 | Verified cleanup of rare compiler profiles | ✓ ROM mode | ✓ ROM mode | ✓ ROM mode | — | — | ✓ ROM mode | — | — | — | — | — | — |
 | Deep Permuter detects a near-match's compiler (`profile_detection`: its saved C under every installed profile, matched neighbours, the compiler map, code habits; told and tried first) | ✓ demo; copies of three real games | ✓ shared ROM path, unchecked | ✓ shared ROM path, unchecked | ✓ judge and neighbours, unchecked (code habits: MIPS only) | — | ✓ shared ROM path, unchecked | — | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build |
-| Profile probe: the few per-function profiles an open function's target points to (`-mfp32`, `-G8`, SN 2.7.2's builds, the 0001 + 0004-assembler pack for any `ldc1` target, KMC for libultra, the profile most matched neighbours use, the project's most used per-function profiles), judged once per saved C by the Deep Permuter and the autopilot's saved-source pass, an exact pair applied for that function only (`profile_probe`) | ✓ demo; the rules from ~1,000 hand matches of one SN 2.8.1 game | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules, unchecked | — | ✓ flag and neighbour rules, unchecked | — | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build |
+| Profile probe: the few per-function profiles an open function's target points to (`-mfp32`, `-G8`, SN 2.7.2's builds, the 0001 + 0004-assembler pack for any `ldc1` target, KMC for libultra, the profile most matched neighbours use, the project's most used per-function profiles, `-fforce-addr` for a target that reads offsets off a held symbol address), and every other -O level of the function's compiler (for the saved C and the machine draft, a clearly closer level then repaired by the Deep Permuter), judged once per saved C by the Deep Permuter and the autopilot's saved-source pass, an exact pair applied for that function only (`profile_probe`) | ✓ demo; the rules from ~1,000 hand matches of one SN 2.8.1 game | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules, unchecked | — | ✓ flag and neighbour rules, unchecked | ✓ -O levels and neighbour rules, unchecked | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build |
 | Repair rules learnt from the Deep Permuter's matches (`mined_rules`): a statement-sized change that made two different matches becomes a rule, tried first on other functions (C only) | ✓ unit tests; extraction measured on saved matches | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked |
 | Flag search (`search_flags`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | — (the project's flags only) | per source file (/Oy- on 32-bit, /O1, /Ob1) | per source file | — (the project's flags only) | the project's build |
 | Compiler map and the judge's survey | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | ✓ per source file, Rich header | the XDK build's compiler (no Rich header: one per game) | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | — |
@@ -902,6 +902,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Grouped ROM variants: selector, identities, checked shared C and single-repository export | ✓ demo + two real releases verified | — adapter validation pending | — adapter validation pending | — | — | — adapter validation pending | — | — object adapter planned | — object adapter planned | — | — object adapter planned | — object adapter planned |
 | Other releases of a game: found, paired, names, header types and code brought over | ✓ | — not yet run | — not yet run | — | — | — not yet run | — | — object pairing planned | — object pairing planned | — | — object pairing planned | — object pairing planned |
 | Automatic attempts from similar verified C | ✓ (ROM) | ✓ (ROM) | ✓ (ROM) | — | — | ✓ (ROM) | — | — | — | — | — | — |
+| Look-alikes in a game get a match's C at once, with its compiler profile and the target's constants (`lookalike_profiles`) | ✓ (ROM) | ✓ (ROM) not run yet | ✓ (ROM) not run yet | — | — | ✓ (ROM) not run yet | — | — no per-function profiles in project mode | — no per-function profiles in project mode | — | — no per-function profiles in project mode | — |
 | Bounded automatic reuse, tiny templates and local SDK C | ✓ (ROM) | ✓ (ROM) | ✓ (ROM) | — | — | ✓ (ROM) | — | — | — | — | — | — |
 | Shared knowledge (two models agree) | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Tidy each source file once it's polished (shared types in one header, names, dead declarations) | — | — | — | — | — | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -1177,6 +1178,25 @@ objects by instruction sequence, align their relocation names, and try the donor
 profiles. The destination judge verifies the resulting C.
 Project-mode similar-transfer support is planned: align target-object relocations and adapt file-local declarations before trying
 similar C through objdiff. Other processors need an instruction reader for this search.
+
+A matched function's open look-alikes in its own ROM game are tried as soon as it matches: its C with their names, with
+the donor's own per-function compiler profile (published for the receiver only on an exact judge's verdict) and a
+compile-guided search for the constants they differ in (32-bit LUI/ORI pairs, negative, repeated and swapped values;
+`app/lookalike_profiles.py`, `arch/mips_immediates.value_sites`). Planned: project mode, once its sources carry a
+per-file compiler the same way (DS's `set_file_compiler`) and its objects are aligned like the similar-code pass; other
+processors need their immediate reader.
+
+The similar-code pass now finds donors by content across every game (a shingle index of four-instruction runs,
+`similarity.ShingleIndex`, before the size-ordered shortlist), works best-first through a game's open functions by how
+alike their closest donor is, compares compiler profiles by the flags that change code (`similar_matches.codegen_key`),
+renames donors with another relocation layout from their aligned instruction runs, tries another game's donor with that
+game's profile the same way as a donor in its own game, and sends a new match to its look-alikes in the user's other active
+games at once. A transfer that doesn't build is tried once more with the donor header's missing types. Still ROM mode
+and MIPS only (project mode: the paragraph above); an idle game keeps a new match in a queue in the catalog and tries
+it first on its next pass. Struct fields at other offsets are moved (`decomprepair.field_offsets`: `p->f`, `p->a.b`,
+`a[i].f`, each dereference of a chain), calls are fitted to this game's prototypes (`call_arity`), numbers that differ
+between several games' C are set from the target's instructions (`similar_matches.consensus`), and the results drawer
+shows what each step found ("What each similar-code step found"). Planned: a callee inlined in one game but not the other.
 
 Cross-game C++ constructor entry replay currently covers N64 overlays with IDO. Main-ROM linking and owned-build
 projects need their own verified constructor-entry selection and export handling before this retry can reach them.
@@ -2365,6 +2385,12 @@ reuse the saved map. See [ROM Explorer](docs/ROM_EXPLORER.md) for support and li
 
 ## Next
 
+### Matched callees' prototypes in project-mode drafts
+
+ROM drafts take the prototype of each matched callee the shared header does not declare (`app/callee_prototypes.py`).
+Project-mode drafts (GameCube/Wii and DS started from scratch, forks, Ghidra's) see only their source file's headers:
+find the matched definition in the project's sources and give it to m2c or Ghidra the same way.
+
 ### Side-by-side viewer: more games, more consoles
 
 Play beside the console (Porting tab; `port/wasm/side_by_side.py`, docs/PORTING.md "Side by side, live") runs the port and the
@@ -2392,9 +2418,11 @@ check the pass on each console in the table, GBA, PS4 and project mode included.
 ### Profile probes for project mode
 
 The profile probe (`app/profile_probe.py`) judges a ROM project's open function under the few per-function profiles its
-target points to and applies an exact one for that function only. Project mode does not get it yet, for the same reason
-as compiler detection: a source file owns its compiler (`Console.file_compiler`, `set_file_compiler`) and a fork's build
-owns its flags. Next: plan the probes from the unit's own objdiff rows, judge them through `try_compiler`'s per-file path
+target points to, and at every other -O level of its compiler (`app/opt_levels.py`), and applies an exact one for that
+function only. Project mode does not get it yet, for the same reason as compiler detection: a source file owns its
+compiler (`Console.file_compiler`, `set_file_compiler`) and a fork's build owns its flags, so the Deep Permuter skips
+this first move there. The levels would apply where files have their own flags (Windows PC and Xbox: /Od, /O1, /O2,
+/Ox through `set_file_flags`; CodeWarrior's -O0 to -O4 on GameCube, Wii and DS). Next: plan the probes from the unit's own objdiff rows, judge them through `try_compiler`'s per-file path
 (`app/filecompilers.py`) and offer an exact one as the file's compiler change. Every project-mode console. The PS1, PS2,
 PS3 and PSP columns run only the flag rules (`-G`) and the neighbours' vote today, unchecked on a real game: their
 consoles have no hints of their own (`Console.profile_probes`) yet, such as an earlier compiler a game mixed in.

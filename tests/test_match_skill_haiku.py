@@ -38,6 +38,17 @@ def test_ordinary_c_is_not_refused():
     assert haiku.faults(source) == []
 
 
+FENCED = "void f(void) { do { g = __repair_a; } while (0); }"
+
+
+def test_scaffolding_the_start_already_has_may_stay_but_none_may_be_added():
+    allowed = haiku.inherited([FENCED, None, ""])
+    assert haiku.faults(FENCED.replace("g =", "h = 1; g ="), allowed) == []
+    assert any("fence" in f for f in haiku.faults(FENCED + " void g2(void) { do {} while (0); }", allowed))
+    assert any("__repair_" in f for f in haiku.faults(FENCED.replace("g =", "__repair_b = 1; g ="), allowed))
+    assert any("volatile" in f for f in haiku.faults("volatile s32 x; " + FENCED, allowed))
+
+
 def revision(source):
     return hashlib.sha256(source.encode()).hexdigest()[:20]
 
@@ -114,6 +125,7 @@ def session(tmp_path, monkeypatch):
     monkeypatch.setattr(haiku, "Worker", Worker)
     monkeypatch.setattr(haiku, "VERIFY_SECONDS", 0)
     monkeypatch.setattr(haiku.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(haiku, "library_chain", lambda root, info, name, profile, path: None)
 
     def write(text):
         path = root / "work.c"
@@ -152,6 +164,43 @@ def test_a_refused_source_is_never_judged(session):
     assert session.sent == [] and Gateway.calls == []
 
 
+def start_from(session, source):
+    state = haiku.read_state(session.root)
+    haiku.write_state(session.root, dict(state, inherited=haiku.inherited([source])))
+
+
+def test_an_improvement_that_keeps_inherited_scaffolding_is_submitted(session):
+    start_from(session, FENCED)
+    source = FENCED + " // own=40 other=70"
+    haiku.main(["try", "small", session.write(source)])
+    assert session.sent == [source]
+
+
+@pytest.mark.parametrize("scores", ["own=0 other=70", "own=90 other=0"])
+def test_an_exact_candidate_with_inherited_scaffolding_is_saved_and_said(session, capsys, monkeypatch, scores):
+    def submit(holder, source, function="", again=""):  # the app records an own-profile exact as matched
+        session.sent.append(source)
+        App.status = "matched"
+        return "judged"
+    monkeypatch.setattr(haiku.setup, "submit", submit)
+    start_from(session, FENCED)
+    source = f"{FENCED} // {scores}"
+    assert haiku.main(["try", "small", session.write(source)]) == 0
+    assert "keeps scaffolding it started with (fence, repair)" in capsys.readouterr().out
+    assert session.sent == [source] or dict(Gateway.calls)["suggest"]["source"] == source
+    assert haiku.main(["done", "small"]) == 0
+    assert "MATCHED (keeps inherited scaffolding: fence, repair)" in capsys.readouterr().out
+
+
+def test_the_screen_lets_the_saved_best_be_the_start(tmp_path):
+    brief = {"name": "f1", "n_insns": 4, "asm": "jr $ra", "best": FENCED + " // own=60", "draft": "// own=80",
+             "best_score": 60, "profiles": [OWN], "declarations": [], "neighbours": [], "trials": []}
+    out = []
+    _, _, allowed = haiku.screen(tmp_path, {"holder": "small", "slug": "game"}, brief, Worker({}), write=out.append)
+    assert allowed == {"fence": 1, "repair:__repair_a": 1}
+    assert "`try` accepts what is already there" in "\n".join(out)
+
+
 def test_done_keeps_the_near_miss_as_a_trial_writes_the_note_and_releases_with_the_token(session, capsys):
     # a worse own-profile score is never submitted, but the closest under another profile is recorded as a trial
     haiku.main(["try", "small", session.write("// own=90 other=7")])
@@ -170,6 +219,55 @@ def test_done_keeps_the_near_miss_as_a_trial_writes_the_note_and_releases_with_t
     assert "best 7 under gcc-2.7.2-kmc -O1" in release["notes"] and "register swap" in release["notes"]
     assert "trial abc123" in release["notes"]
     assert session.stopped == ["small"] and "not matched" in capsys.readouterr().out
+
+
+def chain(monkeypatch, result):
+    asked = []
+
+    def run(root, info, name, profile, path):
+        asked.append((name, profile["flags"], path.read_text()))
+        return result
+    monkeypatch.setattr(haiku, "library_chain", run)
+    return asked
+
+
+def test_done_saves_the_match_the_repair_library_finds_from_a_near_miss(session, monkeypatch, capsys):
+    asked = chain(monkeypatch, "// own=90 other=0")
+
+    def apply(self, tool, arguments, wait=None, real=Gateway.call):
+        if tool == "suggest":
+            App.status = "matched"
+        return real(self, tool, arguments)
+    monkeypatch.setattr(Gateway, "call", apply)
+    haiku.main(["try", "small", session.write("// own=90 other=7")])
+    assert haiku.main(["done", "small"]) == 0
+    assert asked == [("f1", ["-O1"], "// own=90 other=7")]
+    assert dict(Gateway.calls)["suggest"]["source"] == "// own=90 other=0"
+    assert "compiler_experiments" not in tools() and "release_function" not in tools()
+    assert "RESULT f1: MATCHED" in capsys.readouterr().out
+
+
+def test_done_keeps_the_closer_source_the_repair_library_reaches(session, monkeypatch):
+    chain(monkeypatch, "// own=90 other=3")
+    haiku.main(["try", "small", session.write("// own=90 other=7")])
+    haiku.main(["done", "small"])
+    assert dict(Gateway.calls)["compiler_experiments"]["trials"][0]["new"] == "// own=90 other=3"
+    assert "best 3 under" in dict(Gateway.calls)["release_function"]["notes"]
+
+
+def test_scaffolding_the_library_adds_is_not_taken(session, monkeypatch):
+    chain(monkeypatch, "// own=90 other=0\nvoid f(void) { do { } while (0); }")
+    haiku.main(["try", "small", session.write("// own=90 other=7")])
+    haiku.main(["done", "small"])
+    assert "suggest" not in tools()
+    assert "best 7 under" in dict(Gateway.calls)["release_function"]["notes"]
+
+
+def test_a_far_near_miss_is_not_chained(session, monkeypatch):
+    asked = chain(monkeypatch, "// own=900 other=0")
+    haiku.main(["try", "small", session.write(f"// own=900 other={haiku.CHAIN_NEAR + 1}")])
+    haiku.main(["done", "small"])
+    assert asked == []
 
 
 def test_done_with_nothing_tried_only_ends_the_session(session):
@@ -213,7 +311,7 @@ def test_the_screen_shows_the_near_miss_and_the_twin(tmp_path):
              "twin": {"name": "f9", "similarity": 0.9, "toolchain": "gcc-2.7.2-kmc", "flags": ["-O1"],
                       "source": "void f9(void) {}"}}
     out = []
-    results, kept = haiku.screen(tmp_path, {"holder": "small", "slug": "game"}, brief, Worker({}), write=out.append)
+    results, kept, _ = haiku.screen(tmp_path, {"holder": "small", "slug": "game"}, brief, Worker({}), write=out.append)
     text = "\n".join(out)
     assert "near-miss kept from an earlier session: score 3" in text and "void f9(void) {}" in text
     assert "MATCHED twin f9: 90%" in text and "(twin)" in text
@@ -252,6 +350,25 @@ def test_the_brief_offers_trials_and_the_matched_twin_and_picks_fresh_functions_
     assert brief["twin"]["source"] == "void f29(void) {}"
     if toolchains.installed("gcc-2.7.2-kmc"):
         assert any(p["flags"] == ["-O1"] for p in brief["profiles"])
+
+
+def test_among_lately_worked_functions_the_least_given_up_come_first(tmp_path):
+    net = project(tmp_path)
+    pid = net.project_row("game")["id"]
+    with net.project_store(pid).tx() as db:
+        db.execute("UPDATE functions SET seed='void ' || name || '(void) {}' WHERE project_id=?", (pid,))
+        db.execute("UPDATE functions SET best_score=1, best_source='x' WHERE name IN ('f5','f7','f8')")
+        db.execute("UPDATE functions SET abandons=8 WHERE name='f5'")
+        db.execute("UPDATE functions SET abandons=1 WHERE name IN ('f7','f8')")
+        for name, ago in (("f5", 300), ("f7", 100), ("f8", 200)):
+            db.execute("INSERT INTO events(project_id,agent_id,kind,detail,created_at) VALUES(?,?,?,?,?)",
+                       (pid, 999, "release", name, time.time() - ago))
+    items = match_brief.candidates(net, "game", max_insns=10)
+    names = [item["name"] for item in items if item["best_score"] is not None]
+    assert names == ["f8", "f7", "f5"]
+    ranked = haiku.rank(Worker({}), [dict(item, profiles=[OWN], matched_near=0) for item in items
+                                     if item["name"] in names])
+    assert ranked == names
 
 
 def test_the_worker_lists_candidates_and_briefs_a_function_without_writing(tmp_path):

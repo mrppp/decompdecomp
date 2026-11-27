@@ -1164,6 +1164,22 @@ def test_sweep_recovers_exact_candidates_before_search(sweep, monkeypatch):
     assert calls == ['f1']
 
 
+def test_a_finished_function_still_gets_a_probe_it_has_not_had(sweep, monkeypatch):
+    # a pass that doesn't repeat finished searches skipped them before the profile probe learnt the -O levels
+    from decompnet.app import profile_probe_autopilot
+    obj, net, calls, _ = sweep
+    probed = []
+    monkeypatch.setattr(obj, 'probe_pending', lambda proj, fid: False)
+    obj.run('game', 1, 10, Log(), loop=False)
+    assert calls == ['f0', 'f1']
+    monkeypatch.setattr(obj, 'probe_pending', lambda proj, fid: True)  # (still pending: asked once a run all the same)
+    monkeypatch.setattr(profile_probe_autopilot, 'catch_up',
+                        lambda engine, slug, fid, minutes, variants, log: probed.append(fid) or True)
+    result = obj.run('game', 1, 10, Log(), loop=False)
+    assert len(probed) == 2 == len(set(probed)) and result['matched'] == 2
+    assert calls == ['f0', 'f1']  # no function was searched again
+
+
 def _record_pass(obj, net, name, state, result, completed_at):
     cfg, proj = obj.config('game'), net.project_row('game')
     fn = net._function(name, 'game')
@@ -1388,3 +1404,22 @@ def test_status_sends_the_first_rewrite_rows_and_the_export_all_of_them(sweep, m
     assert obj.status('game')['recipes_total'] == 5  # cached for a few seconds: the window does not need the last trial
     obj.reset_metrics('game')
     assert obj.status('game')['recipes_total'] == 0  # a reset shows at once
+
+
+def test_a_missing_package_stops_the_pass_and_keeps_the_queue_instead_of_marking_errors(sweep, monkeypatch):
+    obj,net,calls,_=sweep
+    def broken(*args):
+        raise RuntimeError("No module named 'decomprepair'")
+    monkeypatch.setattr(deep_permuter,'run',broken)
+    with pytest.raises(Exception, match='could not load part of itself'):
+        obj.run('game',1,10,Log())
+    assert obj.status('game')['errors']==0
+    assert obj.history('game',net._function('f0','game'))['state']=='pending'
+
+
+def test_import_errors_from_earlier_passes_are_requeued(sweep):
+    obj,net,*_=sweep
+    fn=net.store.one("SELECT * FROM functions WHERE name='f0'")
+    obj.record(fn,'old-scope','error',1,10,error="RuntimeError: No module named 'decomprepair'")
+    obj.recover_room_transport('game')
+    assert net.store.one('SELECT state,error FROM deep_permutation_passes WHERE function_id=?',fn['id'])['state']=='pending'
