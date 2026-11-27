@@ -14,6 +14,47 @@ MAX_CANDIDATES = 512
 REFINE_TIMEOUT = 120
 
 
+def _branch_delay_frame(image, offset, size, start, order):
+    """A stack allocation in a branch delay slot is part of its surrounding body."""
+    if offset < start + 4:
+        return False
+    word = int.from_bytes(image[offset-4:offset], order)
+    if word >> 26 not in (4, 5, 6, 7, 20, 21, 22, 23):
+        return False
+    displacement = word & 0xffff
+    if displacement & 0x8000:
+        displacement -= 0x10000
+    target = offset + 4 * displacement
+    return offset + 4 <= target < offset + size
+
+
+def _scheduled_prefix(image, offset, size, row, calls, transfers, validate, console):
+    """Keep straight-line argument preparation before a quiet recovered frame."""
+    import rabbitizer
+
+    from ..arch.mips import JR_RA
+
+    start, end, segment, _, _ = row
+    order = 'big' if console.big_endian else 'little'
+    for at in range(offset-8, max(segment.rom_start-4, start-12, offset-76), -4):
+        if int.from_bytes(image[at:at+4], order) != JR_RA:
+            continue
+        entry = at+8
+        if not start <= entry < offset or any(entry < other <= offset for other, _, _ in calls):
+            continue
+        slot = rabbitizer.Instruction(int.from_bytes(image[at+4:at+8], order))
+        if not slot.isValid() or slot.hasDelaySlot():
+            continue
+        mapping = segment.vram-segment.rom_start
+        if any(entry+mapping < target <= offset+mapping for target in transfers):
+            continue
+        full = validate(image, entry, end, entry+mapping, big_endian=console.big_endian,
+                        cpu=console.cpu_variant, asm_check=console.asm_reason, max_lead=16)
+        if full == size+offset-entry:
+            return entry, full
+    return offset, size
+
+
 def refine(config, workdir, image, console, log=print, *, visited=None):
     """Add C subsegment boundaries inside raw .word output, preserving explicit data and known functions."""
     from . import split
@@ -81,8 +122,16 @@ def refine(config, workdir, image, console, log=print, *, visited=None):
     dropped.sort(key=lambda row:row[0]);starts=[r[0] for r in dropped]
     scopes = {raw['start']:raw['exclusive_ram_id'] for raw in cfg['segments']
               if isinstance(raw,dict) and raw.get('exclusive_ram_id')}
-    calls=set()
+    calls=set();transfers=set()
     for fn in functions:
+        for line in fn.lines:
+            word = line.word
+            op = word >> 26
+            if op == 2:
+                transfers.add(((line.vram+4) & 0xf0000000) | ((word & 0x3ffffff) << 2))
+            elif op in (1, 4, 5, 6, 7, 20, 21, 22, 23) or op == 17 and (word >> 21) & 31 == 8:
+                delta = (word & 0xffff) ^ 0x8000
+                transfers.add(line.vram+4+(delta-0x8000)*4)
         owners = [s for s in segments if s.rom_start <= fn.rom < s.rom_end
                   and fn.vram-fn.rom == s.vram-s.rom_start]
         owner = owners[0] if len(owners)==1 else None
@@ -132,7 +181,11 @@ def refine(config, workdir, image, console, log=print, *, visited=None):
         visited.add((offset,target,row[1]))
         size=validate(rom,offset,row[1],target,big_endian=console.big_endian,cpu=console.cpu_variant,
                       asm_check=console.asm_reason)
-        if size and not any(offset<other<offset+size for other,_,_ in calls):
+        if (size and not _branch_delay_frame(rom,offset,size,row[2].rom_start,
+                                             'big' if console.big_endian else 'little')
+                and not any(offset<other<offset+size for other,_,_ in calls)):
+            if console.arch == 'mips' and not any(other == offset for other, _, _ in calls):
+                offset, size = _scheduled_prefix(rom, offset, size, row, calls, transfers, validate, console)
             accepted.append((offset,offset+size,row))
     # Competing called frames must not cut through each other.
     accepted=[a for a in accepted if not any(a is not b and a[0]<b[1] and b[0]<a[1] for b in accepted)]
@@ -152,7 +205,14 @@ def refine(config, workdir, image, console, log=print, *, visited=None):
                     if not isinstance(part,list) or len(part)<2 or part[1]!='c':continue
                     limit=next((s[0] for s in raw['subsegments'][i+1:] if isinstance(s,list) and s),segment.rom_end)
                     if part[0]<=fn.rom<fn.rom+fn.size<=limit:
-                        cuts.update((fn.rom,fn.rom+fn.size));break
+                        cuts.add(fn.rom)
+                        end = fn.rom+fn.size
+                        # A new source unit beginning with a NOP can turn padding or a delay slot
+                        # into a spurious one-word function. Preserve a separately known entry.
+                        if (rom[end:end+4] != bytes(4) or any(other.rom == end for other in known)
+                                or any(offset == end for offset, _, _ in calls)):
+                            cuts.add(end)
+                        break
         for at in sorted(cuts):
             if at<segment.rom_end and at not in existing:
                 raw['subsegments'].append([at,'c',f'{sub[2]}_{at:06X}'])

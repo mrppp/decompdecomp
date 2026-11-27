@@ -129,6 +129,19 @@ def _through_header_crc(root: Path, build_dir: Path, elves, image_path: Path, sh
     return matches
 
 
+def binary_code_coverage(config: dict) -> list[str]:
+    """Binary pieces inside code segments may contain functions, but have no objdiff units."""
+    count = 0
+    for segment in config.get('segments', []):
+        if not isinstance(segment, dict) or segment.get('type') != 'code':
+            continue
+        for entry in segment.get('subsegments') or []:
+            kind = entry.get('type') if isinstance(entry, dict) else entry[1] if isinstance(entry, list) and len(entry) > 1 else None
+            if kind in ('bin', 'textbin'):
+                count += 1
+    return ([f'{count} binary piece{"s" if count != 1 else ""} in code segments may contain code and are not represented as functions.'] if count else [])
+
+
 def verified_rebuild(project, config_path: Path, config: dict, image_path: Path, sha1: str, log) -> bool:
     """Freeze linked code objects only when objcopy of the ELF reproduces the complete original image.
 
@@ -174,6 +187,12 @@ def verified_rebuild(project, config_path: Path, config: dict, image_path: Path,
                     break
         if not matches:
             matches = _through_header_crc(root, build_dir, elves, image_path, sha1, objcopy, binary)
+        if len(matches) > 1:
+            # A preliminary and final ELF may produce the same ROM; only the final link usually has a map.
+            mapped = [elf for elf in matches if elf.with_suffix('.map').is_file()
+                      or (root / (elf.stem + '.map')).is_file()]
+            if len(mapped) == 1:
+                matches = mapped
         if len(matches) != 1:
             raise ForkError("overlay references need exactly one ELF whose complete binary matches the original "
                             "image's SHA-1")
@@ -247,14 +266,27 @@ def verified_rebuild(project, config_path: Path, config: dict, image_path: Path,
                 entry.update(base_path=base.relative_to(root).as_posix(),
                              metadata={'source_path': source.relative_to(root).as_posix()})
             else:
-                entry['metadata'] = {'assembly_source': source.relative_to(root).as_posix()}
+                # Splat output is often ignored and a later clean removes it. Keep the assembly
+                # used for the verified object beside the reference so drafts can still read it.
+                if root not in source.resolve().parents:
+                    raise ForkError('assembly source leaves the checkout; no reference files were created')
+                if source.stat().st_mtime_ns > base.stat().st_mtime_ns:
+                    raise ForkError(f'{source.relative_to(root)} changed after its verified object; rebuild the project')
+                saved = work / 'assembly' / source.relative_to(root)
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, saved)
+                entry['metadata'] = {
+                    'assembly_source': source.relative_to(root).as_posix(),
+                    'draft_assembly': (destination / saved.relative_to(work)).relative_to(root).as_posix(),
+                }
             entries.append(entry)
         pending = work / 'objdiff.json'
-        pending.write_text(json.dumps({'custom_make': 'make', 'custom_args': make_args,
+        ninja = not any((root / name).is_file() for name in ('Makefile', 'makefile', 'GNUmakefile')) and (root / 'build.ninja').is_file()
+        pending.write_text(json.dumps({'custom_make': 'ninja' if ninja else 'make', 'custom_args': [] if ninja else make_args,
                                        'build_target': False, 'build_base': True, 'units': entries,
                                        'coverage_notes': ([f'{len(binary_assembly)} linked binary assembly images '
                                            'are not split into functions and are excluded from function progress.']
-                                           if binary_assembly else [])}, indent=2) + '\n',
+                                           if binary_assembly else []) + binary_code_coverage(config)}, indent=2) + '\n',
                            encoding='utf-8')
         if (root / 'objdiff.json').exists():
             raise ForkError("objdiff.json appeared during setup; the existing configuration was retained")
@@ -623,13 +655,15 @@ def generate(project, config_path: Path, config: dict, console, log=print) -> bo
     except ForkError as error:
         if ("compressed or overlay code segments" not in str(error)
                 and "subsegment 'pad'" not in str(error)
+                and "subsegment 'lib'" not in str(error)
                 and "relative unit names without parent paths" not in str(error)
                 and "numeric start and vram" not in str(error)):
             raise
         try:
             return verified_rebuild(project, config_path, config, image_path, sha1.lower(), log)
         except ForkError as rebuilt:
-            if 'numeric start and vram' in str(error) or 'exactly one ELF' not in str(rebuilt):
+            if ('numeric start and vram' in str(error) or "subsegment 'lib'" in str(error)
+                    or 'exactly one ELF' not in str(rebuilt)):
                 raise
             units = plan(root, config, independent=True, prefer=verified_build_folders(root, sha1))
     configured_elf = inside(root, options.get('elf_path', 'build/project.elf'))
@@ -762,7 +796,7 @@ def generate(project, config_path: Path, config: dict, console, log=print) -> bo
                                        'units': entries,
                                        'coverage_notes': ([] if matching else [
                                            'The source rebuild has not passed the whole-image checksum. Function '
-                                           'progress uses independently byte-verified original sections.'])},
+                                           'progress uses independently byte-verified original sections.']) + binary_code_coverage(config)},
                                       indent=2) + '\n', encoding='utf-8')
         # All outputs stay private to the project. Never overwrite a hand-written configuration or expected/.
         if (root / 'objdiff.json').exists():

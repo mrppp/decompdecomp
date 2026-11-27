@@ -10,10 +10,14 @@
 - loader_mapping.py: bank mappings corroborated by constant arguments to independent loader helpers.
 - indexed_overlays.py: shared RAM slots and DMA bounds recovered from loader arrays and cache calls.
 - indexed_runtime_code.py: executable archive members mapped at their declared runtime addresses.
+- runtime_zlib.py: compressed programs corroborated by runtime call targets and their loaded bytes.
+- runtime_overlays.py: overlapping code banks corroborated by runtime caller and target bytes.
+- runtime_textures.py: bounded emulator snapshots for texture loads whose pixels match the cartridge.
 - level_overlay_table.py: shared-slot level banks and adjacent helpers verified from loader instructions.
 - inferred_overlays.py: overlapping code-bank mappings supported by independently called local entries.
+- reloc_fragments.py: text and linked addresses from consecutive relocation-section fragments.
 - inline_data.py: verified constants and alignment bytes embedded among code.
-- boot_gzip.py, boot_raw_deflate.py, boot_brs.py, boot_refpack.py: compressed programs placed by the boot loader.
+- boot_gzip.py, boot_raw_deflate.py, boot_brs.py, boot_refpack.py, boot_rnc2.py: compressed programs placed by the boot loader.
 - boot_mapping.py: returning TLB boot stubs separated from code with a strongly supported later load mapping.
 - sdk_assembly.py: exact self-contained libultra body fingerprints, classified before C claims.
 - profile_probes.py: the per-function compiler profiles its open functions are judged under automatically (SN 2.7.2 builds, KMC for libultra).
@@ -34,8 +38,9 @@ from pathlib import Path
 
 from ...rom import Picked, RomError
 from .. import EXPORT, RECOMMENDED, ROM, Compiler, Console
-from . import emulator, profile_probes, recomp, sdk_assembly, sdk_linked, sdk_shapes
+from . import emulator, profile_probes, recomp, runtime_textures, sdk_assembly, sdk_linked, sdk_shapes
 from .port import KIT as PORT_KIT
+from .port import SCHEDULER
 
 # Store only a digest of the entire body, including the return delay slot.
 _MUL64_LOW_FIRST_SHA256 = "3de77e7c110a869794ff2998de80fb3fd6e4a7fc046d21378dc764a11b1676d0"
@@ -103,7 +108,14 @@ class Nintendo64(Console):
         from ...arch.mips_assets import read
         # Sound banks find their sample tables from the constant arguments of the game's alBnkfNew calls,
         # read with the app's MIPS reader (decomp-assets has none of its own).
-        return n64.regions(image, context={'read_code': read, **(context or {})}, **kwargs)
+        evidence = context or {}
+        assets = n64.regions(image, context={'read_code': read, **evidence}, **kwargs)
+        if evidence.get('runtime_rom'):
+            assets += runtime_textures.observe(image, evidence['runtime_rom'], evidence.get('runtime_sha1'),
+                                               log=evidence.get('log', lambda _: None),
+                                               status=evidence.get('runtime_observation'),
+                                               progress=kwargs.get('progress', lambda _: None))
+        return assets
 
     def asset_preview(self, data, asset, selection):
         from decompassets import n64
@@ -242,6 +254,10 @@ class Nintendo64(Console):
         # name the ultralib rebuild has too is libultra's own, and goes the usual way.
         return (any(_N_AUDIO.search(c) for c in corpora)
                 and not any(c.startswith("built in / decompals/ultralib") for c in corpora))
+
+    def sdk_sample_code(self, name):
+        # libultra's scheduler (sched.c): the port runs the game's copy, but nobody needs to write it again
+        return bool(SCHEDULER.match(name))
 
     def sdk_assembly_identity(self, code, big_endian=True):
         return sdk_assembly.identify(code, big_endian)

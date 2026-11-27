@@ -86,6 +86,29 @@ def matched(platform: str, skip: tuple[str, ...] = ()) -> list[str]:
     return [f for f in FUNCTIONS if f not in NEAR_MISSES.get(platform, ()) and f not in skip]
 
 
+def test_export_rejudges_a_saved_match_with_an_extra_function(tmp_path):
+    if not _ready('n64'):
+        pytest.skip('needs the N64 compiler and binutils')
+    net, slug = _decompile(tmp_path, 'n64', skip=('abs_s32',))
+    agent, _ = net.local_agent('extra-function-test')
+    body = csource.get((GAME / 'game.c').read_text(), 'abs_s32')
+    source = body + '\ns32 unrelated_export_helper(s32 x) { return x + 7; }\n'
+    assert net.attempt(agent, 'abs_s32', source, slug)['matched']
+    out = net.export_rom(slug, log=lambda *_: None)
+    assert out['identical'] and out['matched'] == len(matched('n64')) and not out['fallback']
+    tree = Path(out['path'])
+    manifest = json.loads((tree / 'build.json').read_text())
+    fn = next(f for f in manifest['functions'] if f['name'] == 'abs_s32')
+    assert fn['entry_only'] and 'unrelated_export_helper' in (tree / fn['c']).read_text()
+    # An edited candidate must be recompiled and compared again; the stored target is never a fallback.
+    src = tree / fn['c']
+    text = src.read_text()
+    assert '-v : v' in text
+    src.write_text(text.replace('-v : v', '-v : v + 1'))
+    result = subprocess.run([sys.executable, 'build.py', 'check', 'abs_s32'], cwd=tree, capture_output=True, text=True)
+    assert result.returncode != 0
+
+
 @pytest.mark.parametrize("platform", ["n64", "ps2", "psp"])
 def test_export_rebuilds_the_game(tmp_path, platform):
     if not _ready(platform):
@@ -220,7 +243,7 @@ def test_generated_address_references_link_across_objects(tmp_path):
     from decompnet.rom import export
 
     shutil.copyfile(Path(export.__file__).with_name("export_build.py"), tmp_path / "build.py")
-    config = {"image": "baserom.z64", "symbols": {}, "functions": [
+    config = {"image": "baserom.z64", "symbols": {}, "assembly": [{"obj": "first.o"}], "functions": [
         {"name": "first", "rom": 0, "vram": 0x80000000},
         {"name": "second", "rom": 16, "vram": 0x80000010}], "segments": [
         {"name": "code", "kind": "code", "start": 0, "end": 24, "vram": 0x80000000,
@@ -238,7 +261,7 @@ def test_generated_address_references_link_across_objects(tmp_path):
         subprocess.run([assembler, "-EB", "-mips2", "-no-pad-sections", "-o", f"{name}.o", f"{name}.s"],
                        cwd=tmp_path, check=True, capture_output=True)
     script = runpy.run_path(str(tmp_path / "build.py"))
-    text = script["linker_script"]({"first": "first.o", "second": "second.o"},
+    text = script["linker_script"]({"second": "second.o"},
                                       [(0x80000000, 0, "first.o"), (0x80000010, 16, "second.o")], [])
     (tmp_path / "game.ld").write_text(text)
     linked = subprocess.run([linker, "-EB", "-T", "game.ld", "-o", "game.elf", "first.o", "second.o"],
@@ -251,7 +274,7 @@ def test_generated_address_references_link_across_objects(tmp_path):
     (tmp_path / "first.s").write_text(sources["first"].replace("D_80001000", "unknown_data"))
     subprocess.run([assembler, "-EB", "-mips2", "-no-pad-sections", "-o", "first.o", "first.s"],
                    cwd=tmp_path, check=True, capture_output=True)
-    text = script["linker_script"]({"first": "first.o", "second": "second.o"},
+    text = script["linker_script"]({"second": "second.o"},
                                       [(0x80000000, 0, "first.o"), (0x80000010, 16, "second.o")], [])
     (tmp_path / "game.ld").write_text(text)
     linked = subprocess.run([linker, "-EB", "-T", "game.ld", "-o", "game.elf", "first.o", "second.o"],
@@ -657,3 +680,58 @@ def test_unresolved_scoped_automatic_names_keep_their_address():
     assert _auto_addresses([text], {'D_80028D68_code_80027AF0'}) == {
         'func_80123400_code_80120000': 0x80123400,
     }
+    assert _auto_addresses(['jal func_8026E0B4_\n.word func_8026A964_'], set()) == {
+        'func_8026E0B4_': 0x8026E0B4, 'func_8026A964_': 0x8026A964,
+    }
+
+
+def test_export_removes_foreign_bank_labels_only(tmp_path):
+    from decompnet.rom.export import remove_foreign_bank_labels
+
+    folder = tmp_path/'asm'/'nonmatchings'
+    folder.mkdir(parents=True)
+    source = folder/'bank.s'
+    source.write_text('nonmatching entry\nalabel entry\n/* 000200 80001000 00000000 */ .word 0\n'
+                      'nonmatching real\nglabel real\n/* 000204 80001004 03E00008 */ jr $ra\n')
+    remove_foreign_bank_labels(tmp_path, [dict(name='entry', rom_offset=0x100),
+                                          dict(name='real', rom_offset=0x204)])
+    assert source.read_text() == ('/* 000200 80001000 00000000 */ .word 0\n'
+                                  'nonmatching real\nglabel real\n/* 000204 80001004 03E00008 */ jr $ra\n')
+
+
+def test_export_removes_shadowed_data_labels_but_keeps_original_bytes(tmp_path):
+    from decompnet.rom.export import remove_shadowed_bss
+
+    data = tmp_path/'asm'/'data'
+    text = tmp_path/'asm'/'nonmatchings'
+    data.mkdir(parents=True)
+    text.mkdir()
+    (text/'unit.s').write_text('glabel entry\n    nop\n')
+    source = data/'layout.data.s'
+    source.write_text('nonmatching entry\nalabel entry\n    .word 7\ndlabel other\n    .word 9\n')
+    remove_shadowed_bss(tmp_path, [{'name': 'entry'}])
+    assert source.read_text() == '    .word 7\ndlabel other\n    .word 9\n'
+
+
+@pytest.mark.parametrize("platform", ["n64", "ps1", "ps2", "psp"])
+def test_export_keeps_backward_delay_slot_address_high(platform):
+    """A loop's delay-slot HI16 uses the LO16 at its backwards branch target."""
+    from decompnet.consoles import get
+
+    console = get(platform)
+    order = 'big' if console.big_endian else 'little'
+    words = [0x8c22e79c, 0x1440fffe, 0x3c01800c]
+    instructions = [
+        'lw $v0, %lo(D_80057698 + (0x67104 & 0xFFFF))($at)',
+        'bnez $v0, target',
+        'lui $at, %hi(D_80057698 + 0x67104)',
+    ]
+    text = ''.join(f'/* {i * 4:06X} {0x80001000 + i * 4:08X} '
+                   f'{word.to_bytes(4, order).hex()} */ {instruction}\n'
+                   for i, (word, instruction) in enumerate(zip(words, instructions)))
+    result = console.export_asm(text)
+    assert '.word 0x3C01800C' in result
+    assert console.export_asm(result) == result
+    assert console.export_asm(text.replace('0x67104 &', '0x67105 &')) == text.replace('0x67104 &', '0x67105 &')
+    forward = text.replace(words[1].to_bytes(4, order).hex(), (0x14400001).to_bytes(4, order).hex())
+    assert console.export_asm(forward) == forward

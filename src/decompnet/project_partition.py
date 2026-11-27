@@ -3,7 +3,7 @@ import json
 
 SHARED = set('''agents helpers pairings sdk_shapes sdk_sources sdk_signatures expression_recipes
 mined_rewrites mined_rules mined_cursors
-repair_policy repair_policy_coverage repair_sequences repair_sequence_outcomes repair_promotions
+repair_policy repair_policy_coverage repair_policy_setups repair_sequences repair_sequence_outcomes repair_promotions
 agent_tool_usage agent_tool_task_usage room_membership_effects activity_events
 variant_games game_variants logical_functions variant_bindings variant_sources variant_edit_locks variant_jobs'''.split())
 SCOPED = set('''functions agent_family_targets agent_selection agent_variant_runs attempt_hints attempts
@@ -16,7 +16,7 @@ notes polish_failures polish_patterns progress_dirty progress_dirty_file progres
 repair_analysis_queue repair_coverage_verdicts repair_attempt_provenance repair_attempt_settings repair_attempt_mismatches repair_cursors repair_examples repair_example_votes
 repair_frontiers repair_input_effects repair_origins repair_outcome_analysis repair_profile_evidence
 repair_proposal_progress repaired_pairs reuse_cursors reuse_runs reuse_trials reviewed_search_seeds
-saved_progress score_commit_baselines symbols twin_misses verification_regressions verified_matches waits'''.split())
+profile_attempts saved_progress score_commit_baselines symbols twin_misses verification_regressions verified_matches waits'''.split())
 TRANSCRIPTS = {'helper_messages','helper_score_events'}
 COUNTERS = {'read_revisions','layout_revision','map_clock','repair_capture_groups'}
 DERIVED = {'read_snapshots','payload_links','payload_sizes'}

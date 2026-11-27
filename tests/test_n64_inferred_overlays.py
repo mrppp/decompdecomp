@@ -3,6 +3,8 @@
 import random
 import struct
 
+import pytest
+
 from decompnet.consoles.n64 import inferred_overlays
 
 
@@ -43,6 +45,23 @@ def test_ambiguous_self_calls_leave_the_original_mapping():
         word=struct.unpack_from('>I',image,0x3000+4*i)[0]
         struct.pack_into('>I',image,0x3200+4*i,word+0x4000)
     assert inferred_overlays.recover(image,found)==(found,set())
+
+
+def test_close_scores_need_unique_closed_callees():
+    image = bytearray(0x3000)
+    mapping, other = 0x80010000, 0x80011000
+    body = (0x27bdffe8, 0xafbf0014, 0x24020007, 0x8fbf0014, 0x03e00008, 0x27bd0018)
+    targets = set()
+    for index in range(12):
+        at = 0x1200+index*0x40
+        struct.pack_into('>6I', image, at, *body)
+        struct.pack_into('>I', image, at-0x1000, body[0])
+        targets.add(mapping+at)
+    scores = {mapping: 40, other: 8}
+    assert inferred_overlays._unique_closed_mapping(image, 0, len(image), targets, scores, mapping, lambda: None)
+    for index in range(12):
+        struct.pack_into('>6I', image, 0x200+index*0x40, *body)
+    assert not inferred_overlays._unique_closed_mapping(image, 0, len(image), targets, scores, mapping, lambda: None)
 
 
 def test_runtime_observed_range_needs_internal_call_corroboration():
@@ -189,3 +208,81 @@ def test_same_address_banks_get_distinct_segment_names(tmp_path, monkeypatch):
             if isinstance(row, dict) and row.get('type') == 'code']
     assert len(rows) == 2 and len({row['name'] for row in rows}) == 2
     assert all(row['subsegments'][0][2] == row['name'] for row in rows)
+
+
+def test_tiny_observed_fragments_join_the_corroborated_runtime_bank():
+    image, _ = fixture()
+    old = (0, 0x5000, 0x80040000)
+    observed = [(0, 4, 0x80100000), (4, 8, 0x80100004), (8, 0x4000, 0x80100008)]
+    mapped, changed = inferred_overlays.runtime_mappings(image, [old], observed)
+    assert mapped == [(0, 0x4000, 0x80100000), (0x4000, 0x5000, 0x80044000)]
+    assert changed == {0}
+    # Conflicting observations cannot supply a mapping for the small fragment.
+    observed.append((0, 4, 0x80200000))
+    mapped, _ = inferred_overlays.runtime_mappings(image, [old], observed)
+    assert mapped[0] == (0, 4, 0x80040000)
+
+
+@pytest.mark.parametrize('second_start', [0x1860, 0x1a00])
+def test_separate_called_banks_leave_intervening_data_unmapped(second_start):
+    image = bytearray(0x4000)
+    rng = random.Random(491)
+    def group(first, last):
+        selected = [first, last]
+        while len(selected) < 17:
+            at = rng.randrange(first+32, last-32, 16)
+            if all(abs(at-other) >= 48 for other in selected):
+                selected.append(at)
+        return sorted(selected)
+    groups = [group(0, 0x1800), group(second_start, 0x3f00)]
+    mappings = (0x80010000, 0x80022000)
+    for group, mapping in zip(groups, mappings):
+        for i, at in enumerate(group):
+            target = group[(i+1) % len(group)] + mapping
+            jump = 0x08000000 | (((at+24+mapping) >> 2) & 0x3ffffff)
+            words = (0x27bdffe8, 0xafbf0014, 0x0c000000 | ((target >> 2) & 0x3ffffff),
+                     0x00000000, jump, 0, 0x8fbf0014, 0x03e00008, 0x27bd0018)
+            struct.pack_into('>9I', image, at, *words)
+    end = groups[0][-1] + 36
+    start = groups[1][0]
+    image[end:start] = b'\x01\x02\x03\x04' * ((start-end)//4)
+    found = [(0, len(image), 0x80400000)]
+    result, changed = inferred_overlays.split_concatenated(image, found)
+    assert result == [(0, end, mappings[0]), (start, len(image), start+mappings[1])]
+    assert changed == {0, start}
+    # A call from an already mapped bank can also make the gap executable.
+    target = mappings[0] + end
+    image.extend(struct.pack('>I', 0x0c000000 | ((target >> 2) & 0x3ffffff)))
+    assert inferred_overlays.split_concatenated(image, found, taken=[(0x4000, 0x4004, 0x80000400)]) == (found, set())
+    # A call into its own independently mapped bank does not establish an
+    # entry in a different bank that shares the runtime address.
+    result, _ = inferred_overlays.split_concatenated(image, found, taken=[(0x4000, 0x4004, target)])
+    assert result == [(0, end, mappings[0]), (start, 0x4000, start+mappings[1])]
+    # A frame hidden in the gap makes its ownership uncertain.
+    struct.pack_into('>I', image, end+4, 0x27bdffe8)
+    assert inferred_overlays.split_concatenated(image, found) == (found, set())
+    # A leaf return is also evidence that the gap may contain code.
+    struct.pack_into('>2I', image, end+4, 0x01020304, 0x03e00008)
+    assert inferred_overlays.split_concatenated(image, found) == (found, set())
+
+
+def test_resident_bss_can_share_a_single_overlapping_overlay_scope():
+    config = {'segments': [
+        {'type': 'code', 'name': 'main', 'start': 0x1000, 'vram': 0x80000000, 'bss_size': 0x3000},
+        {'type': 'code', 'name': 'overlay', 'start': 0x2000, 'vram': 0x80003000,
+         'exclusive_ram_id': 'slot'},
+        [0x3000],
+    ]}
+    assert inferred_overlays.scope_resident_bss(config)
+    assert config['segments'][0]['exclusive_ram_id'] == 'slot'
+    broken = {'segments': [dict(config['segments'][0]), dict(config['segments'][1]), [0x3000]]}
+    broken['segments'][0].pop('exclusive_ram_id')
+    broken['segments'][1]['vram'] = 0x80000800
+    assert not inferred_overlays.scope_resident_bss(broken)
+    assert 'exclusive_ram_id' not in broken['segments'][0]
+    ambiguous = {'segments': [dict(config['segments'][0]), dict(config['segments'][1]),
+                              {'type': 'code', 'name': 'other', 'start': 0x2800, 'vram': 0x80002800,
+                               'exclusive_ram_id': 'other-slot'}, [0x3000]]}
+    ambiguous['segments'][0].pop('exclusive_ram_id')
+    assert not inferred_overlays.scope_resident_bss(ambiguous)
+    assert 'exclusive_ram_id' not in ambiguous['segments'][0]

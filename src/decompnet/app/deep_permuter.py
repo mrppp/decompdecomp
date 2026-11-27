@@ -37,6 +37,7 @@ from . import (
     library_registry,
     permuter_focus,
     permuter_local,
+    repair_asm,
     repair_ranking,
     repair_sequence_lane,
     repair_sequences,
@@ -55,6 +56,7 @@ RANDOM_TRIAL_WINDOW = 64
 DRAFT_RESTART_TRIALS = 24  # candidates a stalled function's draft chain may judge in one search
 RANDOM_SECONDS_WINDOW = 30
 LOCAL_PAUSES = {'phase_budget', 'burst_budget'}
+BOUNDED_RUN = 40  # an allowance below this many compiles is a handoff's: Search.local_reserve
 # A function that comes back to the deep search again and again with no improvement (deep_sweep records its
 # `stalled_passes`) gets a wider pair search: each such pass adds STALL_STEP of the base width, at most STALL_MAX
 # passes' worth (x3). Pair search found the most matches per compile-second on a 1,200-match PS1 project (18 matches
@@ -155,6 +157,10 @@ class Search(Permuter):
         self.deadline = self.started_at+self.seconds
         self.limit = self.random_trial_limit = max_variants
         self.base_seconds, self.base_limit = self.seconds, max_variants
+        # A bounded run (the handoff after an agent releases a function: 6 or 12 compiles) keeps half its allowance for
+        # the targeted repairs: the compiler preflight and the profile sweep used to spend all of it before they began
+        # (a saved best of 15 got 6 compiles, every one on other compilers, and its one-step repair was never tried).
+        self.local_reserve = max_variants // 2 if max_variants < BOUNDED_RUN else 0
         self.extensions = 0
         self.pair_scale = 1.0  # x the pair search's width (escalate)
         # A caller that caps the run (release repairs, maintenance tasks) owns its budget and gets no more.
@@ -428,7 +434,7 @@ class Search(Permuter):
         self.phase = 'compiler preflight'
         try:
             self.report()
-            result = run(self.net, proj, fn, self.log, self.check, max_profiles=self.limit-self.tested)
+            result = run(self.net, proj, fn, self.log, self.check, max_profiles=self.limit-self.tested-self.local_reserve)
         finally:
             self.phase = previous
         self.tested += result['tested']
@@ -446,7 +452,7 @@ class Search(Permuter):
         from . import generation_calls
 
         header = self.net._context(proj['id'], fn['unit'])['header']
-        asm = dict(fn).get('asm') or ''
+        asm = repair_asm.current(self.net, proj, dict(fn).get('asm') or '', source)
         arch, name = proj['arch'], fn['name']
         L = 'decomprepair.'
         # Offer a masked phase merge and guarded sink together before the general proposal cap.
@@ -881,7 +887,8 @@ class Search(Permuter):
         def children(parent):
             labels = {}
             try:
-                found = draft_repairs.variants(parent, fn['name'], proj['arch'], dict(fn).get('asm') or '', flags,
+                found = draft_repairs.variants(parent, fn['name'], proj['arch'],
+                                               repair_asm.current(self.net, proj, dict(fn).get('asm') or '', parent), flags,
                                                labels, limit=None, header=header,
                                                words=None if fork else float_literal_words.read(self.net, proj, fn))
             except Exception:  # noqa: BLE001 - a family that fails on an edited source must not end the search
@@ -1608,7 +1615,7 @@ class Search(Permuter):
             labels = {}
             from .repair_generation import ACTIVE
             pool = getattr(self,'compile_pool',None)
-            args = (source,fn['name'],proj['arch'],fn['asm'] or '',flags)
+            args = (source,fn['name'],proj['arch'],repair_asm.current(self.net,proj,fn['asm'] or '',source),flags)
             options = dict(limit=None,header=header,tables=switch_tables.read(self.net,proj,fn),
                 callees=draft_repairs.capture_followup_repairs.callee_evidence(self.net,proj,fn,source),
                 entry_scope=draft_repairs.promoted_entry_repairs.scope(self.net,proj,fn),
@@ -1938,7 +1945,7 @@ class Search(Permuter):
                                 and residual_bursts<residual_followups.BURSTS
                                 and residual_followups.kind(parent_rows,measured_rows,proj['arch'])):
                             followup_labels = {}
-                            followup = draft_repairs.variants(candidate,fn['name'],proj['arch'],fn['asm'] or '',flags,
+                            followup = draft_repairs.variants(candidate,fn['name'],proj['arch'],repair_asm.current(self.net,proj,fn['asm'] or '',candidate),flags,
                                 followup_labels,limit=None,header=header,entry_scope=draft_repairs.promoted_entry_repairs.scope(self.net,proj,fn),
                                 words=float_literal_words.read(self.net,proj,fn))
                             selected = residual_followups.select([(followup_labels[c],c) for c in followup
@@ -2567,7 +2574,8 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
                     search.best = 0
                 else:
                     # the few per-function profiles its target points to (SN 2.7.2's builds, KMC for library code,
-                    # -mfp32, -G8): judged once per saved C, an exact pair applied for this function only
+                    # -mfp32, -G8) and every other -O level of its compiler, on the saved C and the machine draft:
+                    # judged once per saved C, an exact pair applied for this function only, a closer level repaired
                     from . import profile_probe
                     if profile_probe.run(search, agent, proj, net._function(name, slug), saved):
                         search.best = 0

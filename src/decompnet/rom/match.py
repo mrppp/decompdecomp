@@ -228,6 +228,8 @@ class _Linker:
         self.problems: list[str] = []
         self.library_names: dict[str, int] = {}  # compiler-emitted library call -> the address the game's call has
         self.data_mismatches: list[DataMismatch] = []
+        self.missing_data_reads: list[tuple[int, int]] = []
+        self.required_data_reads: list[tuple[int, int, bytes | None]] = []
         self.local_map: dict[tuple[int, int], int] = {}  # (section index, offset) -> ROM address
         self.target_at = {off: (rtype, addr) for off, rtype, addr in target.relocs}
         self.data: dict[tuple[int, int], int] = {}  # every datum of its own the candidate uses -> ROM address
@@ -394,8 +396,11 @@ class _Linker:
 
     def holds_own_word(self, shndx: int, off: int, base: int) -> bool:
         """Can the ROM keep the candidate's datum at `off` at `base + off`: the ROM's bytes there are the datum's
-        (its first word, or less when the section ends sooner). A word with a relocation in it (a jump table's
-        entry) and a section with no bytes (.bss) always can: their bytes are only known after linking.
+        (its first word, or less when the section ends sooner). A word with a relocation in it and a section with
+        no bytes (.bss) can: their bytes are only known after linking. A jump table's entry is the exception: it
+        is relocated against this function's own code, so the ROM's word there must be an address inside the
+        target function. A switch whose table was voted onto a record array the function indexes more often than
+        its table showed two wrong `%hi`/`%lo` rows (300 points) that the source did not have.
 
         A 72-instruction SN function with one `li.s` literal had it voted to a global pointer's address, because
         that global's %lo appears three times within BASE_WINDOW and the pool's own address only once per half
@@ -407,7 +412,14 @@ class _Linker:
             sec = self.elf.get_section(shndx)
             mine = b"" if sec["sh_type"] == "SHT_NOBITS" else sec.data()[off:off + 4]
             relocated = any(off - 4 < at < off + 4 for at, _, _ in self._relocs_in(shndx))
-            if not mine or relocated:
+            entry = any(at == off and rtype == R_MIPS_32 and symbol["st_shndx"] == self.fn_shndx
+                        for at, rtype, symbol in self._relocs_in(shndx))
+            if entry:
+                word = self.read((base + off) & 0xFFFFFFFF, 4)
+                at = int.from_bytes(word, self.target.order) | 0x80000000 if word and len(word) == 4 else 0
+                start = self.target.vram | 0x80000000  # some games store the words without the KSEG0 bit
+                cache[key] = start <= at < start + len(self.target.code)
+            elif not mine or relocated:
                 cache[key] = True
             else:
                 cache[key] = self.read((base + off) & 0xFFFFFFFF, len(mine)) == mine
@@ -477,7 +489,11 @@ class _Linker:
                 if rtype != R_MIPS_32 or not off <= at <= off + length - 4:
                     continue
                 _, own = self._pointee(s, int.from_bytes(data[at:at + 4], self.target.order))
-                if own is None or own in self.data or (rom := self.read(addr + at - off, 4)) is None:
+                if own is None or own in self.data:
+                    continue
+                pointer = addr + at - off
+                rom = self.required_read(pointer, 4)
+                if rom is None:
                     continue
                 self.local_map[own] = self.data[own] = int.from_bytes(rom, self.target.order)
                 self.widths[own] = None
@@ -499,11 +515,18 @@ class _Linker:
             instruction = int.from_bytes(code[at:at+4],order)
             if instruction & 0xfc1fffff != 8 or instruction >> 21 & 31 == 31:
                 continue
-            witness = jump_table(code,0,len(code),self.target.vram,at,order,reader=self.read)
+            witness = jump_table(code,0,len(code),self.target.vram,at,order,reader=self.required_read)
             if (witness and witness['state']=='validated' and witness['table_address']==address
                     and witness['entry_count']==len(offsets)):
                 return witness['entry_count']*4
         return None
+
+    def required_read(self, addr: int, size: int) -> bytes | None:
+        data = self.read(addr, size)
+        self.required_data_reads.append((addr, size, data))
+        if data is None:
+            self.missing_data_reads.append((addr, size))
+        return data
 
     def verify_data(self, shndx: int, off: int, addr: int, *, instructions_exact: bool = False) -> None:
         """Data the candidate defines must be identical to the ROM data it stands for."""
@@ -534,9 +557,11 @@ class _Linker:
             # stream. Prove the dispatch extent before checking the rest.
             if extent := self.switch_extent(addr, code_pointers):
                 n = extent
-        rom = self.read(addr, n)
+        rom = self.required_read(addr, n)
         if rom is None:
-            return  # the ROM has no bytes there (e.g. .bss in the ROM): nothing to compare
+            # Normal judging allows a datum in BSS. A standalone export with an
+            # incomplete image map must instead prove that omission is safe.
+            return
         if bytes(mine[:n]) != rom:
             # The switch diagnostic needs the actual relocated words, not an
             # interpretation of the abbreviated comparison message.
@@ -594,7 +619,8 @@ class _Linker:
         for (dshndx, off), addr in self.local_map.items():
             placements.setdefault(self.elf.get_section(dshndx).name, {})[off] = addr
         return LinkResult(FunctionObj(self.name, "mips", self.target.big_endian, code, relocs), exact, self.problems,
-                          placements, instructions_exact, linked, self.data_mismatches)
+                          placements, instructions_exact, linked, self.data_mismatches, self.missing_data_reads,
+                          self.required_data_reads)
 
 
 def link(obj: bytes, name: str, target: RomTarget, symbols: SymbolTable, read: ReadFn) -> LinkResult:

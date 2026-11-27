@@ -43,6 +43,97 @@ def test_the_chain_is_bounded():
     assert best == 30 and not taken and 'out of time' in notes[0]
 
 
+def test_a_batch_with_no_improving_child_is_not_a_stall_while_children_are_left_out():
+    # the only improving child is number 8 of 10: under children=3 the first batch (s0..s2) stalls, the chain judges on
+    many = [('x', f's{i}') for i in range(10)]
+    scores = {'a': 30} | {f's{i}': 31 for i in range(10)} | {'s7': 20}
+    judged = []
+
+    def score(sources):
+        judged.extend(sources)
+        return [scores.get(s) for s in sources]
+    final, best, taken, notes = prove_chain.chain('a', lambda s: many if s == 'a' else [], score, children=3)
+    assert (final, best) == ('s7', 20) and taken[0][0] == 'x'
+    assert judged == ['a'] + [f's{i}' for i in range(9)]  # stops after the batch holding the improving child
+    assert any('left out' in note for note in notes)
+    # nothing improves anywhere: every child is judged once, then the chain ends
+    judged.clear()
+    flat = {'a': 30} | {f's{i}': 31 for i in range(10)}
+    _, best, taken, notes = prove_chain.chain('a', lambda s: many if s == 'a' else [],
+                                              lambda ss: judged.extend(ss) or [flat.get(s) for s in ss], children=3)
+    assert best == 30 and not taken and len(judged) == 11 and 'no child of 10' in notes[-1]
+
+
+def _flat(count):
+    judged = []
+
+    def score(sources):
+        judged.extend(sources)
+        return [30 for _ in sources]
+    return judged, [('x', f's{i}') for i in range(count)], score
+
+
+def test_the_cap_ends_the_call_and_says_how_many_children_were_left():
+    judged, many, score = _flat(10)
+    _, best, taken, notes = prove_chain.chain('a', lambda s: many, score, children=3, max_judged=7)
+    assert len(judged) == 1 + 7 and best == 30 and not taken  # the start is not counted
+    assert notes == ['step 1: stopped at the cap of 7 judged variants (max_judged): 3 of 10 children left unjudged']
+    # the cap counts the whole call, not a step; an improving child found at the cap is still taken
+    judged = []
+    scores = {'a': 30, 'b': 20}
+    children = {'a': [('x', 'b'), ('x', 'c'), ('x', 'd')], 'b': [('x', 'e'), ('x', 'f')]}
+    _, best, taken, notes = prove_chain.chain('a', children.get, lambda ss: judged.extend(ss) or
+                                              [scores.get(s, 40) for s in ss], children=2, max_judged=2)
+    assert best == 20 and len(taken) == 1 and judged == ['a', 'b', 'c']
+    assert notes == ['step 1: stopped at the cap of 2 judged variants (max_judged): 1 of 3 children left unjudged',
+                     'step 2: stopped at the cap of 2 judged variants (max_judged): 2 of 2 children left unjudged']
+    # a step that ends exactly at the cap has left nothing out
+    judged, many, score = _flat(4)
+    _, _, _, notes = prove_chain.chain('a', lambda s: many, score, max_judged=4)
+    assert not any('cap' in note for note in notes) and 'no child of 4' in notes[-1]
+
+
+@pytest.mark.parametrize('asked, judged_variants', [(None, 400), (0, 400), (5, 5), (-3, 1), (10_000, 2000)])
+def test_a_call_judges_400_variants_unless_the_caller_asks_up_to_the_maximum(monkeypatch, asked, judged_variants):
+    from decompnet.app import agent_tokens, judge_pool
+    judged, many, score = _flat(2500)
+
+    class Net(_Net):
+        def fork_slug(self, slug):
+            return False
+
+        def _project(self, slug):
+            return {}
+
+        def cfg(self, proj):
+            return {}
+
+    class Pool:
+        errors = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def judge_many(self, sources, check, chunk):
+            return score(sources)
+
+    net = Net(30)
+    net._function = lambda function, slug: {'vram': 0, 'best_score': 30}
+    monkeypatch.setattr(agent_tokens, 'candidate', lambda *a: ('a', 'r'))
+    monkeypatch.setattr(prove_chain, 'compiler_for', lambda *a: {'toolchain': 't', 'flags': ''})
+    monkeypatch.setattr(prove_chain, 'generator', lambda *a: lambda source: many)
+    monkeypatch.setattr(judge_pool, 'JudgePool', Pool)
+    out = prove_chain.run(net, None, 's', 'f', 'r', max_judged=asked)
+    assert len(judged) == 1 + judged_variants
+    assert f'{2500 - judged_variants} of 2500 children left unjudged' in out
+
+
 class _Net:
     def __init__(self, best):
         self.best = best
