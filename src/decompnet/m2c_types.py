@@ -214,7 +214,9 @@ def _missing_halves(source: str) -> str:
     """`(second half of f64)` is where m2c read the odd register of a pair that holds a single (a function that uses
     every callee-saved register as a single and a double in one of them): no register file can be renamed to give the
     double room. C has no such operand; a zero stands in, so the draft compiles and the search can start from it."""
-    return re.sub(r"\(second half of f64\)|\bsecond half of f64\b", "0.0", source)
+    source = re.sub(r"\(second half of f64\)|\bsecond half of f64\b", "0.0", source)
+    # two zero words glued into a double are 0.0; built from the words, the comparison reads them back from the stack
+    return re.sub(r"\bGLUE_F64\(\s*(?:0U?|0\.0)\s*,\s*0U?\s*\)", "0.0", source)
 
 
 def _array_pointers(source: str) -> str:
@@ -224,6 +226,39 @@ def _array_pointers(source: str) -> str:
     source = re.sub(r"(\w+) \(\*(\w*)\)\[\]", lambda m: f"{m[1]} *{m[2]}", source)
     for name in names:
         source = re.sub(rf"\b{re.escape(name)}\[0\]\[0\]", f"{name}[0]", source)
+    return source
+
+
+_ELSE_DEFAULT = re.compile(r"\}\s*else\s*\{\s*default:(?P<body>[^{}:?]*;)\s*\}")
+
+
+def _default_in_else(source: str) -> str:
+    """A `default:` m2c printed in the `else` beside the switch it belongs to: the switch's default and the `else` are one
+    block. `_stray_labels` drops the label, which would leave an unmatched value doing nothing, so the block is copied
+    into the switch first (the compiler merges the two again). Only when the switch is the last statement of the `if`'s
+    arm and the block is plain statements. An N64 text converter's draft lost its `default:` this way: 5315 with it
+    left out, exact with it (and three other spellings)."""
+    for found in reversed(list(_ELSE_DEFAULT.finditer(source))):
+        body = found["body"].strip()
+        if re.search(r"\b(?:goto|break|continue|case|default)\b", body):
+            continue
+        # backwards from the arm's closing brace: the switch's own closing brace, then the brace that opened it
+        close = len(source[:found.start()].rstrip()) - 1
+        if close < 0 or source[close] != "}":
+            continue
+        depth, opened = 0, None
+        for brace in reversed(list(re.finditer(r"[{}]", source[:close + 1]))):
+            depth += 1 if brace[0] == "}" else -1
+            if not depth:
+                opened = brace.start()
+                break
+        if opened is None or not re.search(r"\bswitch\s*\([^{};]*\)\s*(?:/\*[^\n]*?\*/\s*)?$", source[:opened]):
+            continue
+        cases = source[opened:close].rstrip()
+        if re.search(r"\bdefault\s*:", cases):
+            continue
+        leaves = "" if re.search(r"\b(?:break|continue|return\b[^;{}]*)\s*;$", cases) else "break; "
+        source = source[:close] + f"{leaves}default: {body} break; " + source[close:]
     return source
 
 
@@ -253,6 +288,6 @@ def repair(source: str) -> str:
         return source
     for step in (_void_dereferences, _integer_dereferences, _scalar_dereferences, _table_calls, _literal_calls,
                  _address_sums, _library_calls, _pointer_calls, _unknown_pointer_words, _missing_halves, _array_pointers,
-                 _stray_labels, _call_prototypes):
+                 _default_in_else, _stray_labels, _call_prototypes):
         source = step(source)
     return source

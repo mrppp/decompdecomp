@@ -700,9 +700,10 @@ class ForkEngine:
         return builds.build(unit, lambda units: self._build_units(proj, fp, units))
 
     def _build_units(self, proj, fp: ForkProject, units: list) -> list[tuple[bool, str]]:
+        from ..compiler import _slot
         from . import attempt_workers
 
-        with self._build_locks[proj["id"]]:  # (and nothing changes the build's files meanwhile)
+        with self._build_locks[proj["id"]], _slot():  # (and nothing changes the build's files meanwhile)
             return attempt_workers.run("project-build", (fp.root, units), lambda: fp.build_units(units),
                                        build=fp._execute)
 
@@ -3144,6 +3145,14 @@ class ForkEngine:
         key = self._draft_key(cfg, unit, fp.root)
         if fn["seed"] is not None and fn["seed_key"] == key:
             return fn["seed"] or None
+        # A new object fallback only changes failed drafts. Keep existing useful
+        # seeds and migrate their key without regenerating them.
+        legacy = self._draft_key(cfg, unit, fp.root, object_revision=False)
+        if fn["seed"] and fn["seed_key"] == legacy:
+            with self.net.project_store(proj['id']).tx() as db:
+                db.execute("UPDATE functions SET seed_key=? WHERE id=? AND seed_key=? AND seed=?",
+                           (key, fn["id"], legacy, fn["seed"]))
+            return fn["seed"]
         hint = (unit.scratch or {}).get("compiler", "") or compiler_info.describe(fp, cfg.get("version")).get("name", "")
         meta = self._meta(fn)
         try:
@@ -3168,9 +3177,12 @@ class ForkEngine:
         return text
 
     @staticmethod
-    def _draft_key(cfg: dict, unit, root=None) -> str:
+    def _draft_key(cfg: dict, unit, root=None, *, object_revision=True) -> str:
         """Target/header/source inputs for a unit, including an explicit regeneration request."""
         inputs = [cfg.get('draft_generation',0),cfg.get('version'),unit.scratch]
+        if (object_revision and unit.target is not None
+                and arch.get(consoles.get(cfg.get('platform')).arch).object_draft_assembly):
+            inputs.append(('object-draft', drafts.OBJECT_DRAFT_REVISION))
         if unit.target is not None:
             try:inputs.append(hashlib.sha256(unit.target.read_bytes()).hexdigest())
             except OSError:inputs.append(None)
@@ -4149,6 +4161,7 @@ class ForkEngine:
                 if not (stop is not None and stop.is_set()):
                     self.sync(slug)
             eligible = None
+            reported_sdk_units = set()
             while stop is None or not stop.is_set():
                 if all_units:
                     eligible = {r['unit'] for r in self.net.project_store(slug).all(
@@ -4156,6 +4169,18 @@ class ForkEngine:
                         "AND COALESCE(json_extract(meta,'$.set_aside'),0)=0 "
                         "AND json_extract(meta,'$.asm_code') IS NULL AND json_extract(meta,'$.asm_twin') IS NULL",
                         proj['id']) if r['unit']}
+                    # A single generated C file makes every unresolved function in a
+                    # unit open. Hold mixed SDK units until each body is identified;
+                    # otherwise the remaining SDK routines become game candidates.
+                    sdk_units = {r['unit'] for r in self.net.project_store(slug).all(
+                        "SELECT DISTINCT unit FROM functions WHERE project_id=? AND status='asm' "
+                        "AND json_extract(meta,'$.verified_assembly.kind')='sdk'", proj['id']) if r['unit']}
+                    held_sdk_units = eligible & sdk_units
+                    if progress is not None:
+                        for unit_name in sorted(held_sdk_units - reported_sdk_units):
+                            progress(f'Deferred {unit_name}: it contains verified SDK assembly; review its other functions first.')
+                    reported_sdk_units.update(held_sdk_units)
+                    eligible -= sdk_units
                 with self._tree(proj).exclusive(), self._build_locks[proj["id"]]:
                     if all_units:
                         made = prepare(fp, log=progress or (lambda *_: None), stop=stop, units=eligible)
@@ -4329,6 +4354,10 @@ class ForkEngine:
             previous = draft_reports.read(self.net, fid, project_id=proj['id'])
             if not retry_draft and previous.get('key') == input_key and previous.get('complete'):
                 return 'skip'
+            if not retry_draft and previous.get('complete') and (previous.get('scored') or previous.get('matched')):
+                legacy = (self._draft_key(cfg, unit, fp.root, object_revision=False), *inputs[1:])
+                if previous.get('key') == draft_reports.key(repr(legacy), self._known(fp,unit), '', fn):
+                    return 'skip'  # Preserve a scored result under the previous generator.
             report = {'key':input_key, 'compiled':False, 'scored':False, 'matched':False, 'trials':0, 'failures':[]}
             outcomes = []
             for prelude, code in self._autopilot_drafts(proj, fp, cfg, fn, unit, report):

@@ -6,13 +6,16 @@ import os
 import queue
 import sys
 import threading
+from contextlib import closing
 from pathlib import Path
 
 from decompnet import compile_sessions, compile_timing, compiler, consoles
 from decompnet.app.engine.core import Core
 from decompnet.compile_worker import _read, _write
 from decompnet.forks.project import ForkProject
-from decompnet.rom import split
+from decompnet.rom import match, split
+from decompnet.rom.desktop_judge import RustJudge
+from decompnet.rom.verifier_link import PackReader, overlay_linker
 
 
 class RomReader:
@@ -26,7 +29,7 @@ class RomReader:
     def _rom(self, proj):
         path = Path(proj["root"]) / self.cfg(proj)["rom"]["file"]
         stat = path.stat()
-        key = (proj["id"], proj["config"], path, stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns)
+        key = (proj["id"], proj["config"], path, stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns)
         if key != self.key:
             segments = [split.Segment(**item) for item in self.cfg(proj)["segments"]]
             with path.open("rb") as stream:
@@ -57,20 +60,34 @@ class ProjectJudge(ForkProject):
         return result
 
 
-def perform(reader, build, action, args):
+def perform(reader, judge, build, action, args):
     if action == "compile":
         return compiler.compile_source(*args)
     if action == "rom-link":
         proj, fn, obj, target, symbols = args
         try:
-            return consoles.of(reader.cfg(proj)).link_function(obj, fn["name"], target, symbols, reader.reader(proj, fn))
+            console = consoles.of(reader.cfg(proj))
+            if not console.rust_desktop_judge:
+                return console.link_function(obj, fn["name"], target, symbols, reader.reader(proj, fn))
+            # The console picks the overlay or ordinary ROM linker and normalizes C++ names.
+            read = PackReader(reader, proj, fn)
+            ordinary = match.rom_linker.set(judge.link if type(target) is match.RomTarget else None)
+            overlay = overlay_linker.set(judge.link_overlay)
+            try:
+                return console.link_function(obj, fn["name"], target, symbols, read)
+            finally:
+                overlay_linker.reset(overlay)
+                match.rom_linker.reset(ordinary)
         finally:
             if os.name == "nt":  # a live mapping would block replacing an image on Windows
                 reader.close()
     if action == "score":
         from decompnet.network import score_candidate
 
-        return score_candidate(*args)
+        # A running app can reload this worker from a source update.
+        target, candidate, verdict, *options = args
+        native = options and options[0]
+        return score_candidate(target, candidate, verdict, compare=judge.diff if native else None)
     root, *parameters = args
     project = ProjectJudge(root, build)
     if action == "project-build":
@@ -86,6 +103,7 @@ def serve():
     source, replies = sys.stdin.buffer, sys.stdout.buffer
     sys.stdout = sys.stderr
     reader = RomReader()
+    judge = RustJudge()
     pending = queue.Queue()
     cancelled = threading.Event()
 
@@ -117,12 +135,12 @@ def serve():
         return value
 
     _write(replies, ("ready", None))
-    with compile_sessions.session():
+    with closing(judge), compile_sessions.session():
         while (request := pending.get()) is not None:
             counts = compile_timing.Counts()
             try:
                 with compile_timing.collect(counts), compiler.cancellable(check):
-                    result = perform(reader, build, *request)
+                    result = perform(reader, judge, build, *request)
             except Exception as error:
                 _write(replies, ("error", (error, counts.values)))
             else:

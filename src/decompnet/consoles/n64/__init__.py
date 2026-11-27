@@ -59,6 +59,7 @@ class Nintendo64(Console):
     short = "N64"
     status = RECOMMENDED  # tested on real games (Super Mario 64, GoldenEye, Perfect Dark), rebuilt byte for byte
     arch = "mips"
+    rust_desktop_judge = True
     asset_calls = {
         'osPiRawStartDma': dict(role='dma',source=1,destination=2,length=3,domain='rom',direction=0,source_alignment=2,destination_alignment=8,length_alignment=2,max_length=16*1024*1024),
         'osPiStartDma': dict(role='dma',source=3,destination=4,length=5,domain='rom',direction=2,source_alignment=2,destination_alignment=8,length_alignment=2,max_length=16*1024*1024),
@@ -264,6 +265,9 @@ class Nintendo64(Console):
 
     def sdk_assembly_identity(self, code, big_endian=True):
         return sdk_assembly.identify(code, big_endian)
+
+    def sdk_relocated_assembly_identity(self, code, relocations, machine):
+        return sdk_assembly.identify_relocated_entry(code, relocations) if machine == 'EM_MIPS' else None
 
     sdk_shape_sizes = (sdk_shapes._MIN_ANY, sdk_shapes._MAX)
 

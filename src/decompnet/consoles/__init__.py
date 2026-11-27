@@ -117,6 +117,7 @@ class Console:
         return tuple(Compiler(c.version, c.name, "your own copy") for c in kits.compilers(self.kits)
                      if not c.like or c.like in mine)
 
+    rust_desktop_judge = False  # ordinary ROM candidates can use the native attempt worker
     id = ""  # what project configs store as their platform ("n64")
     name = ""  # what the app calls it: "Nintendo 64"
     short = ""  # where space is short (the sidebar): "N64"
@@ -524,6 +525,11 @@ class Console:
 
     def sdk_assembly_identity(self, code: bytes, big_endian: bool = True) -> dict | None:
         """Exact self-contained handwritten SDK bodies only; no heuristic C exclusion."""
+        return None
+
+    def sdk_relocated_assembly_identity(self, code: bytes, relocations: list[tuple[int, int, int]],
+                                        machine: str) -> dict | None:
+        """A console's verified SDK shape with its reference object's validated relocations, if supported."""
         return None
 
     sdk_entry_stub: bool = False  # the cartridge's entry stub is SDK boot code (sdk_assembly_identity tells it by shape)

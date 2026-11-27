@@ -156,6 +156,10 @@
   relocatable analysis banks, whose records remain intact. Games with unverified mappings remain for review.
   Planned: equivalent runtime adapters for the other consoles and project-mode targets.
 
+- Full MIPS coverage scans trace indirect calls in every detected function, with a bounded search per function.
+  Completed groups are checkpointed against the image, layout and tracing implementation, so Stop and resume do
+  not discard earlier callback evidence. A function that exceeds its own bound is still reported as incomplete.
+
 - N64 imports also recognize cartridge tables of headerless, chunked MIO0 executables whose back-references can
   reach earlier chunks. A decoded program is included only when a called entry and a long prefix match the game's
   observed RAM; its analysis image is reconstructed from the original cartridge again during export verification.
@@ -875,7 +879,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Supplied assembly code/data verification | ✓ ROM driver | ✓ ROM driver | ✓ ROM driver | — | — | ✓ ROM driver | — | — own build adapter planned | — own build adapter planned | — | — own build adapter planned | — own build adapter planned |
 | Indexed SDK object assembly proof | ✓ MIPS ROM | ✓ MIPS ROM | ✓ MIPS ROM | — | — | ✓ MIPS ROM | — | — owned-build adapter planned | — owned-build adapter planned | — | — owned-build adapter planned | — owned-build adapter planned |
 | Library C that library detection finds set aside (opt-in, Libraries for this game; linked when your SDK has it) | ✓ MIPS ROM, built-in ultralib table; port glue and replaced, and n_audio (no public source) | ✓ MIPS ROM | ✓ MIPS ROM | — | — | ✓ MIPS ROM | — | — owned-build adapter planned | — owned-build adapter planned | — | — owned-build adapter planned | — owned-build adapter planned |
-| Built-in exact SDK assembly detection before claims | ✓ exact libultra bodies | — pack planned | — pack planned | — | — | — pack planned | — | — pack planned | — pack planned | — | — pack planned | ✓ N64 ELF references without relocations; other packs planned |
+| Built-in exact SDK assembly detection before claims | ✓ exact libultra bodies | — pack planned | — pack planned | — | — | — pack planned | — | — pack planned | — pack planned | — | — pack planned | ✓ N64 self-contained ELF references and validated makerom entry relocations; other packs planned |
 | Exact C / verified source assembly / verified SDK assembly / other assembly / open counts | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ counts | ✓ counts | — | ✓ counts | ✓ counts |
 | Local mapped source preparation | ✓ | ✓ | ✓ | — | — | ✓ | — | body only¹ | body only¹ | — | body only¹ | body only¹ |
 | Verified neighbour context hypotheses and separate body/header bundles | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — own build adapter planned | — own build adapter planned | — | — own build adapter planned | — own build adapter planned |
@@ -2429,6 +2433,10 @@ reuse the saved map. See [ROM Explorer](docs/ROM_EXPLORER.md) for support and li
 
 ## Next
 
+- Autopilot's case-copy draft candidates (`case_label_copies`, then `symbol_run_pointer`) are gated by a target jump
+  table with a shared destination, which `switch_tables.read` reads only for MIPS ROM games: read PowerPC, ARM, x86
+  and project-mode tables so every console gets them.
+
 ### Matched callees' prototypes in project-mode drafts
 
 ROM drafts take the prototype of each matched callee the shared header does not declare (`app/callee_prototypes.py`).
@@ -2675,6 +2683,8 @@ no drafts, and the DS latest/best attempt switch (PR #254). The rest:
   the drafter cache and remake m2c drafts when a header changes, let `redraft` pass an agent's declarations to m2c
   (`seeds.generate_from_asm`), and for DS read the unit's target object (`ForkProject.unit(...).target`) or write a
   temporary `.s` for m2c. The DS autopilot's "no drafts" guard is in progress this round.
+  MIPS project drafts can fall back to a complete, unambiguous reference-object function when the project's assembly
+  cannot be parsed; equivalent object-to-draft readers for PowerPC and ARM remain **—**.
 
 - **C++ methods as `Class::method` on GameCube, Wii and DS.** The rewrite is `Arch.method_draft`, which only x86 has
   (`arch/x86.py`), and the class reader is MIPS and x86 (`classes.py`); both need the PowerPC/ARM readers in "C++
@@ -3344,6 +3354,8 @@ Target-table reading currently supports MIPS ROM assembly with bounded, mapped t
 processors and imported object-mode table discovery: **—**, require their relocation/table adapters.
 Approximate SDK hints in imported project mode: **—**, require reading the target unit object through
 that mode's existing object-format adapter. Generic C source-shape repairs already reach that mode.
+Source-less units mixing verified SDK assembly and unresolved functions are deferred during automatic C
+preparation. Identify the remaining SDK bodies or split mixed units before opening their other functions.
 
 - Done: typed SDK math-call mapping hints, allocation-extent advisories, bounded post-preparation compiler checks,
   and first-error compiler summaries with private full logs. Imported builds retain their own compiler settings;
