@@ -45,9 +45,12 @@ def _reimport_claim(net, slug, name, agent):
         claimed = None
         with store.tx() as db:
             current = db.execute('SELECT * FROM functions WHERE id=?', (fn['id'],)).fetchone()
-            held = db.execute('SELECT 1 FROM claims WHERE function_id=? OR agent_id=?',
-                              (fn['id'], agent.id)).fetchone()
-            if current is not None and current['status'] == 'open' and not held:
+            # Saved authors can hold another function in the editor. This scoped claim
+            # retains attribution without taking or releasing that other claim.
+            held = db.execute('SELECT 1 FROM claims WHERE function_id=?', (fn['id'],)).fetchone()
+            if held:
+                raise NetworkError(f'{name} is already claimed; its saved C is kept for a later check.')
+            if current is not None and current['status'] == 'open':
                 claimed = time.time()
                 net._open_claim(db, current, agent, claimed, net._project(slug))
         try:
@@ -210,6 +213,12 @@ class ImportMixin:
             rom = (workdir / res.image).read_bytes()
 
         analysis_sha1 = hashlib.sha1(rom).hexdigest()
+        retained_reimport_snapshot = None
+        if reimport is not None and json.loads(reimport['config']).get('rom', {}).get('analysis_sha1') == analysis_sha1:
+            old_rows = self.project_store(reimport['id']).all(
+                'SELECT name,rom_offset,vram,size,target,unit FROM functions WHERE project_id=? ORDER BY id', reimport['id'])
+            if console.preserve_reimport_entries(self, reimport, res, rom, old_rows, log):
+                retained_reimport_snapshot = [tuple(row) for row in old_rows]
         if reimport is not None and console.recompiler is not None:
             recompile_review.keep_reviewed_on_reimport(self, reimport, res, rom, analysis_sha1, log)
 
@@ -340,6 +349,11 @@ class ImportMixin:
                 if reimport is None:
                     old_functions, gone, old_names, old_types = {}, {}, [], {}
                 else:
+                    if retained_reimport_snapshot is not None:
+                        current = db.execute('SELECT name,rom_offset,vram,size,target,unit FROM functions '
+                                             'WHERE project_id=? ORDER BY id', (pid,)).fetchall()
+                        if [tuple(row) for row in current] != retained_reimport_snapshot:
+                            raise NetworkError('The project entries changed during reimport. Retry with the current project.')
                     rows = db.execute("SELECT * FROM functions WHERE project_id=?", (pid,)).fetchall()
                     # A bank and address identify renamed functions. A bare address is safe only when
                     # unique on both sides; mutually exclusive overlays share their RAM slots.

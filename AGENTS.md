@@ -18,6 +18,22 @@ from GitHub. `main` is what users update from.
 This fork defaults to `~/Decomp-RetroReversing` (checkouts: `~/Decomp-RetroReversing-dev`),
 separate from upstream databases. Respect explicit `DECOMP_HOME` settings; do not auto-migrate old data.
 
+## Keep the app checkout on main
+
+The user's app checkout is `/Users/a/Documents/GitHub/decompdecomp-rr`. Treat it as read-only for
+implementation work. Only change its branch, files or Python environment when the user specifically asks
+you to work on that checkout. A request to implement, test or merge a change does not authorize that.
+
+- Before the first edit, fetch `origin/main` and create a fresh sibling worktree on a task branch, for
+  example `git worktree add -b fix/short-name ../decompdecomp-rr-short-name origin/main`.
+- Check `git rev-parse --show-toplevel` and `git status --short --branch` in the new worktree. Use its
+  absolute path as the working directory for commands and as the target for edits. Check the path again
+  when resuming or handing off work. Run dependency sync and tests there, using that worktree's own environment.
+- Commit in the task worktree, open a pull request, and merge it once required checks pass so the user
+  can test from `main`. Leave pulling and syncing the app checkout to the user unless they ask you to do it.
+- If you accidentally touch the app checkout, stop editing there. Inspect the diff, preserve any changes
+  you did not make, and tell the user before changing a checkout in use by the app.
+
 ## Commands
 
 ```bash

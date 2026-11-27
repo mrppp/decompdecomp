@@ -13,6 +13,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import ExitStack, nullcontext
+from itertools import islice
 
 from .. import claim_stalls, compile_timing, compiler, scoring, stamped
 from ..candidate_work import preparation as candidate_preparation
@@ -43,6 +44,7 @@ from . import (
     repair_sequences,
     residual_followups,
     search_frontier,
+    search_history,
     stack_padding_repairs,
     switch_tables,
     trial_bookkeeping,
@@ -166,6 +168,7 @@ class Search(Permuter):
         # A caller that caps the run (release repairs, maintenance tasks) owns its budget and gets no more.
         self.extendable = getattr(log, 'maximum_seconds', None) is None
         self.log = log
+        self.miss_cache = getattr(log, 'miss_cache', None)
         self.tested = self.skipped = self.visited = self.rejected = 0
         from .search_efficiency import Measurements
         self.efficiency = Measurements()
@@ -400,9 +403,10 @@ class Search(Permuter):
             info = dict(provenance) | {'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
                                       'phase': phase}
             self.recipe_wins.append((family, best, score, json.dumps(info), time.time()))
-            self.flush_recipes()
+            if trial_bookkeeping.current_turn() is None:
+                self.flush_recipes()
             self.log(f'Improved with {family}: score {best:,} → {score:,}; verified and saved.')
-        elif sum(sum(v[:3]) for v in self.recipe_counts.values()) >= 64:
+        elif trial_bookkeeping.current_turn() is None and sum(sum(v[:3]) for v in self.recipe_counts.values()) >= 64:
             self.flush_recipes()
 
     def phase_summary(self):
@@ -658,16 +662,11 @@ class Search(Permuter):
         seen = {source}
         limit = min(6 + min(len(loop_shapes), 12), (self.limit - self.tested) // 2)
         frontier = []
-        for family, child in proposals:
-            if limit <= 0:
-                break
-            if child in seen:
-                continue
-            seen.add(child)
+        eligible = self._unseen_proposals(proposals, seen)
+        for family, child in self._trial_proposals(agent, proj, fn, islice(eligible, max(0, limit)), fork):
             self.check()
             with repair_trial({'kind': 'deep local repair', 'family': family}):
                 score = self._score(agent, proj, fn, child, best, fork)
-            limit -= 1
             if score is not None and score < best:
                 return score
             if score is not None:
@@ -692,12 +691,8 @@ class Search(Permuter):
             if budget <= 0:
                 break
             proposals, _ = self._local_proposals(parent, proj, fn, rows)
-            for family, child in proposals:
-                if budget <= 0:
-                    break
-                if child in seen:
-                    continue
-                seen.add(child)
+            eligible = self._unseen_proposals(proposals, seen)
+            for family, child in self._trial_proposals(agent, proj, fn, islice(eligible, budget), fork):
                 self.check()
                 with repair_trial({'kind': 'deep local repair', 'family': f'{first}+{family}'}):
                     score = self._score(agent, proj, fn, child, best, fork)
@@ -735,7 +730,7 @@ class Search(Permuter):
             return best
         self.log(f'Searching pairs of repairs: judging {len(kids)} single children, then pairs of the best '
                  f'{int(pair_search.TOP_K * self.pair_scale)} from different families.')
-        with judge_pool.JudgePool(proj['slug'], fn, own['toolchain'], flags, size=self.PAIR_WORKERS) as pool:
+        with judge_pool.JudgePool(proj['slug'], fn, own['toolchain'], flags, size=self.PAIR_WORKERS, net=self.net) as pool:
             cover = parent_bad = None
             if pair_search.row_coverage_enabled(self.net.cfg(proj)):
                 # the rows of each judgment too: a child that fixes a row of the difference is kept whatever its
@@ -1003,7 +998,7 @@ class Search(Permuter):
         candidates = mined_rules.variants(self.net, proj['arch'], source, fn['name'])
         if candidates:
             self.log(f'Trying rewrites learnt from earlier matches: {len(candidates)}.')
-        for family, candidate in candidates:
+        for family, candidate in self._trial_proposals(agent, proj, fn, candidates, fork):
             self.check()
             with repair_trial({'kind': 'deep local repair', 'family': family, 'lineage': [family],
                                'base_source_sha256': hashlib.sha256(source.encode()).hexdigest(),
@@ -1431,7 +1426,7 @@ class Search(Permuter):
             self.log('Searching two statement moves at once: every single move is judged, then a second move on '
                      'the least-different results.')
             rank = self._allocation_rank(proj, fn, source, rows, fork)
-            with judge_pool.JudgePool(proj['slug'], fn, own['toolchain'], flags) as pool:
+            with judge_pool.JudgePool(proj['slug'], fn, own['toolchain'], flags, net=self.net) as pool:
                 score, candidate, judged = paired_moves.search(
                     pool.judge_many, source, fn['name'], header, best, seen=self.local_seen, check=self.check,
                     log=self.log, rank=rank)
@@ -2147,6 +2142,22 @@ class Search(Permuter):
         while len(cache)>64 or sum(size for _,size in cache.values())>8*1024*1024:cache.popitem(last=False)
         return result
 
+    @staticmethod
+    def _unseen_proposals(proposals, seen):
+        for family, child in proposals:
+            if child not in seen:
+                seen.add(child)
+                yield family, child
+
+    def _trial_proposals(self, agent, proj, fn, proposals, fork):
+        # These proposals are already generated. Prime small pages without delaying
+        # the first compile for the entire list or changing which candidates run.
+        proposals = iter(proposals)
+        while page := list(islice(proposals, 8)):
+            if len(page) > 1 and not fork:
+                self._prime_trials(agent, proj, fn, [source for _, source in page], fork)
+            yield from page
+
     def _prime_trials(self, agent, proj, fn, sources, fork):
         # Advisory history lookups must not synchronize the saved tree for every source.
         # Compiler snapshots and publication guards still capture/check fresh DB inputs.
@@ -2156,11 +2167,13 @@ class Search(Permuter):
     def _prime_trial_inputs(self, agent, proj, fn, sources, fork):
         # Scope each candidate exactly as the single-candidate path does. The map
         # lives for one generated chunk and never authorizes a winner.
+        store = self.net.project_store(proj['id']) if self.miss_cache is None else None
+        fid = fn['id']
         keys = []
         self._primed_scopes = {}
         self._primed_trials = {}
         with candidate_preparation():
-            for source in sources:
+            for source in dict.fromkeys(sources):
                 self.check()
                 # External build inputs need a fresh filesystem scan at the actual
                 # trial. Avoid scanning those twice merely to batch one DB read.
@@ -2168,14 +2181,28 @@ class Search(Permuter):
                 if recent_key is None:continue
                 scope = agent_tokens.target_scope(self.net, {**dict(fn), 'best_source': source}, '')
                 self._primed_scopes[recent_key] = scope
-                keys.append('deep-v1:'+hashlib.sha256((scope+source).encode()).hexdigest())
+                if self.miss_cache is not None:
+                    continue
+                key = search_history.signature(scope, source)
+                pending = trial_bookkeeping.lookup(store, ('reuse_trials', fid, key))
+                if pending is None:
+                    keys.append(key)
+                else:
+                    self._primed_trials[fid, key] = pending
         for at in range(0, len(keys), 64):
             group = keys[at:at+64]
-            rows = self.net.project_store(proj['id']).all(
+            rows = store.all(
                 'SELECT signature,feedback FROM reuse_trials WHERE function_id=? AND signature IN ('+
-                ','.join('?' for _ in group)+')', fn['id'], *group)
+                ','.join('?' for _ in group)+')', fid, *group)
             found = {row['signature']: row['feedback'] for row in rows}
             self._primed_trials.update({(fn['id'], key): found.get(key) for key in group})
+
+    def _miss_feedback(self, proj, fn, key, *, read=False):
+        if self.miss_cache is not None:
+            item = self.miss_cache.get(key)
+            return item[1] if item is not None else None
+        return search_history.miss_feedback(self.net.project_store(proj['id']), fn['id'], key,
+                                            getattr(self, '_primed_trials', {}), read=read)
 
     @trial
     def _score_current(self, agent, proj, fn, source, best, fork):
@@ -2209,17 +2236,14 @@ class Search(Permuter):
         scope = getattr(self, '_primed_scopes', {}).get(recent_key) if recent_key is not None else None
         if scope is None:scope = agent_tokens.target_scope(self.net, {**dict(fn), 'best_source': source}, '')
         self._efficiency_scope = scope
-        key = 'deep-v1:'+hashlib.sha256((scope+source).encode()).hexdigest()
-        pending = trial_bookkeeping.lookup(self.net.project_store(proj['id']), ('reuse_trials', fn['id'], key))
-        primed = getattr(self, '_primed_trials', {})
-        cached = ({'feedback':pending} if pending is not None else
-                  {'feedback':primed[fn['id'], key]} if (fn['id'], key) in primed else self.net.project_store(proj['id']).one(
-                      'SELECT feedback FROM reuse_trials WHERE function_id=? AND signature=?', fn['id'], key))
-        feedback = json.loads(cached['feedback']) if cached and cached['feedback'] else None
+        key = search_history.signature(scope, source)
+        cached = None
+        if not self.measuring_baseline and not (current_trial() or {}).get('fresh'):
+            cached = self._miss_feedback(proj, fn, key, read=True)
+        feedback = json.loads(cached) if cached else None
         score = feedback.get('score') if isinstance(feedback, dict) else feedback
         self._cached_rows = feedback.get('rows', []) if isinstance(feedback, dict) else []
-        reused = (not self.measuring_baseline and not (current_trial() or {}).get('fresh')
-                  and isinstance(score, int) and score >= best)
+        reused = isinstance(score, int) and score >= best
         self._trial_reused = reused
         self._trial_locations = None
         self._trial_output_granularity = None
@@ -2270,12 +2294,13 @@ class Search(Permuter):
                                  best <= score <= best*2 and search_frontier.structure_recovery(rows,own[0],proj['arch']) or
                                  best <= score <= best*4 and search_frontier.mask_recovery(rows,own[0],proj['arch'])) else score)
                 if isinstance(feedback,dict):feedback['output']=getattr(self,'_trial_output',None)
-                from .search_history import feedback as compact_feedback
-                packed_feedback = json.dumps(compact_feedback(feedback),separators=(',',':'))
-                trial_bookkeeping.submit(self.net.project_store(proj['id']), [(
-                    'INSERT OR REPLACE INTO reuse_trials(function_id,signature,outcome,reason,feedback) VALUES(?,?,?,?,?)',
-                    (fn['id'], key, 'miss', 'deep function search; path: '+ ' → '.join((current_trial() or {}).get('lineage', [])),
-                     packed_feedback))], memo=(('reuse_trials', fn['id'], key), packed_feedback))
+                packed_feedback = json.dumps(search_history.feedback(feedback), separators=(',', ':'))
+                reason = 'deep function search; path: ' + ' → '.join(provenance.get('lineage', []))
+                if self.miss_cache is not None:
+                    self.miss_cache.record(key, 'miss', reason, packed_feedback)
+                else:
+                    store = self.net.project_store(proj['id'])
+                    search_history.record_miss(store, fn['id'], key, reason, packed_feedback)
         if not self.measuring_baseline:
             self.recipe(fn, source, best, score, 'skipped' if reused else 'tested', elapsed_ms)
             if self.tested and self.tested % 100 == 0 and not reused:
@@ -2426,11 +2451,12 @@ def _full_run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, 
         remaining = max_variants - tried_twin
         if proj is not None and remaining > 1 and twins.has_open_deep_twin(proj, fn):
             remaining -= 1  # Reserve a destination compile if this draft improves.
-        if threads_per_function > 1:
-            from .deep_parallel import run as parallel
-            result = parallel(net, slug, name, minutes, remaining, log, compiler_profiles, threads_per_function, **order)
-        else:
-            result = _run(net, slug, name, minutes, remaining, log, compiler_profiles, **order)
+        with search_history.function_turn(log, net.project_store(fn['project_id']), fn['id']):
+            if threads_per_function > 1:
+                from .deep_parallel import run as parallel
+                result = parallel(net, slug, name, minutes, remaining, log, compiler_profiles, threads_per_function, **order)
+            else:
+                result = _run(net, slug, name, minutes, remaining, log, compiler_profiles, **order)
         result['rank_candidates'] = rank_candidates
         result['tested'] += tried_twin
         if proj is not None and not result['matched'] and result['tested'] < max_variants + result.get('extra_variants', 0):
@@ -2465,7 +2491,8 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
     """Visit the supported local repairs, then spend the remaining budget on random permutations."""
     proj, fn = validate_function(net, slug, name)
     sweeps = getattr(net, 'deep_sweeps', None) if lane is None else None
-    if sweeps:
+    owns_completion = sweeps is not None and not getattr(log, 'sweep_owns_completion', False)
+    if owns_completion:
         from ..candidate_scope import key
         build_scope = key(net, proj, fn)
     from . import deep_profiles
@@ -2770,6 +2797,6 @@ def _run(net, slug, name, minutes, max_variants, log, compiler_profiles=1, *, la
                 log('Saved the measured residual for the next agent claim.')
     result['compiler_profiles'] = compiler_profiles
     result['rank_candidates'] = rank_candidates
-    if sweeps:
+    if owns_completion:
         sweeps.completed(slug, fn, minutes, max_variants, result, build_scope)
     return result

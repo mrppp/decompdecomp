@@ -32,6 +32,24 @@ _KNOWN = {
 # The PI manager references the EPI DMA entry. The scheduler uses linked
 # addresses for queues and OS globals when saving and restoring context.
 _LIBULTRA = {
+    # Complete linked bytes from an image whose public symbol map identifies these entries.
+    # The interrupt routines were compared instruction by instruction with a verified SDK build:
+    # only the linked addresses of the same globals and interrupt-mask table differ. The table's
+    # 128 bytes match; the preamble was assembled from the SDK source and linked at its target.
+    '47ae795a2b12783a13e2b8d03439ce9a39fc826c': {
+        '8081d37a7463efd172c8f0b006ee7ce4fddb12826faab65073fafe16ce990dab':
+            ('__osExceptionPreamble', 16, False, 'os/exceptasm.s'),
+        # Both exception entries match a second SDK build instruction by
+        # instruction after resolving their linked addresses; their 32-byte cause table matches.
+        'ffd9b4ef7ede2edbbad8f193da4f14f841318f70e870c0e4e54b992273702a1f':
+            ('__ptExceptionPreamble', 32, False, 'os/exceptasm.s'),
+        'bbf04453bd2414ee9dfe1663dd5f74f625126b8d485f2995bc644b438a8f6a71':
+            ('__ptException', 160, False, 'os/exceptasm.s'),
+        '54687027e918662c0f4fad3b0c02369bcb54450afefab18763aeb2a130f15c15':
+            ('__osDisableInt', 112, False, 'os/interrupt.s'),
+        '56d0980fd0dbff05336c1bf6863ee9d7df5b5e914ed6bfa1e67cbb51531cc0d6':
+            ('osSetIntMask', 160, False, 'os/setintmask.s'),
+    },
     _LINKED_CLEANUP_THREE_WORDS: {
         'cb6887bd3a5941c6251ff092561b66d2fa53929becbf2cc8f3715e0972ec68fa':
             ('__osDispatchThread', 380, False, 'os/exceptasm.s'),

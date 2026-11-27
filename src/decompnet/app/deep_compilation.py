@@ -246,7 +246,7 @@ def chunk(search, agent, proj, fn, sources, fork):
     if (pool is None or fork or not hasattr(search.net, 'compiled_ahead')
             or len(getattr(search, 'compiler_profiles', [])) > 1):
         yield;return
-    from . import random_safety
+    from . import random_safety, search_history
     header = search.net._context(proj['id'], fn['unit'])['header']
     tickets = {}
     def check():
@@ -270,10 +270,9 @@ def chunk(search, agent, proj, fn, sources, fork):
                 if recent is not None and recent[0]>=search.best:continue
                 scope = getattr(search, '_primed_scopes', {}).get(key)
                 if scope is not None:
-                    import hashlib
                     import json
-                    signature = 'deep-v1:'+hashlib.sha256((scope+source).encode()).hexdigest()
-                    feedback = getattr(search, '_primed_trials', {}).get((fn['id'], signature))
+                    signature = search_history.signature(scope, source)
+                    feedback = search._miss_feedback(proj, fn, signature)
                     if feedback:
                         value = json.loads(feedback)
                         score = value.get('score') if isinstance(value, dict) else value
