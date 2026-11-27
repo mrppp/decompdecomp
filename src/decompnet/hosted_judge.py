@@ -440,7 +440,8 @@ class Packs:
 
 def _judge_with_mips_linker(packs, request, lines, out):
     from .rom.match import elf_preparer, instruction_linker, rom_linker
-    from .rom.verifier_link import project_inputs
+    from .rom.verifier_link import link_overlay, overlay_linker, project_inputs
+    from .scoring import mips_comparer
 
     def exchange(operation, plan, lookup=None):
         out.write(json.dumps({operation: plan}) + "\n")
@@ -473,8 +474,18 @@ def _judge_with_mips_linker(packs, request, lines, out):
 
         return run(obj, target, symbols, read, exchange)
 
+    def compare(target, candidate, align_branches):
+        from .rom.verifier_link import compare_mips
+
+        return compare_mips(target, candidate, align_branches, exchange)
+
+    def overlay(obj, name, target, info):
+        return link_overlay(obj, name, target, info, exchange)
+
+    compare_token = mips_comparer.set(compare if request.get("compare_mips") == 1 else None)
     inputs_token = project_inputs.set(request.get("rom_mips") == 1 and request.get("project_mips") == 1)
     rom_token = rom_linker.set(link_rom if request.get("rom_mips") == 1 else None)
+    overlay_token = overlay_linker.set(overlay if request.get("link_uso") == 1 else None)
     link_token = instruction_linker.set(link)
     prepare_token = elf_preparer.set(prepare if request.get("parse_mips") == 1 else None)
     try:
@@ -482,8 +493,10 @@ def _judge_with_mips_linker(packs, request, lines, out):
     finally:
         elf_preparer.reset(prepare_token)
         instruction_linker.reset(link_token)
+        overlay_linker.reset(overlay_token)
         rom_linker.reset(rom_token)
         project_inputs.reset(inputs_token)
+        mips_comparer.reset(compare_token)
 
 
 def serve(net, lines=sys.stdin, out=sys.stdout) -> None:

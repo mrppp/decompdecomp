@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from decompnet import hosted_export, hosted_judge, hosted_pack, toolchains
+from decompnet import hosted_export, hosted_judge, hosted_pack, scoring, toolchains
 from decompnet.app import mcp_gateway
 from decompnet.app.remote_judge import RemoteJudge
 from decompnet.compiler import compile_source
@@ -60,6 +60,39 @@ def audit_worker():
         assert result == expected, (result, expected)
         return result
 
+    # The parity oracle uses Python's SequenceMatcher even when the optional Rust library is installed.
+    scoring.instruction_alignment._kernel = lambda: None
+    native_compare = verifier_link.compare_mips
+
+    def audit_compare(target, candidate, align_branches, exchange):
+        expected = scoring._diff(target, candidate, details=False, evidence=True)
+        result = native_compare(target, candidate, align_branches, exchange)
+        assert result is not None, "Rust MIPS comparison declined the test object"
+        assert scoring.ScoreEvidence(**result) == expected, (result, expected)
+        return result
+
+    native_evidence = scoring.score_evidence
+
+    def require_native(target, candidate):
+        original = scoring.mips_comparer.get()
+        assert original is not None, "Rust MIPS comparison was not negotiated"
+        used = False
+
+        def compare(*args):
+            nonlocal used
+            used = True
+            return original(*args)
+
+        token = scoring.mips_comparer.set(compare)
+        try:
+            evidence = native_evidence(target, candidate)
+        finally:
+            scoring.mips_comparer.reset(token)
+        assert used, "Python scoring ran instead of the Rust MIPS comparison"
+        return evidence
+
+    scoring.score_evidence = require_native
+    verifier_link.compare_mips = audit_compare
     verifier_link.link_rom = audit
     return main()
 
@@ -151,7 +184,8 @@ def test_real_mips_objects_have_the_same_verdict_on_the_shared_queue(tmp_path, t
     assert scores[-1] is None
 
 
-def queue_parity(tmp_path, net, request, sources):
+def queue_parity(tmp_path, net, request, sources, *,
+                 worker_module="tests.test_rust_mips_link"):
     folder = tmp_path / "hosted"
     hosted_export.export(net, "game", folder / "projects" / "game.sqlite3", log=lambda _: None)
     pack = folder / "packs" / "game.sqlite3"
@@ -170,7 +204,7 @@ def queue_parity(tmp_path, net, request, sources):
     try:
         base = f"http://127.0.0.1:{int(server.stdout.readline().split()[1])}"
         queue = RemoteJudge({"server": base, "token": tokens["admin"], "pack_sha256": digest}, request)
-        entry = "from tests.test_rust_mips_link import audit_worker; raise SystemExit(audit_worker())"
+        entry = f"from {worker_module} import audit_worker; raise SystemExit(audit_worker())"
         worker = subprocess.Popen(
             [str(mcp_gateway.built()), "verifier", "--server", base, "--token", tokens["verifier"],
              "--name", "rust", "--poll", "0.1", "--slots", "2", "--packs", str(tmp_path / "worker-packs"),
