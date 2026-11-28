@@ -47,7 +47,7 @@ def rust_overlay_parity(monkeypatch):
 
 
 @pytest.mark.parametrize('compressed', [False, True])
-def test_rebuild_uso_checks_text_and_symbol_binding(tmp_path, compressed):
+def test_rebuild_uso_checks_text_and_symbol_binding(tmp_path, compressed, monkeypatch):
     if toolchains.installed('ido-5.3') is None:
         pytest.skip('needs IDO 5.3')
     cfg = compiler_config(tmp_path, {'compiler': {'toolchain': 'ido-5.3', 'flags': toolchains.get('ido-5.3').flags}})
@@ -71,6 +71,24 @@ def test_rebuild_uso_checks_text_and_symbol_binding(tmp_path, compressed):
     assert missing.problems == [f'Overlay relocation at +0x{at:X} requires {uso_match.alias(region.offset, index)}.'
                                 for at, index in [(0, 4), (4, 3)]]
     assert uso.rebuild(cartridge, [('test_entry', info, built.obj)]) == cartridge
+    from decompnet.app import mcp_gateway
+    from decompnet.rom.desktop_judge import RustJudge
+
+    if mcp_gateway.built():
+        calls = []
+        def audited_overlay(judge, *args):
+            result = audit_overlay(judge._exchange, *args)
+            calls.append(result.exact)
+            return result
+
+        with monkeypatch.context() as audit:
+            audit.setattr(RustJudge, "link_overlay", audited_overlay)
+            token = uso_match.overlay_linker.set(None)
+            try:
+                assert uso.rebuild(cartridge, [('test_entry', info, built.obj)]) == cartridge
+                assert calls == [True]
+            finally:
+                uso_match.overlay_linker.reset(token)
     wrong = compile_source(cfg, '', source.replace(binding, uso_match.alias(region.offset, 2)))
     assert wrong.ok, wrong.log
     result = uso_match.link(wrong.obj, 'test_entry', code, info)
@@ -1323,9 +1341,31 @@ def test_uso_desktop_and_shared_queue_use_rust(tmp_path, monkeypatch, toolchain)
                "compiler": compiler, "header_sha256": hashlib.sha256(header.encode()).hexdigest()}
     from decompnet.rom.verifier_link import overlay_linker
 
+    fn = net._function("f1", "game")
+    proj = net.project_row("game", sync=False)
+    bad = compile_source(compiler_config(tmp_path, {"compiler": compiler}), header, wrong)
+    assert bad.ok, bad.log
+    batch = net._judge_random_batch(fn, proj, [built.obj, bad.obj, b""])
+    assert batch is not None
+    _, judgments = batch
+    assert judgments[-1] is None  # A declined input leaves its neighbors and their order intact.
     token = overlay_linker.set(None)
     try:
-        scores = queue_parity(tmp_path, net, request, [exact, wrong], worker_module=__name__)
+        from decompnet import scoring
+
+        for obj, (candidate, diff, clean) in zip((built.obj, bad.obj), judgments[:2], strict=True):
+            oracle = _python_link(obj, fn["name"], body.code, info)
+            score = scoring._diff(net._target_obj(fn, proj), oracle.candidate, details=False)
+            assert candidate == oracle.candidate and clean == (not oracle.problems)
+            assert (diff.score, diff.bytes_match) == (0 if oracle.exact else max(1, score.score), oracle.exact)
+    finally:
+        overlay_linker.reset(token)
+
+    token = overlay_linker.set(None)
+    try:
+        with monkeypatch.context() as python:
+            python.setenv("DECOMP_MCP_GATEWAY", "0")
+            scores = queue_parity(tmp_path, net, request, [exact, wrong], worker_module=__name__)
     finally:
         overlay_linker.reset(token)
     assert scores[0] == 0 and scores[1] > 0

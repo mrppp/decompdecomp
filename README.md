@@ -85,9 +85,11 @@ Stage-by-stage detail is in the `console/xbox360` branch's commit messages.
   stand-in for a model that hands in the demo's own C; the app compiles and judges every function for real.</sub>
 </p>
 
-Ordinary N64 desktop attempts and interactive diffs use the same Rust ROM linker and MIPS comparison as shared
-judge workers when the compatible gateway is available. The desktop still runs the project's original compiler locally.
-The Python judge remains available for unsupported inputs and installations without a compatible gateway.
+N64 attempts, direct checks, interactive diffs, and cartridge rebuild verification use the Rust judge
+when a compatible gateway is available. Shared compiler trials use the same linkers. The desktop still runs the project's original compiler locally.
+Source checkouts build the gateway during `uv sync` when Cargo is installed. Otherwise startup checks for
+the latest published gateway and warns if it has to use an older one. Unsupported inputs and incompatible gateways
+fall back to the Python judge.
 
 Packaged builds use a Rust instruction aligner when available. Source checkouts can build it with
 `uv run python packaging/build_alignment.py` and Rust installed. Set `DECOMP_NATIVE_ALIGNMENT=0`
@@ -216,7 +218,8 @@ explicit regeneration opens a new pass. No AI calls are made.
 After the background drafts are made, a ROM project's open functions are also tried under the other compiler
 profiles its matched functions already use. Each function's stored draft, a freshly made draft and its saved C are
 judged under those profiles. A MIPS GCC function whose float registers point to the other register file is judged
-with the other `-mfp32`/`-mfp64` flag too. Only an exact result is applied, and only to that function, as an
+with the other `-mfp32`/`-mfp64` flag too. The profiles are the project's four most used, plus any other one a
+matched function right beside it uses. Only an exact result is applied, and only to that function, as an
 ordinary function-only compiler suggestion (with automatic compiler changes off, it waits on the project page). The
 project's default compiler and its ranges never change. The closest result that is not exact is kept as the
 function's closest attempt under another profile. The pass runs again when a draft changes, when the saved C changes
@@ -1007,6 +1010,10 @@ process environment. Built-in shell, file and web tools are denied: workers use 
 judged tools. Reported input, output and cache tokens are tracked; missing usage or dollar
 costs remain unknown. Live MCP, compile-and-match and permission checks were tested on
 macOS; Linux and Windows launch settings have automated coverage.
+
+### Public projects without a matching build
+
+If a MIPS public project has no build the app can judge, add your game to that import and choose **Use an exported ROM analysis**. Select a previously exported analysis of the same game. The app checks the image and original code, then creates a separate local workspace with the public sources available as reference. The public checkout stays intact, and new matches remain in the local workspace. This workspace does not yet rebuild the whole game with those matches or support portable save and reimport.
 
 ### Repositories with bundled decompdecomp progress
 

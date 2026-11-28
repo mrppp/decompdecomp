@@ -34,6 +34,26 @@ DEBUG_TYPES_FILE = "debug_types.h"
 HEADER_CHECK = "int decomp_header_check;"  # a source that needs nothing but the header to compile
 
 
+def _same_or_extended_analysis(project, image, digest):
+    """Keep verified old entries when a new analysis only appends programs."""
+    info = json.loads(project['config']).get('rom', {})
+    expected = info.get('analysis_sha1')
+    if expected == digest:
+        return True
+    name = info.get('file')
+    if not isinstance(name, str) or not isinstance(expected, str):
+        return False
+    root = Path(project['root']).resolve()
+    path = root / name
+    try:
+        if not path.resolve().is_relative_to(root) or path.is_symlink():
+            return False
+        old = path.read_bytes()
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return bool(old) and hashlib.sha1(old).hexdigest() == expected.lower() and image.startswith(old)
+
+
 @contextmanager
 def _reimport_claim(net, slug, name, agent):
     """Release only the temporary claim made for this saved-source check."""
@@ -53,9 +73,13 @@ def _reimport_claim(net, slug, name, agent):
             if current is not None and current['status'] == 'open':
                 claimed = time.time()
                 net._open_claim(db, current, agent, claimed, net._project(slug))
+        previous = getattr(net._compile_ahead_local, 'reimport_claim', None)
+        if claimed is not None:
+            net._compile_ahead_local.reimport_claim = (fn['project_id'], fn['id'], agent.id, claimed)
         try:
             yield
         finally:
+            net._compile_ahead_local.reimport_claim = previous
             if claimed is not None:
                 with store.tx() as db:
                     deleted = db.execute('DELETE FROM claims WHERE function_id=? AND agent_id=? AND claimed_at=?',
@@ -89,26 +113,33 @@ def pair_old_functions(rows, functions) -> dict:
     return paired
 
 
-def _recreated_matches(net, pid, gone, same_analysis):
-    """Rejudge saved C if boundary repair recreated the same previously matched entry."""
-    if not same_analysis:
+def _recreated_matches(net, pid, gone, compatible_analysis):
+    """Keep and rejudge saved C if boundary repair recreated the exact entry."""
+    if not compatible_analysis:
         return []
     store = net.project_store(pid)
-    old_matches = [old for old in gone.values()
-                   if old['status'] == 'matched' and old['matched_source'] and old['rom_offset'] is not None]
-    if not old_matches:
+    saved = [old for old in gone.values() if old['rom_offset'] is not None and
+             (old['status'] == 'matched' and old['matched_source'] or old['status'] == 'open' and old['best_source'])]
+    if not saved:
         return []
-    rows = store.all('SELECT name,rom_offset,vram,size,target,status FROM functions '
+    rows = store.all('SELECT id,name,rom_offset,vram,size,target,status FROM functions '
                      'WHERE project_id=? AND name IN (SELECT value FROM json_each(?))',
-                     pid, json.dumps([old['name'] for old in old_matches]))
+                     pid, json.dumps([old['name'] for old in saved]))
     by_name = {row['name']: row for row in rows}
     result = []
-    for old in old_matches:
+    for old in saved:
         row = by_name.get(old['name'])
         if (row is not None and row['status'] != 'matched'
                 and (row['rom_offset'], row['vram'], row['size'], row['target']) ==
                     (old['rom_offset'], old['vram'], old['size'], old['target'])):
-            result.append((old['name'], old['matched_source'], old['matched_agent_id']))
+            source=old['matched_source'] if old['status']=='matched' else old['best_source']
+            agent=old['matched_agent_id'] if old['status']=='matched' else old['best_agent_id']
+            # Keep it on the recreated row before the judge runs, so cancellation
+            # or an unavailable compiler cannot strand the source only in notes.
+            with store.tx() as db:
+                db.execute('UPDATE functions SET best_source=?,best_agent_id=?,best_score=MAX(1,COALESCE(n_insns,1))*100 '
+                           'WHERE id=? AND status=\'open\' AND best_source IS NULL',(source,agent,row['id']))
+            result.append((old['name'],source,agent))
     return result
 
 
@@ -237,9 +268,10 @@ class ImportMixin:
 
         analysis_sha1 = hashlib.sha1(rom).hexdigest()
         retained_reimport_snapshot = None
-        if reimport is not None and json.loads(reimport['config']).get('rom', {}).get('analysis_sha1') == analysis_sha1:
+        compatible_analysis = reimport is not None and _same_or_extended_analysis(reimport, rom, analysis_sha1)
+        if compatible_analysis:
             old_rows = self.project_store(reimport['id']).all(
-                'SELECT name,rom_offset,vram,size,target,unit FROM functions WHERE project_id=? ORDER BY id', reimport['id'])
+                'SELECT name,rom_offset,vram,size,target,unit,meta,gone_mark FROM functions WHERE project_id=? ORDER BY id', reimport['id'])
             if console.preserve_reimport_entries(self, reimport, res, rom, old_rows, log):
                 retained_reimport_snapshot = [tuple(row) for row in old_rows]
         if reimport is not None and console.recompiler is not None:
@@ -373,7 +405,7 @@ class ImportMixin:
                     old_functions, gone, old_names, old_types = {}, {}, [], {}
                 else:
                     if retained_reimport_snapshot is not None:
-                        current = db.execute('SELECT name,rom_offset,vram,size,target,unit FROM functions '
+                        current = db.execute('SELECT name,rom_offset,vram,size,target,unit,meta,gone_mark FROM functions '
                                              'WHERE project_id=? ORDER BY id', (pid,)).fetchall()
                         if [tuple(row) for row in current] != retained_reimport_snapshot:
                             raise NetworkError('The project entries changed during reimport. Retry with the current project.')
@@ -386,10 +418,10 @@ class ImportMixin:
                                and old_counts[r['vram']] == new_counts[r['vram']] == 1}
                     by_unit = {(r['unit'], r['vram']): r for r in rows}
                     by_name = {r["name"]: r for r in rows}
-                    # An improved overlay mapping can move a function's VRAM while its original image bytes
-                    # stay put. Reserve such matches by unique ROM offset before an unrelated function at the old
-                    # virtual address can take their identity. Only identical analysis images and entry bytes
-                    # are safe; changed extents are judged again. A name used by other code cannot be retained.
+                    # An improved overlay mapping can move a function or rename its unit while its original
+                    # image bytes stay put. Reserve unique ROM offsets before another function at the same
+                    # virtual address can take their identity. Changed extents are judged again, and a name
+                    # used by other code cannot be retained.
                     old_functions = {}
                     used_ids = set()
                     blocked_ids = set()
@@ -403,13 +435,14 @@ class ImportMixin:
                         order = 'big' if picked.big_endian else 'little'
                         for fn in res.functions:
                             old = by_offset.get(fn.rom)
-                            if (old is None or old['vram'] == fn.vram or not old['target'] or not fn.lines
+                            if (old is None or not old['target'] or not fn.lines
                                     or old['target'][:4] != fn.lines[0].word.to_bytes(4, order)):
                                 continue
                             if old['name'] in symbols.by_name and old['name'] != fn.name:
-                                # The old name now belongs to different code. Keep its saved C in notes rather
-                                # than silently assigning it to that code or creating a duplicate function name.
-                                blocked_ids.add(old['id'])
+                                # A moved entry's old name belongs to other code; don't assign its C there.
+                                # At the same VRAM, leave existing unit/name pairing to resolve the alias.
+                                if old['vram'] != fn.vram:
+                                    blocked_ids.add(old['id'])
                                 continue
                             old_functions[fn.name] = old
                             used_ids.add(old['id'])
@@ -441,6 +474,9 @@ class ImportMixin:
                 shared_entries = intentional(res.functions, console, res.segments)
                 lost = []
                 for name, old in gone.items():
+                    if name in getattr(res, 'retained_join_archives', ()):
+                        # Keep the absorbed row and its ID for boundary history/undo.
+                        continue
                     for table in ("claims", "attempts", "twin_misses"):
                         db.execute(f"DELETE FROM {table} WHERE function_id=?", (old["id"],))
                     db.execute("UPDATE notes SET function_id=NULL, text=? || COALESCE(text, '') "
@@ -641,14 +677,23 @@ class ImportMixin:
         # on an extent no C can match (boundary_repairs.apply_entry_fixes; each fix undoable in Review boundaries).
         from ..boundary_repairs import apply_entry_fixes
         try:
-            apply_entry_fixes(self, slug, log)
+            if compatible_analysis:
+                identities=[(r['rom_offset'],r['vram'],r['size'],r['target']) for r in gone.values()
+                            if r['rom_offset'] is not None and r['vram'] is not None and r['target']]
+                counts=Counter(identities)
+                preferred={(r['rom_offset'],r['vram'],r['size'],r['target']):r['name'] for r in gone.values()
+                           if r['rom_offset'] is not None and r['vram'] is not None and r['target']
+                           and counts[(r['rom_offset'],r['vram'],r['size'],r['target'])]==1}
+                apply_entry_fixes(self, slug, log, preferred_entries=preferred)
+            else:
+                apply_entry_fixes(self, slug, log)
         except NetworkError as e:
             log(f"function boundaries were not fixed automatically: {e}")
         if reimport is not None:
-            recovered = _recreated_matches(self, pid, gone, same_analysis)
+            recovered = _recreated_matches(self, pid, gone, compatible_analysis)
             if recovered:
                 rejudge.extend(recovered)
-                log(f'{len(recovered)} previously matched entries returned after boundary repair; their saved C will be checked again.')
+                log(f'{len(recovered)} saved entries returned after boundary repair; their C will be checked again.')
         # Automatic boundary fixes invalidate earlier shared-entry evidence.
         # Reprove it against the final stored split before a helper can claim it.
         from ..boundary_review import refresh_shared_entries

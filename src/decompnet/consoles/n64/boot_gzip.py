@@ -15,6 +15,8 @@ MAX_MEMBER = 4 * 1024 * 1024
 # text member. Their consumers load them as data. Match the full audited spans
 # so versions that change a table still go through the normal boundary review.
 INLINE_TABLES = (
+    (bytes.fromhex('800838d000000000800c3e6800000000'), 40,
+     'a7fc74bb39c1ba40e5f3911db5f6fd9ee028308f5eb206a0be65a5b8a33f4949'),
     (bytes.fromhex('8005a6848005a6848005a6648005a670'), 64,
      '89861ba83028659d467c7a8de5b65f5f4ec558f35c354c57fb3e6111645bab49'),
     (bytes.fromhex('07aa01010003ffffffff00200020000a'), 0x8b0,
@@ -207,10 +209,28 @@ def find(rom, boot_ranges):
     pointer = _pointer_find(rom, boot_ranges)
     if pointer:
         return pointer
-    from . import boot_brs, boot_compact_mio, boot_lzss, boot_raw_deflate, boot_refpack, boot_rnc2, boot_two_bit
+    from . import (
+        boot_brs,
+        boot_byte_lz,
+        boot_chunked_bits,
+        boot_compact_mio,
+        boot_erz,
+        boot_flag_lz,
+        boot_huffman,
+        boot_lzss,
+        boot_paired_rle,
+        boot_raw_deflate,
+        boot_refpack,
+        boot_rnc2,
+        boot_rnx,
+        boot_two_bit,
+        boot_xor,
+    )
     return (boot_compact_mio.find(rom, boot_ranges) or boot_raw_deflate.find(rom, boot_ranges) or boot_brs.find(rom, boot_ranges)
-            or boot_lzss.find(rom, boot_ranges) or boot_refpack.find(rom, boot_ranges)
-            or boot_two_bit.find(rom, boot_ranges) or boot_rnc2.find(rom, boot_ranges))
+            or boot_byte_lz.find(rom, boot_ranges) or boot_chunked_bits.find(rom, boot_ranges)
+            or boot_lzss.find(rom, boot_ranges) or boot_flag_lz.find(rom, boot_ranges) or boot_huffman.find(rom, boot_ranges) or boot_refpack.find(rom, boot_ranges)
+            or boot_two_bit.find(rom, boot_ranges) or boot_rnc2.find(rom, boot_ranges) or boot_erz.find(rom, boot_ranges)
+            or boot_rnx.find(rom, boot_ranges) or boot_paired_rle.find(rom, boot_ranges) or boot_xor.find(rom, boot_ranges))
 
 
 def verify_analysis(rom, expanded, boot_ranges):
@@ -251,7 +271,7 @@ def inline_tables(text):
 def add(config, workdir, image, rom, boot_ranges, log):
     if not (programs := find(rom, boot_ranges)):
         return None
-    from . import boot_brs, boot_lzss, boot_rnc2, boot_two_bit
+    from . import boot_brs, boot_byte_lz, boot_chunked_bits, boot_erz, boot_lzss, boot_rnc2, boot_rnx, boot_two_bit
     from .boot_mapping import extend_startup_descriptor, extend_startup_trap
 
     extend_startup_trap(config, rom, log)
@@ -260,9 +280,19 @@ def add(config, workdir, image, rom, boot_ranges, log):
         boot_lzss.extend_boot(config, rom, log)
     cfg = yaml.safe_load(config.read_text(encoding='utf-8'))
     segments = cfg['segments']
+    if boot_chunked_bits.repair_variant_entry(segments, rom):
+        log('Kept the original boot helper together across the initial split.')
+    if boot_chunked_bits.repair_variant_relocations(workdir / 'reloc_addrs.txt', rom):
+        log('Removed two false stack-frame relocations from the boot loader.')
     segments.pop()
     expanded = bytearray(rom)
-    two_bit = boot_two_bit.find(rom, boot_ranges) or boot_rnc2.find(rom, boot_ranges)
+    two_bit = boot_two_bit.find(rom, boot_ranges) or boot_rnc2.find(rom, boot_ranges) or boot_erz.find(rom, boot_ranges)
+    byte_lz = boot_byte_lz.find(rom, boot_ranges)
+    chunked_bits = boot_chunked_bits.find(rom, boot_ranges)
+    rnx = boot_rnx.find(rom, boot_ranges)
+    if chunked_bits:
+        # Splat can mistake the lower replacement address for a size.
+        boot_chunked_bits.drop_impossible_bss(segments)
     repeated = {vram for vram, _, _ in programs if sum(vram == other for other, _, _ in programs) > 1}
     # Distinct starting addresses can still overlap when one program extends
     # into another overlay's slot; all programs then need scoped symbols.
@@ -289,7 +319,19 @@ def add(config, workdir, image, rom, boot_ranges, log):
             text = text[8:]
         sections = boot_lzss.startup_sections(text, vram) if boot_lzss.find(rom, boot_ranges) else None
         two_bit_start = boot_two_bit.code_start(text) if two_bit and any(vram == p[0] for p in two_bit) else None
-        if two_bit_start:
+        if chunked_bits and any(vram == p[0] and len(text) == len(p[1]) for p in chunked_bits):
+            sections = boot_chunked_bits.variant_sections(text)
+            if sections:
+                code, data_start, code_resume = sections
+                parts = [[start, 'data', f'{name}_startup_data'], [start + code, 'hasm'],
+                         [start + data_start, 'data', f'{name}_early_data'], [start + code_resume, 'c', name]]
+            else:
+                parts = [[start, 'data', f'{name}_startup_data'], [start + boot_chunked_bits.code_start(vram, text), 'c', name]]
+        elif rnx and any(vram == p[0] for p in rnx):
+            parts = [[start, 'data', f'{name}_startup_data'], [start + boot_rnx.CODE_START, 'c', name]]
+        elif byte_lz and any(vram == p[0] for p in byte_lz):
+            parts = [[start, 'data', f'{name}_startup_data'], [start + 64, 'c', name]]
+        elif two_bit_start:
             parts = [[start, 'data', f'{name}_startup_data'], [start + two_bit_start, 'c', name]]
         elif sections:
             entry_end, code_start = sections
@@ -300,12 +342,18 @@ def add(config, workdir, image, rom, boot_ranges, log):
         for before, after in inline_tables(text):
             parts.extend([[start + before, 'rodata', f'{name}_table_{before:X}'],
                           [start + after, 'c', f'{name}_text_{after:X}']])
-        parts.append([start + len(text), 'data', name])
+        # Splat's MIPS data output writes whole words. Preserve a partial final
+        # word as raw bytes so an odd-sized decoded member can rebuild exactly.
+        tail = len(data) % 4
+        if len(data) > tail:
+            parts.append([start + len(text), 'data', name])
         segment = dict(name=name, type='code', start=start, vram=vram, subsegments=parts)
         if overlapping or replacing:
             segment.update(exclusive_ram_id='replaced_boot' if replacing else f'gzip_slot_{vram:08X}', symbol_name_format=f'$VRAM_{name}',
                            symbol_name_format_no_rom=f'$VRAM_{name}')
         segments.append(segment)
+        if tail:
+            segments.append(dict(type='bin', start=start + len(text) + len(data) - tail))
         expanded.extend(text)
         expanded.extend(data)
     segments.append([len(expanded)])
@@ -314,5 +362,17 @@ def add(config, workdir, image, rom, boot_ranges, log):
     cfg['options']['target_path'] = filename
     cfg['sha1'] = hashlib.sha1(expanded).hexdigest()
     config.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8')
-    log(f'Unpacked {len(programs)} compressed program(s) at the addresses supplied by the boot loader')
+    log(f'Recovered {len(programs)} encoded boot program(s) at the addresses supplied by the loader')
+    # Some boot programs load further compressed executables themselves.
+    # Observe their calls against the expanded boot program before splitting.
+    from ...rom import split
+    from . import loaded_code, runtime_zlib
+
+    taken = split.code_ranges(config)
+    loaded = loaded_code.find(workdir / image, bytes(expanded), taken, log=log)
+    if loaded.get('decoded_programs'):
+        result = runtime_zlib.add(config, workdir, image, rom, taken, loaded['decoded_programs'], log,
+                                  base_image=bytes(expanded), boot_ranges=boot_ranges)
+        if result:
+            return result
     return filename

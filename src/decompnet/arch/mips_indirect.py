@@ -1,6 +1,8 @@
 """Bounded MIPS indirect-transfer evidence. No guessed mapping becomes an executable edge."""
 
 import struct
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
 
 MAX_ENTRIES=256
 MAX_CALLS=512
@@ -292,11 +294,17 @@ def jump_table(image,start,end,vram,at,order,ranges=(),mappings=(),*,reader=None
         if targets := destinations(image[offset:offset+count*4]):
             valid.append((offset,verified,targets))
     if not valid:
-        aliases = [r for r in ranges if r.get('target_prefix')==vram&0xe0000000
-                   and (r.get('boot_copy') or uses_ido_guard and r.get('code_delta')==vram-start)]
+        scoped = [r for r in ranges if r.get('scoped_copy') and r.get('target_prefix')==vram&0xe0000000
+                  and r.get('code_delta')==vram-start and r['vram'] <= address
+                  and address+count*4 <= r['vram']+r['rom_end']-r['rom_start']]
+        # A verified overlay replaces the initial boot copy at the same address. Only the record belonging to
+        # this code mapping may decide its table; sibling overlays and the older boot contents are not concurrent.
+        aliases = scoped or [r for r in ranges if r.get('target_prefix')==vram&0xe0000000
+                             and (r.get('boot_copy') or uses_ido_guard and r.get('code_delta')==vram-start)]
         choices,error = locations(address,count*4,image,aliases)
         if error:return {**result,'reason':error}
-        resident = [r for r in aliases if r.get('boot_copy') and r['vram']-r['rom_start']==vram-start]
+        resident = [r for r in aliases if (r.get('boot_copy') or r.get('scoped_copy'))
+                    and r['vram']-r['rom_start']==vram-start]
         absolute, _ = locations(address, count*4, image, resident)
         for offset,verified in choices:
             data = image[offset:offset+count*4]
@@ -346,26 +354,31 @@ def _stack_index_guard(image, start, at, order):
 
 def _address_pair_guard(image, start, at, order):
     """The guarded index and a LUI/addiu address pair meet in a separate result register."""
-    if at-start < 32:
-        return None
-    bound, branch, delay, scale, hi, low, add, load, jump, slot = (
-        int.from_bytes(image[p:p+4], order) for p in range(at-32, at+8, 4))
-    index, cond = (bound >> 21) & 31, (bound >> 16) & 31
-    count = bound & 0xffff
-    scaled, base = (scale >> 11) & 31, (hi >> 16) & 31
-    result, dest = (add >> 11) & 31, (jump >> 21) & 31
-    if (bound >> 26 != 11 or not index or not cond or index == cond or not 0 < count <= MAX_ENTRIES
-            or branch >> 26 != 4 or (branch >> 21) & 31 != cond or (branch >> 16) & 31
-            or delay or slot or scale >> 26 or scale & 63 or (scale >> 6) & 31 != 2
-            or (scale >> 16) & 31 != index or (scale >> 21) & 31 or not scaled
-            or hi >> 26 != 15 or not base or base == scaled
-            or low >> 26 != 9 or (low >> 21) & 31 != base or (low >> 16) & 31 != base
-            or add >> 26 or add & 63 != 33 or not result
-            or {(add >> 21) & 31, (add >> 16) & 31} != {base, scaled}
-            or load >> 26 != 35 or (load >> 21) & 31 != result or (load >> 16) & 31 != dest
-            or jump & 0xfc1fffff != 8 or not dest):
-        return None
-    return at-32, branch, count, (((hi & 0xffff) << 16) + signed(low) + signed(load)) & 0xffffffff
+    for scheduled in (False, True):
+        distance = 28 if scheduled else 32
+        if at-start < distance:
+            continue
+        words = [int.from_bytes(image[p:p+4], order) for p in range(at-distance, at+8, 4)]
+        if not scheduled and words.pop(2):  # the unscheduled guard has an empty delay slot
+            continue
+        bound, branch, scale, hi, low, add, load, jump, slot = words
+        index, cond = (bound >> 21) & 31, (bound >> 16) & 31
+        count = bound & 0xffff
+        scaled, base = (scale >> 11) & 31, (hi >> 16) & 31
+        result, dest = (add >> 11) & 31, (jump >> 21) & 31
+        if (bound >> 26 != 11 or not index or not cond or index == cond or not 0 < count <= MAX_ENTRIES
+                or branch >> 26 != 4 or (branch >> 21) & 31 != cond or (branch >> 16) & 31
+                or slot or scale >> 26 or scale & 63 or (scale >> 6) & 31 != 2
+                or (scale >> 16) & 31 != index or (scale >> 21) & 31 or not scaled
+                or hi >> 26 != 15 or not base or base == scaled
+                or low >> 26 != 9 or (low >> 21) & 31 != base or (low >> 16) & 31 != base
+                or add >> 26 or add & 63 != 33 or not result
+                or {(add >> 21) & 31, (add >> 16) & 31} != {base, scaled}
+                or load >> 26 != 35 or (load >> 21) & 31 != result or (load >> 16) & 31 != dest
+                or jump & 0xfc1fffff != 8 or not dest):
+            continue
+        return at-distance, branch, count, (((hi & 0xffff) << 16) + signed(low) + signed(load)) & 0xffffffff
+    return None
 
 
 def calls(image,functions,order,*,full_scan=False,check=lambda:None,progress=lambda _:None,checkpoint=None):
@@ -388,18 +401,50 @@ def calls(image,functions,order,*,full_scan=False,check=lambda:None,progress=lam
     return results,limited
 
 
+def _consumer_index(traced,check):
+    """Index call loads without losing trace order or weakening mapping evidence."""
+    exact=defaultdict(list);indexed=defaultdict(list)
+    for i,call in enumerate(traced):
+        if not i % 128:check()
+        base,terms=call['load_address']
+        if not terms:
+            exact[base].append(i)
+        elif len(terms)==1:
+            stride=next(iter(terms.values()))
+            if stride and 4<=stride<=256 and stride%4==0:
+                indexed[(stride,base%stride)].append((base,i))
+    for entries in indexed.values():entries.sort()
+    return exact,indexed
+
+
+def _possible_consumers(cells,exact,indexed,strides):
+    matches=set()
+    for cell,_ in cells:
+        matches.update(exact.get(cell,()))
+        for stride in strides:
+            entries=indexed.get((stride,cell%stride),())
+            lo=bisect_left(entries,(cell-stride*255,-1))
+            hi=bisect_right(entries,(cell,float('inf')))
+            matches.update(i for _,i in entries[lo:hi])
+    return sorted(matches)
+
+
 def consumers(image,functions,rows,order,ranges,mappings,unresolved=None,*,check=lambda:None,
               full_scan=False,progress=lambda _:None,checkpoint=None):
+    from .audit_spool import editable
     traced,limited=(calls(image,functions,order,full_scan=True,check=check,progress=progress,checkpoint=checkpoint)
                     if full_scan else calls(image,functions,order))
+    exact,indexed=_consumer_index(traced,check)
+    strides=sorted({stride for stride,_ in indexed})
     linked=set()
-    for row in rows:
+    for row in editable(rows):
         check()
         found=[]
         for ref in row['pointer_references']:
             cells={(s['vram']+ref['rom_offset']-s['rom_start'],True) for s in ranges if s['rom_start']<=ref['rom_offset']<s['rom_end']}
             if not cells:cells={(ref['rom_offset']+m,False) for m in mappings}
-            for call in traced:
+            for index in _possible_consumers(cells,exact,indexed,strides):
+                call=traced[index]
                 base,terms=call['load_address']
                 for cell,verified in cells:
                     stride=next(iter(terms.values())) if len(terms)==1 else None

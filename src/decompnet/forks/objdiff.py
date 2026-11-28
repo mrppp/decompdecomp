@@ -89,35 +89,50 @@ def _run_compatible(args: list[str], cwd: Path, timeout: float = 600) -> str:
         return _run(retry, cwd=cwd, timeout=timeout)
 
 
-def _exclude_stubs(project: Path, cfg: dict, rep: dict) -> dict:
-    """Assembly placeholders are undecompiled even when their bytes compare identically."""
+def stub_symbols(text: str, names) -> set[str]:
+    """Names whose source definition is an assembly placeholder, not recovered C."""
     from . import csource
 
-    units = {u.get("name"): u for u in cfg.get("units", [])}
+    # Only parse a name if a placeholder line can mention it: a unit can have
+    # thousands of real C definitions and very few assembly stubs.
+    lines = [line for line in text.splitlines()
+             if any(macro in line for macro in ('INCLUDE_ASM', 'GLOBAL_ASM', 'INCLUDE_RODATA_FN'))]
+    if not lines:
+        return set()
+    found = set()
+    for name in names:
+        if not any(name.split('::')[-1] in line for line in lines):
+            continue
+        span = csource.find(text, name)
+        if span and csource.is_stub(text[span[0]:span[1]]):
+            found.add(name)
+    return found
+
+
+def _exclude_stubs(project: Path, cfg: dict, rep: dict) -> dict:
+    """Assembly placeholders are undecompiled even when their bytes compare identically."""
+    units = {(u.get('name') or u.get('path')): u for u in cfg.get('units') or cfg.get('objects') or []}
     removed_count = removed_bytes = 0
     for unit in rep.get("units", []):
         source = (units.get(unit.get("name"), {}).get("metadata") or {}).get("source_path")
         if not source:
             continue
         path = (project / source).resolve()
-        if project.resolve() not in path.parents:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        # A stub recognized by csource is a single line containing one of these macros and the
-        # function's simple name. Avoid parsing every C definition in a large, mostly recovered file.
-        stub_lines = [line for line in text.splitlines()
-                      if any(macro in line for macro in ("INCLUDE_ASM", "GLOBAL_ASM", "INCLUDE_RODATA_FN"))]
-        if not stub_lines:
+        names = [fn['name'] for fn in unit.get('functions', [])]
+        if project.resolve() not in path.parents or path.suffix.lower() in ('.s', '.asm'):
+            stubs = set(names)
+        else:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                stubs = set(names)  # An old object without readable source is not C evidence.
+            else:
+                stubs = stub_symbols(text, names)
+        if not stubs:
             continue
         count = size = 0
         for fn in unit.get("functions", []):
-            if not any(fn["name"].split("::")[-1] in line for line in stub_lines):
-                continue
-            span = csource.find(text, fn["name"])
-            if span and csource.is_stub(text[span[0]:span[1]]):
+            if fn['name'] in stubs:
                 if float(fn.get("fuzzy_match_percent") or 0) >= 100:
                     count += 1
                     size += int(fn.get("size") or 0)
@@ -129,6 +144,20 @@ def _exclude_stubs(project: Path, cfg: dict, rep: dict) -> dict:
     return rep
 
 
+def exclude_diff_stubs(result: FunctionDiff, text: str) -> FunctionDiff:
+    """Unit diffs and reports agree: exact assembly placeholders are not C matches."""
+    names = set(result.unit_scores)
+    if result.symbol:
+        names.add(result.symbol)
+    stubs = stub_symbols(text, names)
+    for name in stubs:
+        if name in result.unit_scores:
+            result.unit_scores[name] = None
+    if result.symbol in stubs:
+        result.match_percent = None
+    return result
+
+
 def _subtract_matches(measures: dict, count: int, size: int) -> None:
     if not count:
         return
@@ -137,6 +166,18 @@ def _subtract_matches(measures: dict, count: int, size: int) -> None:
     for kind in ("functions", "code"):
         total = int(measures.get("total_" + kind) or 0)
         measures["matched_" + kind + "_percent"] = 100 * int(measures["matched_" + kind]) / total if total else 0
+
+
+def _absolute_config(project, cfg):
+    """Keep object paths anchored to the real project in a temporary objdiff view."""
+    for key in ('target_dir', 'base_dir'):
+        if cfg.get(key):
+            cfg[key] = str((project / cfg[key]).resolve())
+    for unit in cfg.get('units') or cfg.get('objects') or []:
+        for key in ('target_path', 'base_path'):
+            if unit.get(key):
+                unit[key] = str((project / unit[key]).resolve())
+    return cfg
 
 
 def report(project: Path, out: Path) -> dict:
@@ -150,18 +191,29 @@ def report(project: Path, out: Path) -> dict:
     guards = {}
     missing = [u for u in cfg.get("units", []) if u.get("base_path") and
                (not (project / u["base_path"]).is_file() or stale(project, u, guards))]
-    if not missing:
-        _run_compatible(["report", "generate", "-p", str(project), "-o", str(out)], cwd=project, timeout=1800)
-        return _exclude_stubs(project, cfg, subtract_conflicts(project, json.loads(out.read_text(encoding="utf-8"))))
-    for unit in cfg.get("units", []):
-        for key in ("target_path", "base_path"):
-            if unit.get(key):
-                unit[key] = str((project / unit[key]).resolve())
-    for unit in missing:
-        del unit["base_path"]
     with tempfile.TemporaryDirectory(prefix="decompwtf-report-") as tmp:
-        (Path(tmp) / "objdiff.json").write_text(json.dumps(cfg), encoding="utf-8")
-        _run_compatible(["report", "generate", "-p", tmp, "-o", str(out.resolve())], cwd=project, timeout=1800)
+        from .untyped_entries import view
+
+        directory = Path(tmp)
+        changed = False
+        for index, unit in enumerate(cfg.get('units') or cfg.get('objects') or []):
+            target = unit.get('target_path') or (str(Path(cfg['target_dir']) / unit['path'])
+                                                 if cfg.get('target_dir') and unit.get('path') else None)
+            if not target:
+                continue
+            original = (project / target).resolve()
+            adjusted = view(original, directory, f'target-{index}.o')
+            if adjusted != original:
+                unit['target_path'] = str(adjusted)
+                changed = True
+        if not missing and not changed:
+            _run_compatible(["report", "generate", "-p", str(project), "-o", str(out)], cwd=project, timeout=1800)
+        else:
+            _absolute_config(project, cfg)
+            for unit in missing:
+                del unit["base_path"]
+            (directory / "objdiff.json").write_text(json.dumps(cfg), encoding="utf-8")
+            _run_compatible(["report", "generate", "-p", tmp, "-o", str(out.resolve())], cwd=project, timeout=1800)
     return _exclude_stubs(project, cfg, subtract_conflicts(project, json.loads(out.read_text(encoding="utf-8"))))
 
 
@@ -448,6 +500,27 @@ def _rows_agree(left: dict, right: dict) -> bool:
 
 
 def diff(target: Path | None, base: Path | None, symbol: str | None, cwd: Path, options: dict | None = None,
+         project: Path | None = None, unit: str | None = None) -> FunctionDiff:
+    """Compare the same verified object view used by project reports."""
+    from .untyped_entries import view
+
+    with tempfile.TemporaryDirectory(prefix='decompwtf-objdiff-entry-') as tmp:
+        directory = Path(tmp)
+        adjusted = view(target, directory)
+        original = Path(target).resolve() if target is not None else None
+        if adjusted != original and project is not None and unit and base is not None and base.exists():
+            cfg = json.loads((project / 'objdiff.json').read_text(encoding='utf-8'))
+            _absolute_config(project, cfg)
+            entry = next((item for item in cfg.get('units') or cfg.get('objects') or []
+                          if (item.get('name') or item.get('path')) == unit), None)
+            if entry is not None:
+                entry['target_path'] = str(adjusted)
+                (directory / 'objdiff.json').write_text(json.dumps(cfg), encoding='utf-8')
+                project = directory
+        return _diff(adjusted, base, symbol, cwd, options, project, unit)
+
+
+def _diff(target: Path | None, base: Path | None, symbol: str | None, cwd: Path, options: dict | None = None,
          project: Path | None = None, unit: str | None = None) -> FunctionDiff:
     """Diff one function between the target (expected) and base (yours) objects; symbol None measures the whole
     unit (unit_scores) without one function's rows.

@@ -86,9 +86,13 @@ def matched(platform: str, skip: tuple[str, ...] = ()) -> list[str]:
     return [f for f in FUNCTIONS if f not in NEAR_MISSES.get(platform, ()) and f not in skip]
 
 
-def test_export_rejudges_a_saved_match_with_an_extra_function(tmp_path):
+def test_export_rejudges_a_saved_match_with_an_extra_function(tmp_path, monkeypatch):
     if not _ready('n64'):
         pytest.skip('needs the N64 compiler and binutils')
+    from decompnet.app import mcp_gateway
+
+    if program := mcp_gateway.built():
+        monkeypatch.setenv('DECOMP_MCP_GATEWAY', str(program))
     net, slug = _decompile(tmp_path, 'n64', skip=('abs_s32',))
     agent, _ = net.local_agent('extra-function-test')
     body = csource.get((GAME / 'game.c').read_text(), 'abs_s32')
@@ -318,6 +322,19 @@ def test_export_moves_data_boundary_past_known_function_tail():
     assert result['segments'][0]['subsegments'][1][0] == 0x11c
     assert config['segments'][0]['subsegments'][1][0] == 0x118  # the project's config stays unchanged
     assert _export_segments(config, [{'vram': 0x80000010, 'size': 8}])['segments'] == config['segments']
+
+
+def test_export_removes_source_cuts_inside_a_matched_function():
+    from decompnet.rom.export import _export_segments
+
+    config = {'segments':[{'type':'code','start':0x100,'vram':0x80000000,
+                           'subsegments':[[0x100,'c','first'],[0x104,'c','inside'],[0x120,'c','next']]}, [0x140]]}
+    matched = {'name':'first','vram':0x80000000,'rom_offset':0x100,'size':0x20,'status':'matched'}
+    result = _export_segments(config, [matched])
+    assert result['segments'][0]['subsegments'] == [[0x100,'c','first'],[0x120,'c','next']]
+    assert len(config['segments'][0]['subsegments']) == 3
+    other = {'name':'inside','vram':0x80000004,'rom_offset':0x104,'size':4,'status':'open'}
+    assert _export_segments(config, [matched, other])['segments'][0]['subsegments'] == config['segments'][0]['subsegments']
 
 
 def test_export_split_uses_its_generated_symbol_file():
@@ -678,6 +695,39 @@ def test_overlapping_banks_link_to_separate_rom_offsets(tmp_path):
     assert (tmp_path/'game.z64').read_bytes()==original
 
 
+@pytest.mark.parametrize('scope', ['code_80001000', 'program_80001000', 'program_80001000_2'])
+@pytest.mark.parametrize('kind', ['jtbl', 'D'])
+def test_scoped_local_jump_table_can_be_referenced_from_another_object(tmp_path, scope, kind):
+    import runpy
+
+    from decompnet.rom import export
+
+    if toolchains.installed('binutils-mips') is None:
+        pytest.skip('needs pinned MIPS binutils')
+    shutil.copyfile(Path(export.__file__).with_name('export_build.py'), tmp_path/'build.py')
+    base = 0x80001000
+    functions = [dict(name='first',vram=base,rom=0), dict(name='second',vram=base+8,rom=8)]
+    segments = [dict(name='bank',kind='code',start=0,end=16,vram=base,pieces=[],bss=[])]
+    (tmp_path/'build.json').write_text(json.dumps(dict(image='base.z64',symbols={},functions=functions,segments=segments)))
+    (tmp_path/'base.z64').write_bytes(bytes(16))
+    assembler = toolchains.binary('binutils-mips').parent/'mips-ps2-decompals-as'
+    linker = toolchains.binary('binutils-mips').parent/'mips-ps2-decompals-ld'
+    label = f'{kind}_80001000_{scope}'
+    (tmp_path/'first.s').write_text(f'.text\n.set noreorder\n.globl first\nfirst:\n{label}:\njr $31\nnop\n')
+    (tmp_path/'second.s').write_text(f'.text\n.set noreorder\n.globl second\nsecond:\nlui $2,%hi({label})\n'
+                                    f'addiu $2,$2,%lo({label})\n')
+    for name in ('first','second'):
+        subprocess.run([str(assembler),'-EB','-mips2','-no-pad-sections','-o',f'{name}.o',f'{name}.s'],
+                       cwd=tmp_path,check=True,capture_output=True)
+    script = runpy.run_path(str(tmp_path/'build.py'))
+    placed = [(base,0,'first.o'), (base+8,8,'second.o')]
+    text = script['linker_script']({'first':'first.o','second':'second.o'},placed,[])
+    assert f'PROVIDE("{label}" = 0x80001000);' in text
+    (tmp_path/'game.ld').write_text(text)
+    subprocess.run([str(linker),'-EB','-T','game.ld','-o','game.elf','first.o','second.o'],
+                   cwd=tmp_path,check=True,capture_output=True)
+
+
 def test_export_keeps_fallthrough_entries_separate():
     from decompnet.rom.export import _fallthrough_entries, _symbol_lines
 
@@ -715,6 +765,53 @@ def test_unresolved_scoped_automatic_names_keep_their_address():
     assert _auto_addresses(['jal func_8026E0B4_\n.word func_8026A964_'], set()) == {
         'func_8026E0B4_': 0x8026E0B4, 'func_8026A964_': 0x8026A964,
     }
+    assert _auto_addresses(['%hi(D_800A8130_code_8009B340_987A0)'], set()) == {
+        'D_800A8130_code_8009B340_987A0': 0x800A8130,
+    }
+
+
+def test_nonmatching_data_block_is_not_an_entry_function():
+    from decompnet.rom.export import _starts_with_data_label
+
+    assert _starts_with_data_label('nonmatching func_80001000\n\ndlabel func_80001000\n.word 1\n', 'func_80001000')
+    assert not _starts_with_data_label('nonmatching func_80001000\n\nglabel func_80001000\njr $ra\n', 'func_80001000')
+    assert not _starts_with_data_label('dlabel other\n', 'func_80001000')
+
+
+def test_export_resplits_a_known_entry_swallowed_by_splat(tmp_path):
+    from decompnet.rom.export import _resplit_unemitted
+
+    asm = tmp_path/'asm/nonmatchings/bank'
+    asm.mkdir(parents=True)
+    (asm/'first.s').write_text('glabel first\n/* 0 80001000 03E00008 */ jr $ra\n'
+                               'alabel second\n/* 8 80001008 03E00008 */ jr $ra\n')
+    image = bytes.fromhex('03e00008 00000000 03e00008 00000000')
+    rows = [dict(name='first',vram=0x80001000,rom_offset=0,size=8,target=image[:8]),
+            dict(name='second',vram=0x80001008,rom_offset=8,size=8,target=image[8:])]
+    config = {'segments':[dict(name='bank',type='code',start=0,vram=0x80001000,
+                               subsegments=[[0,'c','bank']]), [len(image)]]}
+    cuts, present = _resplit_unemitted(config,tmp_path,rows,image)
+    assert cuts == ['second']
+    assert (0x80001000,0) in present
+    assert config['segments'][0]['subsegments'] == [[0,'c','bank'], [8,'c','bank_export_8']]
+    assert not _resplit_unemitted(config,tmp_path,rows,image)[0]
+    config['segments'][0]['subsegments'].pop()
+    rows[0]['size'] = 12  # shared or overlapping entries need boundary review
+    assert not _resplit_unemitted(config,tmp_path,rows,image)[0]
+
+
+def test_nonmatching_data_uses_the_assembly_preamble(tmp_path):
+    import runpy
+
+    from decompnet.rom import export
+
+    shutil.copyfile(Path(export.__file__).with_name('export_build.py'), tmp_path/'build.py')
+    entry = {'kind':'asm', 'src':'asm/nonmatchings/bank/data.s', 'obj':'build/asm/data.o', 'wrap':True}
+    (tmp_path/'build.json').write_text(json.dumps({'assembly':[entry], 'functions':[], 'asm_preamble':'# preamble\n'}))
+    script = runpy.run_path(str(tmp_path/'build.py'))
+    objects, _, _ = script['objects']()
+    assert objects == [('asm', 'build/wrap/build/asm/data.s', entry['obj'])]
+    assert (tmp_path/objects[0][1]).read_text() == '# preamble\n.include "asm/nonmatchings/bank/data.s"\n'
 
 
 def test_export_removes_foreign_bank_labels_only(tmp_path):
@@ -795,9 +892,9 @@ def test_export_keeps_backward_delay_slot_address_high(platform):
     result = console.export_asm(text)
     assert '.word 0x3C01800C' in result
     assert console.export_asm(result) == result
-    assert console.export_asm(text.replace('0x67104 &', '0x67105 &')) == text.replace('0x67104 &', '0x67105 &')
+    assert 'lui $at, %hi(D_80057698 + 0x67104)' in console.export_asm(text.replace('0x67104 &', '0x67105 &'))
     forward = text.replace(words[1].to_bytes(4, order).hex(), (0x14400001).to_bytes(4, order).hex())
-    assert console.export_asm(forward) == forward
+    assert 'lui $at, %hi(D_80057698 + 0x67104)' in console.export_asm(forward)
 
 
 def test_foreign_scoped_local_labels_are_not_exported_twice(tmp_path):
@@ -814,3 +911,28 @@ def test_foreign_scoped_local_labels_are_not_exported_twice(tmp_path):
     assert '.L80001010_code_80001000' not in foreign.read_text()
     assert 'alabel .L80001010_code_80001000' in own.read_text()
     assert '.word 0' in foreign.read_text()
+
+
+@pytest.mark.parametrize(('platform', 'endian'), [('n64', 'big'), ('ps2', 'little'), ('ps1', 'little')])
+def test_export_preserves_large_mips_relocation_addends(tmp_path, platform, endian):
+    from decompnet.consoles import get
+
+    if toolchains.installed('binutils-mips') is None:
+        pytest.skip('needs pinned MIPS binutils')
+    source = ('.text\n.set noreorder\n.globl entry\nentry:\n'
+              'lui $22, %hi(D_800DD880 + 0x5A604)\n'
+              'addiu $22, $22, %lo(D_800DD880 + (0x5A604 & 0xFFFF))\n')
+    fixed = get(platform).export_asm(source)
+    assert '%lo(D_800DD880 + 0x5A604)' in fixed
+    (tmp_path/'entry.s').write_text(fixed)
+    (tmp_path/'game.ld').write_text('D_800DD880 = 0x800DD880;\nSECTIONS { . = 0x80000000; .text : { *(.text) } }\n')
+    tools = toolchains.binary('binutils-mips').parent
+    flag = '-EB' if endian == 'big' else '-EL'
+    subprocess.run([str(tools/'mips-ps2-decompals-as'), flag, '-mips2', '-o', 'entry.o', 'entry.s'],
+                   cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run([str(tools/'mips-ps2-decompals-ld'), flag, '-T', 'game.ld', '-o', 'game.elf', 'entry.o'],
+                   cwd=tmp_path, check=True, capture_output=True)
+    with (tmp_path/'game.elf').open('rb') as stream:
+        data = ELFFile(stream).get_section_by_name('.text').data()
+    assert int.from_bytes(data[:4], endian) == 0x3C168013
+    assert int.from_bytes(data[4:8], endian) == 0x26D67E84

@@ -26,6 +26,130 @@ def fixture(words=BODY,cuts=(0,12,32),order='big'):
     return image,functions,[Segment('code',0,len(image),BASE)]
 
 
+@pytest.mark.parametrize('case', ['return', 'branch', 'changed', 'different_bytes', 'no_transfer'])
+def test_restore_shared_original_delay_slot(case):
+    from decompnet.rom.automatic_boundaries import _restore_original_delay_slots
+
+    transfer = {'return': 0x03e00008, 'branch': 0x10400001}.get(case, 0x03e00008)
+    if case == 'no_transfer':
+        transfer = 0x24020001
+    image, functions, _ = fixture([0x27bdffe8, transfer, 0x27bd0018], cuts=(0, 12))
+    original = functions[0]
+    short = replace(original, lines=original.lines[:2])
+    if case == 'changed':
+        short = replace(short, lines=[replace(short.lines[0], word=0), short.lines[1]])
+    if case == 'different_bytes':
+        image = image[:8] + bytes(4)
+    result = _restore_original_delay_slots([short], {(original.rom, original.vram): original}, image, 'big')
+    assert result[0].size == (12 if case in ('return', 'branch') else 8)
+
+
+@pytest.mark.parametrize('case', ['store', 'escape', 'call', 'mismatch', 'store_address', 'branch_escape', 'delay',
+                                  'exception'])
+def test_indexed_store_reference_is_only_data_when_address_does_not_escape(case):
+    from decompnet.rom.automatic_boundaries import _indexed_store_references
+
+    # lui $at, %hi(entry); addu $at, $at, $v0; sb $v1, %lo(entry)($at)
+    words = [0, 0x3c018000, 0x00220821, 0xa0232000, 0x03e00008, 0]
+    if case == 'escape':
+        words[4] = 0x00202025  # or $a0, $at, $zero
+    elif case == 'call':
+        words[4] = 0x0c000800
+    elif case == 'store_address':
+        words[3] = 0xac212000  # sw $at, %lo(entry)($at)
+    elif case == 'branch_escape':
+        words[4:] = [0x10000001, 0, 0x00202025, 0x03e00008, 0]
+    elif case == 'delay':
+        words[0] = 0x0c000800  # the high half could escape through the call
+    elif case == 'exception':
+        words[4] = 0x0000000c  # syscall can transfer register state to a handler
+    image, functions, _ = fixture(words, cuts=(0, len(words)*4))
+    fn = functions[0]
+    fn.lines[1] = replace(fn.lines[1], operands='$at, %hi(entry)')
+    fn.lines[3] = replace(fn.lines[3], operands='$v1, %lo(other)($at)' if case == 'mismatch'
+                          else '$v1, %lo(entry)($at)')
+    found = _indexed_store_references(fn)
+    assert bool(found) == (case == 'store')
+    if found:
+        assert found == {4: {'entry'}, 12: {'entry'}}
+
+
+@pytest.mark.parametrize('case', ['other_bank', 'escape', 'same_bank'])
+def test_shared_slot_indexed_store_does_not_invent_callable_entry(case, monkeypatch):
+    from decompnet.rom import automatic_boundaries
+
+    words = [0x27bdffe8, 0xafbf0014, 0x0c000800, 0x24040001, 0x8fbf0014, 0x03e00008, 0x27bd0018,
+             0, 0x3c018000, 0x00220821, 0xa0231010]
+    if case == 'escape':
+        words.append(0x00202025)  # the computed address can escape in $a0
+    words += [0x03e00008, 0]
+    image, functions, _ = fixture(words, cuts=(0, 16, 28, len(words)*4))
+    head, tail, caller = functions
+    if case != 'same_bank':
+        caller.segment = 'caller'
+        caller.vram = BASE + 0x1000
+        caller.lines = [replace(line, vram=caller.vram + line.rom - caller.rom) for line in caller.lines]
+    caller.lines[1] = replace(caller.lines[1], operands=f'$at, %hi({tail.name})')
+    caller.lines[3] = replace(caller.lines[3], operands=f'$v1, %lo({tail.name})($at)')
+    segments = ([Segment('code', 0, len(image), BASE)] if case == 'same_bank' else
+                [Segment('code', 0, 28, BASE), Segment('caller', 28, len(image), caller.vram)])
+    monkeypatch.setattr(automatic_boundaries, 'shared_slot_calls', lambda *args: ([], [segments[0]]))
+    result = repair(functions, [], image, consoles.get('n64'), segments)
+    protected = case != 'other_bank'
+    assert any(fn.rom == tail.rom for fn in result) == protected
+    assert next(fn for fn in result if fn.rom == head.rom).size == (16 if protected else 28)
+
+
+@pytest.mark.parametrize('case', ['valid', 'different slot', 'one sibling', 'head call', 'body call', 'computed head',
+                                  'head pointer', 'explicit', 'competing mapping', 'non-code data', 'bad sibling',
+                                  'limited trace'])
+def test_callback_slot_recovers_a_scheduled_frame_entry_without_claiming_padding(case, monkeypatch):
+    from decompnet.rom import callback_prefix
+
+    recover = callback_prefix.recover
+    if case == 'limited trace':
+        read = callback_prefix.read
+        monkeypatch.setattr(callback_prefix, 'read', lambda *args, **kwargs: read(*args, **kwargs) | {'limited': True})
+
+    body = [0x27bdffe8,0xafbf0014,0,0x8fbf0014,0x03e00008,0x27bd0018]
+    sibling = [0x8f8503d4, *body]
+    head = [0xf85c0537,0x2925fc9e,0x8f8503d0]
+    sibling_one = BASE+44
+    sibling_two = BASE+72
+    targets = [BASE+16,sibling_one,sibling_two]
+    slots = [0xd34,0xd30 if case == 'different slot' else 0xd34,0xd34]
+    if case == 'one sibling': targets[-1] = BASE+0x400
+    caller = []
+    for target,slot in zip(targets,slots):
+        caller += [0x3c028000,0x24420000 | (target & 0xffff),0xaf820000 | slot]
+    if case == 'computed head':
+        caller += [0x3c028000,0x24421008,0xaf820d40]
+    if case in ('head call','body call'):
+        target = BASE+(8 if case == 'head call' else 20)
+        caller += [0x0c000000 | ((target >> 2) & 0x3ffffff),0]
+    caller += [0x03e00008,0]
+    words = [0x03e00008,0,*head,*body,*sibling,*sibling,*caller]
+    if case == 'bad sibling': words[18] = 0x27bdffd8
+    end = len(words)*4
+    image,functions,segments = fixture(words,cuts=(0,8,20,44,72,100,end))
+    if case == 'head pointer': image += (BASE+8).to_bytes(4,'big')
+    if case == 'competing mapping': segments.append(Segment('other',0,len(image),BASE))
+    data = [DataSymbol('existing',BASE+8,8,4,'data')] if case == 'non-code data' else []
+    explicit = {BASE+8} if case == 'explicit' else set()
+    result = recover(functions,data,image,consoles.get('n64'),segments,explicit)
+    found = [fn for fn in result if fn.vram == BASE+16]
+    assert bool(found) == (case == 'valid')
+    if found:
+        assert found[0].size == 28
+        assert any(symbol.rom == 8 and symbol.size == 8 and symbol.boundary_proven for symbol in data)
+        integrated_data = []
+        integrated = repair(functions, integrated_data, image, consoles.get('n64'), segments)
+        assert any(fn.vram == BASE+16 and fn.size == 28 for fn in integrated)
+        assert any(symbol.rom == 8 and symbol.size == 8 for symbol in integrated_data)
+    else:
+        assert any(fn.vram == BASE+8 and fn.size == 12 for fn in result)
+
+
 @pytest.mark.parametrize('case', ['padding', 'pointer', 'interior_pointer', 'called_padding', 'not_called_next',
                                   'not_loop', 'data', 'different_delay'])
 def test_unentered_transfers_after_a_called_self_loop_are_alignment(case):
@@ -304,11 +428,33 @@ def test_an_alignment_hole_stays_out_of_pieces_that_do_not_join():
     assert [(f.vram,f.size) for f in result]==[(BASE,12),(BASE+16,16)]
 
 
+def test_partition_rejects_a_function_start_inside_an_unowned_gap():
+    from decompnet.rom.automatic_boundaries import _owned_partition
+
+    _, functions, _ = fixture(BODY[:3] + [0] + BODY[4:], cuts=(0, 12, 32))
+    functions[1] = replace(functions[1], vram=BASE+16, rom=16, lines=functions[1].lines[1:])
+    assert _owned_partition(functions, {0, 12, 16, 32}, {(12, 16)}) == [(0, 12), (16, 32)]
+    assert _owned_partition(functions, {0, 12, 20, 32}, set()) is None
+
+
 def test_a_piece_whose_frame_comes_after_scheduled_loads_joins_its_tail():
     words=[0x03e00008,0,0x3c028010,0x904202a0]+BODY  # a return, then loads ahead of the next frame
     image,functions,segments=fixture(words,cuts=(0,8,24,48))
     result=repair(functions,[],image,consoles.get('n64'),segments)
     assert [(f.vram,f.size) for f in result]==[(BASE,8),(BASE+8,40)]
+
+
+def test_called_load_before_frame_joins_closed_scheduled_switch():
+    words = [0x8f8204b4, 0x27bdffe8, 0xafbf0014,
+             0x2c430002, 0x1060000b, 0x00021880, 0x3c048000, 0x24841100,
+             0x00641021, 0x8c430000, 0x00600008, 0,
+             0x10000003, 0, 0, 0, 0x8fbf0014, 0x03e00008, 0x27bd0018,
+             0x0c000000 | ((BASE >> 2) & 0x3ffffff), 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 4, 76, 92))
+    image += bytes(0x100-len(image)) + (BASE+48).to_bytes(4, 'big') + (BASE+64).to_bytes(4, 'big')
+    segments.append(Segment('table', 0x100, 0x108, BASE+0x100))
+    result = repair(functions, [], image, consoles.get('n64'), segments)
+    assert [(fn.rom, fn.size) for fn in result] == [(0, 76), (76, 16)]
 
 
 @pytest.mark.parametrize('independent_call', [False, True])
@@ -439,6 +585,25 @@ def test_segment_prefix_with_saved_register_switch_is_recovered_as_data(case):
     else:
         assert result==functions
         assert not data
+
+
+@pytest.mark.parametrize('case',['valid','entry','bad_prefix','bad_target'])
+def test_constant_prefix_before_validated_switch_is_data(case):
+    start = BASE+24
+    prefix = [0x30000001 if case=='bad_prefix' else 0x30000000,0,0,0,
+              start+44, BASE+0x300 if case=='bad_target' else start+52]
+    call = 0x0c000000 | (((BASE+0x200)>>2)&0x3ffffff)
+    code = [0x3c158000,0x26b51010,call,0,0x2c620002,0x10400007,0x00031080,
+            0x00551021,0x8c420000,0x00400008,0,0x03e00008,0,0x03e00008,0]
+    image,functions,segments = fixture(prefix+code,cuts=(0,24,84))
+    symbols = [f'entry = 0x{BASE:08X}; // type:func'] if case=='entry' else ()
+    data=[]
+    result=repair(functions,data,image,consoles.get('n64'),segments,symbols=symbols)
+    if case=='valid':
+        assert [(fn.rom,fn.size) for fn in result]==[(24,60)]
+        assert [(row.rom,row.size,row.kind) for row in data]==[(0,16,'data'),(16,8,'jtbl')]
+    else:
+        assert result==functions
 
 
 @pytest.mark.parametrize('protected',[False,True])
@@ -1311,6 +1476,48 @@ def test_stale_copy_requires_one_consistent_relocation():
     assert not _same_stale_instructions(image, 0, len(old)*4, len(old)*4, 'big')
 
 
+@pytest.mark.parametrize('case', ['delayed', 'branch_before_frame', 'different_register', 'open_next',
+                                  'incoming', 'pointer', 'uncalled_next'])
+def test_stale_copy_before_called_delayed_frame(case):
+    from collections import defaultdict
+
+    from decompnet.rom.automatic_boundaries import stale_code_copies
+
+    prior = [0x27bdffe8] + [0x24840001+i for i in range(13)] + [0x03e00008, 0x27bd0018]
+    next_body = [0x3c0e8008, 0x8dce2ccc, *BODY]
+    if case == 'branch_before_frame': next_body[1] = 0x10000001
+    if case == 'different_register': next_body[1] = 0x8dcf2ccc
+    if case == 'open_next': next_body[-2] = 0
+    image, functions, segments = fixture(prior + prior[3:11] + next_body + BODY,
+                                          cuts=(0, 64, 96, 136, 168))
+    ghost = functions[1]
+    references = defaultdict(set)
+    for target in (functions[0].vram, functions[2].vram):
+        references[target].add((len(image), 'code'))
+        image += (0x0c000000 | (target >> 2 & 0x3ffffff)).to_bytes(4, 'big')
+    if case == 'incoming': references[ghost.vram+4].add((0, 'code'))
+    if case == 'pointer': image += ghost.vram.to_bytes(4, 'big')
+    calls = {functions[0].vram, functions[2].vram}
+    if case == 'uncalled_next': calls.remove(functions[2].vram)
+    found = stale_code_copies(functions, image, 'big', consoles.get('n64'), segments,
+                              lambda fn: (0, ''), set(), references, calls, [])
+    assert ((ghost.rom, ghost.vram) in found) == (case == 'delayed')
+
+
+def test_stale_copy_exposed_by_closing_previous_function():
+    prior = [0x27bdffe8] + [0x24840001+i for i in range(13)] + [0x03e00008, 0x27bd0018]
+    next_body = [0x3c0e8008, 0x8dce2ccc, *BODY]
+    call = lambda address: 0x0c000000 | ((address >> 2) & 0x3ffffff)
+    words = prior + prior[3:11] + next_body + BODY + [call(BASE), 0, call(BASE+96), 0, 0x03e00008, 0]
+    image, functions, segments = fixture(words, cuts=(0, 96, 136, 168, 192))
+    data = []
+    result = repair(functions, data, image, consoles.get('n64'), segments)
+    assert any(fn.vram == BASE and fn.size == 64 for fn in result)
+    assert not any(fn.vram == BASE+64 for fn in result)
+    assert any(fn.vram == BASE+96 for fn in result)
+    assert any(item.vram == BASE+64 and item.size == 32 and item.boundary_proven for item in data)
+
+
 def test_code_table_names_only_contiguous_distinct_starts_outside_code():
     from decompnet.rom.automatic_boundaries import _code_table_entries
 
@@ -1321,3 +1528,17 @@ def test_code_table_names_only_contiguous_distinct_starts_outside_code():
     assert not _code_table_entries(functions, image + packed[:8], 'big', segments)
     assert not _code_table_entries(functions, image + packed[:4]*3, 'big', segments)
     assert not _code_table_entries(functions, image + packed, 'big', [Segment('all', 0, len(image)+12, BASE)])
+
+
+@pytest.mark.parametrize('case', ['invalid delay', 'valid delay', 'independent caller'])
+def test_undefined_branch_in_link_delay_does_not_cut_another_body(case):
+    # A conditional link with another branch in its delay slot cannot establish a defined call target.
+    target = BASE+28
+    bad_link = 0x04f10000 | (((target-(BASE+4))//4) & 0xffff)
+    words = [bad_link, 0x1000ffff if case != 'valid delay' else 0, 0x1000ffff, 0, *BODY]
+    if case == 'independent caller':
+        words += [0x0c000000 | ((target >> 2) & 0x3ffffff),0,0x03e00008,0]
+    image, functions, segments = fixture(words, cuts=(0,12,16,28,48,len(words)*4) if len(words)*4>48 else (0,12,16,28,48))
+    result = repair(functions, [], image, consoles.get('n64'), segments)
+    head = next(fn for fn in result if fn.rom == 16)
+    assert head.size == (32 if case == 'invalid delay' else 12)

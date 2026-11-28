@@ -18,9 +18,9 @@ dependencies = [
     "spimdisasm>=1.42.4",
     "rabbitizer>=1.16.2",
     # the repair families, RetroReversing/decomp-repair: a tagged archive, so installing needs no git
-    "decomprepair @ https://github.com/RetroReversing/decomp-repair/archive/refs/tags/v0.6.413.tar.gz",
+    "decomprepair @ https://github.com/RetroReversing/decomp-repair/archive/refs/tags/v0.6.477.tar.gz",
     # the asset recognisers (N64 textures, sound banks, models, fonts; RNC), RetroReversing/decomp-assets
-    "decompassets @ https://github.com/RetroReversing/decomp-assets/archive/refs/tags/v0.254.0.tar.gz",
+    "decompassets @ https://github.com/RetroReversing/decomp-assets/archive/refs/tags/v0.291.0.tar.gz",
     # compile decomprepair on this machine (app/native_library.py)
     "cython>=3.1",
     "setuptools>=75",
@@ -43,7 +43,17 @@ decomp = "decompnet.app.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.18,<0.14.0"]
-build-backend = "uv_build"
+build-backend = "build_backend"
+backend-path = ["."]
+
+[tool.uv]
+cache-keys = [
+    {file = "pyproject.toml"}, {file = "build_backend.py"}, {file = "gateway/Cargo.*"},
+    {file = "gateway/THIRD_PARTY_LICENSES.txt"}, {file = "gateway/src/**/*.rs"}, {env = "DECOMP_BUILD_GATEWAY"},
+]
+
+[tool.uv.build-backend]
+source-include = ["build_backend.py"]
 
 [dependency-groups]
 dev = [

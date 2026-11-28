@@ -168,3 +168,56 @@ def test_paged_audio_reaches_console_previews():
     for layout in ('big-indexed-audio', 'big-sam-audio'):
         bank = next(item for item in assets if item.get('layout') == layout)
         assert console.asset_preview(image, bank, {})['mime'] == 'audio/wav'
+
+
+def test_chunked_indexed_image_reaches_console_preview():
+    import struct
+
+    from decompnet.consoles import get
+
+    decoded = (struct.pack(">4HI2H", 8, 1, 1, 0xffff, 72, 8, 8) + bytes(range(64))
+               + bytes.fromhex("020601000008") + bytes(512))
+    chunks = [decoded[i:i+127] for i in range(0, len(decoded), 127)]
+    packed = b"12345" + b"".join(bytes([0x80 | len(chunk)]) + chunk for chunk in chunks) + b"\0"
+    asset = dict(layout="chunked-lz-indexed-image", offset=0, size=len(packed),
+                 expanded=len(decoded), reason="Validated directory and embedded palette.")
+    result = get("n64").asset_preview(packed, asset, {})
+    assert result["media"] == "image"
+    assert (result["details"]["width"], result["details"]["height"]) == (8, 8)
+
+
+def test_chunked_runtime_mesh_reaches_console_preview():
+    import struct
+
+    from decompnet.consoles import get
+
+    data = bytearray(0x200)
+    for i, point in enumerate(((0, 0, 0), (100, 0, 0), (0, 100, 0), (0, 0, 100))):
+        struct.pack_into(">3hH2h4B", data, 0x100+i*16, *point, 0, i, i, 20+i, 40+i, 60+i, 255)
+    for i, command in enumerate(((0x0400103f, 0x01000000), (0xb1000204, 0x00000406),
+                                 (0xb1000602, 0x00020604))):
+        struct.pack_into(">II", data, 0x20+i*8, *command)
+    chunks = [data[i:i+127] for i in range(0, len(data), 127)]
+    packed = b"12345" + b"".join(bytes([0x80 | len(chunk)]) + chunk for chunk in chunks) + b"\0"
+    asset = dict(layout="runtime-chunked-model", offset=0, size=len(packed), expanded=len(data),
+                 label="Local mesh", meshes=[dict(command=0x20, command_size=24, vertex=0x100)])
+    result = get("n64").asset_preview(packed, asset, {})
+    assert result["media"] == "model" and result["triangles"] == 4
+
+
+def test_ea_xa_sound_bank_reaches_console_preview():
+    import struct
+
+    from decompnet.consoles import get
+
+    image = bytearray(0x40 + 15)
+    image[:20] = b"BNKb\x04\0\0\x01\0\0\0\x40\0\0\0\x0f\0\0\0\0"
+    image[20:24] = struct.pack(">I", 4)
+    record = (b"PT\x02\0\xfd\x85\x02\0\x1c\x84\x02\x3e\x80"
+              b"\x83\x01\x07\x88\x04\0\0\0\x40\xff")
+    image[24:24+len(record)] = record
+    image[0x40:] = b"\x0c" + b"\x1f"*14
+    from decompassets.n64 import bnkb_audio
+    bank, = bnkb_audio.regions(image)
+    result = get("n64").asset_preview(image, bank, {})
+    assert result["media"] == "audio" and result["details"]["original_samples"] == 28

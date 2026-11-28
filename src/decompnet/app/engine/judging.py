@@ -138,7 +138,8 @@ class JudgeMixin:
             def local_link():
                 from ...rom.verifier_link import PackReader, project_inputs
 
-                if project_inputs.get() and type(target) is match.RomTarget and "rom_offset" in fn.keys():
+                if (type(target) is match.RomTarget and "rom_offset" in fn.keys()
+                        and (project_inputs.get() or getattr(console, "rust_desktop_judge", False))):
                     read = PackReader(self, proj, fn)
                 else:
                     read = self.reader(proj, fn)
@@ -176,6 +177,47 @@ class JudgeMixin:
         return (store.read_version('inputs',proj['id']),getattr(self,'_generation',{}).get(proj['id'],0),
                 proj.get('config') if isinstance(proj,dict) else proj['config'],
                 tuple((key,dict(fn).get(key)) for key in ('name','target','relocs','vram','meta','size','unit','rom_offset')))
+
+    def _random_batch_scope(self, fn, proj):
+        from ...rom.desktop_judge import image_identity
+
+        scope = self._diagnostic_scope(fn, proj)
+        if scope is None:
+            return None
+        try:
+            image = image_identity(proj["root"], self.cfg(proj)["rom"]["file"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        return scope, image, scoring.ALIGN_BRANCH_TARGETS
+
+    def _judge_random_batch(self, fn, proj, objects, *, count=None):
+        from ...rom.desktop_judge import direct_judge
+        from ...rom.verifier_link import PackReader
+
+        console = self.console(proj)
+        if not console.rust_desktop_judge or fn["rom_offset"] is None:
+            return None
+        scope = self._random_batch_scope(fn, proj)
+        if scope is None:
+            return None
+        target = self._rom_target(fn)
+        overlay = console.export_overlay(target)
+        if overlay is None and type(target) is not match.RomTarget:
+            return None
+        with direct_judge() as judge:
+            if judge is None:
+                return None
+            symbols = self.symbols(proj["id"])
+            canonical = console.target_object(fn, self.cfg(proj), symbols)
+            canonical.cpu = console.cpu_variant
+            read = PackReader(self, proj, fn)
+            if count is None:
+                results = judge.batch(objects, target, canonical, symbols, read, overlay)
+            else:
+                results = judge.combined(objects, count, target, canonical, symbols, read, overlay)
+        if results is not None and scope == self._random_batch_scope(fn, proj):
+            return scope, results
+        return None
 
     def _complete_search_evaluation(self,fn,proj,obj):
         local=self.__dict__.get('_search_link_local')
@@ -217,10 +259,11 @@ class JudgeMixin:
             from ...elfobj import FunctionObj
             from ..allocation_evidence import diagnose
             from ..allocation_evidence import text as allocation_text
-            cpu = self._target_obj(fn,proj).cpu
+            original = self._target_obj(fn, proj)
             physical = self._compare_candidate(
-                proj, FunctionObj(fn['name'], proj['arch'], bool(proj['big_endian']), target.code, cpu=cpu),
-                FunctionObj(fn['name'], proj['arch'], bool(proj['big_endian']), res.linked_code, cpu=cpu),
+                proj, FunctionObj(fn['name'], proj['arch'], bool(proj['big_endian']), target.code,
+                                  cpu=original.cpu, native_judge=original.native_judge),
+                FunctionObj(fn['name'], proj['arch'], bool(proj['big_endian']), res.linked_code, cpu=original.cpu),
                 advisory=True).rows
             diagnosis = diagnose(physical,proj['arch'])
             if diagnosis['register_only'] and diagnosis['register_cycles']:
@@ -257,11 +300,12 @@ class JudgeMixin:
                 from ..allocation_evidence import diagnose
                 # Search actually consumes physical register cycles. Keep those rows without
                 # producing unrelated export/address diagnostics or relinking the object.
-                cpu = self._target_obj(fn, proj).cpu
+                original = self._target_obj(fn, proj)
                 with compile_timing.phase('search_diagnostics'):
                     physical = scoring.diff(
-                        FunctionObj(fn['name'],proj['arch'],bool(proj['big_endian']),target.code,cpu=cpu),
-                        FunctionObj(fn['name'],proj['arch'],bool(proj['big_endian']),res.linked_code,cpu=cpu)).rows
+                        FunctionObj(fn['name'], proj['arch'], bool(proj['big_endian']), target.code,
+                                    cpu=original.cpu, native_judge=original.native_judge),
+                        FunctionObj(fn['name'], proj['arch'], bool(proj['big_endian']), res.linked_code, cpu=original.cpu)).rows
                     diagnosis = diagnose(physical, proj['arch'])
                 if diagnosis['register_only'] and diagnosis['register_cycles']:
                     return physical
@@ -386,7 +430,10 @@ class JudgeMixin:
             return False
         for poll in range(100):
             if check_cancel is not None:check_cancel()
-            held = self.project_store(fn['project_id']).one('SELECT agent_id FROM claims WHERE function_id=?', fid)
+            held = self.project_store(fn['project_id']).one('SELECT agent_id,claimed_at FROM claims WHERE function_id=?', fid)
+            own = getattr(self._compile_ahead_local, 'reimport_claim', None)
+            if held and own == (fn['project_id'], fid, held['agent_id'], held['claimed_at']):
+                return poll > 0  # This reimport opened the claim for its own saved-source check.
             identity = self.store.one('SELECT name FROM agents WHERE id=?', held['agent_id']) if held else None
             if not identity or identity['name'] != 'autopilot':
                 return poll > 0

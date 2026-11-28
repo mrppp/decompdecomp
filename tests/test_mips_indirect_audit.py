@@ -7,6 +7,24 @@ from decompnet.arch.mips_gaps import extent
 from decompnet.arch.mips_indirect import calls, consumers, jump_table
 
 
+def test_consumer_index_matches_exhaustive_search_in_trace_order():
+    from decompnet.arch.mips_indirect import _consumer_index, _possible_consumers
+
+    traced=[{'load_address':(base,terms)} for base in range(0x1000,0x1100,4)
+            for terms in ({}, {'index':4}, {'index':12}, {'index':256},
+                          {'index':3}, {'a':4,'b':8})]
+    exact,indexed=_consumer_index(traced,lambda:None)
+    for cell in (0xffc,0x1000,0x1044,0x10fc,0x1100,0x1ffc):
+        expected=[]
+        for i,call in enumerate(traced):
+            base,terms=call['load_address']
+            stride=next(iter(terms.values())) if len(terms)==1 else None
+            if (not terms and base==cell) or (stride and 4<=stride<=256 and stride%4==0
+                    and 0<=cell-base<stride*256 and (cell-base)%stride==0):
+                expected.append(i)
+        assert _possible_consumers({(cell,True)},exact,indexed,sorted({s for s,_ in indexed}))==expected
+
+
 def fixture(order='big'):
     image=bytearray(0x1200)
     words=[0x2c620002,0x1040000b,0,0x00031080,0x3c018000,0x00220821,0x8c221100,0x00400008,0,
@@ -79,6 +97,28 @@ def test_guarded_switch_uses_a_separate_address_pair(order):
         changed = bytearray(image)
         changed[offset:offset+4] = word.to_bytes(4, order)
         found = jump_table(changed, 0x1000, 0x1040, 0x80001000, 0x1020, order, ranges)
+        assert found is None or found['state'] != 'validated'
+
+
+@pytest.mark.parametrize('order', ['big', 'little'])
+def test_guarded_address_pair_scales_in_the_branch_delay_slot(order):
+    words = [0x2c430002, 0x1060000b, 0x00021880, 0x3c048000, 0x24841100,
+             0x00641021, 0x8c430000, 0x00600008, 0, 0x03e00008, 0,
+             0x03e00008, 0, 0x03e00008, 0]
+    image = bytearray(0x1200)
+    image[0x1000:0x103c] = b''.join(word.to_bytes(4, order) for word in words)
+    image[0x1100:0x1108] = b''.join(word.to_bytes(4, order) for word in (0x80001024, 0x8000102c))
+    ranges = [dict(rom_start=0x1100, rom_end=0x1108, vram=0x80001100)]
+    result = jump_table(image, 0x1000, 0x103c, 0x80001000, 0x101c, order, ranges)
+    assert result['state'] == 'validated' and result['entry_count'] == 2
+    assert extent(image, 0x1000, 0x103c, 0x80001000, order, table_ranges=ranges)['flow_closed']
+    for offset, word in ((0x1008, 0x00031880),  # scales a different index
+                         (0x1010, 0x24851100),  # changes the address register
+                         (0x1038, 0x08000403),  # jumps past the guard
+                         (0x1100, 0x80001200)):  # a table target outside the body
+        changed = bytearray(image)
+        changed[offset:offset+4] = word.to_bytes(4, order)
+        found = jump_table(changed, 0x1000, 0x103c, 0x80001000, 0x101c, order, ranges)
         assert found is None or found['state'] != 'validated'
 
 
@@ -376,3 +416,20 @@ def test_guard_can_schedule_stack_spills_and_an_unrelated_move():
 
     image[0x1008:0x100c] = struct.pack('>I', 0x00801825)  # Clobbers the checked index.
     assert jump_table(image, 0x1000, end, 0x80001000, 0x1024, 'big', ranges) is None
+
+
+def test_scoped_dma_table_replaces_boot_mapping_only_for_its_own_code():
+    image = bytearray(0x1200)
+    words = [0x2c620002,0x1040000a,0x00031080,0x3c018000,0x00220821,0x8c221100,0x00400008,0,
+             0x03e00008,0,0x03e00008,0,0x03e00008,0]
+    image[0x1000:0x1038] = struct.pack('>14I',*words)
+    image[0x1100:0x1108] = struct.pack('>2I',0x80001020,0x80001028)
+    boot = dict(rom_start=0x1120,rom_end=0x1128,vram=0x80001100,target_prefix=0x80000000,boot_copy=True)
+    scoped = dict(rom_start=0x1100,rom_end=0x1108,vram=0x80001100,target_prefix=0x80000000,
+                  scoped_copy=True,code_delta=0x80000000)
+    result = jump_table(image,0x1000,0x1038,0x80001000,0x1018,'big',[boot,scoped])
+    assert result['state'] == 'validated' and result['rom_offset'] == 0x1100
+    wrong = dict(scoped,code_delta=0x80000004)
+    assert jump_table(image,0x1000,0x1038,0x80001000,0x1018,'big',[boot,wrong])['state'] == 'unresolved'
+    competing = dict(scoped,rom_start=0x1130,rom_end=0x1138)
+    assert jump_table(image,0x1000,0x1038,0x80001000,0x1018,'big',[boot,scoped,competing])['state'] == 'unresolved'

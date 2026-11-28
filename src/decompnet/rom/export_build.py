@@ -80,8 +80,12 @@ def mixed_mips_abi(stderr: str) -> bool:
     width = r": linking (?:32-bit code with 64-bit code|64-bit code with 32-bit code)$"
     abi = r": ABI mismatch: linking \w+ module with previous \w+ modules$"
     merge = r": failed to merge target specific data of file .+$"
+    # Addressed NOLOAD pools can move the location counter backwards in a
+    # valid overlay link; this warning does not explain a failed link.
+    backwards = r": warning: dot moved backwards before .+$"
     return (any(re.search(width, line) or re.search(abi, line) for line in lines)
-            and all(re.search(width, line) or re.search(abi, line) or re.search(merge, line) for line in lines))
+            and all(re.search(width, line) or re.search(abi, line) or re.search(merge, line)
+                    or re.search(backwards, line) for line in lines))
 
 
 def binutils(tool: str) -> str:
@@ -163,7 +167,8 @@ def objects() -> tuple[list[tuple[str, str, str]], dict[str, str], list[tuple[in
     linker script line names among all the objects it was given, ran for 40 minutes without finishing."""
     out, provides, placed = [], {}, []
     for a in B["assembly"]:
-        out.append(("asm", a["src"], a["obj"]))
+        source = wrap(a['obj'].removesuffix('.o'), [a['src']]) if a.get('wrap') else a['src']
+        out.append(("asm", source, a["obj"]))
     for d in B.get("data", []):  # the game's data from its C (placed as pieces of its segment)
         out.append(("c", d["src"], d["obj"]))
     runs: dict[str, tuple[list[dict], int | None]] = {}  # splat file -> (its current run of assembly, where it ends)
@@ -518,7 +523,11 @@ def linker_script(provides: dict[str, str], placed: list[tuple[int, int, str]], 
                 if symbol["st_shndx"] != "SHN_UNDEF":
                     continue
                 name = symbol.name
-                address = AUTO_NAME.match(name) or re.fullmatch(r"\.L([0-9A-Fa-f]{8})(?:_[\w]+)?", name)
+                # A scoped overlay may define an automatic name locally in
+                # one object while another object refers to it. Its suffix
+                # identifies the bank; the first address is still the target.
+                base = re.sub(r'_(?:code|program)_[0-9A-Fa-f]{8}(?:_[0-9]+)?$', '', name)
+                address = AUTO_NAME.fullmatch(base) or re.fullmatch(r"\.L([0-9A-Fa-f]{8})(?:_[\w]+)?", name)
                 if address:
                     auto_addresses[name] = int(address.group(1), 16)
     lines += [f'PROVIDE("{name}" = 0x{address:08X});' for name, address in sorted(auto_addresses.items())]
@@ -596,7 +605,13 @@ def build() -> bool:
             if hashlib.sha1(original).hexdigest() != cartridge["sha1"]:
                 raise ValueError("original cartridge checksum differs from the fixed export target")
             reference = original
-            if cartridge.get("verified_blocks"):
+            if rows := cartridge.get("runtime_zlib"):
+                from decompnet.consoles.n64.runtime_zlib import verify_analysis
+
+                if not verify_analysis(original, out, rows):
+                    fail("Rebuilt code differs from the original runtime compressed programs.")
+                out = original
+            elif cartridge.get("verified_blocks"):
                 from decompnet.consoles.n64.code import verify_unpacked_analysis
 
                 if not verify_unpacked_analysis(original, out):
@@ -608,17 +623,29 @@ def build() -> bool:
                 if not verify_analysis(original, out, boot_ranges):
                     fail("Rebuilt code differs from the original compressed boot programs.")
                 out = original
+            elif cipher_ranges := cartridge.get("byte_cipher_ranges"):
+                from decompnet.consoles.n64.runtime_byte_cipher import verify_analysis
+
+                if not verify_analysis(original, out, cipher_ranges):
+                    fail("Rebuilt code differs from the original runtime-decoded program.")
+                out = original
             elif cartridge.get("indexed_archive"):
                 from decompnet.consoles.n64.indexed_runtime_code import verify_analysis
 
                 if not verify_analysis(original, out):
                     fail("Rebuilt code differs from the original compressed archive members.")
                 out = original
-            elif rows := cartridge.get("runtime_zlib"):
-                from decompnet.consoles.n64.runtime_zlib import verify_analysis
+            elif cartridge.get("table_overlays"):
+                from decompnet.consoles.n64.overlays import verify_analysis
 
-                if not verify_analysis(original, out, rows):
-                    fail("Rebuilt code differs from the original runtime compressed programs.")
+                if not verify_analysis(original, out):
+                    fail("Rebuilt code differs from the original table-defined overlays.")
+                out = original
+            elif boot_ranges := cartridge.get("paged_boot_ranges"):
+                from decompnet.consoles.n64.indexed_tlb_code import verify_analysis
+
+                if not verify_analysis(original, out, boot_ranges):
+                    fail("Rebuilt code differs from the original paged programs.")
                 out = original
             else:
                 out = rebuild_cartridge(out, original, cartridge["blocks"])
@@ -677,16 +704,17 @@ def check(name: str) -> bool:
     big = B["big_endian"]
     rf = split.parse_function(ROOT / fn["asm"], fn["seg"], big)
     target = match.target_from_split(rf, table.resolve, big, B.get("gp") or 0)
-    image = (ROOT / B["image"]).read_bytes()
-
-    def read(addr: int, n: int) -> bytes | None:
-        for seg in B["segments"]:
-            if seg["kind"] == "code":
-                size = (seg["end"] if seg["end"] is not None else len(image)) - seg["start"]
-                if seg["vram"] <= addr and addr + n <= seg["vram"] + size:
-                    at = seg["start"] + addr - seg["vram"]
-                    return image[at:at + n]
-        return None
+    from export_entry import verified_image_reader, verify_target
+    try:
+        image, read = verified_image_reader(ROOT, B)
+    except (OSError, ValueError) as error:
+        print(f"{name}: {error}")
+        return False
+    try:
+        verify_target(image, B, fn, target)
+    except ValueError as error:
+        print(f"{name}: {error}")
+        return False
 
     cfg = compiler_config(ROOT, {"compiler": compiler_for(B, fn["vram"], fn)})
     cfg.include_dirs = (str(ROOT / "include"),)
@@ -698,11 +726,21 @@ def check(name: str) -> bool:
         print(res.log)
         return False
     symbol = fn.get('symbol') or fn['name']
-    linked = match.link(res.obj, symbol, target, table, read)
-    if not linked.exact:
+    from decompnet.consoles import get
+
+    console = get(B.get("platform"))
+    linker = console.link_function if console.rust_desktop_judge else match.link
+    try:
+        linked = linker(res.obj, symbol, target, table, read)
+    except ValueError as error:
+        print(f"{name}: {error}")
+        return False
+    if not linked.exact or linked.missing_data_reads:
         print(f"{name}: not identical yet")
         for p in linked.problems:
             print(f"  - {p}")
+        for address, size in linked.missing_data_reads:
+            print(f"  - unverified constant at 0x{address:08X} ({size} bytes); add a reviewed data mapping")
         return False
     fn["c"] = src
     from decompnet.rom.export import _section_bases, _single_definition
