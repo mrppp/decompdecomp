@@ -37,6 +37,26 @@ def test_records_verify_zlib_and_leave_unknown_storage_opaque():
     assert overlays.read(bytes(0x6000)) == []
 
 
+def test_overlay_import_keeps_startup_trap_with_boot_stub(tmp_path):
+    from decompnet.consoles.n64 import code
+
+    image = bytearray(cartridge())
+    at = 0x1080
+    vram = 0x80000480
+    call = 0x0c000000 | (((vram+0x38) >> 2) & 0x3ffffff)
+    struct.pack_into('>8I', image, at-8, call, 0, 0x0001008d, 0,
+                     0x40849000, 0x40809800, 0x03e00008, 0)
+    (tmp_path/'rom.z64').write_bytes(image)
+    cfg = {'options':{'target_path':'rom.z64'},'segments':[
+        {'name':'entry','type':'code','start':0x1000,'vram':0x80000400,'subsegments':[[0x1000,'hasm']]},
+        {'name':'main','type':'code','start':at,'vram':vram,'follows_vram':'entry','subsegments':[[at,'c','main']]},
+        {'type':'bin','start':0x1200},[len(image)]]}
+    config = tmp_path/'splat.yaml';config.write_text(yaml.safe_dump(cfg,sort_keys=False))
+    assert code.add_segments(config,tmp_path,'rom.z64',log=lambda *_:None) == 'rom.overlays.z64'
+    segments = split.segments_from_config(config)
+    assert next(s for s in segments if s.name=='main').rom_start == at+8
+
+
 @pytest.mark.parametrize('change', ['checksum', 'size', 'range', 'bomb'])
 def test_invalid_streams_and_table_ranges_fail_before_import(change):
     image = bytearray(cartridge())
@@ -108,6 +128,24 @@ def test_byte_patches_reconstruct_paired_bank_without_mutating_base():
     assert entries[2].data == bytes(expected)
     assert entries[2].storage == entries[3].storage == 'byte-patches'
     assert entries[3].data[7] == 0x52
+
+
+@pytest.mark.parametrize('source', [cartridge, patched_cartridge])
+def test_expanded_analysis_requires_exact_verified_overlay_bytes(tmp_path, source):
+    original = source()
+    (tmp_path/'rom.z64').write_bytes(original)
+    config = tmp_path/'splat.yaml'
+    config.write_text(yaml.safe_dump({'options':{'target_path':'rom.z64'}, 'segments':[[0,'bin'],[len(original)]]}))
+    name = overlays.add(config, tmp_path, 'rom.z64', lambda *_:None)
+    expanded = (tmp_path/name).read_bytes()
+    assert overlays.verify_analysis(original, expanded)
+    for offset in (0, len(original), len(original)+0x2000, len(expanded)-1):
+        changed = bytearray(expanded); changed[offset] ^= 1
+        assert not overlays.verify_analysis(original, bytes(changed))
+    assert not overlays.verify_analysis(original, expanded[:-1])
+    assert not overlays.verify_analysis(original, expanded+b'\0')
+    damaged = bytearray(original); damaged[0x2000] ^= 1
+    assert not overlays.verify_analysis(bytes(damaged), expanded)
 
 
 def test_byte_patch_outside_base_fails():

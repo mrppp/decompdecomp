@@ -15,11 +15,134 @@ from ..arch.mips import JR_RA, is_frame
 from ..arch.mips_code_recovery import called_extent, leaf_extent
 
 
+def _has_delay_slot(word):
+    import rabbitizer
+    return rabbitizer.Instruction(word).hasDelaySlot()
+
+
+def _owned_partition(group, cuts, padding):
+    """Reject a partition that begins a function in an unowned alignment gap."""
+    ordered = sorted(cuts)
+    spans = [(a, b) for a, b in zip(ordered, ordered[1:]) if (a, b) not in padding]
+    return spans if all(any(fn.rom <= a < fn.rom + fn.size for fn in group) for a, _ in spans) else None
+
+
+def _restore_original_delay_slots(functions, original_entries, image, order):
+    """Keep an original transfer's delay word even when it is also a separate entry."""
+    out = []
+    for fn in functions:
+        original = original_entries.get((fn.rom, fn.vram))
+        if (fn.lines and _has_delay_slot(fn.lines[-1].word) and original is not None
+                and original.size >= fn.size + 4
+                and all(a.rom == b.rom and a.vram == b.vram and a.word == b.word
+                        for a, b in zip(fn.lines, original.lines))):
+            delay = original.lines[len(fn.lines)]
+            if (delay.rom == fn.rom + fn.size and delay.vram == fn.vram + fn.size
+                    and image[delay.rom:delay.rom + 4] == delay.word.to_bytes(4, order)):
+                fn = replace(fn, lines=fn.lines + [delay])
+        out.append(fn)
+    return out
+
+
+_AT = re.compile(r'\$(?:at|1)\b')
+_HI = re.compile(r'%hi\(([^)]+)\)')
+_LO = re.compile(r'%lo\(([^)]+)\)')
+
+
+def _indexed_store_references(fn):
+    """Symbolic addresses used only for an indexed store, without escaping in $at.
+
+    A different overlay can store to RAM occupied by a function in this image.
+    Splat names that data address after the function, but the store does not
+    establish a callable entry. Decline uncertain control flow or any use of
+    the computed address before $at is overwritten.
+    """
+    lines = fn.lines
+    if any(b.rom != a.rom + 4 or b.vram != a.vram + 4 for a, b in zip(lines, lines[1:])):
+        return {}
+    by_vram = {line.vram: i for i, line in enumerate(lines)}
+
+    def unsafe(line):
+        return (line.mnemonic.startswith('.') or _AT.search(line.operands)
+                or line.mnemonic.lower() in ('eret', 'syscall', 'break', 'teq', 'tne', 'tge', 'tgeu', 'tlt', 'tltu',
+                                              'teqi', 'tnei', 'tgei', 'tgeiu', 'tlti', 'tltiu'))
+
+    def dies_after(start):
+        pending, seen = [start], set()
+        while pending:
+            i = pending.pop()
+            if i in seen:
+                continue
+            if i < 0 or i >= len(lines) or len(seen) >= 512:
+                return False
+            seen.add(i)
+            line = lines[i]
+            word, op = line.word, line.word >> 26
+            if op == 15 and (word >> 16) & 31 == 1:
+                continue  # an unconditional overwrite
+            if unsafe(line):
+                return False
+            if not _has_delay_slot(word):
+                pending.append(i + 1)
+                continue
+            if i + 1 >= len(lines):
+                return False
+            delay = lines[i + 1]
+            if unsafe(delay) or _has_delay_slot(delay.word):
+                return False
+            if word == JR_RA:
+                continue
+            if op == 2:
+                target = ((line.vram + 4) & 0xf0000000) | ((word & 0x3ffffff) << 2)
+                if target not in by_vram:
+                    return False
+                pending.append(by_vram[target])
+            elif op in (1, 4, 5, 6, 7, 20, 21, 22, 23) or op == 17 and (word >> 21) & 31 == 8:
+                if op == 1 and (word >> 16) & 31 in (16, 17, 18, 19):
+                    return False  # a linking branch may pass the register to its callee
+                delta = word & 0xffff
+                target = line.vram + 4 + (delta - 0x10000 if delta & 0x8000 else delta) * 4
+                if target not in by_vram:
+                    return False
+                pending.extend((i + 2, by_vram[target]))
+            else:
+                return False  # calls and indirect transfers can consume $at
+        return True
+
+    out = defaultdict(set)
+    for i in range(len(lines) - 2):
+        high, add, store = lines[i:i + 3]
+        a, b, c = high.word, add.word, store.word
+        if not (a >> 26 == 15 and (a >> 16) & 31 == 1
+                and i > 0 and not _has_delay_slot(lines[i - 1].word)
+                and add.rom == high.rom + 4 and store.rom == add.rom + 4
+                and add.vram == high.vram + 4 and store.vram == add.vram + 4
+                and b >> 26 == 0 and b & 63 == 33 and (b >> 21) & 31 == 1
+                and (b >> 11) & 31 == 1 and (b >> 16) & 31 != 1
+                and c >> 26 in (40, 41, 43, 57) and (c >> 21) & 31 == 1
+                and ((c >> 16) & 31 != 1 or c >> 26 == 57)):
+            continue
+        hi, lo = _HI.search(high.operands), _LO.search(store.operands)
+        if not hi or not lo or hi.group(1) != lo.group(1) or not dies_after(i + 3):
+            continue
+        symbol = re.match(r'\s*([\w.$]+)', hi.group(1))
+        if symbol:
+            out[high.rom].add(symbol[1])
+            out[store.rom].add(symbol[1])
+    return out
+
+
 def repair(functions, data, image, console, segments, *, symbols=(), log=print, inline_data=()):
     """Keep all original instructions while joining/splitting strictly validated bodies."""
     if console.arch!='mips':return functions
     from .split import _LOCAL_REF, _SYMBOL_LINE, AsmLine, DataSymbol
     explicit={int(m[2],16) for text in symbols for m in _SYMBOL_LINE.finditer(text)}
+    from .callback_prefix import recover as recover_callback_prefixes
+    before_callbacks = len(functions)
+    functions = recover_callback_prefixes(functions, data, image, console, segments, explicit,
+                                           check=getattr(log, 'check_cancel', lambda: None))
+    if len(functions) < before_callbacks:
+        log(f'Recovered {before_callbacks-len(functions)} callback entries with validated shared slots.')
     starts={f.vram for f in functions}
     original_entries={(f.rom, f.vram):f for f in functions}
     order='big' if console.big_endian else 'little'
@@ -33,6 +156,19 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
 
     # A raw function-pointer entry is independent evidence even without a direct call.
     shared,slots=shared_slot_calls(functions,image,console,segments)
+    store_tails = set()
+    if slots:
+        ordered = sorted(functions, key=lambda fn: (owner(fn), fn.rom))
+        for head, tail in zip(ordered, ordered[1:]):
+            if (owner(head)[0] < 0 or owner(head) != owner(tail) or not head.lines or tail.size < 8
+                    or head.rom + head.size != tail.rom or head.vram + head.size != tail.vram
+                    or not is_frame(head.lines[0].word) or is_frame(tail.lines[0].word)
+                    or tail.lines[-2].word != JR_RA):
+                continue
+            if called_extent(image, head.rom, tail.rom + tail.size, head.vram,
+                             big_endian=console.big_endian, cpu=console.cpu_variant,
+                             asm_check=console.asm_reason) == head.size + tail.size:
+                store_tails.add(tail.vram)
     # A stored word equal to an address in a shared slot may be any sibling overlay's table entry, and the segment's
     # own extent can run on over its siblings' images (the game above: five overlays in one segment's ROM range).
     zero_entries = {fn.vram for fn in functions if fn.size == 4 and not fn.lines[0].word}
@@ -48,8 +184,15 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
     lines_by_rom={line.rom:line for fn in functions for line in fn.lines}
     reference_bodies={}
     for fn in functions:
-        for line in fn.lines:
+        store_refs = _indexed_store_references(fn) if slots else {}
+        for index,line in enumerate(fn.lines):
             op=line.word>>26
+            # A conditional link with a transfer in its delay slot has no defined MIPS execution. In particular,
+            # instruction-shaped data can look like a call into the middle of a real framed function. Do not
+            # treat that impossible link as an independent entry, while retaining all ordinary calls and pointers.
+            if (op == 1 and (line.word >> 16) & 31 in (16, 17, 18, 19) and index+1 < len(fn.lines)
+                    and _has_delay_slot(fn.lines[index+1].word)):
+                continue
             if op in (2,3):
                 dest=((line.vram+4)&0xf0000000)|((line.word&0x3ffffff)<<2)
                 references[dest].add((line.rom,fn.segment))
@@ -63,6 +206,10 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
                 transfer_targets.add(dest)
             for token in re.findall(r'[\w.]+',line.operands):
                 if token in names:
+                    address = names[token]
+                    if (address in store_tails and token in store_refs.get(line.rom, ())
+                            and any(s.contains(address, 4) and not s.rom_start <= line.rom < s.rom_end for s in slots)):
+                        continue
                     references[names[token]].add((line.rom,fn.segment))
                     reference_bodies[line.rom]=fn
     for dest,offset,segment in shared:
@@ -275,12 +422,17 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
             if end-8 in lines and lines[end-8].word==JR_RA:
                 if (following:=seed(end)) is not None:heapq.heappush(pending,following)
         if not accepted:result.extend(group);continue
-        changed+=len(accepted)
         names={f.rom:f.name for f in group};by_start={f.rom:f for f in group}
         labels=set().union(*(f.labels for f in group))
-        ordered=sorted(cuts)
-        for start,end in zip(ordered,ordered[1:]):
-            if (start,end) in padding:continue
+        # A proposed cut can land inside an unowned alignment hole. Do not
+        # invent an owner for it: retain the original group for review.
+        spans = _owned_partition(group, cuts, padding)
+        if spans is None:
+            log(f'Kept original boundaries near 0x{lo+mapping:08X}: a proposed split crosses unowned alignment.')
+            result.extend(group)
+            continue
+        changed+=len(accepted)
+        for start,end in spans:
             source=by_start.get(start) or next(f for f in group if f.rom<=start<f.rom+f.size)
             name=names.get(start,f'func_{start+mapping:08X}')
             body=[replace(lines[at]) for at in range(start,end,4)]
@@ -667,7 +819,19 @@ def repair(functions, data, image, console, segments, *, symbols=(), log=print, 
         log(f'Joined {recovered_continuations} unentered framed continuations.')
     if shared_delay_entries:
         log(f'Preserved {shared_delay_entries} called NOP entries shared with a return delay slot.')
-    return kept if dropped or markers or recovered_data or recovered_shared or recovered_fallthrough or recovered_continuations or shared_delay_entries or return_wrappers or backward_loops or cache_prefixes else result if changed else functions
+    final = kept if dropped or markers or recovered_data or recovered_shared or recovered_fallthrough or recovered_continuations or shared_delay_entries or return_wrappers or backward_loops or cache_prefixes else result if changed else functions
+    # Closing called bodies can expose a stale fragment that was initially part
+    # of a larger piece. Recheck the frozen result with the same entry guards.
+    late_stale = stale_code_copies(final, image, order, console, segments, owner, explicit,
+                                   references, direct_calls, data)
+    if late_stale:
+        # Reimport must not restore the old function solely because its bytes
+        # still exist. Keep its original extent and record why it was removed.
+        data.extend(DataSymbol(fn.name, fn.vram, fn.rom, fn.size, 'data', boundary_proven=True)
+                    for fn in final if (fn.rom, fn.vram) in late_stale)
+        final = [fn for fn in final if (fn.rom, fn.vram) not in late_stale]
+        log(f'Left {len(late_stale)} additional proven stale code copies in the original image.')
+    return _restore_original_delay_slots(final, original_entries, image, order)
 
 
 
@@ -1161,7 +1325,7 @@ def assembly_extent(image, start, end, vram, console, order, *, allow_cache=Fals
 
 
 def recover_segment_switch_data(functions, data, image, order, tables, protected, references, log):
-    """Recover a segment prefix with a printable string tail and a proven switch table."""
+    """Recover a segment prefix whose data precedes a proven switch table."""
     from ..arch.mips_indirect import jump_table
     from .split import DataSymbol
 
@@ -1176,11 +1340,13 @@ def recover_segment_switch_data(functions, data, image, order, tables, protected
         if index<len(entries) and entries[index]<fn.vram+fn.size:
             continue
         raw = image[fn.rom:fn.rom+fn.size]
-        if not re.match(rb'[ -~]{4,60}\x00', raw):
+        string_prefix = bool(re.match(rb'[ -~]{4,60}\x00', raw))
+        constant_prefix = raw[:16] == (0x30000000).to_bytes(4, order) + bytes(12)
+        if not (string_prefix or constant_prefix):
             continue
         offsets = {offset for offset,_ in references.get(fn.vram,())}
         for consumer in functions:
-            if not any(consumer.rom<=offset<consumer.rom+consumer.size for offset in offsets):
+            if not constant_prefix and not any(consumer.rom<=offset<consumer.rom+consumer.size for offset in offsets):
                 continue
             for line in consumer.lines:
                 if line.word==JR_RA or line.word&0xfc1fffff!=8:
@@ -1190,12 +1356,13 @@ def recover_segment_switch_data(functions, data, image, order, tables, protected
                 if not table or table['state']!='validated':
                     continue
                 start = table['rom_offset']-fn.rom
-                if (not 0<start<fn.size or start+table['entry_count']*4!=fn.size
-                        or not re.fullmatch(rb'[ -~]{4,60}\x00+', raw[:start])):
+                prefix_ok = (string_prefix and re.fullmatch(rb'[ -~]{4,60}\x00+', raw[:start])
+                             or constant_prefix and start == 16)
+                if not (0<start<fn.size and start+table['entry_count']*4==fn.size and prefix_ok):
                     continue
-                data.append(DataSymbol(fn.name,fn.vram,fn.rom,start,'data'))
+                data.append(DataSymbol(fn.name,fn.vram,fn.rom,start,'data',boundary_proven=True))
                 data.append(DataSymbol(f"jtbl_{table['table_address']:08X}",table['table_address'],
-                                       table['rom_offset'],fn.size-start,'jtbl'))
+                                       table['rom_offset'],fn.size-start,'jtbl',boundary_proven=True))
                 removed.add(id(fn))
                 break
             if id(fn) in removed:
@@ -1428,6 +1595,20 @@ def string_address_references(fn, references, lines, bodies):
         uses.difference_update((start,start+4))
     return True
 
+def _stale_next_frame(fn):
+    """Accept a frame scheduled after a global load as well as at entry."""
+    if is_frame(fn.lines[0].word):
+        return True
+    if len(fn.lines) < 3 or not is_frame(fn.lines[2].word):
+        return False
+    first, second = (line.word for line in fn.lines[:2])
+    reg = (first >> 16) & 31
+    # This straight-line prelude cannot enter the copied fragment or depend on
+    # its registers. The function's own frame follows the global load.
+    return (first >> 26 == 15 and reg not in (0, 29, 31)
+            and second >> 26 == 35 and (second >> 21) & 31 == reg and (second >> 16) & 31 == reg)
+
+
 def stale_code_copies(functions, image, order, console, segments, owner, explicit, references, calls, data):
     """Find unentered stale copies of another called function between a return and the next frame."""
     ordered = sorted(functions, key=lambda fn: (owner(fn), fn.rom))
@@ -1441,7 +1622,7 @@ def stale_code_copies(functions, image, order, console, segments, owner, explici
                 or before.rom + before.size != fn.rom or before.vram + before.size != fn.vram
                 or before.size < 8 or before.lines[-2].word != JR_RA
                 or fn.rom + fn.size != after.rom or fn.vram + fn.size != after.vram
-                or after.vram not in calls or not is_frame(after.lines[0].word)
+                or after.vram not in calls or not _stale_next_frame(after)
                 or not any(not fn.rom <= src < fn.rom+fn.size
                            and int.from_bytes(image[src:src+4], order) >> 26 == 3
                            for src, _ in references.get(after.vram, ()))
@@ -1459,6 +1640,14 @@ def stale_code_copies(functions, image, order, console, segments, owner, explici
         segment = segments[index_owner]
         if sum(s.contains(fn.vram, fn.size) for s in segments) != 1:
             continue
+        if not is_frame(after.lines[0].word):
+            # A delayed frame is useful evidence only when the called entry's
+            # entire extent closes independently of the fragment before it.
+            length = called_extent(image, after.rom, min(segment.rom_end, after.rom+0x4000),
+                                   after.vram, big_endian=console.big_endian,
+                                   cpu=console.cpu_variant, asm_check=console.asm_reason)
+            if length != after.size:
+                continue
         for other in ordered:
             if (other is fn or owner(other) != owner(fn) or abs(other.rom-fn.rom) > 0x800
                     or other.vram not in named and (other.vram not in calls

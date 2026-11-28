@@ -10,6 +10,7 @@ use crate::mips_elf::{self, Elf, Symbol};
 use crate::mips_link::{bytes, patch};
 
 mod data;
+pub use data::link_data;
 
 pub const VERSION: u64 = 1;
 type Key = (usize, i64);
@@ -104,6 +105,43 @@ fn width(op: u32) -> Option<usize> {
 }
 
 impl<'a, R: Reader> Linker<'a, R> {
+    fn new(
+        elf: &'a Elf<'a>,
+        symbols: &'a [Symbol<'a>],
+        target: &'a Target,
+        target_code: &'a [u8],
+        code: &'a [u8],
+        function_section: usize,
+        metadata: &'a crate::mips_ecoff::Procedures<'a>,
+        reader: &'a mut R,
+    ) -> Self {
+        Self {
+            elf,
+            symbols,
+            target,
+            target_code,
+            code,
+            function_section,
+            metadata,
+            target_at: target
+                .relocs
+                .iter()
+                .map(|&(at, kind, address)| (at, (kind, address)))
+                .collect(),
+            reader,
+            sections: HashMap::new(),
+            bindings: HashMap::new(),
+            bases: HashMap::new(),
+            library: HashMap::new(),
+            placements: BTreeMap::new(),
+            data: BTreeMap::new(),
+            data_order: Vec::new(),
+            problems: Vec::new(),
+            required: Vec::new(),
+            mismatches: Vec::new(),
+        }
+    }
+
     fn problem(&mut self, text: String) {
         if !self.problems.contains(&text) {
             self.problems.push(text);
@@ -416,10 +454,17 @@ impl<'a, R: Reader> Linker<'a, R> {
 }
 
 pub async fn link<R: Reader>(request: &Value, reader: &mut R) -> Result<Value, String> {
-    let object = bytes(&request["object"])?;
+    link_bytes(&bytes(&request["object"])?, &request["target"], reader).await
+}
+
+pub(crate) async fn link_bytes<R: Reader>(
+    object: &[u8],
+    target: &Value,
+    reader: &mut R,
+) -> Result<Value, String> {
     let target: Target =
-        serde_json::from_value(request["target"].clone()).map_err(|error| error.to_string())?;
-    let Some(elf) = Elf::read(&object) else {
+        serde_json::from_value(target.clone()).map_err(|error| error.to_string())?;
+    let Some(elf) = Elf::read(object) else {
         return Ok(Value::Null);
     };
     if elf
@@ -452,31 +497,16 @@ pub async fn link<R: Reader>(request: &Value, reader: &mut R) -> Result<Value, S
     let target_code = bytes(&json!(target.code))?;
     let mut first = None;
     for prefer_base in [false, true] {
-        let mut linker = Linker {
-            elf: &elf,
-            symbols: &symbols,
-            target: &target,
-            target_code: &target_code,
+        let mut linker = Linker::new(
+            &elf,
+            &symbols,
+            &target,
+            &target_code,
             code,
-            function_section: prepared.section,
-            metadata: &metadata,
-            target_at: target
-                .relocs
-                .iter()
-                .map(|&(at, kind, address)| (at, (kind, address)))
-                .collect(),
+            prepared.section,
+            &metadata,
             reader,
-            sections: HashMap::new(),
-            bindings: HashMap::new(),
-            bases: HashMap::new(),
-            library: HashMap::new(),
-            placements: BTreeMap::new(),
-            data: BTreeMap::new(),
-            data_order: Vec::new(),
-            problems: Vec::new(),
-            required: Vec::new(),
-            mismatches: Vec::new(),
-        };
+        );
         let result = linker.run(&prepared.relocs, prefer_base).await?;
         let problems = linker.problems.len();
         if let Some((initial, count)) = first.take() {

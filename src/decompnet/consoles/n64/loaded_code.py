@@ -161,6 +161,12 @@ def _region(rom: bytes, dump: bytes, target: int) -> tuple[int, int, int] | None
         lo -= 16
     while hi + 16 <= len(rom) and hi + 16 + shift <= len(dump) and dump[hi + shift:hi + 16 + shift] == rom[hi:hi + 16]:
         hi += 16
+    # A run can begin or end between 16-byte boundaries. Keep complete words
+    # at the edge so a frame is not lost to an unrelated changed word.
+    while lo - 4 >= 0x1000 and lo - 4 + shift >= 0x400 and dump[lo - 4 + shift:lo + shift] == rom[lo - 4:lo]:
+        lo -= 4
+    while hi + 4 <= len(rom) and hi + 4 + shift <= len(dump) and dump[hi + shift:hi + 4 + shift] == rom[hi:hi + 4]:
+        hi += 4
     return lo, hi, 0x80000000 + lo + shift  # the whole overlay as RAM holds it: find() cuts it to code
 
 
@@ -217,14 +223,17 @@ def find(rom_path: Path, rom: bytes, taken, found=(), *, log=print, stop=lambda:
         inspect_dumps(dumps)
     added: list[tuple[int, int, int]] = []
     moved, moved_ranges, decoded, seen = [], set(), set(), set()
-    todo = _targets(rom, known)
-    called = set(todo)  # every call into code no segment has, for where a segment starts
+    calls = _targets(rom, known)
+    seeds = {v for _, _, v in found}  # inspect partial inferred ranges against the captured load
+    todo = calls | seeds
+    called = set(calls)  # every call into code no segment has, for where a segment starts
     while todo:
         target = todo.pop()
         if target in seen:
             continue
         seen.add(target)
-        if any(v <= target < v + e - s for s, e, v in known + added):
+        seed = target in seeds
+        if not seed and any(v <= target < v + e - s for s, e, v in known + added):
             continue
         region, code = None, False
         for dump in dumps:
@@ -241,6 +250,8 @@ def find(rom_path: Path, rom: bytes, taken, found=(), *, log=print, stop=lambda:
             continue
         s, e, v = region
         shift = v - s  # a ROM offset's load address is the offset plus this
+        if seed and not any(v0 == target and v0-s0 == shift for s0, _, v0 in found):
+            continue  # a different bank happened to occupy this inferred address
         overlapping = [(ks, ke, kv) for ks, ke, kv in known + added if ks < e and s < ke]
         for ks, ke, kv in overlapping:  # the split's own segment here: the run says where the game runs it
             if kv - ks != shift and not any(m["rom"] == max(s, ks) for m in moved):
@@ -276,15 +287,30 @@ def find(rom_path: Path, rom: bytes, taken, found=(), *, log=print, stop=lambda:
     if moved:
         log(f"{len(moved)} places the split puts at another address than the game runs them: " + ", ".join(
             f"ROM {m['rom']:#x} at {m['split']:#x}, run at {m['runs_at']:#x}" for m in moved[:4]))
-    from . import runtime_mio_chunks, runtime_zlib
+    from . import runtime_mio, runtime_mio_chunks, runtime_zlib
     programs = runtime_zlib.find(rom, dumps, decoded, known+added, check=check)
     from . import runtime_refpack
     occupied_programs = [(0, len(runtime_zlib._payload(rom, row)), row['vram']) for row in programs]
-    programs += runtime_refpack.find(rom, dumps, decoded, known+added+occupied_programs, check=check)
+    # A previous decoder may have appended an analysis image to `rom`.
+    # Runtime program sources must come from the original cartridge.
+    programs += runtime_refpack.find(Path(rom_path).read_bytes(), dumps, decoded,
+                                     known+added+occupied_programs, check=check)
     occupied_programs = [(0, len(runtime_zlib._payload(rom, row)), row['vram']) for row in programs]
     programs += runtime_mio_chunks.find(rom, dumps, decoded, known+added+occupied_programs, check=check)
-    overlaps = runtime_overlays.regions(rom, late_dumps, known+added, check=getattr(log, 'check_cancel', lambda: None))
+    occupied_programs = [(0, len(runtime_zlib._payload(rom, row)), row['vram']) for row in programs]
+    programs += runtime_mio.find(Path(rom_path).read_bytes(), dumps, decoded,
+                                 known+added+occupied_programs, check=check)
+    from . import runtime_ring
+    occupied_programs = [(0, len(runtime_zlib._payload(rom, row)), row['vram']) for row in programs]
+    programs += runtime_ring.find(Path(rom_path).read_bytes(), dumps, decoded,
+                                  known+added+occupied_programs, check=check)
+    from . import runtime_table_ring
+    occupied_programs = [(0, len(runtime_zlib._payload(rom, row)), row['vram']) for row in programs]
+    programs += runtime_table_ring.find(Path(rom_path).read_bytes(), dumps,
+                                        known+added+occupied_programs, check=check)
+    overlaps = runtime_overlays.regions(rom, dumps+late_dumps, known+added,
+                                       check=getattr(log, 'check_cancel', lambda: None), moved=moved_ranges)
     if overlaps:
-        log(f'Found {len(overlaps)} independently corroborated overlapping code bank(s) in later runtime snapshots.')
+        log(f'Found {len(overlaps)} independently corroborated overlapping code bank(s) in runtime snapshots.')
     return {"segments": added, "overlap_segments": overlaps, "decoded": len(decoded), "moved": moved, "moved_ranges": sorted(moved_ranges),
             "decoded_programs": programs}

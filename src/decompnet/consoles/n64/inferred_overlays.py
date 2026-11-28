@@ -163,6 +163,27 @@ def recover(image, found, taken=(), check=lambda: None, *, changed=()):
     return result, {lo for lo,_,vram in result if vram >= first}
 
 
+def _runtime_continuation(image,start,end,address,old,previous,verified,ranges):
+    """A witnessed bank can continue into two closed entries called by its verified predecessor."""
+    from ...arch.mips_code_recovery import called_extent
+
+    for lo,hi,base in previous:
+        if hi!=start or lo not in verified or base-lo!=address-start:
+            continue
+        if not any(a<=lo and end<=b and v-a==address-start for a,b,v in ranges):
+            continue
+        words=struct.unpack_from(f'>{(hi-lo)//4}I',image,lo)
+        targets={0x80000000|((word&0x03ffffff)<<2) for word in words if word>>26==3}
+        # A call to the old placement is contradictory evidence; don't choose a bank.
+        if any(old<=target<old+end-start for target in targets):
+            continue
+        closed={target for target in targets if address<=target<address+end-start
+                and called_extent(image,start+target-address,end,target,cpu='vr4300')}
+        if len(closed)>=2:
+            return True
+    return False
+
+
 def runtime_mappings(image, found, ranges, taken=()):
     """Apply RAM-observed placements when internal calls also support them."""
     result, changed = [], set()
@@ -187,9 +208,16 @@ def runtime_mappings(image, found, ranges, taken=()):
             offsets = [4*i for i, word in enumerate(words)
                        if is_frame(word) or i >= 2 and words[i-2] == JR_RA]
             calls = {0x80000000 | ((word & 0x03ffffff) << 2) for word in words if word >> 26 == 3}
+            if start == lo and address in calls and 0 not in offsets:
+                # A bank may start with a called leaf instead of a stack frame.
+                # Count it only when its complete body closes at this mapping.
+                from ...arch.mips_code_recovery import leaf_extent
+                if leaf_extent(image, start, end, address, cpu='vr4300'):
+                    offsets.append(0)
             actual = len(calls & {address+offset for offset in offsets})
             previous = len(calls & {old+offset for offset in offsets})
-            if address != old and actual >= 3 and actual > previous:
+            if address != old and (actual >= 3 and actual > previous or
+                                   _runtime_continuation(image,start,end,address,old,result,changed,ranges)):
                 parts.append((start,end,address))
                 corrected.add(start)
             else:
@@ -250,10 +278,15 @@ def safe_scopes(found, scoped, taken):
 def scope(config, found, scoped):
     """Put each overlapping connected set into one exclusive address space."""
     if not scoped:
-        return
+        return True
     segments = {seg['start']: seg for seg in config['segments']
                 if isinstance(seg, dict) and seg.get('type') == 'code'}
     remaining = {lo for lo,_,_ in found if lo in scoped}
+    # A recovered range may have been inserted as a child of resident code,
+    # rather than as a separate bank. Scoping its parent would also scope other
+    # code; retain the earlier mappings instead of guessing or raising KeyError.
+    if not remaining <= segments.keys():
+        return False
     ranges = {lo:(vram,vram+hi-lo) for lo,hi,vram in found if lo in scoped}
     while remaining:
         pending = [min(remaining)]
@@ -272,6 +305,12 @@ def scope(config, found, scoped):
             name = segment['name']
             segment.update(exclusive_ram_id=ident, symbol_name_format=f'$VRAM_{name}',
                            symbol_name_format_no_rom=f'$VRAM_{name}')
+    return True
+
+
+def apply_scopes(config, found, scoped):
+    """Scope inferred banks and check every resident BSS they can touch."""
+    return scope(config, found, scoped) and scope_resident_bss(config)
 
 
 def scope_resident_bss(config):

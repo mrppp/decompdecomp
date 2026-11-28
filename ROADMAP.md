@@ -110,6 +110,14 @@
   occupant. Rebuildable exports retain separate ROM placements and scoped symbols for overlapping banks.
   Strong, unambiguous self-call evidence also corrects inferred code placed over a sibling bank.
   Byte-matched emulator RAM ranges refine smaller inferred banks when their local calls corroborate the mapping.
+  A contiguous observed bank can carry that mapping into a neighbouring fragment when two closed entries
+  there are called by the independently verified predecessor and no call supports its former placement.
+- Done: the N64 missed-function search can recover a verified body inside a handwritten boot
+  assembly unit while keeping the surrounding assembly. Planned: apply the same verified
+  recovery automatically during the initial import.
+- Done: MIPS project reports and judges expose a global untyped `func_` entry hidden inside another
+  symbol when both sides of the split have independently closed control flow and their addresses agree.
+  The original target object stays untouched. Other untyped entries still need boundary evidence.
 - Done: N64 imports map audited inline data spans separately from executable text when their
   full surrounding fingerprints match. This prevents constants and alignment words from cutting
   otherwise closed function bodies.
@@ -117,6 +125,28 @@
   text/data member boundaries. Rebuildable exports check the linked bytes against those members
   before retaining the cartridge's original gzip encoding. Audited embedded tables use full-span
   fingerprints to keep their bytes out of the function inventory.
+- Done: N64 imports recover boot code decoded in place by a verified backwards byte-XOR loop.
+  The cartridge mapping and complete loop determine its bounds, and export rechecks every decoded byte.
+- Done: N64 imports recover audited adaptive-Huffman boot programs when both their loaders and
+  decoded text match their full fingerprints, retaining separately loaded raw banks. Exports
+  verify the decoded programs before keeping the original compressed cartridge; other loader
+  variants still need their own evidence.
+- Done: N64 imports recover an audited CRC-checked RNX boot page chain and keep its data prefix
+  separate from executable text. Exports verify the decoded image against the cartridge pages.
+- Done: N64 imports recover audited byte-run and backreference programs when the loader,
+  mappings and complete decoded images agree, including a program observed at two addresses;
+  exports check the decoded bytes against the cartridge.
+- Done: N64 imports recover audited chunked bitstream boot programs and runtime-confirmed overlapping banks,
+  preserving data prefixes and checking decoded bytes when exporting. Each supported loader build is checked against its own
+  directory, decoded image and observed text. Other loader variants need separate evidence.
+- Done: N64 imports recover boot programs stored in loader-referenced ERZ pages, checking each
+  page's RNC checksum and the loader's destination and call. Exports verify the linked program
+  against the decoded pages before retaining the original cartridge encoding.
+- Done: N64 imports scan separately decompressed code blocks independently and leave the
+  artificial padding between them as raw bytes, so inferred code ranges do not join different blocks.
+  A uniquely supported linked address is recovered when at least eight independently called bodies
+  close on that mapping; a fragment without its own closed target retains its prior placement.
+  Planned: review blocks whose mappings are ambiguous or exceed the bounded evidence search.
 - Done: N64 imports recover a whole gap between two code segments that share a mapping
   when the game's data stores the gap's start as a pointer and the gap is one balanced
   frame (a racing game's command handlers, 3.5 and 8 KB, called only through a table).
@@ -133,6 +163,10 @@
   running (`PORT_ENTRIES`, the project's `runtime-entries.txt`), Play says which no function
   starts, and the next import takes them as entries, opening a gap between two overlays
   under the mapping of the code before it (two more on that game).
+  Alignment-based gap mappings need a unique best offset and at least two calls not already explained by a
+  mapped bank; ties and calls that might target an existing overlay remain for review.
+  A runtime-observed bank can count its first entry as an internal call when that entry is a complete called leaf,
+  even when it has no stack frame; the other mapping and overlap checks still apply.
   A project that exists gains them without a reimport: Code coverage review's **Add missed
   functions** (`find_missed_functions`, the console's `missed_functions`) runs the same
   search on the project's own splat config and adds what it finds as open functions and
@@ -154,7 +188,8 @@
   their overlay scopes and existing symbols are retained. Conflicting groups are subdivided; a stopped search
   retains its verified groups and rechecks them on resume. The cartridge split is checked separately from appended
   relocatable analysis banks, whose records remain intact. Games with unverified mappings remain for review.
-  Planned: equivalent runtime adapters for the other consoles and project-mode targets.
+  Planned: equivalent runtime adapters for the other consoles and project-mode targets; trace virtual TLB
+  addresses in paged N64 programs when runtime observations currently expose only physical RAM.
 
 - Full MIPS coverage scans trace indirect calls in every detected function, with a bounded search per function.
   Completed groups are checkpointed against the image, layout and tracing implementation, so Stop and resume do
@@ -163,6 +198,10 @@
 - N64 imports also recognize cartridge tables of headerless, chunked MIO0 executables whose back-references can
   reach earlier chunks. A decoded program is included only when a called entry and a long prefix match the game's
   observed RAM; its analysis image is reconstructed from the original cartridge again during export verification.
+  Standard MIO0 streams and aligned raw DEFLATE streams are also recovered when three called targets and 64 KiB
+  of loaded bytes agree with one unambiguous cartridge stream. Code that is never observed running can still be missing.
+  An audited ring-buffer loader also supplies its source and destination; its decoded program must match a called
+  entry and 64 KiB of runtime memory before import, and export decodes the original cartridge stream again.
   Existing projects need a saved-project restore or another supported migration to use the expanded image.
 
 - Saved projects retain fingerprints for post-import discoveries and re-run verified discovery before applying
@@ -196,6 +235,10 @@
   distinct direct calls strongly agree with an established later load mapping.
   Explicit data/BSS, competing mappings and uncertain boundaries are left unchanged.
   Existing projects need a reviewed reimport; running projects are not rewritten.
+
+- Done: N64 imports recover loader-indexed compressed code pages mapped through a
+  TLB, together with their separately loaded data, when the loader and every page
+  agree. Rebuilds verify the decoded image against the original cartridge.
 
 - Done: saved-match recovery eligibility scans use the current database without
   triggering implicit progress-folder exports on every project/fork lookup. Explicit
@@ -548,6 +591,9 @@ merged scheduler target into dispatch, cleanup, and interrupt-mask entries befor
 Implemented: N64 ROM imports name and set aside exact libultra matrix conversion, cache maintenance,
 and scheduler queue-pop assembly variants as SDK code before agents can claim them. The Deep Permuter also
 checks existing local ROM projects for these signatures before searching C candidates.
+The exact whole-cache writeback routine also recognises a build that uses a different scratch register.
+Six short or relocated 64-bit conversion helpers are also identified in their verified original and expanded
+images; their complete linked bodies and constant data were checked against the pinned SDK source build.
 
 Implemented: N64 ROM imports recognise an exact low-word-first 64-bit multiply helper and set it aside
 before agents can claim it. Fresh imports name a unique unnamed copy `mul64_low_first`.
@@ -810,6 +856,24 @@ on Apple Silicon; physical Intel Mac and retail-game checks remain planned.
 - Resident N64 directory copy loops now establish overlay ROM bounds and instruction-cache
   ranges. Banks that reuse a RAM range keep separate symbols and function boundaries.
 
+## ROM-backed public imports
+
+An imported public project without a matching build can use an existing exported ROM analysis as a local workspace. The selected game's SHA-1 must match the export's image directly; compressed analysis images are not supported yet. The public checkout stays separate and new matches remain in the local analysis. The N64 class and struct readers do not yet read these generated reference objects. A whole-game rebuild with those matches, portable save and reimport, and the remaining project features have not yet been verified for this workspace. Add those capabilities and audit the feature table on a real project before claiming them as supported. Setup retains and validates copied files across interruption and preserves the prepared workspace before measurement. Resuming target preparation and measurement still repeats those phases; add durable checkpoints for them.
+
+
+These workspaces use the project engine with the ROM judge, so the ordinary public-decomp column below is not evidence that every feature has been checked here. An N64 scratch copy was used for the checks marked below; other MIPS platforms still need the same audit. A — is work to implement or verify before claiming support.
+
+| ROM-backed public import feature | Status |
+| :-- | :-- |
+| Original image and function verification; claims, briefs, compile and match, machine drafts, Autopilot, header-aware redraft | ✓ N64 scratch copy |
+| SDK assembly set aside, local fingerprints and twins pass, cross-game lookup, project map and re-measure | ✓ N64 scratch copy; cross-game match still needs a donor check |
+| Drafting C++ methods, class recovery, struct layouts and debug-symbol briefs | — class and struct readers need the reference image adapter; audit methods and debug symbols |
+| Compiler ranges, suggestions, survey and flag search | — expose and test the reference profiles through the project compiler tools |
+| Joining and splitting code, assembly and agent verdicts, Check again, boundary reports | — audit each path against reference-backed units |
+| Cross-game and regional matches, shared knowledge, permuter and polishing | — exercise actual matches and confirm the reference judge protects them |
+| Names, saves and reopen, reimport, rebuildable export and rooms | — implement missing integration and verify the resulting project preserves matches |
+| Setup progress | — retain reference preparation across interruption and resume verification without repeating completed checks |
+
 ## What works where
 
 Polishing can ask helpers to check 64-bit PC compilation and repair casts between pointers and 32-bit integers.
@@ -872,7 +936,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Compile-tested draft refresh and saved diagnostics | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ m2c | ✓ Ghidra | — | — draft generator planned | ✓ supported draft generators |
 | Initial callback, forwarded-argument and overlapping-frame recovery | ✓ bounded MIPS | ✓ bounded MIPS | ✓ bounded MIPS | — | — | ✓ bounded MIPS | — | — processor reader planned | — processor reader planned | — | — processor reader planned | ✓ MIPS C; other readers planned |
 | Autopilot: free matches from drafts | ✓ | ✓ | ✓ | twins only | — | ✓ | ✓ (demo: 34 matches) | ✓ | ✓ exact drafts of tiny shapes (32-bit); Ghidra's made compilable | ✓ as PC | twins only (no drafts yet) | — |
-| Drafts follow the header (and, in ROM mode, matched callees' own prototypes), made in the background; `redraft` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ (m2c and `redraft`) | — | ✓ Ghidra's | ✓ Ghidra's | — | — |
+| Drafts follow the header (and, in ROM mode, matched callees' own prototypes), made in the background; `redraft` | ✓ | ✓ | ✓ | — | — | ✓ | ✓ (m2c and `redraft`) | — | ✓ Ghidra's | ✓ Ghidra's | — | ✓ ROM-backed MIPS; — other public builds |
 | C++ methods drafted as `Class::method` | ✓ | ✓ | ✓ | — | — | ✓ | — | — | ✓ (RTTI, and classes from the vtables constructors store) | ✓ (RTTI, vtables) | — | — |
 | Twins: free matches from identical code | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ (ran; no pairs in demo) | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Resumable source/profile queue and explicit assembly reconsideration | ✓ ROM | ✓ ROM | ✓ ROM | — | — | ✓ ROM | — | — owned-build adapter planned | — owned-build adapter planned | — | — owned-build adapter planned | — owned-build adapter planned |
@@ -923,7 +987,7 @@ folder, `src/decompnet/consoles/<id>/`; a new console adds a column (CONTRIBUTIN
 | Verified cleanup of rare compiler profiles | ✓ ROM mode | ✓ ROM mode | ✓ ROM mode | — | — | ✓ ROM mode | — | — | — | — | — | — |
 | Deep Permuter detects a near-match's compiler (`profile_detection`: its saved C under every installed profile, matched neighbours, the compiler map, code habits; told and tried first) | ✓ demo; copies of three real games | ✓ shared ROM path, unchecked | ✓ shared ROM path, unchecked | ✓ judge and neighbours, unchecked (code habits: MIPS only) | — | ✓ shared ROM path, unchecked | — | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build |
 | Profile probe: the few per-function profiles an open function's target points to (`-mfp32`, `-G8`, SN 2.7.2's builds, the 0001 + 0004-assembler pack for any `ldc1` target, KMC for libultra, the profile most matched neighbours use, the project's most used per-function profiles, `-fforce-addr` for a target that reads offsets off a held symbol address), and every other -O level of the function's compiler (for the saved C and the machine draft, a clearly closer level then repaired by the Deep Permuter), judged once per saved C by the Deep Permuter and the autopilot's saved-source pass, an exact pair applied for that function only (`profile_probe`) | ✓ demo; the rules from ~1,000 hand matches of one SN 2.8.1 game | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules (`-G`), unchecked | ✓ flag and neighbour rules, unchecked | — | ✓ flag and neighbour rules, unchecked | ✓ -O levels and neighbour rules, unchecked | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build |
-| Drafts under other profiles: after the background drafts, each open function's stored draft, a fresh draft and its saved C judged under the profiles the project's matched functions use (and the other `-mfp` flag where the target's float registers point to it), an exact pair applied for that function only, the closest kept as its closest attempt (`profile_drafts`) | ✓ demo, `-mfp32`/`-mfp64` variants | ✓ shared ROM path, unchecked (no demo compiler here) | ✓ shared ROM path, unchecked | — no machine drafts: m2c can't read its code | — the project's build | ✓ shared ROM path, unchecked | ✓ shared ROM path, unchecked | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build |
+| Drafts under other profiles: after the background drafts, each open function's stored draft, a fresh draft and its saved C judged under the profiles the project's matched functions use, the most used and its matched neighbours' (and the other `-mfp` flag where the target's float registers point to it), an exact pair applied for that function only, the closest kept as its closest attempt (`profile_drafts`) | ✓ demo, `-mfp32`/`-mfp64` variants | ✓ shared ROM path, unchecked (no demo compiler here) | ✓ shared ROM path, unchecked | — no machine drafts: m2c can't read its code | — the project's build | ✓ shared ROM path, unchecked | ✓ shared ROM path, unchecked | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — per-file compilers: planned | — the project's build |
 | Repair rules learnt from the Deep Permuter's matches (`mined_rules`): a statement-sized change that made two different matches becomes a rule, tried first on other functions (C only) | ✓ unit tests; extraction measured on saved matches | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked | ✓ shared, unchecked |
 | Flag search (`search_flags`) | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | — (the project's flags only) | per source file (/Oy- on 32-bit, /O1, /Ob1) | per source file | — (the project's flags only) | the project's build |
 | Compiler map and the judge's survey | ✓ | ✓ | ✓ | — | — | ✓ | — | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | ✓ per source file, Rich header | the XDK build's compiler (no Rich header: one per game) | ✓ from scratch: per source file (its own compilers, nearest first); else the project's build | — |

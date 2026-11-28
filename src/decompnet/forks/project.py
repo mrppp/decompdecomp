@@ -2059,6 +2059,13 @@ class ForkProject:
 
     def build_unit(self, unit: Unit, log=lambda *_: None) -> tuple[bool, str]:
         """Build one unit's object with the project's own build, as objdiff.json says."""
+        if manifest := self.objdiff_config().get('rom_reference_manifest'):
+            from .rom_judge import unit_diff
+            try:
+                unit_diff(self, unit, None, manifest)
+                return True, ''
+            except (ForkError, objdiff.ObjdiffError) as error:
+                return False, str(error)
         if unit.base is None:
             return False, "this unit has no source object to build"
         cfg = self.objdiff_config()
@@ -2107,6 +2114,8 @@ class ForkProject:
         build's log when it built). A unit whose own build raises gets the exception in its place in the list, for
         its caller alone (_UnitBuilds)."""
         cfg = self.objdiff_config()
+        if cfg.get('rom_reference_manifest'):
+            return [self.build_unit(unit, log=log) for unit in units]
         make = cfg.get("custom_make") or "make"
         tool = _tool(make) or make
         if len(units) < 2 or any(u.base is None or u.scaffold for u in units) or Path(tool).stem.lower() != "ninja":
@@ -2146,7 +2155,10 @@ class ForkProject:
         depends on it. Counting the object alone, an x86 game's edits that broke such a step were kept as breaking
         nothing, and the next agent to compile there was told the file was broken before it came."""
         # (the build's targets are named from the folder it runs in: `-C sub` says final.o for sub/final.o)
-        want = {os.path.normpath(t) for t in [*targets, *self._made_from(targets)]}
+        if self.objdiff_config().get('rom_reference_manifest'):
+            want = {os.path.normpath(t) for t in targets}
+        else:
+            want = {os.path.normpath(t) for t in [*targets, *self._made_from(targets)]}
         return {u.name for u in self.units() if u.base is not None and self._target(u.base) in want}
 
     def _build_dir(self) -> str:
@@ -2233,6 +2245,23 @@ class ForkProject:
         """Build every object, going on past sources that don't compile yet (work in progress); `failed`
         collects the ones that didn't."""
         cfg = self.objdiff_config()
+        if cfg.get('rom_reference_manifest'):
+            problems = []
+            done = 0
+            check_cancel = getattr(log, 'check_cancel', lambda: None)
+            for unit in self.units():
+                if not unit.source:
+                    continue
+                check_cancel()
+                ok, message = self.build_unit(unit, log=log)
+                if not ok:
+                    problems.append(f'{unit.name}: {message}')
+                    if failed is not None and unit.base is not None:
+                        failed.append(self._target(unit.base))
+                done += 1
+                if done % 50 == 0:
+                    log(f'Built {done} ROM reference candidates')
+            return not problems, '\n'.join(problems)
         make = cfg.get("custom_make") or "make"
         if (make == "ninja" or Path(make).name.startswith("ninja")) and self._all_source():
             # -k 0: keep going past work in progress that doesn't compile yet
@@ -2241,15 +2270,34 @@ class ForkProject:
         keep_going = ["-k"] if Path(make).name in ("make", "gmake", "mingw32-make") else []
         return self.run([_tool(make) or make, *cfg.get("custom_args", []), *keep_going], log=log, failed=failed)
 
-    def report(self) -> dict:
+    def report(self, log=print) -> dict:
+        if manifest := self.objdiff_config().get('rom_reference_manifest'):
+            from .rom_judge import report
+            return report(self, manifest, log=log)
         return objdiff.report(self.root, self.root / STATE / "report.json")
 
     def diff(self, unit: Unit, symbol: str) -> objdiff.FunctionDiff:
+        manifest = self.objdiff_config().get('rom_reference_manifest')
+        if manifest:
+            from .rom_judge import unit_diff
+            return unit_diff(self, unit, symbol, manifest)
         from .linkedimages import stale
         entry = next((u for u in self.objdiff_config().get("units", []) if u.get("name") == unit.name), {})
         base = None if stale(self.root, entry, {}) else unit.base
-        return objdiff.diff(unit.target, base, symbol, cwd=self.root, options=self.diff_options(unit),
-                            project=self.root if unit.mappings else None, unit=unit.name)
+        result = objdiff.diff(unit.target, base, symbol, cwd=self.root, options=self.diff_options(unit),
+                              project=self.root if unit.mappings else None, unit=unit.name)
+        if unit.source:
+            source = (self.root / unit.source).resolve()
+            if self.root.resolve() in source.parents and source.suffix.lower() not in ('.s', '.asm'):
+                try:
+                    return objdiff.exclude_diff_stubs(result, source.read_text(encoding='utf-8', errors='replace'))
+                except OSError:
+                    pass
+            # An object left by an earlier build is not evidence of recovered C
+            # when its source cannot be checked for assembly placeholders.
+            result.unit_scores = dict.fromkeys(result.unit_scores)
+            result.match_percent = None
+        return result
 
     # ------------------------------------------------------------------ linking (dtk-template projects)
     # A file whose code and data match is linked into the game: configure.py marks it Matching, the build then

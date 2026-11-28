@@ -10,17 +10,21 @@
 - runtime_scoped.py: called code corroborated in RAM despite an overlapping overlay address.
 - reimport_preserve.py: stage existing byte-verified entries omitted by a replacement split.
 - loader_mapping.py: bank mappings corroborated by constant arguments to independent loader helpers.
+- stack_dma.py: stack-argument PI transfers that prove data mapped alongside independently placed code.
 - indexed_overlays.py: shared RAM slots and DMA bounds recovered from loader arrays and cache calls.
 - indexed_runtime_code.py: executable archive members mapped at their declared runtime addresses.
-- runtime_zlib.py, runtime_refpack.py: compressed programs corroborated by runtime call targets and loaded bytes.
+- indexed_tlb_code.py: loader-indexed compressed pages and data mapped by a TLB program.
+- runtime_zlib.py, runtime_refpack.py, runtime_table_ring.py: compressed programs corroborated by loaded bytes and calls.
 - runtime_overlays.py: overlapping code banks corroborated by runtime caller and target bytes.
-- runtime_mio_chunks.py: source-backed chunked MIO0 programs corroborated against RAM.
+- runtime_mio.py, runtime_mio_chunks.py: source-backed MIO0 programs corroborated against RAM.
+- runtime_ring.py: a source-backed ring-buffer program identified by its loader and runtime bytes.
 - runtime_textures.py: bounded emulator snapshots for texture loads whose pixels match the cartridge.
 - level_overlay_table.py: shared-slot level banks and adjacent helpers verified from loader instructions.
 - inferred_overlays.py: overlapping code-bank mappings supported by independently called local entries.
 - reloc_fragments.py: text and linked addresses from consecutive relocation-section fragments.
 - inline_data.py: verified constants and alignment bytes embedded among code.
-- boot_gzip.py, boot_compact_mio.py, boot_raw_deflate.py, boot_brs.py, boot_refpack.py, boot_rnc2.py: compressed programs placed by the boot loader.
+- boot_flag_lz.py: an audited flag-byte boot decoder and its bounded program stream.
+- boot_gzip.py, boot_compact_mio.py, boot_raw_deflate.py, boot_brs.py, boot_refpack.py, boot_rnc2.py, boot_rnx.py, boot_erz.py, boot_byte_lz.py, boot_huffman.py, boot_chunked_bits.py, boot_paired_rle.py, boot_xor.py: encoded programs placed by the boot loader; packed_mapping.py recovers linked addresses in other compressed code blocks. runtime_byte_cipher.py recovers an audited in-place runtime decoder.
 - boot_mapping.py: returning TLB boot stubs separated from code with a strongly supported later load mapping.
 - sdk_assembly.py: exact self-contained libultra body fingerprints, classified before C claims.
 - profile_probes.py: the per-function compiler profiles its open functions are judged under automatically (SN 2.7.2 builds, KMC for libultra).
@@ -335,14 +339,29 @@ class Nintendo64(Console):
         from .uso_match import Target, symbolic_target
 
         target = self.target_from_row(fn, cfg)
-        return symbolic_target(target) if isinstance(target, Target) else canonical_target(target, symbols)
+        obj = symbolic_target(target) if isinstance(target, Target) else canonical_target(target, symbols)
+        obj.native_judge = True
+        return obj
 
     def link_function(self, obj, name, target, symbols, read):
+        from ...rom import match
+        from ...rom.desktop_judge import direct_link
         from . import uso_match
 
         if isinstance(target, uso_match.Target):
-            return uso_match.link(obj, name, target.code, target.uso)
-        return super().link_function(obj, name, target, symbols, read)
+            return uso_match.verify(obj, name, target.code, target.uso)
+        if type(target) is not match.RomTarget or match.rom_linker.get() is not None:
+            return super().link_function(obj, name, target, symbols, read)
+        # Exported source may use a different spelling from its assembly listing.
+        if target.name != name:
+            from dataclasses import replace
+
+            target = replace(target, name=name)
+        token = match.rom_linker.set(direct_link)
+        try:
+            return super().link_function(obj, name, target, symbols, read)
+        finally:
+            match.rom_linker.reset(token)
 
     def export_overlay(self, target):
         from .uso_match import Target
@@ -431,6 +450,10 @@ class Nintendo64(Console):
         from .inline_data import apply
 
         expanded = add_segments(config, workdir, image, log)
+        if expanded == image:
+            from .runtime_byte_cipher import add as decode_runtime_code
+
+            expanded = decode_runtime_code(config, workdir, expanded, log)
         apply(config, (workdir / expanded).read_bytes(), log)
         return expanded
 

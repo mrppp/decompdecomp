@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import struct
+import zlib
 from pathlib import Path
 
 import yaml
@@ -11,6 +12,19 @@ from decompassets.n64 import paired_resources
 
 _HEADER = re.compile(rb'\x80[\x00-\x3f]..\x78[\x01\x5e\x9c\xda]', re.DOTALL)
 MANIFEST = 'runtime-zlib.json'
+_RAW_LIMIT = 8 * 1024 * 1024
+
+
+def _raw_deflate(data):
+    """Decode a complete, bounded raw stream and report the bytes it consumed."""
+    try:
+        decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+        payload = decoder.decompress(data, _RAW_LIMIT + 1)
+    except zlib.error:
+        return None
+    if not decoder.eof or len(payload) > _RAW_LIMIT:
+        return None
+    return payload, len(data) - len(decoder.unused_data)
 
 
 def _payload(rom, row):
@@ -22,6 +36,29 @@ def _payload(rom, row):
         return None
     if row.get('codec', 'zlib') == 'zlib':
         return paired_resources.unpack_zlib(rom, row['offset'], row['size'])
+    if row.get('codec') == 'raw_deflate':
+        decoded = _raw_deflate(memoryview(rom)[row['offset']:row['offset']+row['size']])
+        if decoded and decoded[1] == row['size'] and len(decoded[0]) == row.get('expanded'):
+            return decoded[0]
+        return None
+    if row.get('codec') == 'ring_lzss':
+        from .runtime_ring import decode
+        decoded = decode(memoryview(rom)[row['offset']:row['offset']+row['size']])
+        if decoded and decoded[1] == row['size'] and len(decoded[0]) == row.get('expanded'):
+            return decoded[0]
+        return None
+    if row.get('codec') == 'table_ring':
+        from .runtime_table_ring import decode
+        decoded = decode(memoryview(rom)[row['offset']:row['offset']+row['size']])
+        if decoded and decoded[1] == row['size'] and len(decoded[0]) == row.get('expanded'):
+            return decoded[0]
+        return None
+    if row.get('codec') == 'mio0':
+        from .runtime_mio import unpack
+        decoded = unpack(rom[:row['offset']+row['size']], row['offset'])
+        if decoded and decoded[1] == row['size'] and len(decoded[0]) == row.get('expanded'):
+            return decoded[0]
+        return None
     if row.get('codec') == 'refpack':
         from decompassets import formats, refpack
         try:
@@ -55,16 +92,10 @@ def find(rom, dumps, targets, occupied=(), check=lambda: None):
     if len(targets) < 3:
         return []
     candidates = []
-    for number, match in enumerate(_HEADER.finditer(rom)):
-        if number % 128 == 0:
-            check()
-        offset = match.start()
-        if offset % 2:
-            continue
-        size = struct.unpack_from('>I', rom, offset)[0] & 0x7fffffff
-        payload = paired_resources.unpack_zlib(rom, offset, size)
+
+    def consider(payload, row):
         if payload is None or len(payload) < 0x10000:
-            continue
+            return
         placements = {}
         for dump in dumps:
             for target in targets:
@@ -86,7 +117,33 @@ def find(rom, dumps, targets, occupied=(), check=lambda: None):
                 placements.setdefault(base, set()).add(target)
         for base, calls in placements.items():
             if len(calls) >= 3:
-                candidates.append(dict(offset=offset, size=size, vram=base, calls=sorted(calls)))
+                candidates.append(dict(row, vram=base, calls=sorted(calls)))
+
+    for number, match in enumerate(_HEADER.finditer(rom)):
+        if number % 128 == 0:
+            check()
+        offset = match.start()
+        if offset % 2:
+            continue
+        size = struct.unpack_from('>I', rom, offset)[0] & 0x7fffffff
+        payload = paired_resources.unpack_zlib(rom, offset, size)
+        consider(payload, dict(offset=offset, size=size))
+    # Headerless streams have no signature. Aligned starts following padding give a bounded
+    # shortlist; exact decompression, three calls and the observed RAM prefix decide identity.
+    for number, match in enumerate(re.finditer(rb'\x00{8,}', rom)):
+        if number % 128 == 0:
+            check()
+        end = match.end()
+        # A stored DEFLATE block can itself begin with zero bytes. Its aligned
+        # start can therefore be just inside the padding run, not at its end.
+        offset = end & ~15
+        if (end == len(rom) or end - offset > 4 or offset - match.start() < 8
+                or rom[offset] & 6 == 6):
+            continue
+        decoded = _raw_deflate(memoryview(rom)[offset:offset+_RAW_LIMIT * 2])
+        if decoded:
+            payload, size = decoded
+            consider(payload, dict(codec='raw_deflate', offset=offset, size=size, expanded=len(payload)))
     return candidates if len(candidates) == 1 else []
 
 
@@ -94,8 +151,21 @@ def verify_analysis(rom, expanded, rows):
     """Prove the appended bytes are exactly the declared original compressed streams."""
     if not isinstance(rows, list) or not rows or expanded[:len(rom)] != rom:
         return False
-    cursor = len(rom)+(-len(rom)%16)+16
-    if any(expanded[len(rom):cursor]):
+    base_size = rows[0].get('base_size', len(rom)) if isinstance(rows[0], dict) else 0
+    if type(base_size) is not int or not len(rom) <= base_size <= len(expanded):
+        return False
+    if base_size != len(rom):
+        from .boot_gzip import verify_analysis as verify_boot
+        ranges = rows[0].get('boot_ranges')
+        if (not isinstance(ranges, list) or not ranges
+                or any(not isinstance(r, (list, tuple)) or len(r) != 3
+                       or any(type(n) is not int for n in r) for r in ranges)
+                or any(not 0 <= start < end <= len(rom) or not 0x80000000 <= vram < 0x80800000
+                       for start, end, vram in ranges)
+                or not verify_boot(rom, expanded[:base_size], ranges)):
+            return False
+    cursor = base_size+(-base_size%16)+16
+    if any(expanded[base_size:cursor]):
         return False
     for row in rows:
         if not isinstance(row, dict) or type(row.get('offset')) is not int or type(row.get('size')) is not int:
@@ -111,12 +181,21 @@ def verify_analysis(rom, expanded, rows):
     return end == len(expanded) and not any(expanded[cursor:end])
 
 
-def add(config, workdir, image, rom, taken, rows, log):
+def add(config, workdir, image, rom, taken, rows, log, *, base_image=None, boot_ranges=None):
     from .loader_code import complete
 
-    expanded = bytearray(rom)
+    base = rom if base_image is None else base_image
+    if base != rom:
+        from .boot_gzip import verify_analysis as verify_boot
+        if not boot_ranges or not verify_boot(rom, base, boot_ranges):
+            return None
+        rows = [dict(row) for row in rows]
+        rows[0]['base_size'] = len(base)
+        rows[0]['boot_ranges'] = boot_ranges
+    expanded = bytearray(base)
     expanded.extend(bytes(-len(expanded)%16+16))
     programs = []
+    trap_tables = {}
     for row in rows:
         payload = _payload(rom, row)
         if not payload:
@@ -135,17 +214,46 @@ def add(config, workdir, image, rom, taken, rows, log):
             return None
         last = max(hi for _,hi,_ in found)
         last = _contiguous_tail(expanded, last, end, row['vram']+last-start)
+        if row.get('codec') == 'table_ring':
+            from .loaded_code import _called_trap_table
+            calls = [start + address - row['vram'] for address in row['calls']]
+            if table := _called_trap_table(expanded, start, end, calls):
+                lo, hi = table
+                trap_tables[start] = (lo, hi, row['vram'] + lo - start)
+                last = max(last, hi)
         text_end = min(end, (last+15)&~15)
         programs.append((row,start,text_start,text_end,end))
     cfg = yaml.safe_load(config.read_text(encoding='utf-8'))
     segments = [segment for segment in cfg['segments'] if not isinstance(segment,list) or len(segment) != 1]
-    segments.append(dict(type='bin',start=len(rom)))
+    # Splat treats the whole span between its lowest and highest global segments as
+    # occupied, including holes. Keep resident low memory distinct when an observed
+    # overlay lives in such a hole; its segments are not mutually exclusive with the bank.
+    from ...rom import split
+    existing = split.segments_from_config(config)
+    for row, start, _, _, end in programs:
+        if row.get('codec') != 'table_ring':
+            continue
+        lo, hi = row['vram'], row['vram'] + end - start
+        below = [s for s in existing if not s.exclusive_ram_id and s.vram + s.rom_end-s.rom_start <= lo]
+        above = [s for s in existing if not s.exclusive_ram_id and s.vram >= hi]
+        if below and above:
+            low_names = {s.name for s in below}
+            for segment in segments:
+                if isinstance(segment, dict) and segment.get('name') in low_names:
+                    segment['exclusive_ram_id'] = 'runtime_resident_low'
+    segments.append(dict(type='bin',start=len(base)))
     for index,(row,start,text_start,text_end,end) in enumerate(programs):
         name = f'runtime_program_{index:04d}'
         parts = ([[start,'bin',name+'_prefix']] if text_start > start else []) + [[text_start,'c',name]]
         if text_end < end:
             parts.append([text_end,'data',name])
-        segments.append(dict(name=name,type='code',start=start,vram=row['vram'],subsegments=parts))
+        segment = dict(name=name,type='code',start=start,vram=row['vram'],subsegments=parts)
+        if any(other is not row and row['vram'] < other['vram'] + other_end - other_start
+               and other['vram'] < row['vram'] + end - start
+               for other,other_start,_,_,other_end in programs):
+            segment.update(exclusive_ram_id='runtime_program_banks', symbol_name_format=f'$VRAM_{name}',
+                           symbol_name_format_no_rom=f'$VRAM_{name}')
+        segments.append(segment)
     expanded.extend(bytes(-len(expanded)%16))
     segments.append([len(expanded)])
     filename = f'{Path(image).stem}.runtime{Path(image).suffix}'
@@ -154,6 +262,18 @@ def add(config, workdir, image, rom, taken, rows, log):
     cfg['sha1'] = hashlib.sha1(expanded).hexdigest()
     cfg['segments'] = segments
     config.write_text(yaml.safe_dump(cfg,sort_keys=False),encoding='utf-8')
+    if trap_tables:
+        symbol_path = workdir/'symbol_addrs.txt'
+        text = symbol_path.read_text(encoding='utf-8') if symbol_path.exists() else ''
+        for index,(row,start,_,_,_) in enumerate(programs):
+            if start not in trap_tables:
+                continue
+            lo, hi, vram = trap_tables[start]
+            name = f'runtime_program_{index:04d}'
+            for offset in range(0, hi-lo, 8):
+                text += (f'\n{name}_trap_{offset:04X} = 0x{vram+offset:X}; // '
+                         f'type:func size:0x8 rom:0x{lo+offset:X} segment:{name}')
+        symbol_path.write_text(text.rstrip()+'\n', encoding='utf-8')
     (workdir/MANIFEST).write_text(json.dumps(rows),encoding='utf-8')
     coverage = workdir/'analysis-coverage.json'
     try:

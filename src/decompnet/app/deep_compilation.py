@@ -1,14 +1,16 @@
-"""Compile independent ROM variants ahead; judging and publication remain on the search lane."""
+"""Compile ROM variants ahead and pre-score random batches without recording a result."""
 import copy
 import functools
+import os
 import queue
 import threading
 import time
 from collections import deque
 from concurrent.futures import CancelledError, Future
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 
-from .. import compile_sessions, compile_sharing, compile_timing, compile_worker, compiler
+from .. import batch_compile, compile_sessions, compile_sharing, compile_timing, compile_worker, compiler
 from ..candidate_work import preparation as candidate_preparation
 
 
@@ -16,8 +18,18 @@ def _bucket(prefix, size):
     return f"{prefix}_{size if size <= 2 else '3_4' if size <= 4 else '5_8'}"
 
 
+@dataclass(frozen=True)
+class BatchJudgment:
+    compiled: compiler.CompileResult | batch_compile.CombinedCandidate
+    scope: tuple
+    candidate: object
+    diff: object
+    clean: bool
+
+
 class Ticket:
     started = False  # already running (a batch could not take it): another worker may compile it alone
+    batch_judgment = None
     batch = None  # (group, net, proj, header, fn) when it may compile with others (Pool._run_batch)
 
     def __init__(self, key, snapshot, run, check):
@@ -200,14 +212,31 @@ class Pool:
             group[0].check()
             token = compile_timing.ORIGIN.set('batch')
             try:
-                with compiler.cancellable(group[0].check), compile_timing.collect(group[0].compile_counts, append=True):
-                    results = net._compile_batch(proj, header, [t.batch_source for t in group], fn)
+                options = os.environ
+                native = (getattr(net, "_judge_random_batch", None)
+                          if options.get("DECOMP_N64_BATCH_JUDGE") != "0"
+                          and options.get("DECOMP_N64_COMBINED_ELF") != "0"
+                          and all(getattr(ticket, "random_rewrite", False) for ticket in group) else None)
+                token_split = batch_compile.combined_judge.set(
+                    (lambda obj, count: native(fn, proj, obj, count=count)) if native else None)
+                try:
+                    with compiler.cancellable(group[0].check), compile_timing.collect(group[0].compile_counts, append=True):
+                        results = net._compile_batch(proj, header, [t.batch_source for t in group], fn)
+                finally:
+                    batch_compile.combined_judge.reset(token_split)
             finally:
                 compile_timing.ORIGIN.reset(token)
         except BaseException as error:
             for ticket in group:
                 ticket.future.set_exception(error)
             return
+        if results and os.environ.get("DECOMP_N64_BATCH_JUDGE") != "0":
+            for ticket, result in zip(group, results):
+                if isinstance(result, batch_compile.CombinedCandidate) and result.batch_verdict is not None:
+                    scope, verdict = result.batch_verdict
+                    ticket.batch_judgment = BatchJudgment(result, scope, *verdict)
+                    compile_timing.add("batch_judged", 1)
+            self._judge_random_batch(group, results, net, proj, fn)
         alone = sum(1 for index in range(len(group)) if not results or results[index] is None)
         if alone:
             compile_timing.add('batch_alone', alone)
@@ -232,6 +261,30 @@ class Pool:
                 ticket.future.set_result(result)
         if mine is not None:
             self._run_one(mine)
+
+    def _judge_random_batch(self, group, results, net, proj, fn):
+        judge = getattr(net, "_judge_random_batch", None)
+        if judge is None:
+            return
+        eligible = [(ticket, result) for ticket, result in zip(group, results)
+                    if result is not None and not isinstance(result, batch_compile.CombinedCandidate)
+                    and result.ok and result.obj and getattr(result, "batched", False)
+                    and getattr(ticket, "random_rewrite", False) and not ticket.stopped.is_set()]
+        if len(eligible) < 2:
+            return
+        # This is speculative. Any failure leaves the normal single-object judge available.
+        try:
+            with compile_timing.collect(group[0].compile_counts, append=True), compile_timing.phase("batch_judge"):
+                batch = judge(fn, proj, [result.obj for _, result in eligible])
+        except Exception:
+            return
+        if batch is None:
+            return
+        scope, verdicts = batch
+        for (ticket, result), verdict in zip(eligible, verdicts, strict=True):
+            if verdict is not None:
+                ticket.batch_judgment = BatchJudgment(result, scope, *verdict)
+                compile_timing.add("batch_judged", 1)
 
     def close(self):
         # Search chunk contexts cancel their own pending/running tickets first.
@@ -284,6 +337,7 @@ def chunk(search, agent, proj, fn, sources, fork):
                     # what batch_compile needs: the run's group (one function, one header) and this candidate
                     ticket.batch = ((id(search.net), proj['id'], fn['id'], header), search.net, proj, header, fn)
                     ticket.batch_source = source
+                    ticket.random_rewrite = True
                 tickets[source] = ticket
         with pool.window(list(tickets.values()), check):
             compile_timing.add('ahead_submitted', len(tickets))

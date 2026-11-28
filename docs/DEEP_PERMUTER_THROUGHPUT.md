@@ -242,3 +242,43 @@ uv run python -m decompnet.thread_cpu            # this edition's home; or pass 
 
 Compiler processes are not Python: their time is in `compile_timing` (the run's `throughput`). `DECOMP_THREAD_CPU=0`
 turns all of it off. Helper reports older than a day are removed when a helper starts.
+
+## N64 local batch judging
+
+When the local random-rewrite lane compiles several candidates together, the Rust gateway can link their
+objects against one project snapshot and reuse the disassembled target for summary scoring. The search
+consumes a batch summary only for a miss at or above its current best score and while the project and
+image inputs still match. Improvements and exact matches go through the ordinary judge and an independent
+compile before they can be published.
+
+With a current gateway and KMC GCC installed, compare the ordinary individual Rust requests and batch
+requests by toggling `DECOMP_N64_BATCH_JUDGE` for the same command:
+
+```sh
+DECOMP_N64_BATCH_JUDGE=0 PYTHONPATH=src uv run --locked python tools/benchmark_deep_pipeline.py \
+  --local-batches --functions 16 --variants 32 --workers 4 --slots 4 --declarations 300
+DECOMP_N64_BATCH_JUDGE=1 PYTHONPATH=src uv run --locked python tools/benchmark_deep_pipeline.py \
+  --local-batches --functions 16 --variants 32 --workers 4 --slots 4 --declarations 300
+```
+
+On an Apple Silicon Mac, the median of three runs rose from 295 to 338 judged candidates per second
+(about 15%). Both modes ran 64 compiler invocations, recorded 512 trials, and returned the same score digest.
+The batch mode consumed all 512 batch summaries. This controlled workload includes compilation and trial
+history. The speedup depends on how often a real search can compile candidates together.
+
+### Combined compiler objects
+
+The N64 lane now sends the original ELF once per compiler batch. Rust finds the
+candidate entries, rejects file-local references or missing entries as the Python
+splitter does, and links and scores the remaining entries in place. A candidate
+that needs the ordinary judge materializes its renamed object on demand. Unsupported
+ELF inputs and gateways without the combined operation use the Python splitter.
+
+To isolate this change, use the same `--local-batches` command above with
+`DECOMP_N64_BATCH_JUDGE=1` in both modes. Toggle `DECOMP_N64_COMBINED_ELF` from
+`0` to `1`. On an Apple Silicon Mac with the same optimized gateway, medians across
+five runs per mode were 412 and 571 judged candidates per second, a 38.5% increase.
+Both paths used 64 compiler invocations and recorded 512 trials with identical
+score digests. The new path sent 64 combined ELF objects and used 512 batch miss
+summaries. The benchmark uses synthetic candidate bodies and includes compilation
+and trial history. Real projects can have different rates of batch eligibility.

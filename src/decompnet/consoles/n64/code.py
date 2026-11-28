@@ -46,10 +46,12 @@ def _code_like(words: tuple[int, ...]) -> bool:
 
 
 def find_segments(rom: bytes, taken: list[tuple[int, int, int]], ends: tuple[int, ...] = (), *, log=print,
-                  declared: tuple[tuple[int, int, int], ...] = ()) -> list[tuple[int, int, int]]:
+                  declared: tuple[tuple[int, int, int], ...] = (),
+                  source_ranges: tuple[tuple[int, int], ...] | list[tuple[int, int]] = ()) -> list[tuple[int, int, int]]:
     """(rom_start, rom_end, vram) of code segments outside `taken` (rom_start, rom_end, vram of the known ones).
     `ends`: where the known segments end, their data included (splat's config): code found after one can begin
-    right there. `declared`: those segments whole (rom_start, rom_end, vram), where a switch's jump table is read."""
+    right there. `declared`: those segments whole (rom_start, rom_end, vram), where a switch's jump table is read.
+    `source_ranges`: separate original or decompressed images; their padding never supplies a mapping."""
     size = len(rom) & ~3
     known_code = [(s, e) for s, e, _ in taken]
     calls: list[int] = []  # every call the known code makes outside itself: some go into the code found here
@@ -64,6 +66,10 @@ def find_segments(rom: bytes, taken: list[tuple[int, int, int]], ends: tuple[int
         pos = max(pos, e)
     if pos < size:
         gaps.append((pos, size))
+    if source_ranges:
+        # Each appended decompressed block is a separate source image. Its
+        # synthetic padding and its neighbour cannot establish a shared mapping.
+        gaps=[(max(a,lo),min(b,hi)) for a,b in gaps for lo,hi in source_ranges if a<hi and lo<b]
 
     candidates = []  # (start, end, vram, how sure): every stretch placed first, the surest kept first
     stretches = []  # every stretch of code, for the second pass
@@ -137,6 +143,12 @@ def find_segments(rom: bytes, taken: list[tuple[int, int, int]], ends: tuple[int
 
     found=refine(rom,found+referenced_gaps(rom,sorted(taken+found),declared),taken,log)
     return close_gaps(rom, loaded_code(rom,found,verified(rom,taken),taken,log), taken)
+
+
+def _within_sources(found, source_ranges):
+    """Keep inferred code inside actual source bytes, excluding appended zero padding."""
+    return [(start,end,vram+start-lo) for lo,hi,vram in found for a,b in source_ranges
+            if (start:=max(lo,a)) < (end:=min(hi,b))]
 
 
 def reconcile_between(rom, found, taken=(), log=print):
@@ -299,20 +311,27 @@ def complete_gaps(rom, taken, found, declared=(), entries=(), log=print):
     for (s0,e0,v0),(s1,_,v1) in zip(spans,spans[1:]):
         if e0<s1 and v0-s0!=v1-s1 and s1-e0<=0x10000 and any(v0+e0-s0<=a<v0+s1-s0 for a in entries):
             banks.append((e0,s1,v0+e0-s0))
-    slack=aligned_gaps(rom,spans,check=check)
+    deferred = []
+    slack=aligned_gaps(rom,spans,check=check,on_deferred=lambda lo,hi: deferred.append((lo,hi)))
+    if deferred:
+        examples = ', '.join(f'ROM {lo:#x}–{hi:#x}' for lo, hi in deferred[:3])
+        log(f'Left {len(deferred)} gap{"s" if len(deferred) != 1 else ""} with ambiguous alignment for review ({examples}): '
+            'calls also fit another offset or an existing bank.')
     banks+=slack
     table=mapped_data(spans,declared,len(rom))+[dict(rom_start=a,rom_end=b,vram=v) for a,b,v in slack]
     return loaded_code(rom,list(found),sorted(banks),taken,log,table_ranges=table,
                        what='gaps between code on one mapping',entries=entries)
 
 
-def aligned_gaps(rom,spans,reach=0x100,*,check=lambda:None):
+def aligned_gaps(rom,spans,reach=0x100,*,check=lambda:None,on_deferred=lambda *_:None):
     """(rom_start, rom_end, vram) of each gap between two code ranges on different mappings whose first bytes the
     code before it places a few bytes later than its own mapping does: an overlay's next function starts on an
     alignment boundary (16 bytes), so the bytes after its last listed function sit that much further on. Counted
     only when known code calls at least two frames of the gap at that offset (a call is the evidence, as a gap's
     mapping is otherwise unknown): a racing game's overlay tail of five functions, 5.7 KB with its constants, stayed
     raw bytes because its calls land 0x10 past where the code before it ends."""
+    from bisect import bisect_right
+
     from ...arch.mips_references import references
 
     gaps=[(e0,s1,v0+e0-s0) for (s0,e0,v0),(s1,_,v1) in zip(spans,spans[1:])
@@ -322,15 +341,28 @@ def aligned_gaps(rom,spans,reach=0x100,*,check=lambda:None):
     for a,b,v in spans:
         check()
         targets.update(t for t,_,kind in references(rom,a,b,v) if kind=='call')
+    # A call already explained by another mapped bank cannot independently
+    # select an overlapping gap's placement: it may call that known bank.
+    mapped = sorted((v, v+b-a) for a, b, v in spans)
+    starts, ends = [], []
+    for start, end in mapped:
+        starts.append(start)
+        ends.append(max(end, ends[-1] if ends else end))
+    unowned = {t for t in targets if (i := bisect_right(starts, t)-1) < 0 or t >= ends[i]}
     out=[]
     for lo,hi,vram in gaps:
         check()
-        best=None
+        best, offsets, best_hits = 0, [], set()
         for d in range(0,reach,4):
             hits={t for t in targets if vram+d<=t<vram+d+hi-lo
                   and is_frame(int.from_bytes(rom[lo+t-vram-d:lo+t-vram-d+4],'big'))}
-            if len(hits)>=2 and (best is None or len(hits)>best[0]):best=(len(hits),d)
-        if best:out.append((lo,hi,vram+best[1]))
+            if len(hits)>=2:
+                if len(hits)>best:best,offsets,best_hits=len(hits),[d],hits
+                elif len(hits)==best:offsets.append(d)
+        if len(offsets)==1 and len(best_hits & unowned)>=2:
+            out.append((lo,hi,vram+offsets[0]))
+        elif offsets:
+            on_deferred(lo,hi)
     return out
 
 
@@ -396,7 +428,9 @@ def boot_switch_range(image, segments):
 
 def relocated_switch_ranges(image, segments):
     """Track the immediate data tail of code ranges that share an overlay load mapping."""
-    ranges = boot_switch_range(image, segments)
+    from . import stack_dma
+
+    ranges = boot_switch_range(image, segments) + stack_dma.ranges(image, segments)
     ordered = sorted(segments,key=lambda segment:segment.rom_start)
     for i,(previous,segment) in enumerate(zip(ordered,ordered[1:]), 1):
         delta = segment.vram-segment.rom_start
@@ -545,7 +579,8 @@ def unpack_code(rom: bytes) -> list[tuple[int, bytes]]:
 
 # ---------------------------------------------------------------------------------------------- into splat's config
 
-def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_replacing_boot=False) -> str:
+def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_replacing_boot=False,
+                 skip_paged=False) -> str:
     """An N64 game's code outside the main segment (n64code.py), added to splat's config as code segments of their
     own. Compressed code (Rare's, Yaz0, RNC method 1) is unpacked first and appended to a working copy of the ROM, which splat then
     reads instead (and an export rebuilds). Code the search can't place is then found by running the game, when the
@@ -556,11 +591,17 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
 
     from . import (
         boot_brs,
+        boot_chunked_bits,
         boot_gzip,
+        boot_huffman,
+        boot_paired_rle,
+        boot_rnx,
+        boot_xor,
         copied_overlays,
         dma_overlays,
         indexed_overlays,
         indexed_runtime_code,
+        indexed_tlb_code,
         level_overlay_table,
         named_dma,
         overlays,
@@ -570,6 +611,9 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
     )
 
     if result := overlays.add(config, workdir, image, log):
+        from .boot_mapping import extend_startup_trap
+
+        extend_startup_trap(config, (workdir / result).read_bytes(), log)
         return result
 
     original = image
@@ -581,9 +625,28 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
     taken = split.code_ranges(config)
     if taken and (result := indexed_runtime_code.add(config,workdir,image,rom,taken,log)):
         return result
+    if taken and not skip_paged and indexed_tlb_code.find(rom, taken):
+        # Keep all ordinary cartridge mappings first. The paged program is an
+        # addition, not a replacement for independently discovered ROM code.
+        base = add_segments(config, workdir, image, log, skip_replacing_boot=skip_replacing_boot, skip_paged=True)
+        if base != original:
+            return base
+        taken = split.code_ranges(config)
+        if result := indexed_tlb_code.add(config, workdir, image, rom, taken, log):
+            return result
     if taken and (result := resident_deflate.add(config,workdir,image,rom,taken,log)):
         return result
-    if taken and not skip_replacing_boot and boot_brs.find(rom, taken):
+    if taken and not skip_replacing_boot and (boot_huffman.streamed(rom, boot_gzip._coalesce_boot_ranges(taken))
+                                               or boot_rnx.present(rom) or boot_paired_rle.present(rom)
+                                               or boot_chunked_bits.find(rom, boot_gzip._coalesce_boot_ranges(taken))):
+        # The same loader also DMA-loads raw code elsewhere. Keep those banks
+        # before adding the independently verified expanded program.
+        base = add_segments(config, workdir, image, log, skip_replacing_boot=True)
+        if base == original:
+            if result := boot_gzip.add(config, workdir, image, rom, split.code_ranges(config), log):
+                return result
+        return base
+    if taken and not skip_replacing_boot and (boot_brs.find(rom, taken) or boot_xor.find(rom, taken)):
         # The replacement program reuses the boot addresses. Recover the boot
         # code first, before the expanded image introduces overlapping banks.
         base = add_segments(config, workdir, image, log, skip_replacing_boot=True)
@@ -617,9 +680,11 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
         rom = bytes(work)
         kib = sum(len(d) for _, d in packed) // 1024
         log(f"unpacked {len(packed)} compressed code block{'s' if len(packed) != 1 else ''} ({kib} KiB)")
+    sources=([(0,len(original_rom)&~3)]+[(at,(at+len(data))&~3) for at,(_,data) in zip(locations,packed)] if packed else [])
     known = split.segments_from_config(config)
     found = find_segments(rom, taken, tuple(s.rom_end for s in known), log=log,
-                          declared=tuple((s.rom_start, s.rom_end, s.vram) for s in known)) if taken else []
+                          declared=tuple((s.rom_start, s.rom_end, s.vram) for s in known),source_ranges=sources) if taken else []
+    if sources:found=_within_sources(found,sources)
     if not packed and taken and (banks := copied_overlays.read(original_rom, taken)):
         copied_overlays.add(config, original_rom, found, banks, log)
         return original
@@ -648,6 +713,7 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
         found = sorted(found + loaded["segments"])
         found = sorted(complete_gaps(rom, taken, found, tuple((s.rom_start, s.rom_end, s.vram) for s in known),
                                      runtime_entries(workdir), log=log))
+        if sources:found=_within_sources(found,sources)
     if not packed and not found and loaded.get('decoded_programs'):
         from . import runtime_zlib
         if result := runtime_zlib.add(config, workdir, original, original_rom, taken,
@@ -698,12 +764,17 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
                                              changed=runtime | banks | {start for start,_,_ in overlaps})
     # Corrected addresses can expose a called prologue whose frame lies beyond
     # the scanner's original alignment tail.
+    from .code_tails import bridge_called_frame
     from .code_tails import complete as complete_tails
     called = set()
     for start,end,entry in (*taken, *found):
         words = struct.unpack_from(f'>{(end-start)//4}I', rom, start)
         called.update(jal_targets(words, entry))
     found = complete_tails(rom, found, taken, called=called)
+    bridged = bridge_called_frame(rom, found, taken, called=called)
+    if len(bridged) < len(found):
+        log(f'Recovered {len(found)-len(bridged)} called code bodies across gaps in their mapping.')
+    found = bridged
     # A complete framed tail can overlap a different inferred ROM bank at the
     # same runtime address. Keep both only when exclusive scopes can hold them.
     expanded = complete_tails(rom, found, taken, called=called, allow_inferred_overlap=True)
@@ -716,13 +787,25 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
     if safe_expanded is not None:
         found, scoped = expanded, safe_expanded
     found = inferred_overlays.drop_pointer_fragments(rom, found, taken)
+    linked=set()
+    if sources:
+        before_clipping=found
+        found=_within_sources(found,sources)
+        scoped={start for start,_,_ in found if any(lo in scoped and lo<=start<hi for lo,hi,_ in before_clipping)}
+        from . import packed_mapping
+        found,linked=packed_mapping.recover(rom,found,sources[1:],taken,getattr(log,'check_cancel',lambda:None))
+        for start,end,address in found:
+            for other,stop,base in found:
+                if start!=other and (start in linked or other in linked) and address<base+stop-other and base<address+end-start:
+                    scoped.update((start,other))
     scoped &= {start for start,_,_ in found}
     safe = inferred_overlays.safe_scopes(found, scoped, taken)
     if safe is None:
-        found, scoped = before_mapping, set()
+        found, scoped, linked = before_mapping, set(), set()
         log('Kept the original code mappings because independent banks would overlap the global address range.')
     else:
         scoped = safe
+    if linked:log(f'Corrected {len(linked)} packed code ranges using independently closed linked call targets.')
     if runtime and scoped:
         log(f'Corrected {len(runtime)} inferred code ranges using RAM-observed bytes and their internal calls.')
     # A run of relocation-section files can be mistaken for one continuous
@@ -753,7 +836,7 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
                     coverage.write_text(json.dumps(list(dict.fromkeys([*notes, message]))), encoding='utf-8')
             else:
                 log('Kept the original code mappings: relocation-backed fragments conflict with resident code.')
-    if overlaps:
+    if scoped:
         import copy
         unscoped_cfg = copy.deepcopy(cfg)
     insert_segments(config, cfg, found, len(rom))
@@ -767,13 +850,12 @@ def add_segments(config: Path, workdir: Path, image: str, log=print, *, skip_rep
             split._add_symbols(workdir / 'symbol_addrs.txt', symbols)
     if scoped:
         cfg = yaml.safe_load(config.read_text(encoding='utf-8'))
-        inferred_overlays.scope(cfg, found, scoped)
-        if overlaps and not inferred_overlays.scope_resident_bss(cfg):
+        if not inferred_overlays.apply_scopes(cfg, found, scoped):
             log('Kept the original code mappings: the observed overlays conflict with resident code scopes.')
             insert_segments(config, unscoped_cfg, before_mapping, len(rom))
         else:
             config.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8')
-        log('Recovered overlapping code-bank addresses from their independent internal calls.')
+            log('Recovered overlapping code-bank addresses from their independent internal calls.')
     kib = sum(en - st for st, en, _ in found) // 1024
     log(f"found {len(found)} more code segment{'s' if len(found) != 1 else ''} the game loads later ({kib} KiB)")
     if not packed and loaded.get('decoded_programs'):
@@ -861,7 +943,7 @@ def insert_segments(config: Path, cfg: dict, found, size: int, *, scopes=None) -
     # Several import paths also discover code in a raw child of a code parent. Keep it in that
     # parent: a top-level insertion would cut off the parent's later children and lose their mappings.
     parents = split.segments_from_config_data(cfg)
-    children, outside = [], []
+    children, outside, recovered_tails = [], [], []
     for body in found:
         lo, hi, _ = body
         overlaps = [s for s in parents if s.rom_start < hi and lo < s.rom_end]
@@ -871,7 +953,10 @@ def insert_segments(config: Path, cfg: dict, found, size: int, *, scopes=None) -
                 children.append(body)
                 continue
             if len(overlaps) == 1 and _replaceable_parent_tail(cfg, body):
-                outside.append(body)
+                raw = next(s for s in cfg['segments'] if isinstance(s, dict) and s.get('start') == parent.rom_start)
+                source = max((s for s in raw['subsegments'] if isinstance(s, list) and len(s) >= 2 and s[0] <= lo),
+                             key=lambda s: s[0])
+                recovered_tails.append((body, raw, source[1]))
                 continue
             raw = next((s for s in cfg.get('segments', []) if isinstance(s, dict)
                         and s.get('start') == parent.rom_start and s.get('type') == 'code'), {})
@@ -883,8 +968,22 @@ def insert_segments(config: Path, cfg: dict, found, size: int, *, scopes=None) -
                 raise RomError('Recovered code crosses an existing bank or has a different mapping. Review it before importing.')
         else:
             outside.append(body)
-    if children:
-        _cut_inside(cfg, sorted(children))
+    # Keep discoveries in their existing parent: separate top-level banks at
+    # guessed boundaries can cut one real function across export parents.
+    for (lo, _, _), parent, _ in recovered_tails:
+        child = next((s for s in parent['subsegments'] if isinstance(s, list) and s and s[0] == lo), None)
+        if child is None:
+            parent['subsegments'].append([lo, 'bin'])
+        else:
+            child[1] = 'bin'
+    if children or recovered_tails:
+        _cut_inside(cfg, sorted(children + [body for body, _, _ in recovered_tails]))
+    starts = {body[0] for body, _, _ in recovered_tails}
+    for (_, hi, _), parent, kind in recovered_tails:
+        if hi not in starts:
+            child = next((s for s in parent['subsegments'] if isinstance(s, list) and s and s[0] == hi), None)
+            if child is not None and child[1] == 'bin':
+                child[1] = kind
     found = outside
 
     def start_of(seg):
@@ -893,7 +992,7 @@ def insert_segments(config: Path, cfg: dict, found, size: int, *, scopes=None) -
     # splat measures a parent's VRAM end as ROM length + bss_size. New code segments can split its data
     # tail: remember that end so the explicit BSS still describes the same addresses after the split.
     bss_ends = {}
-    for seg in split.segments_from_config(config):
+    for seg in parents:
         raw = next(s for s in cfg["segments"] if isinstance(s, dict) and s.get("start") == seg.rom_start)
         if raw.get("bss_size") and any(isinstance(sub, dict) and sub.get("type") == "bss" and "vram" in sub
                                        for sub in raw.get("subsegments", [])):
@@ -1195,7 +1294,57 @@ def _bodies_inside_code(cfg, rom, taken, known, log):
     banks = [(a, b, v) for a, b, v in taken]
     table = [dict(rom_start=a, rom_end=b, vram=v) for a, b, v in banks]
     found = complete(rom, spans, banks, (), log, table_ranges=table, what="the gaps inside code segments")
+    found += _called_scoped_bin_bodies(cfg, rom, spans, log)
     return sorted(set(found) - set(spans))
+
+
+def _called_scoped_bin_bodies(cfg, rom, known, log):
+    """Follow calls within each declared overlay into that bank's raw gaps."""
+    from ...arch.mips_references import references
+    from .loader_code import complete
+
+    check = getattr(log, 'check_cancel', lambda: None)
+    progress = getattr(log, 'progress', lambda _: None)
+    parents = split.segments_from_config_data(cfg)
+    raw = {s.get('start'): s for s in cfg.get('segments', []) if isinstance(s, dict)}
+    recovered = []
+
+    def quiet(_message):
+        pass
+
+    quiet.check_cancel = check
+    for index, bank in enumerate(parents):
+        check()
+        progress({'phase': 'Checking called code in overlay gaps', 'done': index, 'total': len(parents)})
+        parent = raw.get(bank.rom_start, {})
+        subs = sorted((s for s in parent.get('subsegments', []) if isinstance(s, list) and len(s) >= 2),
+                      key=lambda s: s[0])
+        if not bank.exclusive_ram_id or not any(s[1] == 'bin' for s in subs):
+            continue
+        scope = [(lo, hi, vram) for lo, hi, vram in known
+                 if bank.rom_start <= lo < hi <= bank.rom_end and vram - lo == bank.vram - bank.rom_start]
+        if not scope:
+            continue
+        gaps = [(s[0], subs[i + 1][0] if i + 1 < len(subs) else bank.rom_end)
+                for i, s in enumerate(subs) if s[1] == 'bin']
+        calls = {target for lo, hi, vram in scope for target, _, kind in references(rom, lo, hi, vram)
+                 if kind == 'call' and any(a <= bank.rom_start + target - bank.vram < b for a, b in gaps)}
+        if not calls:
+            continue
+        bounds = (bank.rom_start, bank.rom_end, bank.vram)
+        table = [dict(rom_start=bank.rom_start, rom_end=bank.rom_end, vram=bank.vram)]
+        found = complete(rom, scope, [bounds], (), quiet, table_ranges=table,
+                         what='declared overlay banks')
+        for body in set(found) - set(scope):
+            lo, hi, vram = body
+            source = max((s for s in subs if s[0] <= lo), key=lambda s: s[0], default=None)
+            if (source and source[1] == 'bin' and vram in calls and _cut_ok(cfg, body)
+                    and not any(a < hi and lo < b for a, b, _ in known)):
+                recovered.append(body)
+    progress({'phase': 'Checking called code in overlay gaps', 'done': len(parents), 'total': len(parents)})
+    if recovered:
+        log(f'Found {len(recovered)} called bodies in declared overlay gaps for staged verification.')
+    return recovered
 
 
 def _owner(cfg, lo, hi):
@@ -1217,7 +1366,9 @@ def _cut_ok(cfg, body):
         return False
     subs = [s for s in seg.get('subsegments', []) if isinstance(s, list) and len(s) >= 2]
     containing = max((s for s in subs if s[0] <= lo), key=lambda s: s[0], default=None)
-    return (containing is not None and containing[1] in ('c', 'bin') and
+    # A called body can live after the boot jump in one handwritten assembly
+    # unit. The staged split still has to reproduce it and every existing body.
+    return (containing is not None and containing[1] in ('c', 'bin', 'hasm') and
             not any(lo < s[0] < hi and s[1] != containing[1] for s in subs))
 
 
@@ -1231,7 +1382,7 @@ def _replaceable_parent_tail(cfg, body):
     subs = [s for s in seg.get('subsegments', []) if isinstance(s, list) and len(s) >= 2]
     source = max((s for s in subs if s[0] <= lo), key=lambda s: s[0], default=None)
     return (source is not None and source[1] in ('data', '.data', 'rodata', '.rodata')
-            and not any(s[0] >= lo for s in subs))
+            and not any(s[0] > lo or s[0] == lo and s is not source for s in subs))
 
 
 def _cut_inside(cfg, bodies):

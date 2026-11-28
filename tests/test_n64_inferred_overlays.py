@@ -75,6 +75,23 @@ def test_runtime_observed_range_needs_internal_call_corroboration():
     assert inferred_overlays.runtime_mappings(image,[old],[observed])==([old],set())
 
 
+def test_runtime_bank_counts_a_closed_called_leaf_at_its_start():
+    image = bytearray(0x200)
+    base = 0x80100000
+    old = (0, len(image), 0x80040000)
+    observed = (0, len(image), base)
+    struct.pack_into('>3I', image, 0, 0x24020001, 0x03e00008, 0)
+    for at in (0x40, 0x80):
+        struct.pack_into('>3I', image, at, 0x27bdffe8, 0x03e00008, 0x27bd0018)
+    def jal(address):
+        return 0x0c000000 | ((address >> 2) & 0x3ffffff)
+    struct.pack_into('>3I', image, 0x100, jal(base), jal(base+0x40), jal(base+0x80))
+    assert inferred_overlays.runtime_mappings(image, [old], [observed]) == ([observed], {0})
+    assert inferred_overlays.runtime_mappings(image, [old], [observed], [(0x400, 0x500, base)]) == ([old], set())
+    struct.pack_into('>I', image, 4, 0x1000ffff)  # A looping entry is not a closed leaf.
+    assert inferred_overlays.runtime_mappings(image, [old], [observed]) == ([old], set())
+
+
 def test_runtime_range_can_cover_only_part_of_inferred_code():
     image,found=fixture()
     old=(0,0x5000,0x80040000)
@@ -82,6 +99,31 @@ def test_runtime_range_can_cover_only_part_of_inferred_code():
     mapped,changed=inferred_overlays.runtime_mappings(image,[old],[observed])
     assert mapped==[(0,0x4000,0x80100000),(0x4000,0x5000,0x80044000)]
     assert changed=={0}
+
+
+def test_runtime_bank_continuation_needs_shared_observation_and_two_closed_callees():
+    image,_=fixture();base=0x80100000
+    first=(0,0x4000,0x80040000);second=(0x4000,0x5000,0x80090000)
+    observed=(0,0x5000,base)
+    body=(0x27bdffe8,0xafbf0014,0x24020007,0x8fbf0014,0x03e00008,0x27bd0018)
+    for at in (0x4000,0x4040):struct.pack_into('>6I',image,at,*body)
+    def jal(address):return 0x0c000000|((address>>2)&0x3ffffff)
+    struct.pack_into('>2I',image,0x3200,jal(base+0x4000),jal(base+0x4040))
+    mapped,changed=inferred_overlays.runtime_mappings(image,[first,second],[observed])
+    assert mapped==[(0,0x4000,base),(0x4000,0x5000,base+0x4000)] and changed=={0,0x4000}
+    # Two independently observed pieces do not establish that they coexisted.
+    assert inferred_overlays.runtime_mappings(image,[first,second],[(0,0x4000,base),(0x4000,0x5000,base+0x4000)])[0][1]==second
+    saved=image[0x3000:0x3000+4*48];image[0x3000:0x3000+4*48]=bytes(4*48)
+    assert inferred_overlays.runtime_mappings(image,[first,second],[observed])[0]==[first,second]
+    image[0x3000:0x3000+4*48]=saved
+    struct.pack_into('>I',image,0x3204,0)
+    assert inferred_overlays.runtime_mappings(image,[first,second],[observed])[0][1]==second
+    struct.pack_into('>I',image,0x3204,jal(base+0x4040))
+    struct.pack_into('>I',image,0x4040,0)
+    assert inferred_overlays.runtime_mappings(image,[first,second],[observed])[0][1]==second
+    struct.pack_into('>6I',image,0x4040,*body)
+    struct.pack_into('>I',image,0x3208,jal(second[2]))
+    assert inferred_overlays.runtime_mappings(image,[first,second],[observed])[0][1]==second
 
 
 def test_rejected_partial_runtime_range_does_not_split_the_inferred_segment():
@@ -300,3 +342,26 @@ def test_extend_tail_wrapper_requires_separated_entry_and_mapped_tail():
     assert inferred_overlays.extend_tail_wrapper(image, bank, []) == bank
     struct.pack_into('>I', image, 0x30, 0x10000001)
     assert inferred_overlays.extend_tail_wrapper(image, bank, target) == bank
+
+
+def test_single_inferred_bank_scopes_resident_bss():
+    config = {'segments': [
+        {'type': 'code', 'name': 'main', 'start': 0x1000, 'vram': 0x80000400, 'bss_size': 0x1000},
+        {'type': 'code', 'name': 'bank', 'start': 0x2000, 'vram': 0x80001800},
+        [0x2800],
+    ]}
+    assert inferred_overlays.apply_scopes(config, [(0x2000, 0x2800, 0x80001800)], {0x2000})
+    assert config['segments'][0]['exclusive_ram_id'] == config['segments'][1]['exclusive_ram_id']
+
+
+def test_child_range_cannot_scope_its_entire_resident_parent():
+    config = {'segments': [
+        {'type': 'code', 'name': 'main', 'start': 0x1000, 'vram': 0x80000400,
+         'subsegments': [[0x1000, 'c'], [0x1800, 'c']]},
+        {'type': 'code', 'name': 'bank', 'start': 0x2000, 'vram': 0x80000c00},
+        [0x2800],
+    ]}
+    assert not inferred_overlays.apply_scopes(config, [(0x1800, 0x1c00, 0x80000c00),
+                                                        (0x2000, 0x2400, 0x80000c00)],
+                                                {0x1800, 0x2000})
+    assert all('exclusive_ram_id' not in segment for segment in config['segments'] if isinstance(segment, dict))

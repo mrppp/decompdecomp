@@ -36,32 +36,58 @@ def object_for(obj, name, code):
     return bytes(data)
 
 
+def verified_image_reader(root, manifest):
+    """Read only unambiguous, explicitly mapped bytes from the verified original image."""
+    image=(root/manifest['image']).read_bytes()
+    if hashlib.sha1(image).hexdigest()!=manifest['sha1']:
+        raise ValueError('Restore the verified game image before checking an entry.')
+    ranges=[dict(rom_start=s['start'],rom_end=s['end'] or len(image),vram=s['vram'])
+            for s in manifest['segments'] if s['kind']=='code']+manifest.get('data_mappings',[])
+    for s in ranges:
+        if not 0<=s['rom_start']<s['rom_end']<=len(image):
+            raise ValueError('A reviewed data mapping exceeds the verified image.')
+    def read(addr,n):
+        hits=[s for s in ranges if s['vram']<=addr and addr+n<=s['vram']+s['rom_end']-s['rom_start']]
+        offsets={s['rom_start']+addr-s['vram'] for s in hits}
+        if len(offsets)>1:
+            raise ValueError(f'Overlapping image mappings disagree about constant 0x{addr:08X} ({n} bytes).')
+        if offsets:
+            at=offsets.pop();return image[at:at+n]
+        return None
+    return image, read
+
+
+def verify_target(image, manifest, fn, target):
+    """Only the verified image, never a changed assembly file, supplies reference bytes."""
+    offset=fn.get('rom')
+    address=fn.get('vram')
+    code=target.code
+    if (not code or not isinstance(offset, int) or offset<0 or offset+len(code)>len(image)
+            or image[offset:offset+len(code)]!=code):
+        raise ValueError('The target assembly does not match the verified image at its recorded offset.')
+    if (not isinstance(address, int) or target.vram!=address or not any(
+            s['kind']=='code' and s['start']<=offset and offset+len(code)<=(s['end'] or len(image))
+            and s['vram']+offset-s['start']==address for s in manifest['segments'])):
+        raise ValueError('The target address does not match the verified image mapping.')
+
+
 def write(root, manifest, fn, path):
     """Rejudge the current compiled object against the verified image before extracting its entry."""
-    image=(root/manifest['image']).read_bytes()
-    if hashlib.sha1(image).hexdigest()!=manifest['sha1']:raise ValueError('Restore the verified game image before extracting an entry.')
+    image,read=verified_image_reader(root,manifest)
     table=SymbolTable([Symbol(n,a,0,'data') for n,a in manifest['symbols'].items()]+
                       [Symbol(d['name'],d['vram'],d.get('size',0),'data') for d in manifest.get('data',[])]+
                       [Symbol(n,a,0,'data') for n,a in manifest.get('labels',{}).items() if n not in manifest['symbols']]+
                       [Symbol(f['name'],f['vram'],0,'func') for f in manifest['functions']])
     target=match.target_from_split(split.parse_function(root/fn['asm'],fn['seg'],manifest['big_endian']),table.resolve,
                                    manifest['big_endian'],manifest.get('gp') or 0)
-    # Some old exports kept readonly pools as raw blobs, outside their code
-    # parents. Only explicit reviewed mappings may expose those bytes; never
-    # guess an address delta merely to make the judge accept a constant.
-    ranges=[dict(rom_start=s['start'],rom_end=s['end'] or len(image),vram=s['vram'])
-            for s in manifest['segments'] if s['kind']=='code']+manifest.get('data_mappings',[])
-    for s in ranges:
-        if not 0<=s['rom_start']<s['rom_end']<=len(image):raise ValueError('A reviewed data mapping exceeds the verified image.')
-    def read(addr,n):
-        hits=[s for s in ranges if s['vram']<=addr and addr+n<=s['vram']+s['rom_end']-s['rom_start']]
-        offsets={s['rom_start']+addr-s['vram'] for s in hits}
-        if len(offsets)>1:raise ValueError(f'Overlapping image mappings disagree about constant 0x{addr:08X} ({n} bytes).')
-        if offsets:
-            at=offsets.pop();return image[at:at+n]
-        return None
+    verify_target(image,manifest,fn,target)
     name=fn.get('symbol') or fn['name']  # the C's name for it (export.py: splat's may be the automatic one)
-    obj=path.read_bytes();linked=match.link(obj,name,target,table,read)
+    from decompnet.consoles import get
+
+    console = get(manifest.get('platform'))
+    linker = console.link_function if console.rust_desktop_judge else match.link
+    obj = path.read_bytes()
+    linked = linker(obj, name, target, table, read)
     if not linked.exact or linked.linked_code is None:
         raise ValueError('Entry extraction requires freshly verified exact code and data: '+'; '.join(linked.problems))
     if linked.missing_data_reads:

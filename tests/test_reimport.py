@@ -92,6 +92,62 @@ def test_reimport_rejudge_releases_only_its_own_claims(tmp_path):
     assert 'removed' in note['text'] and 'int preserved;' in note['text']
 
 
+def test_reimport_does_not_wait_on_its_own_autopilot_claim(tmp_path, monkeypatch):
+    from decompnet.app.engine import importing, judging
+
+    net = RomNetwork(tmp_path/'app.db', tmp_path)
+    with net.store.tx() as db:
+        pid = db.execute('INSERT INTO projects(slug,name,root,arch,config) VALUES(?,?,?,?,?)',
+                         ('game', 'Game', str(tmp_path), 'mips', '{}')).lastrowid
+        for index, name in enumerate(('own', 'other')):
+            db.execute('INSERT INTO functions(project_id,name,size,n_insns,target,relocs,status,vram) '
+                       'VALUES(?,?,?,?,?,?,?,?)', (pid, name, 4, 1, b'\0'*4, '[]', 'open', 0x80000000+4*index))
+    agent = net.attribution_agent('autopilot')
+    store = net.project_store(pid)
+    other = net._function('other', 'game')
+    with store.tx() as db:
+        db.execute('INSERT INTO claims VALUES(?,?,?,?)', (other['id'], agent.id, 1.0, 9999999999.0))
+    waited = []
+    def release(_):
+        waited.append(True)
+        with store.tx() as db:
+            db.execute('DELETE FROM claims WHERE function_id=?', (other['id'],))
+    monkeypatch.setattr(judging, 'time', SimpleNamespace(sleep=release))
+    with importing._reimport_claim(net, 'game', 'own', agent):
+        assert net._yield_autopilot('own', 'game') is False
+        assert waited == []
+        assert net._yield_autopilot('other', 'game') is True
+        assert waited == [True]
+    assert getattr(net._compile_ahead_local, 'reimport_claim', None) is None
+    assert store.one('SELECT COUNT(*) AS n FROM claims')['n'] == 0
+
+
+def test_reimport_still_waits_if_its_claim_is_replaced(tmp_path, monkeypatch):
+    from decompnet.app.engine import importing, judging
+
+    net = RomNetwork(tmp_path/'app.db', tmp_path)
+    with net.store.tx() as db:
+        pid = db.execute('INSERT INTO projects(slug,name,root,arch,config) VALUES(?,?,?,?,?)',
+                         ('game', 'Game', str(tmp_path), 'mips', '{}')).lastrowid
+        db.execute('INSERT INTO functions(project_id,name,size,n_insns,target,relocs,status,vram) '
+                   'VALUES(?,?,?,?,?,?,?,?)', (pid, 'f', 4, 1, b'\0'*4, '[]', 'open', 0x80000000))
+    agent = net.attribution_agent('autopilot')
+    store = net.project_store(pid)
+    fn = net._function('f', 'game')
+    waited = []
+    def release(_):
+        waited.append(True)
+        with store.tx() as db:
+            db.execute('DELETE FROM claims WHERE function_id=?', (fn['id'],))
+    monkeypatch.setattr(judging, 'time', SimpleNamespace(sleep=release))
+    with importing._reimport_claim(net, 'game', 'f', agent):
+        with store.tx() as db:
+            db.execute('UPDATE claims SET claimed_at=? WHERE function_id=?', (1.0, fn['id']))
+        assert net._yield_autopilot('f', 'game') is True
+        assert waited == [True]
+    assert getattr(net._compile_ahead_local, 'reimport_claim', None) is None
+
+
 @pytest.mark.parametrize("legacy_reset",[False,True])
 def test_reimport_replaces_analysis_and_keeps_only_unchanged_matches(tmp_path, monkeypatch, legacy_reset):
     root = tmp_path / "game"
@@ -294,7 +350,10 @@ def test_reimport_still_blocks_projects_with_an_active_room(tmp_path):
 
 
 @pytest.mark.parametrize('derived', [False, True])
-def test_reimport_pairs_saved_matches_by_overlay_and_address(tmp_path, monkeypatch, derived):
+@pytest.mark.parametrize('unit_changed', [False, True])
+def test_reimport_pairs_saved_matches_by_overlay_and_address(tmp_path, monkeypatch, derived, unit_changed):
+    import hashlib
+
     from decompnet import consoles
 
     root = tmp_path / 'banks'
@@ -302,7 +361,9 @@ def test_reimport_pairs_saved_matches_by_overlay_and_address(tmp_path, monkeypat
     net = RomNetwork(tmp_path / 'banks.db', tmp_path)
     cfg = {'kind': 'rom', 'platform': 'n64', 'big_endian': True,
            'compiler': {'toolchain': 'gcc-2.7.2-kmc', 'flags': ['-O2']},
-           'rom': {'file': 'rom.z64', 'sha1': 'same', 'analysis_sha1': 'stale'}, 'segments': []}
+           'rom': {'file': 'rom.z64', 'sha1': 'same',
+                   'analysis_sha1': hashlib.sha1(b'derived image' if derived else bytes(16)).hexdigest()
+                   if unit_changed else 'stale'}, 'segments': []}
     originals = {}
     with net.store.tx() as db:
         pid = db.execute('INSERT INTO projects(slug,name,root,arch,config) VALUES(?,?,?,?,?)',
@@ -310,26 +371,28 @@ def test_reimport_pairs_saved_matches_by_overlay_and_address(tmp_path, monkeypat
         for index in [1, 2]:
             name = f'renamed_bank_{index}'
             body = bytes.fromhex(f'2402000{index}')
-            fid = db.execute('INSERT INTO functions(project_id,name,unit,vram,size,n_insns,target,relocs,status,matched_source) '
-                             'VALUES(?,?,?,?,?,?,?,?,?,?)', (pid, name, f'overlay_{index:03d}', 0x80300000,
-                              4, 1, body, '[]', 'matched', f'int {name}(void) {{ return {index}; }}')).lastrowid
+            fid = db.execute('INSERT INTO functions(project_id,name,unit,vram,size,n_insns,target,relocs,status,matched_source,rom_offset) '
+                             'VALUES(?,?,?,?,?,?,?,?,?,?,?)', (pid, name, f'overlay_{index:03d}', 0x80300000,
+                              4, 1, body, '[]', 'matched', f'int {name}(void) {{ return {index}; }}',
+                              index * 4 if unit_changed else None)).lastrowid
             originals[fid] = (name, body)
 
     def replacement(work, *a, **kw):
         functions = []
         # Reverse order to catch accidental address-only pairing and stolen match identities.
         for index in [2, 1]:
-            unit = f'overlay_{index:03d}'
+            unit = f'{"renamed" if unit_changed else "overlay"}_{index:03d}'
             line = split.AsmLine(index * 4, 0x80300000, 0x24020000 + index, 'addiu', f'v0, zero, {index}')
             functions.append(split.RomFunction(f'func_80300000_{unit}', 0x80300000, index * 4, unit,
                                                 [line], work / (unit + '.s')))
+        if unit_changed:
+            (work/'splat.yaml').write_text('segments: []\n')
         if derived:(work/'analysis.bin').write_bytes(b'derived image')
         return split.SplitResult(functions, [], [], {}, work / 'splat.yaml', 'KMC', '', image='analysis.bin' if derived else 'rom.z64')
     monkeypatch.setattr(split, 'split_rom', replacement)
     picked = Picked('n64', bytes(16), 'rom.z64', {'title': 'Banks', 'size': 16, 'sha1': 'same',
                     'game_code': 'DEMO', 'region': 'Test', 'compiler_guess': 'KMC'}, True)
     net.import_split(consoles.get('n64'), picked, reimport_slug='banks', log=lambda *_: None)
-    import hashlib
     recorded = net.cfg(net.project_row('banks'))['rom']
     assert recorded['sha1'] == 'same'
     assert recorded['analysis_sha1'] == hashlib.sha1(b'derived image' if derived else bytes(16)).hexdigest()
@@ -576,16 +639,34 @@ def test_reimport_rechecks_saved_c_for_exact_entry_recreated_after_boundary_repa
     assert saved['status'] == 'open' and saved['best_source'] == old['matched_source']
 
 
-def test_reimport_queues_a_match_recreated_by_boundary_repair(tmp_path, monkeypatch):
+def test_reimport_keeps_a_recreated_open_entrys_best_attempt_before_recheck(tmp_path):
+    from decompnet.app.engine.importing import _recreated_matches
+
+    net=RomNetwork(tmp_path/'app.db',tmp_path)
+    with net.store.tx() as db:
+        pid=db.execute('INSERT INTO projects(slug,name,root,arch,config) VALUES(?,?,?,?,?)',
+                       ('game','Game',str(tmp_path),'mips','{}')).lastrowid
+        db.execute("INSERT INTO functions(project_id,name,vram,rom_offset,size,n_insns,target,relocs,status) VALUES(?,?,?,?,?,?,?,?,?)",
+                   (pid,'returned',0x80001000,0x1000,8,2,b'\0'*8,'[]','open'))
+    old={'name':'returned','vram':0x80001000,'rom_offset':0x1000,'size':8,'target':b'\0'*8,
+         'status':'open','best_source':'int returned(void) { return 0; }','best_agent_id':None}
+    assert _recreated_matches(net,pid,{'returned':old},True)==[('returned',old['best_source'],None)]
+    row=net.project_store(pid).one('SELECT status,best_source,best_score FROM functions WHERE project_id=?',pid)
+    assert row['status']=='open' and row['best_source']==old['best_source'] and row['best_score']==200
+
+
+@pytest.mark.parametrize('extended', [False, True])
+def test_reimport_queues_a_match_recreated_by_boundary_repair(tmp_path, monkeypatch, extended):
     import hashlib
 
     root = tmp_path/'game'
     root.mkdir()
-    (root/'old.z64').write_bytes(b'original')
+    old_image = bytes(16)
+    (root/'old.z64').write_bytes(old_image)
     net = RomNetwork(tmp_path/'app.db', tmp_path)
-    image = bytes(16)
+    image = old_image + (bytes(16) if extended else b'')
     cfg = {'kind':'rom', 'platform':'n64', 'big_endian':True,
-           'rom':{'file':'old.z64','sha1':'same','analysis_sha1':hashlib.sha1(image).hexdigest()},
+           'rom':{'file':'old.z64','sha1':'same','analysis_sha1':hashlib.sha1(old_image).hexdigest()},
            'segments':[], 'compiler':{'toolchain':'gcc-2.7.2-kmc','flags':['-O2']}}
     with net.store.tx() as db:
         pid = db.execute('INSERT INTO projects(slug,name,root,arch,config) VALUES(?,?,?,?,?)',
@@ -611,7 +692,7 @@ def test_reimport_queues_a_match_recreated_by_boundary_repair(tmp_path, monkeypa
         fn = split.RomFunction('new',0x80001000,0,'code',[line],work/'new.s')
         return split.SplitResult([fn],[],[split.Segment('code',0,16,0x80001000)],{},work/'splat.yaml','KMC','',image='rom.z64')
 
-    def repair(network, slug, log):
+    def repair(network, slug, log, **kwargs):
         with network.project_store(pid).tx() as db:
             db.execute('INSERT INTO functions(project_id,name,vram,rom_offset,size,n_insns,target,relocs,status) '
                        'VALUES(?,?,?,?,?,?,?,?,?)',(pid,'returned',0x80001008,8,4,1,bytes(4),'[]','open'))
