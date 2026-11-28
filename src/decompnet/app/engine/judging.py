@@ -124,8 +124,9 @@ class JudgeMixin:
 
             if console is None:
                 # An engine with no console connector at all (a bare Core, which tests judge with) links with the
-                # generic matcher, exactly as Console.link_function's default does.
-                from ...rom import match
+                # generic matcher, exactly as Console.link_function's default does. (`match` is the module's own
+                # import: importing it here made it local to this function, unset for local_link below whenever a
+                # console exists: "cannot access free variable 'match'" once upstream's check read it first.)
 
                 class _Generic:
                     @staticmethod
